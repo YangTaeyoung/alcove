@@ -189,8 +189,10 @@ def main():
                 log("QEMU exited with", proc.returncode)
                 break
             # "Press any key to boot from CD or DVD": tap Space during the first
-            # 75 s of the first boot only. Later boots must NOT boot the CD.
-            if fresh and now - started < 75 and now - last_key >= 1.0:
+            # 25 s of the first boot only (the prompt shows ~5-10 s in and the
+            # setup GUI, where Space would hit Cancel, appears after ~40 s).
+            # Later boots must NOT boot the CD.
+            if fresh and now - started < 25 and now - last_key >= 1.0:
                 press(49)
                 last_key = now
             if now - last_shot >= 60:
