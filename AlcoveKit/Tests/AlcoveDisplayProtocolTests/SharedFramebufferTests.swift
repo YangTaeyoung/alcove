@@ -14,7 +14,12 @@ final class SharedFramebufferTests: XCTestCase {
         fb.withBytes { buf in
             XCTAssertEqual(buf[0], 0xAA); XCTAssertEqual(buf[3], 0xDD); XCTAssertEqual(buf[16383], 0x7F)
         }
-        XCTAssertEqual(fb.baseAddress.load(as: UInt8.self), 0xAA)
+        // `baseAddress` is only valid while `fb` is alive, and Swift may release `fb`
+        // right after its last use; pin the lifetime explicitly around raw-pointer use.
+        withExtendedLifetime(fb) {
+            XCTAssertEqual(fb.baseAddress.load(as: UInt8.self), 0xAA)
+            XCTAssertEqual(fb.baseAddress.load(fromByteOffset: 16383, as: UInt8.self), 0x7F)
+        }
     }
 
     func testSeesWritesMadeAfterMapping() throws {

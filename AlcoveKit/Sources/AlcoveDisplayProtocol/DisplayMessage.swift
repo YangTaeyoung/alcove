@@ -91,7 +91,14 @@ public enum FromQEMU: Sendable, Equatable {
     }
 }
 
-/// Pointer buttons, numbered as QEMU's qapi `InputButton` enum.
+/// Pointer buttons, numbered as QEMU's qapi `InputButton` enum (v11.1.1:
+/// left, middle, right, wheel-up, wheel-down, side, extra, wheel-left,
+/// wheel-right, touch).
+///
+/// `touch` (9) is the qapi multi-touch contact button. The v1 protocol
+/// document lists only 0..8 for `btn`; the backend accepts any qapi ordinal,
+/// but usb-tablet (HID) has no mapping for it and drops it silently. Only
+/// virtio-input devices act on it.
 public enum InputButton: Int, Sendable, CaseIterable {
     case left = 0, middle, right, wheelUp, wheelDown, side, extra, wheelLeft, wheelRight, touch
 }

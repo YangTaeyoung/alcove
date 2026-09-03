@@ -43,7 +43,7 @@ index a07cb47..b66bf27 100644
         description: 'CURL block device driver')
  option('gio', type : 'feature', value : 'auto',
 diff --git a/qapi/ui.json b/qapi/ui.json
-index b2c42a7..9be78a7 100644
+index b2c42a7..2d3ed7a 100644
 --- a/qapi/ui.json
 +++ b/qapi/ui.json
 @@ -1459,6 +1459,23 @@
@@ -64,7 +64,7 @@ index b2c42a7..9be78a7 100644
 +# Since: 11.1
 +##
 +{ 'struct': 'DisplayAlcove',
-+  'data': { '*socket': 'str',
++  'data': { 'socket': 'str',
 +            '*shmdir': 'str' } }
 +
  ##
@@ -115,10 +115,10 @@ index 34970ff..5dc6f8d 100644
      "             [,gl=on|core|es|off][,rendernode=<file>]\n"
 diff --git a/ui/alcove.c b/ui/alcove.c
 new file mode 100644
-index 0000000..51771a8
+index 0000000..0dd5044
 --- /dev/null
 +++ b/ui/alcove.c
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,844 @@
 +/*
 + * Alcove display backend.
 + *
@@ -156,10 +156,23 @@ index 0000000..51771a8
 +#include <sys/un.h>
 +
 +#define ALCOVE_PROTOCOL_VERSION 1
-+/* Outbound bytes we are willing to queue before coalescing updates. */
++/* Outbound bytes queued before update/mouse/cursor messages are coalesced. */
 +#define ALCOVE_OUT_HIGH_WATER   (256 * 1024)
++/* Outbound bytes queued before we give up on a peer that stopped reading. */
++#define ALCOVE_OUT_MAX          (4 * 1024 * 1024)
++/* Longest single inbound line, i.e. the unterminated tail of the buffer. */
 +#define ALCOVE_IN_MAX_LINE      (64 * 1024)
++/* Inbound bytes handled per fd-handler invocation before yielding. */
++#define ALCOVE_IN_BUDGET        (64 * 1024)
 +#define ALCOVE_REFRESH_MS       16
++/*
++ * cursor_alloc() rejects anything larger than 512x512, so one file of this
++ * size holds every cursor QEMU can produce and never has to be re-created.
++ */
++#define ALCOVE_CURSOR_FILE_SIZE (512 * 512 * 4)
++/* Bounds applied to app-supplied integers before they reach QEMU. */
++#define ALCOVE_REL_MAX          32767
++#define ALCOVE_UI_MAX           16384
 +
 +typedef struct AlcoveShm {
 +    char *path;
@@ -176,11 +189,15 @@ index 0000000..51771a8
 +    AlcoveShm fb;
 +    unsigned fb_gen;
 +    AlcoveShm cursor;
-+    unsigned cursor_gen;
 +    int width, height, stride;
-+    /* dirty rectangle accumulated while the socket is backpressured */
++    /* State coalesced while the socket is backpressured. */
 +    bool dirty;
 +    int dx0, dy0, dx1, dy1;
++    bool mouse_pending;
++    int mouse_x, mouse_y;
++    bool mouse_on;
++    bool cursor_pending;
++    int cur_w, cur_h, cur_hx, cur_hy;
 +} AlcoveDisplay;
 +
 +static struct {
@@ -189,6 +206,8 @@ index 0000000..51771a8
 +    GString *out;
 +    GString *in;
 +    bool write_handler;
++    bool teardown_scheduled;
++    GPtrArray *retired;         /* superseded shm paths, see alcove_shm_retire() */
 +    AlcoveDisplay *dpy;
 +} alcove = { .fd = -1 };
 +
@@ -196,7 +215,8 @@ index 0000000..51771a8
 +
 +static void alcove_read(void *opaque);
 +static void alcove_write(void *opaque);
-+static void alcove_flush_dirty(AlcoveDisplay *d);
++static void alcove_flush_pending(AlcoveDisplay *d);
++static void alcove_teardown_bh(void *opaque);
 +
 +static void alcove_disconnect(const char *why)
 +{
@@ -210,6 +230,15 @@ index 0000000..51771a8
 +    alcove.write_handler = false;
 +    g_string_truncate(alcove.out, 0);
 +    g_string_truncate(alcove.in, 0);
++    /*
++     * This can run from inside a DisplayChangeListener callback (console.c
++     * is iterating its listener list) or from alcove_read(), so the listener
++     * is torn down from a bottom half rather than right here.
++     */
++    if (!alcove.teardown_scheduled) {
++        alcove.teardown_scheduled = true;
++        aio_bh_schedule_oneshot(qemu_get_aio_context(), alcove_teardown_bh, NULL);
++    }
 +}
 +
 +static void alcove_update_handlers(void)
@@ -220,6 +249,11 @@ index 0000000..51771a8
 +    }
 +    qemu_set_fd_handler(alcove.fd, alcove_read, want_write ? alcove_write : NULL, NULL);
 +    alcove.write_handler = want_write;
++}
++
++static bool alcove_backpressured(void)
++{
++    return alcove.out->len >= ALCOVE_OUT_HIGH_WATER;
 +}
 +
 +/* Try to push the queued bytes out; returns false if the socket died. */
@@ -240,6 +274,15 @@ index 0000000..51771a8
 +        alcove_disconnect(n == 0 ? "closed by peer" : strerror(errno));
 +        return false;
 +    }
++    /*
++     * State coalesced under backpressure must be re-armed from here and not
++     * only from the write handler: a mouse/cursor/switch send can empty the
++     * queue, after which alcove_update_handlers() drops the write handler
++     * and no write-readiness wakeup would ever flush what is pending.
++     */
++    if (alcove.fd >= 0 && alcove.dpy && !alcove_backpressured()) {
++        alcove_flush_pending(alcove.dpy);
++    }
 +    alcove_update_handlers();
 +    return alcove.fd >= 0;
 +}
@@ -247,6 +290,10 @@ index 0000000..51771a8
 +static void alcove_send(const char *line, size_t len)
 +{
 +    if (alcove.fd < 0) {
++        return;
++    }
++    if (alcove.out->len + len > ALCOVE_OUT_MAX) {
++        alcove_disconnect("peer not reading");
 +        return;
 +    }
 +    g_string_append_len(alcove.out, line, len);
@@ -262,23 +309,14 @@ index 0000000..51771a8
 +    qobject_unref(dict);
 +}
 +
-+static bool alcove_backpressured(void)
-+{
-+    return alcove.out->len >= ALCOVE_OUT_HIGH_WATER;
-+}
-+
 +static void alcove_write(void *opaque)
 +{
-+    if (!alcove_drain()) {
-+        return;
-+    }
-+    if (alcove.dpy && !alcove_backpressured()) {
-+        alcove_flush_dirty(alcove.dpy);
-+    }
++    alcove_drain();
 +}
 +
 +/* ---------------------------------------------------------- shared memory */
 +
++/* Unmap and unlink: only once no peer can still be reading the path. */
 +static void alcove_shm_release(AlcoveShm *shm)
 +{
 +    if (shm->map) {
@@ -293,11 +331,74 @@ index 0000000..51771a8
 +    shm->size = 0;
 +}
 +
++/*
++ * A superseded file may still be named by a `switch`/`cursor` message the
++ * app has not read yet, so unmap it now but defer the unlink to teardown or
++ * cleanup, when nobody can be about to open it.  Files are only superseded
++ * when the surface grows, so the list stays short.
++ */
++static void alcove_shm_retire(AlcoveShm *shm)
++{
++    if (shm->map) {
++        munmap(shm->map, shm->size);
++        shm->map = NULL;
++    }
++    if (shm->path) {
++        g_ptr_array_add(alcove.retired, shm->path);
++        shm->path = NULL;
++    }
++    shm->size = 0;
++}
++
++static void alcove_unlink_retired(void)
++{
++    for (guint i = 0; i < alcove.retired->len; i++) {
++        unlink(g_ptr_array_index(alcove.retired, i));
++    }
++    g_ptr_array_set_size(alcove.retired, 0);
++}
++
++/*
++ * Reserve the blocks up front so that running out of space is reported here
++ * instead of surfacing later from the blit: on Linux a write fault into an
++ * unallocated page of a shared file mapping raises SIGBUS, and on macOS the
++ * write succeeds into a page that can never be written back.
++ */
++static bool alcove_shm_preallocate(int fd, const char *path, size_t size)
++{
++    int err = 0;
++#if defined(F_PREALLOCATE)
++    fstore_t st = {
++        .fst_flags = F_ALLOCATEALL,
++        .fst_posmode = F_PEOFPOSMODE,
++        .fst_offset = 0,
++        .fst_length = size,
++    };
++    if (fcntl(fd, F_PREALLOCATE, &st) < 0) {
++        err = errno;
++    }
++#elif defined(CONFIG_POSIX_FALLOCATE)
++    err = posix_fallocate(fd, 0, size);
++#endif
++    if (err == ENOSPC || err == EDQUOT || err == EFBIG) {
++        error_report("alcove: cannot allocate %zu bytes for %s: %s",
++                     size, path, strerror(err));
++        return false;
++    }
++    /* Any other error means this filesystem cannot preallocate; allocate lazily. */
++    return true;
++}
++
 +static bool alcove_shm_create(AlcoveShm *shm, const char *path, size_t size)
 +{
 +    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 +    if (fd < 0) {
 +        error_report("alcove: cannot create %s: %s", path, strerror(errno));
++        return false;
++    }
++    if (!alcove_shm_preallocate(fd, path, size)) {
++        close(fd);
++        unlink(path);
 +        return false;
 +    }
 +    if (ftruncate(fd, size) < 0) {
@@ -336,6 +437,29 @@ index 0000000..51771a8
 +    alcove_send(line, n);
 +}
 +
++static void alcove_send_mouse(AlcoveDisplay *d, int x, int y, bool on)
++{
++    char line[128];
++    int n = snprintf(line, sizeof(line),
++                     "{\"t\":\"mouse\",\"con\":%d,\"x\":%d,\"y\":%d,\"on\":%s}\n",
++                     d->con_index, x, y, on ? "true" : "false");
++    alcove_send(line, n);
++}
++
++static void alcove_send_cursor(AlcoveDisplay *d)
++{
++    QDict *msg = qdict_new();
++    qdict_put_str(msg, "t", "cursor");
++    qdict_put_int(msg, "con", d->con_index);
++    qdict_put_int(msg, "w", d->cur_w);
++    qdict_put_int(msg, "h", d->cur_h);
++    qdict_put_int(msg, "hx", d->cur_hx);
++    qdict_put_int(msg, "hy", d->cur_hy);
++    qdict_put_str(msg, "shm", d->cursor.path);
++    qdict_put_int(msg, "size", (int64_t)d->cur_w * d->cur_h * 4);
++    alcove_send_dict(msg);
++}
++
 +static void alcove_flush_dirty(AlcoveDisplay *d)
 +{
 +    if (!d->dirty) {
@@ -343,6 +467,23 @@ index 0000000..51771a8
 +    }
 +    d->dirty = false;
 +    alcove_send_update(d, d->dx0, d->dy0, d->dx1 - d->dx0, d->dy1 - d->dy0);
++}
++
++/*
++ * Send whatever was coalesced while backpressured.  Every flag is cleared
++ * before its send because alcove_send() -> alcove_drain() re-enters here.
++ */
++static void alcove_flush_pending(AlcoveDisplay *d)
++{
++    alcove_flush_dirty(d);
++    if (d->mouse_pending) {
++        d->mouse_pending = false;
++        alcove_send_mouse(d, d->mouse_x, d->mouse_y, d->mouse_on);
++    }
++    if (d->cursor_pending) {
++        d->cursor_pending = false;
++        alcove_send_cursor(d);
++    }
 +}
 +
 +static void alcove_mark(AlcoveDisplay *d, int x, int y, int w, int h)
@@ -398,22 +539,26 @@ index 0000000..51771a8
 +    d->stride = stride;
 +    d->dirty = false;
 +
-+    if (d->shadow) {
-+        pixman_image_unref(d->shadow);
-+        d->shadow = NULL;
-+    }
++    g_clear_pointer(&d->shadow, pixman_image_unref);
 +    if (!d->fb.map || d->fb.size < need) {
 +        AlcoveShm old = d->fb;
 +        char *path = g_strdup_printf("%s/fb%d-%u.bgra", alcove.shmdir,
 +                                     d->con_index, ++d->fb_gen);
++        bool ok;
 +        memset(&d->fb, 0, sizeof(d->fb));
-+        if (!alcove_shm_create(&d->fb, path, need)) {
-+            g_free(path);
++        ok = alcove_shm_create(&d->fb, path, need);
++        g_free(path);
++        if (!ok) {
 +            d->fb = old;
++            /*
++             * Without a shared surface every later `update` would describe
++             * a surface the app never received.  Drop the connection so the
++             * app sees EOF (display lost) instead of bogus geometry.
++             */
++            alcove_disconnect("cannot create shared framebuffer");
 +            return;
 +        }
-+        g_free(path);
-+        alcove_shm_release(&old);
++        alcove_shm_retire(&old);
 +    }
 +    d->shadow = pixman_image_create_bits(PIXMAN_x8r8g8b8, w, h, d->fb.map, stride);
 +    alcove_blit(d, 0, 0, w, h);
@@ -443,14 +588,19 @@ index 0000000..51771a8
 +static void alcove_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
 +{
 +    AlcoveDisplay *d = container_of(dcl, AlcoveDisplay, dcl);
-+    char line[128];
 +    if (alcove.fd < 0) {
 +        return;
 +    }
-+    int n = snprintf(line, sizeof(line),
-+                     "{\"t\":\"mouse\",\"con\":%d,\"x\":%d,\"y\":%d,\"on\":%s}\n",
-+                     d->con_index, x, y, on ? "true" : "false");
-+    alcove_send(line, n);
++    if (alcove_backpressured()) {
++        /* Only the latest position matters; keep one pending message. */
++        d->mouse_pending = true;
++        d->mouse_x = x;
++        d->mouse_y = y;
++        d->mouse_on = on;
++        return;
++    }
++    d->mouse_pending = false;
++    alcove_send_mouse(d, x, y, on);
 +}
 +
 +static void alcove_cursor_define(DisplayChangeListener *dcl, QEMUCursor *c)
@@ -460,29 +610,31 @@ index 0000000..51771a8
 +        return;
 +    }
 +    size_t bytes = (size_t)c->width * c->height * 4;
-+    AlcoveShm old = d->cursor;
-+    char *path = g_strdup_printf("%s/cursor%d-%u.argb", alcove.shmdir,
-+                                 d->con_index, ++d->cursor_gen);
-+    memset(&d->cursor, 0, sizeof(d->cursor));
-+    if (!alcove_shm_create(&d->cursor, path, alcove_page_round(bytes))) {
-+        g_free(path);
-+        d->cursor = old;
++    if (bytes > ALCOVE_CURSOR_FILE_SIZE) {
++        warn_report("alcove: ignoring %ux%u cursor", c->width, c->height);
 +        return;
 +    }
-+    g_free(path);
++    if (!d->cursor.map) {
++        char *path = g_strdup_printf("%s/cursor%d.argb", alcove.shmdir, d->con_index);
++        bool ok = alcove_shm_create(&d->cursor, path,
++                                    alcove_page_round(ALCOVE_CURSOR_FILE_SIZE));
++        g_free(path);
++        if (!ok) {
++            /* The app keeps the previous cursor; nothing stale is announced. */
++            return;
++        }
++    }
 +    memcpy(d->cursor.map, c->data, bytes);
-+    alcove_shm_release(&old);
-+
-+    QDict *msg = qdict_new();
-+    qdict_put_str(msg, "t", "cursor");
-+    qdict_put_int(msg, "con", d->con_index);
-+    qdict_put_int(msg, "w", c->width);
-+    qdict_put_int(msg, "h", c->height);
-+    qdict_put_int(msg, "hx", c->hot_x);
-+    qdict_put_int(msg, "hy", c->hot_y);
-+    qdict_put_str(msg, "shm", d->cursor.path);
-+    qdict_put_int(msg, "size", bytes);
-+    alcove_send_dict(msg);
++    d->cur_w = c->width;
++    d->cur_h = c->height;
++    d->cur_hx = c->hot_x;
++    d->cur_hy = c->hot_y;
++    if (alcove_backpressured()) {
++        d->cursor_pending = true;
++        return;
++    }
++    d->cursor_pending = false;
++    alcove_send_cursor(d);
 +}
 +
 +static const DisplayChangeListenerOps alcove_dcl_ops = {
@@ -496,6 +648,11 @@ index 0000000..51771a8
 +};
 +
 +/* --------------------------------------------------------------- input */
++
++static int alcove_clamp(int64_t v, int64_t lo, int64_t hi)
++{
++    return v < lo ? lo : v > hi ? hi : v;
++}
 +
 +static void alcove_handle_key(AlcoveDisplay *d, QDict *m)
 +{
@@ -535,13 +692,22 @@ index 0000000..51771a8
 +    } else if (!strcmp(t, "key")) {
 +        alcove_handle_key(d, m);
 +    } else if (!strcmp(t, "abs")) {
++        /* qemu_input_queue_abs() scales linearly and never clamps. */
 +        qemu_input_queue_abs(d->dcl.con, INPUT_AXIS_X,
-+                             qdict_get_try_int(m, "x", 0), 0, INPUT_EVENT_ABS_MAX);
++                             alcove_clamp(qdict_get_try_int(m, "x", 0),
++                                          0, INPUT_EVENT_ABS_MAX),
++                             0, INPUT_EVENT_ABS_MAX);
 +        qemu_input_queue_abs(d->dcl.con, INPUT_AXIS_Y,
-+                             qdict_get_try_int(m, "y", 0), 0, INPUT_EVENT_ABS_MAX);
++                             alcove_clamp(qdict_get_try_int(m, "y", 0),
++                                          0, INPUT_EVENT_ABS_MAX),
++                             0, INPUT_EVENT_ABS_MAX);
 +    } else if (!strcmp(t, "rel")) {
-+        qemu_input_queue_rel(d->dcl.con, INPUT_AXIS_X, qdict_get_try_int(m, "dx", 0));
-+        qemu_input_queue_rel(d->dcl.con, INPUT_AXIS_Y, qdict_get_try_int(m, "dy", 0));
++        qemu_input_queue_rel(d->dcl.con, INPUT_AXIS_X,
++                             alcove_clamp(qdict_get_try_int(m, "dx", 0),
++                                          -ALCOVE_REL_MAX, ALCOVE_REL_MAX));
++        qemu_input_queue_rel(d->dcl.con, INPUT_AXIS_Y,
++                             alcove_clamp(qdict_get_try_int(m, "dy", 0),
++                                          -ALCOVE_REL_MAX, ALCOVE_REL_MAX));
 +    } else if (!strcmp(t, "btn")) {
 +        int64_t b = qdict_get_try_int(m, "b", -1);
 +        if (b >= 0 && b < INPUT_BUTTON__MAX) {
@@ -552,11 +718,10 @@ index 0000000..51771a8
 +    } else if (!strcmp(t, "lift")) {
 +        qkbd_state_lift_all_keys(d->kbd);
 +    } else if (!strcmp(t, "ui")) {
-+        QemuUIInfo info = {
-+            .width = qdict_get_try_int(m, "w", 0),
-+            .height = qdict_get_try_int(m, "h", 0),
-+        };
-+        if (info.width > 0 && info.height > 0) {
++        int64_t w = qdict_get_try_int(m, "w", 0);
++        int64_t h = qdict_get_try_int(m, "h", 0);
++        if (w > 0 && h > 0 && w <= ALCOVE_UI_MAX && h <= ALCOVE_UI_MAX) {
++            QemuUIInfo info = { .width = w, .height = h };
 +            qemu_console_set_ui_info(d->dcl.con, &info, false);
 +        }
 +    } else if (!strcmp(t, "refresh")) {
@@ -568,23 +733,54 @@ index 0000000..51771a8
 +    qobject_unref(obj);
 +}
 +
++/* Dispatch every complete line in alcove.in and drop them from the buffer. */
++static void alcove_process_lines(void)
++{
++    size_t pos = 0;
++
++    while (alcove.fd >= 0) {
++        char *start = alcove.in->str + pos;
++        char *nl = memchr(start, '\n', alcove.in->len - pos);
++        if (!nl) {
++            break;
++        }
++        *nl = '\0';
++        pos = nl + 1 - alcove.in->str;
++        if (nl != start) {
++            alcove_handle_line(start);
++        }
++    }
++    /* alcove_disconnect() empties the buffer; never erase past its end. */
++    if (alcove.fd >= 0 && pos > 0) {
++        g_string_erase(alcove.in, 0, pos);
++    }
++}
++
 +static void alcove_read(void *opaque)
 +{
 +    char buf[4096];
-+    ssize_t n;
++    size_t budget = ALCOVE_IN_BUDGET;
 +
-+    for (;;) {
-+        n = recv(alcove.fd, buf, sizeof(buf), 0);
++    /*
++     * Parse after every chunk so a backlog of small messages is consumed
++     * incrementally (the line limit applies to one line, not to the
++     * backlog), and yield after ALCOVE_IN_BUDGET bytes so a fast peer cannot
++     * monopolise the main loop: the handler is level-triggered and runs
++     * again for whatever is left.
++     */
++    while (alcove.fd >= 0 && budget > 0) {
++        ssize_t n = recv(alcove.fd, buf, MIN(sizeof(buf), budget), 0);
 +        if (n > 0) {
 +            g_string_append_len(alcove.in, buf, n);
-+            if (alcove.in->len > ALCOVE_IN_MAX_LINE) {
++            budget -= n;
++            alcove_process_lines();
++            if (alcove.fd >= 0 && alcove.in->len > ALCOVE_IN_MAX_LINE) {
 +                alcove_disconnect("input line too long");
-+                return;
 +            }
 +            continue;
 +        }
 +        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-+            break;
++            return;
 +        }
 +        if (n < 0 && errno == EINTR) {
 +            continue;
@@ -592,23 +788,37 @@ index 0000000..51771a8
 +        alcove_disconnect(n == 0 ? "closed by peer" : strerror(errno));
 +        return;
 +    }
-+    for (;;) {
-+        char *nl = memchr(alcove.in->str, '\n', alcove.in->len);
-+        if (!nl) {
-+            break;
-+        }
-+        *nl = '\0';
-+        if (nl != alcove.in->str) {
-+            alcove_handle_line(alcove.in->str);
-+        }
-+        g_string_erase(alcove.in, 0, nl - alcove.in->str + 1);
-+        if (alcove.fd < 0) {
-+            break;
-+        }
-+    }
 +}
 +
 +/* ------------------------------------------------------------ lifecycle */
++
++/*
++ * Runs on the main loop after alcove_disconnect(): nobody reads the shadow
++ * any more (v1 has no reconnect), so stop the 16 ms refresh and the blits,
++ * drop the shared files, and make sure no key the app was holding stays
++ * pressed in the guest.
++ */
++static void alcove_teardown_bh(void *opaque)
++{
++    AlcoveDisplay *d = alcove.dpy;
++
++    alcove.teardown_scheduled = false;
++    if (!d || alcove.fd >= 0) {
++        return;
++    }
++    qemu_console_unregister_listener(&d->dcl);
++    if (d->kbd) {
++        qkbd_state_lift_all_keys(d->kbd);
++    }
++    g_clear_pointer(&d->shadow, pixman_image_unref);
++    d->surface = NULL;
++    d->dirty = false;
++    d->mouse_pending = false;
++    d->cursor_pending = false;
++    alcove_shm_release(&d->fb);
++    alcove_shm_release(&d->cursor);
++    alcove_unlink_retired();
++}
 +
 +static int alcove_connect(const char *path)
 +{
@@ -649,24 +859,55 @@ index 0000000..51771a8
 +    return n;
 +}
 +
++/*
++ * The protocol promises absolute `shm` paths, so a relative socket= or
++ * shmdir= is resolved against our cwd once, here.  The directory is
++ * validated up front (after the socket, whose error is the documented one):
++ * a bad shmdir must fail fast like a bad socket does, not produce a VM that
++ * runs invisibly.
++ */
++static char *alcove_resolve_shmdir(const char *socket_path, const char *shmdir_opt)
++{
++    g_autofree char *dir = shmdir_opt ? g_strdup(shmdir_opt)
++                                      : g_path_get_dirname(socket_path);
++    char *shmdir = g_canonicalize_filename(dir, NULL);
++
++    if (g_mkdir_with_parents(shmdir, 0700) < 0) {
++        error_report("alcove: cannot create shmdir %s: %s", shmdir, strerror(errno));
++        exit(1);
++    }
++    if (access(shmdir, W_OK | X_OK) < 0) {
++        error_report("alcove: shmdir %s is not writable: %s", shmdir, strerror(errno));
++        exit(1);
++    }
++    return shmdir;
++}
++
 +static void alcove_display_init(DisplayState *ds, DisplayOptions *opts)
 +{
 +    const char *socket_path = opts->u.alcove.socket;
 +    QemuConsole *con;
 +    AlcoveDisplay *d;
 +
++    /* The QAPI schema makes socket mandatory; this guards hand-built options. */
 +    if (!socket_path) {
 +        error_report("alcove: -display alcove requires socket=<path>");
 +        exit(1);
 +    }
 +    alcove.out = g_string_sized_new(4096);
 +    alcove.in = g_string_sized_new(4096);
-+    alcove.shmdir = opts->u.alcove.shmdir ? g_strdup(opts->u.alcove.shmdir)
-+                                          : g_path_get_dirname(socket_path);
++    alcove.retired = g_ptr_array_new_with_free_func(g_free);
 +    alcove.fd = alcove_connect(socket_path);
 +    if (alcove.fd < 0) {
 +        exit(1);
 +    }
++    alcove.shmdir = alcove_resolve_shmdir(socket_path, opts->u.alcove.shmdir);
++    /*
++     * Register the read side before anything is sent: from now on
++     * alcove_update_handlers() is the only owner of the fd registration and
++     * adds/removes the write handler as the queue fills and drains.
++     */
++    qemu_set_fd_handler(alcove.fd, alcove_read, NULL, NULL);
 +
 +    con = qemu_console_lookup_default();
 +    d = g_new0(AlcoveDisplay, 1);
@@ -685,7 +926,6 @@ index 0000000..51771a8
 +
 +    qemu_console_register_listener(con, &d->dcl, &alcove_dcl_ops);
 +    d->kbd = qkbd_state_init(d->dcl.con);
-+    qemu_set_fd_handler(alcove.fd, alcove_read, NULL, NULL);
 +}
 +
 +static void alcove_display_cleanup(void)
@@ -703,11 +943,10 @@ index 0000000..51771a8
 +    }
 +    qemu_console_unregister_listener(&d->dcl);
 +    g_clear_pointer(&d->kbd, qkbd_state_free);
-+    if (d->shadow) {
-+        pixman_image_unref(d->shadow);
-+    }
++    g_clear_pointer(&d->shadow, pixman_image_unref);
 +    alcove_shm_release(&d->fb);
 +    alcove_shm_release(&d->cursor);
++    alcove_unlink_retired();
 +    g_free(d);
 +    alcove.dpy = NULL;
 +}

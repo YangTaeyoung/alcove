@@ -3,7 +3,8 @@ import XCTest
 import AlcoveDisplayProtocol
 
 /// End-to-end tests against the real engine in build/qemu-build (EDK2 only, no OS).
-/// Skipped when the engine has not been built.
+/// Skipped when the engine has not been built. The state machine itself is
+/// covered without QEMU in VMControllerFakeEngineTests.
 final class VMControllerTests: XCTestCase {
     private var tmp: URL!
     private var engine: EngineLocator.Engine!
@@ -16,10 +17,15 @@ final class VMControllerTests: XCTestCase {
     }
     override func tearDownWithError() throws { if let tmp { try? FileManager.default.removeItem(at: tmp) } }
 
+    /// Firmware-only VM with one ISO-backed CD-ROM and one empty tray, so the
+    /// usb-bot/scsi-cd topology is exercised by the real engine.
     private func makeVM() throws -> VMController {
+        let iso = tmp.appendingPathComponent("blank.iso")
+        try Data(count: 2 * 1024 * 1024).write(to: iso)
         var config = VMConfig.defaults(name: "FirmwareOnly", guestOS: .other)
         config.cpuCount = 2; config.memoryMiB = 512
         config.disks = [.init(id: "disk0", fileName: "disk0.qcow2", sizeGiB: 1, bus: .virtioBlk)]
+        config.cdroms = [.init(id: "cd0", path: iso.path), .init(id: "cd1", path: nil)]
         config.display = .ramfb
         config.network = .none
         let bundle = try VMBundle.create(config, in: tmp, engine: engine)
@@ -42,6 +48,9 @@ final class VMControllerTests: XCTestCase {
         try await vm.start()
         var s = await vm.state
         XCTAssertEqual(s, .running)
+        // QEMU holds a write lock on its pidfile while alive
+        let pid = VMController.pidfileLockHolder(vm.bundle.pidFileURL.path)
+        XCTAssertNotNil(pid)
 
         let hello = try await firstDisplayMessage(vm, { if case .hello = $0 { return true }; return false })
         XCTAssertNotNil(hello, "display backend must connect")
@@ -62,7 +71,18 @@ final class VMControllerTests: XCTestCase {
         try await vm.deleteSnapshot(named: "first")
         list = try await vm.snapshots()
         XCTAssertTrue(list.isEmpty)
+        // a failed restore leaves the guest running, not silently paused
         await XCTAssertThrowsErrorAsync(try await vm.restoreSnapshot(named: "missing"))
+        s = await vm.state; XCTAssertEqual(s, .running)
+        let afterFailedRestore = try await vm.qmp!.queryStatus()
+        XCTAssertTrue(afterFailedRestore.running)
+
+        // media change on the real scsi-cd devices: insert into the empty tray, then eject
+        let iso = tmp.appendingPathComponent("blank.iso")
+        try await vm.changeMedium(cdromID: "cd1", isoPath: iso.path)
+        var cfg = await vm.config; XCTAssertEqual(cfg.cdroms[1].path, iso.path)
+        try await vm.changeMedium(cdromID: "cd1", isoPath: nil)
+        cfg = await vm.config; XCTAssertNil(cfg.cdroms[1].path)
 
         let shot = tmp.appendingPathComponent("shot.png")
         try await vm.screenshot(to: shot)
@@ -74,6 +94,7 @@ final class VMControllerTests: XCTestCase {
         XCTAssertEqual(s, .stopped)
         let qmpAfter = await vm.qmp; XCTAssertNil(qmpAfter)
         let displayAfter = await vm.display; XCTAssertNil(displayAfter)
+        XCTAssertNil(VMController.pidfileLockHolder(vm.bundle.pidFileURL.path))
     }
 
     func testSuspendToDiskAndResume() async throws {
@@ -83,23 +104,37 @@ final class VMControllerTests: XCTestCase {
         var s = await vm.state
         XCTAssertEqual(s, .stopped)
         XCTAssertTrue(vm.bundle.isSuspended)
+        XCTAssertNotNil(vm.bundle.loadSuspendedConfig())
         try await vm.start()
         s = await vm.state
         XCTAssertEqual(s, .running)
         XCTAssertFalse(vm.bundle.isSuspended)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vm.bundle.suspendConfigURL.path))
         try await vm.shutdown(force: true)
     }
 
-    func testFailureIsReportedWithLog() async throws {
+    func testFailureIsReportedWithLogExactlyOnce() async throws {
         let vm = try makeVM()
+        let log = StateLog()
+        let observer = Task { for await s in vm.states { await log.append(s) } }
+        defer { observer.cancel() }
         try FileManager.default.removeItem(at: vm.bundle.efiVarsURL)   // QEMU refuses to start
         await XCTAssertThrowsErrorAsync(try await vm.start())
         let s = await vm.state
         guard case .failed(let msg) = s else { return XCTFail("expected failed, got \(s)") }
-        XCTAssertTrue(msg.contains("efi-vars.fd") || msg.contains("exited"), msg)
+        XCTAssertTrue(msg.contains("efi-vars.fd"), msg)
+        try await Task.sleep(for: .seconds(1))
+        let states = await log.states
+        XCTAssertEqual(states, [.starting, .failed(msg)], "the late exit notification must not replace the report")
     }
 }
 
 func XCTAssertThrowsErrorAsync(_ expression: @autoclosure () async throws -> some Any, file: StaticString = #filePath, line: UInt = #line) async {
     do { _ = try await expression(); XCTFail("expected error", file: file, line: line) } catch {}
+}
+
+/// Collects a controller's `states` stream.
+actor StateLog {
+    private(set) var states: [VMController.State] = []
+    func append(_ s: VMController.State) { states.append(s) }
 }

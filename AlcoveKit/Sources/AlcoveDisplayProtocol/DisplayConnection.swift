@@ -4,7 +4,11 @@ import Foundation
 /// the QEMU `alcove` backend connects to, decodes inbound messages onto an
 /// `AsyncStream`, and writes outbound messages.
 ///
-/// Thread-safe: all socket state is confined to a private serial queue.
+/// Thread-safe: all socket state is confined to a private serial queue. Every
+/// public member may be called from any thread, including from `onEnd` and
+/// from the connection's own queue; no block queued on that queue ever holds
+/// a strong reference to the connection, so releasing the last reference from
+/// any thread is safe.
 public final class DisplayConnection: @unchecked Sendable {
     public enum ConnectionError: Error, Equatable {
         case socket(errno: Int32)
@@ -25,6 +29,9 @@ public final class DisplayConnection: @unchecked Sendable {
     public let messages: AsyncStream<FromQEMU>
 
     private let queue = DispatchQueue(label: "alcove.display.connection")
+    /// Set on `queue` only, so `DispatchQueue.getSpecific` tells whether the
+    /// caller is already on it (a `sync` from there would deadlock/abort).
+    private let queueKey = DispatchSpecificKey<Bool>()
     private let continuation: AsyncStream<FromQEMU>.Continuation
     private var listenFD: Int32
     private var listenSource: DispatchSourceRead?
@@ -39,6 +46,10 @@ public final class DisplayConnection: @unchecked Sendable {
 
     /// Create the socket at `socketPath` (a stale file is removed) and start listening.
     /// The first client to connect becomes the peer; later connections are refused.
+    ///
+    /// `onEnd` is called exactly once, on a global concurrent queue (never on
+    /// the connection's own queue), after the stream has finished and the
+    /// sockets are closed. It may call back into the connection.
     public init(socketPath: String, onEnd: (@Sendable (EndReason) -> Void)? = nil) throws {
         var addr = sockaddr_un()
         let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
@@ -75,32 +86,50 @@ public final class DisplayConnection: @unchecked Sendable {
         messages = AsyncStream(bufferingPolicy: .unbounded) { cont = $0 }
         continuation = cont
 
+        queue.setSpecific(key: queueKey, value: true)
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in self?.acceptClient() }
-        source.resume()
+        // Store before resuming: a client already queued on the socket makes
+        // acceptClient() run on `queue` immediately, and it must see the source.
         listenSource = source
+        source.resume()
     }
 
     deinit {
-        close()
+        // No other reference exists and every queued block captures `self`
+        // weakly, so nothing can touch the state concurrently: tear down
+        // directly. Hopping onto `queue` here would abort the process whenever
+        // the last reference is dropped on the queue itself.
+        finish(.closed)
     }
 
     /// Whether QEMU is currently connected.
-    public var isConnected: Bool { queue.sync { clientFD >= 0 } }
+    public var isConnected: Bool { onQueue { clientFD >= 0 } }
 
     /// Queue a message for QEMU. Safe from any thread; drops silently once closed.
     public func send(_ message: ToQEMU) {
         let line = message.encodedLine
-        queue.async { [self] in
-            guard clientFD >= 0 else { return }
-            outbox.append(contentsOf: line.utf8)
-            flushOutbox()
+        // Weak: a queued send must never be the last owner of the connection.
+        queue.async { [weak self] in
+            guard let self, self.clientFD >= 0 else { return }
+            self.outbox.append(contentsOf: line.utf8)
+            self.flushOutbox()
         }
     }
 
-    /// Stop listening, disconnect the peer and finish the stream.
+    /// Stop listening, disconnect the peer and finish the stream. Idempotent;
+    /// safe from any thread, including the connection's own queue and `onEnd`.
     public func close() {
-        queue.sync { finish(.closed) }
+        onQueue { finish(.closed) }
+    }
+
+    /// Run `body` on `queue`, synchronously, without deadlocking when the
+    /// caller is already on it.
+    private func onQueue<T>(_ body: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: queueKey) == true {
+            return body()
+        }
+        return queue.sync(execute: body)
     }
 
     // MARK: - queue-confined
@@ -115,13 +144,16 @@ public final class DisplayConnection: @unchecked Sendable {
         clientFD = fd
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in self?.readAvailable() }
-        source.resume()
         readSource = source
-        // one peer only
+        source.resume()
+        // One peer only (QEMU connects exactly once): stop listening and give
+        // up the path now, so a later listener bound to the same path is not
+        // removed when this instance finishes.
         listenSource?.cancel()
         listenSource = nil
         Darwin.close(listenFD)
         listenFD = -1
+        unlink(socketPath)
     }
 
     private func readAvailable() {
@@ -166,8 +198,8 @@ public final class DisplayConnection: @unchecked Sendable {
                 if writeSource == nil {
                     let source = DispatchSource.makeWriteSource(fileDescriptor: clientFD, queue: queue)
                     source.setEventHandler { [weak self] in self?.flushOutbox() }
-                    source.resume()
                     writeSource = source
+                    source.resume()
                 }
                 return
             }
@@ -179,6 +211,7 @@ public final class DisplayConnection: @unchecked Sendable {
         writeSource = nil
     }
 
+    /// Tear everything down once. Runs on `queue`, or from `deinit`.
     private func finish(_ reason: EndReason) {
         guard !finished else { return }
         finished = true
@@ -186,10 +219,15 @@ public final class DisplayConnection: @unchecked Sendable {
         listenSource?.cancel(); listenSource = nil
         readSource?.cancel(); readSource = nil
         writeSource?.cancel(); writeSource = nil
-        if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1 }
+        // The path belongs to this instance only while it is still listening
+        // (acceptClient() unlinks it when the peer arrives).
+        if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1; unlink(socketPath) }
         if clientFD >= 0 { Darwin.close(clientFD); clientFD = -1 }
-        unlink(socketPath)
         continuation.finish()
-        onEnd?(reason)
+        // Deliver off the queue so the handler may call back into the
+        // connection (isConnected/close/send) without re-entering `queue`.
+        if let onEnd {
+            DispatchQueue.global().async { onEnd(reason) }
+        }
     }
 }

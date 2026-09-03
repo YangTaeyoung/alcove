@@ -1,8 +1,10 @@
 import Foundation
 
 /// A client connection to a unix stream socket delivering newline-terminated
-/// lines. All socket state lives on a private serial queue; callbacks are
-/// invoked on that queue.
+/// lines (a trailing CR is stripped, QEMU terminates QMP lines with CRLF).
+/// All socket state lives on a private serial queue; callbacks are invoked on
+/// that queue, in wire order, and `onEnd` is invoked exactly once after the
+/// last `onLine`.
 final class UnixLineTransport: @unchecked Sendable {
     enum TransportError: Error, Equatable {
         case pathTooLong(String)
@@ -11,6 +13,7 @@ final class UnixLineTransport: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "alcove.qmp.transport")
+    private let queueKey = DispatchSpecificKey<Int>()
     private var fd: Int32
     private var readSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
@@ -40,13 +43,25 @@ final class UnixLineTransport: @unchecked Sendable {
         fd = s
         self.onLine = onLine
         self.onEnd = onEnd
+        queue.setSpecific(key: queueKey, value: 1)
         let source = DispatchSource.makeReadSource(fileDescriptor: s, queue: queue)
         source.setEventHandler { [weak self] in self?.readAvailable() }
+        // The descriptor is closed only from the cancellation handler: libdispatch
+        // documents that closing it earlier races with a still-running event handler
+        // if the descriptor number gets reused (man dispatch_source_set_cancel_handler).
+        source.setCancelHandler { Darwin.close(s) }
         source.resume()
         readSource = source
     }
 
-    deinit { close() }
+    /// Never dispatch_sync from here: the last reference can be dropped inside a
+    /// block running on `queue` (e.g. the owner releases us from `onEnd`), and a
+    /// sync hop onto the current serial queue traps. Cancelling is asynchronous;
+    /// the read source's cancel handler closes the descriptor once no handler runs.
+    deinit {
+        writeSource?.cancel()
+        readSource?.cancel()
+    }
 
     func send(_ data: Data) {
         queue.async { [self] in
@@ -56,8 +71,14 @@ final class UnixLineTransport: @unchecked Sendable {
         }
     }
 
+    /// Close the socket. `onEnd("closed")` is invoked (once) before this returns
+    /// unless the transport already ended.
     func close() {
-        queue.sync { finish("closed") }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            finish("closed")            // already on our queue: a sync hop would deadlock/trap
+        } else {
+            queue.sync { finish("closed") }
+        }
     }
 
     private func readAvailable() {
@@ -67,9 +88,11 @@ final class UnixLineTransport: @unchecked Sendable {
             if n > 0 {
                 pending.append(contentsOf: buffer[0..<n])
                 while let nl = pending.firstIndex(of: 10) {
-                    let line = Data(pending[pending.startIndex..<nl])
+                    var line = pending[pending.startIndex..<nl]
+                    if line.last == 13 { line = line.dropLast() }   // CRLF framing (monitor/monitor.c monitor_puts_locked)
+                    let out = Data(line)
                     pending.removeSubrange(pending.startIndex...nl)
-                    if !line.isEmpty { onLine(line) }
+                    if !out.isEmpty { onLine(out) }
                 }
                 if n < buffer.count { return }
                 continue
@@ -103,9 +126,11 @@ final class UnixLineTransport: @unchecked Sendable {
     private func finish(_ reason: String) {
         guard !closed else { return }
         closed = true
-        readSource?.cancel(); readSource = nil
+        // Write source first: once cancelled its handler cannot fire again, so the
+        // read source's cancel handler (which closes the fd) cannot race with it.
         writeSource?.cancel(); writeSource = nil
-        if fd >= 0 { Darwin.close(fd); fd = -1 }
+        readSource?.cancel(); readSource = nil
+        fd = -1
         onEnd(reason)
     }
 }

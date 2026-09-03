@@ -33,22 +33,31 @@ extension QMPClient {
 
     // MARK: block devices (qapi/block.json, block-core.json)
 
+    /// One `BlockInfo` from `query-block` (qapi/block-core.json).
     public struct BlockDevice: Sendable, Equatable {
+        /// Legacy drive name; `""` for backends created by `-blockdev` + `-device drive=`.
         public let device: String
+        /// The guest device holding the block backend: its qdev `id`, or its QOM path when it
+        /// has none. For `usb-storage` this is the internally created SCSI child
+        /// (`/machine/peripheral/<id>/<id>.0/legacy[0]`), not the `usb-storage` `id`.
         public let qdev: String?
         public let removable: Bool
         public let file: String?
         public let trayOpen: Bool?
+        /// `inserted.node-name`: the block node currently inserted; nil when the medium is ejected.
+        public let nodeName: String?
     }
 
-    /// `query-block` (qapi/block-core.json): drives created with `-drive`.
+    /// `query-block` (qapi/block-core.json): every block backend that has a name or an
+    /// attached guest device.
     public func queryBlock() async throws -> [BlockDevice] {
         let r = try await execute("query-block")
         guard let list = r.arrayValue else { throw QMPError.unexpectedReturn(command: "query-block", value: r) }
         return list.map { b in
             BlockDevice(device: b["device"]?.stringValue ?? "", qdev: b["qdev"]?.stringValue,
                         removable: b["removable"]?.boolValue ?? false,
-                        file: b["inserted"]?["file"]?.stringValue, trayOpen: b["tray_open"]?.boolValue)
+                        file: b["inserted"]?["file"]?.stringValue, trayOpen: b["tray_open"]?.boolValue,
+                        nodeName: b["inserted"]?["node-name"]?.stringValue)
         }
     }
 
@@ -59,14 +68,45 @@ extension QMPClient {
         return list.compactMap { $0["node-name"]?.stringValue }
     }
 
-    /// `blockdev-change-medium` (qapi/block.json): insert `filename` into the removable device `id`.
+    /// `blockdev-change-medium` (qapi/block.json): insert `filename` into the removable
+    /// device `deviceID`. Without `force` QEMU only asks the guest to release a locked tray
+    /// and fails with "Device '...' is locked and force was not specified"; wait for
+    /// `DEVICE_TRAY_MOVED{tray-open:true}` and retry, or use the `force:` overload.
+    ///
+    /// `deviceID` is the `-device id=` (or QOM path) of the guest device; see
+    /// `blockBackendID(for:)` for how it is mapped to the backend QEMU expects.
     public func changeMedium(deviceID: String, filename: String, format: String = "raw") async throws {
-        _ = try await execute("blockdev-change-medium", arguments: ["id": .string(deviceID), "filename": .string(filename), "format": .string(format)])
+        try await changeMedium(deviceID: deviceID, filename: filename, format: format, force: false)
     }
 
-    /// `eject` (qapi/block.json).
+    /// `blockdev-change-medium` with `force` (since QEMU 7.1): open the tray even if the
+    /// guest has locked it.
+    public func changeMedium(deviceID: String, filename: String, format: String = "raw", force: Bool) async throws {
+        var args: [String: JSON] = ["id": .string(try await blockBackendID(for: deviceID)), "filename": .string(filename), "format": .string(format)]
+        if force { args["force"] = .bool(true) }
+        _ = try await execute("blockdev-change-medium", arguments: .object(args))
+    }
+
+    /// `eject` (qapi/block.json). `deviceID` as for `changeMedium`.
     public func eject(deviceID: String, force: Bool = false) async throws {
-        _ = try await execute("eject", arguments: ["id": .string(deviceID), "force": .bool(force)])
+        _ = try await execute("eject", arguments: ["id": .string(try await blockBackendID(for: deviceID)), "force": .bool(force)])
+    }
+
+    /// The `id` QEMU's medium commands need for guest device `deviceID`.
+    ///
+    /// `blockdev-change-medium`/`eject` resolve `id` with `blk_by_qdev_id`, which requires
+    /// the block backend to be attached to exactly that device (system/qdev-monitor.c
+    /// `blk_by_qdev_id`). `usb-storage` hands its drive to an internally created SCSI
+    /// device (hw/usb/dev-storage-classic.c "Hack alert", hw/scsi/scsi-bus.c
+    /// `scsi_bus_legacy_add_drive`), so its own `id` fails with "Device does not have a
+    /// block device backend"; the working id is that child's QOM path, which `query-block`
+    /// reports as `qdev` (block/qapi.c `bdrv_query_info` -> `blk_get_attached_dev_id`).
+    /// Returns the `qdev` equal to `deviceID` or nested under it, else `deviceID` unchanged
+    /// (callers may already pass a `qdev` value or a device QEMU can resolve directly).
+    private func blockBackendID(for deviceID: String) async throws -> String {
+        let devices = try await queryBlock()
+        let path = deviceID.hasPrefix("/") ? deviceID : "/machine/peripheral/\(deviceID)"   // qdev_device_add parents `-device id=` there
+        return devices.compactMap(\.qdev).first { $0 == deviceID || $0.hasPrefix(path + "/") } ?? deviceID
     }
 
     // MARK: devices (qapi/qdev.json)
@@ -149,26 +189,44 @@ extension QMPClient {
     // MARK: migration to file (suspend to disk) (qapi/migration.json)
 
     /// `migrate` to `uri` (e.g. `file:/path` or `exec:cat > path`) and poll
-    /// `query-migrate` until completed. The VM is left stopped afterwards.
+    /// `query-migrate` until completed. The VM is left stopped afterwards, also
+    /// on failure. On timeout or cancellation the outgoing migration is aborted
+    /// with `migrate_cancel` before the error is rethrown, so QEMU stops writing
+    /// the state file once the caller has given up.
     public func migrate(uri: String, timeout: Duration = .seconds(600)) async throws {
         _ = try await execute("migrate", arguments: ["uri": .string(uri)])
         let clock = ContinuousClock()
         let deadline = clock.now + timeout
-        while clock.now < deadline {
-            let info = try await execute("query-migrate")
-            switch info["status"]?.stringValue {
-            case "completed": return
-            case "failed", "cancelled":
-                throw QMPError.job(id: "migrate", error: info["error-desc"]?.stringValue ?? (info["status"]?.stringValue ?? "failed"))
-            default: try await Task.sleep(for: .milliseconds(200))
+        do {
+            while clock.now < deadline {
+                let info = try await execute("query-migrate")
+                switch info["status"]?.stringValue {
+                case "completed": return
+                case "failed", "cancelled":
+                    throw QMPError.job(id: "migrate", error: info["error-desc"]?.stringValue ?? (info["status"]?.stringValue ?? "failed"))
+                default: try await Task.sleep(for: .milliseconds(200))
+                }
             }
+        } catch is CancellationError {
+            await cancelMigration()
+            throw CancellationError()
         }
+        await cancelMigration()
         throw QMPError.timeout("migrate")
+    }
+
+    /// `migrate_cancel` (qapi/migration.json; succeeds even when nothing is migrating).
+    /// Runs in an unstructured task so it still goes out when the caller was cancelled.
+    private func cancelMigration() async {
+        await Task { _ = try? await self.execute("migrate_cancel", timeout: .seconds(10)) }.value
     }
 
     // MARK: input (qapi/ui.json input-send-event), an alternative to the display socket
 
-    /// Send key press+release through QMP using a QKeyCode name (e.g. "ret").
+    /// Send ONE key event (`down: true` = press, `down: false` = release) through
+    /// QMP using a QKeyCode name (e.g. "ret"). A full keystroke is two calls:
+    /// `sendKey(qcode:down: true)` then `sendKey(qcode:down: false)`; a press
+    /// without the release leaves the key held in the guest.
     public func sendKey(qcode: String, down: Bool) async throws {
         let ev: JSON = ["type": "key", "data": ["down": .bool(down), "key": ["type": "qcode", "data": .string(qcode)]]]
         _ = try await execute("input-send-event", arguments: ["events": [ev]])

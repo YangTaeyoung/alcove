@@ -61,10 +61,12 @@ final class FakeQMPServer: @unchecked Sendable {
     }
 
     /// Write one JSON line to the client (usable from any thread, e.g. to inject events).
+    /// Lines are CRLF-terminated like real QEMU output (monitor/monitor.c `monitor_puts_locked`
+    /// inserts `\r` before every `\n`; docs/interop/qmp-spec.rst "always terminating with CRLF").
     func sendLine(_ json: JSON) {
         lock.lock(); defer { lock.unlock() }
         guard clientFD >= 0, var data = try? json.serialized() else { return }
-        data.append(10)
+        data.append(contentsOf: [13, 10])
         _ = data.withUnsafeBytes { write(clientFD, $0.baseAddress, $0.count) }
     }
 

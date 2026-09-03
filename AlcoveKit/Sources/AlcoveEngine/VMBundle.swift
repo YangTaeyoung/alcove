@@ -18,6 +18,9 @@ public struct VMBundle: Sendable, Equatable {
     public var efiVarsURL: URL { url.appendingPathComponent("efi-vars.fd") }
     public var runURL: URL { url.appendingPathComponent("run") }
     public var suspendStateURL: URL { url.appendingPathComponent("suspend.state") }
+    /// The configuration the engine ran with when it was suspended; a resume must
+    /// launch exactly that machine, whatever `config.json` says by then.
+    public var suspendConfigURL: URL { url.appendingPathComponent("suspend.config.json") }
     /// Unix socket paths are limited to 104 bytes on macOS, so sockets live in a
     /// short per-VM directory under /tmp keyed by a hash of the bundle path.
     public var socketDirectory: String {
@@ -31,6 +34,8 @@ public struct VMBundle: Sendable, Equatable {
     public var tpmStateURL: URL { url.appendingPathComponent("tpm") }
     public var serialLogURL: URL { runURL.appendingPathComponent("serial.log") }
     public var qemuLogURL: URL { runURL.appendingPathComponent("qemu.log") }
+    /// Written by QEMU (`-pidfile`) and write-locked for as long as it lives.
+    public var pidFileURL: URL { runURL.appendingPathComponent("qemu.pid") }
 
     public init(url: URL) { self.url = url }
 
@@ -47,6 +52,19 @@ public struct VMBundle: Sendable, Equatable {
 
     /// Whether a suspended state exists to resume from.
     public var isSuspended: Bool { FileManager.default.fileExists(atPath: suspendStateURL.path) }
+
+    /// The configuration saved next to `suspend.state`, or nil when absent or unreadable.
+    public func loadSuspendedConfig() -> VMConfig? {
+        guard let data = try? Data(contentsOf: suspendConfigURL) else { return nil }
+        return try? VMConfig.decode(data)
+    }
+
+    /// Forget a suspended session so the next start boots from scratch.
+    public func discardSuspendState(fileManager fm: FileManager = .default) throws {
+        for u in [suspendStateURL, suspendConfigURL] where fm.fileExists(atPath: u.path) {
+            try fm.removeItem(at: u)
+        }
+    }
 
     /// Create a new bundle: directory, config, disk images (qcow2) and the UEFI
     /// variable store (copied from the engine's template, else zero-filled).

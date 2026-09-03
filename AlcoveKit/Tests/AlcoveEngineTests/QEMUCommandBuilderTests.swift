@@ -29,16 +29,21 @@ final class QEMUCommandBuilderTests: XCTestCase {
             "-device", "nvme,drive=disk0,id=disk0-dev,serial=alcove-disk0,bootindex=1",
             "-blockdev", "driver=file,node-name=cd0-file,filename=/isos/win.iso,read-only=on,locking=off",
             "-blockdev", "driver=raw,node-name=cd0,file=cd0-file,read-only=on",
-            "-device", "usb-storage,drive=cd0,id=cd0-dev,bus=xhci.0,removable=on,bootindex=10",
-            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22",
+            // a scsi-cd behind usb-bot: usb-storage would turn the -blockdev node into a scsi-hd
+            "-device", "usb-bot,id=cd0-bot,bus=xhci.0",
+            "-device", "scsi-cd,drive=cd0,id=cd0-dev,bus=cd0-bot.0,bootindex=100",
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:\(c.agentHostPort)-:\(VMConfig.agentGuestPort)",
             "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc",
             "-device", "virtio-rng-pci",
             "-device", "virtio-serial-pci,id=vser0",
+            "-smbios", "type=11,value=alcove-token=\(c.agentToken)",
             "-qmp", "unix:\(bundle.qmpSocketPath),server=on,wait=off",
             "-serial", "file:/vms/Test.alcovevm/run/serial.log", "-monitor", "none",
+            "-pidfile", "/vms/Test.alcovevm/run/qemu.pid",
             "-rtc", "base=utc,clock=host",
         ]
         XCTAssertEqual(a, expected)
+        XCTAssertEqual(QEMUCommandBuilder.cdromDeviceID("cd0"), "cd0-dev")
     }
 
     func testLinuxProfileUsesVirtioBlkAndGPU() {
@@ -47,7 +52,8 @@ final class QEMUCommandBuilderTests: XCTestCase {
         XCTAssertTrue(a.contains("virtio-gpu-pci"))
         XCTAssertTrue(a.contains("virtio-blk-pci,drive=disk0,id=disk0-dev,bootindex=1"))
         XCTAssertFalse(a.contains("ramfb"))
-        XCTAssertFalse(a.joined(separator: " ").contains("hostfwd"))
+        // only the guest-agent forward, no user port forwards
+        XCTAssertTrue(a.contains("user,id=net0,hostfwd=tcp:127.0.0.1:\(c.agentHostPort)-:\(VMConfig.agentGuestPort)"))
     }
 
     func testOptionsAndExtras() {
@@ -58,35 +64,88 @@ final class QEMUCommandBuilderTests: XCTestCase {
         let a = args(c, .init(incomingStatePath: "/vms/Test.alcovevm/suspend.state", bootFromCDROM: true))
         let joined = a.joined(separator: " ")
         XCTAssertTrue(joined.contains("-incoming file:/vms/Test.alcovevm/suspend.state"))
-        XCTAssertTrue(joined.contains("virtio-blk-pci,drive=cd0,id=cd0-dev,bootindex=0"), "linux guests get virtio CD-ROMs")
-        XCTAssertFalse(joined.contains("usb-storage"))
+        XCTAssertTrue(joined.contains("-device usb-bot,id=cd0-bot,bus=xhci.0 -device scsi-cd,drive=cd0,id=cd0-dev,bus=cd0-bot.0,bootindex=0"))
         XCTAssertTrue(joined.contains("virtio-blk-pci,drive=disk0,id=disk0-dev,bootindex=20"))
-        XCTAssertTrue(joined.contains("-tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis-device,tpmdev=tpm0"))
+        XCTAssertTrue(joined.contains("-chardev socket,id=chrtpm,path=\(bundle.swtpmSocketPath) -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis-device,tpmdev=tpm0"))
         XCTAssertTrue(joined.contains("usb-host,bus=xhci.0,id=usbhost0,vendorid=0x05ac,productid=0x12a8"))
         XCTAssertFalse(joined.contains("-netdev"))
     }
 
-    func testCDROMBusOverride() {
-        var c = VMConfig.defaults(name: "B", guestOS: .linux, installISO: "/i.iso")
-        c.cdroms[0].bus = .usb
-        XCTAssertTrue(args(c).joined(separator: " ").contains("usb-storage,drive=cd0"))
-        var w = VMConfig.defaults(name: "W", guestOS: .windows, installISO: "/w.iso")
-        XCTAssertTrue(args(w).joined(separator: " ").contains("usb-storage,drive=cd0"))
-        w.cdroms[0].bus = .virtio
-        XCTAssertTrue(args(w).joined(separator: " ").contains("virtio-blk-pci,drive=cd0"))
+    /// Every device needs its own boot index; QEMU refuses a duplicate
+    /// ("The bootindex 10 has already been used", system/bootdevice.c).
+    func testEveryCDROMAndDiskGetsADistinctBootIndex() {
+        var c = VMConfig.defaults(name: "Two", guestOS: .windows, installISO: "/isos/win.iso")
+        c.cdroms.append(.init(id: "cd1", path: "/isos/virtio-win.iso"))
+        c.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 8, bus: .virtioBlk))
+        func bootIndexes(_ a: [String]) -> [Int] {
+            a.compactMap { arg in
+                arg.split(separator: ",").first { $0.hasPrefix("bootindex=") }.flatMap { Int($0.dropFirst("bootindex=".count)) }
+            }
+        }
+        let normal = bootIndexes(args(c))
+        XCTAssertEqual(normal, [1, 2, 100, 101])
+        let cdFirst = bootIndexes(args(c, .init(bootFromCDROM: true)))
+        XCTAssertEqual(cdFirst, [20, 21, 0, 1])
+        XCTAssertTrue(args(c).contains("scsi-cd,drive=cd1,id=cd1-dev,bus=cd1-bot.0,bootindex=101"))
     }
 
-    func testTPMIsSkippedWithoutSwtpm() {
+    /// Both QEMU option parsers end a value at a single comma and read `,,` as a
+    /// literal comma; every user-controlled path or name must be escaped, while
+    /// `-serial file:`, `-pidfile` and `-incoming file:` take their string verbatim.
+    func testCommasInNamesAndPathsAreEscaped() {
+        let engine = EngineLocator.Engine(qemuSystem: "/e, f/qemu-system-aarch64", qemuImg: "/e, f/qemu-img", firmwareDir: "/e, f/pc-bios", swtpm: "/e, f/swtpm")
+        let bundle = VMBundle(url: URL(fileURLWithPath: "/vms/a, b/Test.alcovevm"))
+        var c = VMConfig.defaults(name: "Work, Dev", guestOS: .linux, installISO: "/isos/x, y.iso")
+        c.tpm = true
+        let a = QEMUCommandBuilder(engine: engine).arguments(for: c, bundle: bundle, options: .init(incomingStatePath: bundle.suspendStateURL.path))
+        XCTAssertEqual(QEMUCommandBuilder.escape("a,b,,c"), "a,,b,,,,c")
+        XCTAssertTrue(a.contains("guest=Work,, Dev,debug-threads=on"))
+        XCTAssertTrue(a.contains("if=pflash,format=raw,readonly=on,file=/e,, f/pc-bios/edk2-aarch64-code.fd"))
+        XCTAssertTrue(a.contains("if=pflash,format=raw,file=/vms/a,, b/Test.alcovevm/efi-vars.fd"))
+        XCTAssertTrue(a.contains("alcove,socket=\(bundle.displaySocketPath),shmdir=/vms/a,, b/Test.alcovevm/run"))
+        XCTAssertTrue(a.contains("driver=file,node-name=disk0-file,filename=/vms/a,, b/Test.alcovevm/disk0.qcow2,discard=unmap"))
+        XCTAssertTrue(a.contains("driver=file,node-name=cd0-file,filename=/isos/x,, y.iso,read-only=on,locking=off"))
+        XCTAssertTrue(a.contains("file:/vms/a, b/Test.alcovevm/run/serial.log"))
+        XCTAssertTrue(a.contains("/vms/a, b/Test.alcovevm/run/qemu.pid"))
+        XCTAssertTrue(a.contains("file:/vms/a, b/Test.alcovevm/suspend.state"))
+        // nothing else carries an unescaped comma from a path
+        let verbatim = Set(["file:/vms/a, b/Test.alcovevm/run/serial.log", "/vms/a, b/Test.alcovevm/run/qemu.pid", "file:/vms/a, b/Test.alcovevm/suspend.state"])
+        for arg in a where arg.contains(", ") && !verbatim.contains(arg) {
+            XCTAssertTrue(arg.contains(",, "), "unescaped comma in \(arg)")
+        }
+    }
+
+    /// A configured TPM is always emitted; a missing swtpm must fail loudly
+    /// (VMController refuses to start) instead of silently dropping the device.
+    func testTPMIsEmittedEvenWithoutSwtpm() {
         var c = VMConfig.defaults(name: "T", guestOS: .windows)
         c.tpm = true
         let noSwtpm = EngineLocator.Engine(qemuSystem: "/e/q", qemuImg: "/e/i", firmwareDir: "/e", swtpm: nil)
         let a = QEMUCommandBuilder(engine: noSwtpm).arguments(for: c, bundle: bundle)
-        XCTAssertFalse(a.contains("-tpmdev"))
+        XCTAssertTrue(a.contains("-tpmdev"))
+        XCTAssertTrue(a.contains("tpm-tis-device,tpmdev=tpm0"))
+        c.tpm = false
+        XCTAssertFalse(QEMUCommandBuilder(engine: noSwtpm).arguments(for: c, bundle: bundle).contains("-tpmdev"))
     }
 
-    func testEmptyCDROMIsOmitted() {
+    /// An ISO-less drive is still a device (an empty tray), so media can be inserted later.
+    func testEmptyCDROMIsAnEmptyTray() {
         var c = VMConfig.defaults(name: "E", guestOS: .linux)
         c.cdroms = [.init(id: "cd0", path: nil)]
-        XCTAssertFalse(args(c).joined(separator: " ").contains("cd0"))
+        let a = args(c)
+        XCTAssertFalse(a.contains { $0.contains("node-name=cd0") })
+        XCTAssertTrue(a.contains("usb-bot,id=cd0-bot,bus=xhci.0"))
+        XCTAssertTrue(a.contains("scsi-cd,id=cd0-dev,bus=cd0-bot.0,bootindex=100"))
+    }
+    func testCDROMVirtioBusOption() {
+        let l = VMConfig.defaults(name: "L", guestOS: .linux, installISO: "/i.iso")
+        XCTAssertTrue(args(l).joined(separator: " ").contains("scsi-cd,drive=cd0"), "USB CD by default")
+        var seed = l
+        seed.cdroms[0].bus = .virtio
+        let sj = args(seed).joined(separator: " ")
+        XCTAssertTrue(sj.contains("virtio-blk-pci,drive=cd0,id=\(QEMUCommandBuilder.cdromDeviceID("cd0")),bootindex=100"), sj)
+        XCTAssertFalse(sj.contains("usb-bot"))
+        seed.cdroms[0].path = nil
+        XCTAssertFalse(args(seed).joined(separator: " ").contains("cd0"), "an empty virtio CD is omitted")
     }
 }

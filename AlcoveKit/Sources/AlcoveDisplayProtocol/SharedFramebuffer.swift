@@ -40,6 +40,13 @@ public final class SharedFramebuffer: @unchecked Sendable {
         try body(UnsafeRawBufferPointer(start: base, count: size))
     }
 
-    /// Raw pointer to the mapping; valid for the lifetime of this object.
+    /// Raw pointer to the mapping; valid only while this object is alive.
+    ///
+    /// Swift may release an object right after its *last use*, not at the end
+    /// of its scope, so a pointer obtained from a local that is not used again
+    /// can dangle before the callee reads it (the mapping is `munmap`ed in
+    /// `deinit`). Either keep the `SharedFramebuffer` stored for as long as
+    /// the pointer is in use, wrap the use in `withExtendedLifetime(fb) { ... }`,
+    /// or prefer `withBytes(_:)`, which keeps the object alive for the call.
     public var baseAddress: UnsafeRawPointer { UnsafeRawPointer(base) }
 }

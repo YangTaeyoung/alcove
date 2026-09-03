@@ -43,6 +43,8 @@ final class VMConfigTests: XCTestCase {
         var c = VMConfig.defaults(name: "V", guestOS: .linux)
         c.name = " "; XCTAssertThrowsError(try c.validate()) { XCTAssertEqual($0 as? VMConfig.ValidationError, .emptyName) }
         c.name = "a/b"; XCTAssertThrowsError(try c.validate())
+        // swtpm's --tpmstate dir= is comma-delimited with no escape
+        c.name = "Work, Dev"; XCTAssertThrowsError(try c.validate()) { XCTAssertEqual($0 as? VMConfig.ValidationError, .invalidName("Work, Dev")) }
         c.name = "ok"; c.cpuCount = 0; XCTAssertThrowsError(try c.validate())
         c.cpuCount = 2; c.memoryMiB = 64; XCTAssertThrowsError(try c.validate())
         c.memoryMiB = 1024; c.disks = []; XCTAssertThrowsError(try c.validate()) { XCTAssertEqual($0 as? VMConfig.ValidationError, .noDisks) }
@@ -50,6 +52,20 @@ final class VMConfigTests: XCTestCase {
         XCTAssertThrowsError(try c.validate()) { XCTAssertEqual($0 as? VMConfig.ValidationError, .duplicateID("d")) }
         c.disks = [.init(id: "d", fileName: "d.qcow2", sizeGiB: 1, bus: .nvme)]; c.macAddress = "nope"
         XCTAssertThrowsError(try c.validate())
+    }
+
+    func testAgentFieldsAreGeneratedAndMigrated() throws {
+        let c = VMConfig.defaults(name: "A", guestOS: .linux)
+        XCTAssertEqual(c.agentToken.count, 36)
+        XCTAssertTrue((17000...17999).contains(c.agentHostPort))
+        XCTAssertEqual(c.agentHostPort, VMConfig.agentPort(for: c.agentToken))
+        // an old config without the fields decodes with fresh values
+        var obj = try JSONSerialization.jsonObject(with: try c.encoded()) as! [String: Any]
+        obj.removeValue(forKey: "agentToken"); obj.removeValue(forKey: "agentHostPort")
+        let old = try VMConfig.decode(try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(old.agentToken.count, 36)
+        XCTAssertEqual(old.agentHostPort, VMConfig.agentPort(for: old.agentToken))
+        XCTAssertEqual(try VMConfig.decode(try c.encoded()).agentToken, c.agentToken)
     }
 
     func testRandomMACIsLocallyAdministeredUnicast() {

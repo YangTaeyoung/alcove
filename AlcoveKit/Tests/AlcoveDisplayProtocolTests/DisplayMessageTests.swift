@@ -22,6 +22,23 @@ final class DisplayMessageTests: XCTestCase {
         XCTAssertEqual(try decode(#"{"t":"future","x":1}"#), .unknown(type: "future"))
     }
 
+    /// Forward compatibility: a newer backend may add fields to a known message
+    /// (docs/display-protocol.md, "Unknown `t` values are ignored"); they must be
+    /// ignored rather than rejected.
+    func testKnownMessagesTolerateUnknownFields() throws {
+        XCTAssertEqual(try decode(#"{"t":"update","con":0,"x":1,"y":2,"w":3,"h":4,"future":1,"n":{"a":[1,2]}}"#),
+                       .update(.init(con: 0, x: 1, y: 2, w: 3, h: 4)))
+        XCTAssertEqual(try decode(#"{"t":"switch","con":0,"w":4,"h":2,"stride":16,"fmt":"bgra8","shm":"/x","size":4096,"fmt2":"rgba8","gen":7}"#),
+                       .switchSurface(.init(con: 0, w: 4, h: 2, stride: 16, fmt: "bgra8", shm: "/x", size: 4096)))
+        XCTAssertEqual(try decode(#"{"t":"hello","v":1,"consoles":1,"abs":true,"caps":["x"]}"#),
+                       .hello(.init(v: 1, consoles: 1, abs: true)))
+        XCTAssertEqual(try decode(#"{"t":"cursor","con":0,"w":32,"h":32,"hx":1,"hy":2,"shm":"/tmp/c","size":4096,"premul":false}"#),
+                       .cursor(.init(con: 0, w: 32, h: 32, hx: 1, hy: 2, shm: "/tmp/c", size: 4096)))
+        XCTAssertEqual(try decode(#"{"t":"mouse","con":0,"x":10,"y":20,"on":false,"z":3}"#),
+                       .mouse(.init(con: 0, x: 10, y: 20, on: false)))
+        XCTAssertEqual(try decode(#"{"t":"bye","reason":"shutdown"}"#), .bye)
+    }
+
     func testHelloWithoutAbsField() throws {
         XCTAssertEqual(try decode(#"{"t":"hello","v":1,"consoles":2}"#), .hello(.init(v: 1, consoles: 2)))
     }
@@ -68,10 +85,20 @@ final class DisplayMessageTests: XCTestCase {
     }
 
     func testInputButtonOrdinalsMatchQapi() {
+        // qapi/ui.json `InputButton` at the pinned tag: left, middle, right, wheel-up,
+        // wheel-down, side, extra, wheel-left, wheel-right, touch.
+        XCTAssertEqual(InputButton.allCases.map(\.rawValue), Array(0..<10))
         XCTAssertEqual(InputButton.left.rawValue, 0)
+        XCTAssertEqual(InputButton.middle.rawValue, 1)
         XCTAssertEqual(InputButton.right.rawValue, 2)
         XCTAssertEqual(InputButton.wheelUp.rawValue, 3)
+        XCTAssertEqual(InputButton.wheelDown.rawValue, 4)
+        XCTAssertEqual(InputButton.side.rawValue, 5)
+        XCTAssertEqual(InputButton.extra.rawValue, 6)
+        XCTAssertEqual(InputButton.wheelLeft.rawValue, 7)
         XCTAssertEqual(InputButton.wheelRight.rawValue, 8)
+        // `touch` (9) is the qapi multi-touch contact; the v1 protocol document lists
+        // only 0..8 and usb-tablet ignores it, see the enum's doc comment.
         XCTAssertEqual(InputButton.touch.rawValue, 9)
     }
 }

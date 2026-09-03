@@ -116,7 +116,8 @@ def main():
             fail(f"guest clipboard did not receive host text: {out!r}")
         log("host -> guest clipboard OK")
 
-        # guest -> host clipboard
+        # guest -> host clipboard (leave the agent's 2 s echo-suppression window)
+        time.sleep(2.5)
         guest_text = f"typed in guest {int(time.time())}"
         agent.exec(f"Set-Clipboard -Value '{guest_text}'")
         m = agent.recv("clipboard.changed", 15)

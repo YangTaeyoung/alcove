@@ -40,7 +40,8 @@ public struct VMConfig: Codable, Sendable, Equatable {
         public var id: String
         /// Absolute path of the ISO, or nil for an empty drive.
         public var path: String?
-        /// Bus to attach on; nil means "USB for Windows guests, virtio otherwise".
+        /// Bus to attach on; nil means USB (a SCSI CD-ROM behind usb-bot, with a
+        /// tray so media can be changed while running).
         public var bus: CDBus?
         public init(id: String, path: String?, bus: CDBus? = nil) { self.id = id; self.path = path; self.bus = bus }
     }
@@ -102,15 +103,32 @@ public struct VMConfig: Codable, Sendable, Equatable {
     /// Locally administered MAC for the first NIC, fixed at creation.
     public var macAddress: String
     public var createdAt: Date
+    /// Secret the guest agent must echo (passed to the guest as an SMBIOS OEM string).
+    public var agentToken: String
+    /// Host loopback port forwarded to the guest agent (guest port 7645).
+    public var agentHostPort: Int
 
     public init(schemaVersion: Int = VMConfig.currentSchemaVersion, name: String, guestOS: GuestOS, cpuCount: Int,
                 memoryMiB: Int, disks: [Disk], cdroms: [CDROM] = [], network: Network = .user(portForwards: []),
                 display: DisplayDevice, tpm: Bool = false, usbPassthrough: [USBSelector] = [],
-                sharedFolders: [SharedFolder] = [], macAddress: String = VMConfig.randomMAC(), createdAt: Date = Date()) {
+                sharedFolders: [SharedFolder] = [], macAddress: String = VMConfig.randomMAC(), createdAt: Date = Date(),
+                agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil) {
         self.schemaVersion = schemaVersion; self.name = name; self.guestOS = guestOS; self.cpuCount = cpuCount
         self.memoryMiB = memoryMiB; self.disks = disks; self.cdroms = cdroms; self.network = network
         self.display = display; self.tpm = tpm; self.usbPassthrough = usbPassthrough
         self.sharedFolders = sharedFolders; self.macAddress = macAddress; self.createdAt = createdAt
+        self.agentToken = agentToken
+        self.agentHostPort = agentHostPort ?? VMConfig.agentPort(for: agentToken)
+    }
+
+    /// Guest port the agent listens on.
+    public static let agentGuestPort = 7645
+
+    /// A host port in 17000...17999 derived from the token (stable per VM).
+    public static func agentPort(for token: String) -> Int {
+        var h: UInt32 = 2166136261
+        for b in token.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
+        return 17000 + Int(h % 1000)
     }
 
     /// Sensible defaults per guest OS.
@@ -145,7 +163,11 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public func validate() throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw ValidationError.emptyName }
-        guard !trimmed.contains("/"), !trimmed.contains(":"), trimmed != ".", trimmed != ".." else { throw ValidationError.invalidName(name) }
+        // The name is part of every bundle path. "," is refused because swtpm's
+        // `--tpmstate dir=` is comma-delimited with no escape (QEMU's own options are escaped by the builder).
+        guard !trimmed.contains("/"), !trimmed.contains(":"), !trimmed.contains(","), trimmed != ".", trimmed != ".." else {
+            throw ValidationError.invalidName(name)
+        }
         guard (1...64).contains(cpuCount) else { throw ValidationError.cpuCount(cpuCount) }
         guard (256...(512 * 1024)).contains(memoryMiB) else { throw ValidationError.memory(memoryMiB) }
         guard !disks.isEmpty else { throw ValidationError.noDisks }
@@ -175,7 +197,8 @@ extension VMConfig {
 
     public func encoded() throws -> Data { try VMConfig.encoder.encode(self) }
 
-    /// Decode, migrating older schema versions forward.
+    /// Decode, migrating older schema versions forward. Configs written before
+    /// the agent fields existed get a fresh token and port.
     public static func decode(_ data: Data) throws -> VMConfig {
         var config = try decoder.decode(VMConfig.self, from: data)
         if config.schemaVersion < currentSchemaVersion {
@@ -183,5 +206,31 @@ extension VMConfig {
             config.schemaVersion = currentSchemaVersion
         }
         return config
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, name, guestOS, cpuCount, memoryMiB, disks, cdroms, network, display, tpm,
+             usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        name = try c.decode(String.self, forKey: .name)
+        guestOS = try c.decode(GuestOS.self, forKey: .guestOS)
+        cpuCount = try c.decode(Int.self, forKey: .cpuCount)
+        memoryMiB = try c.decode(Int.self, forKey: .memoryMiB)
+        disks = try c.decode([Disk].self, forKey: .disks)
+        cdroms = try c.decodeIfPresent([CDROM].self, forKey: .cdroms) ?? []
+        network = try c.decodeIfPresent(Network.self, forKey: .network) ?? .user(portForwards: [])
+        display = try c.decode(DisplayDevice.self, forKey: .display)
+        tpm = try c.decodeIfPresent(Bool.self, forKey: .tpm) ?? false
+        usbPassthrough = try c.decodeIfPresent([USBSelector].self, forKey: .usbPassthrough) ?? []
+        sharedFolders = try c.decodeIfPresent([SharedFolder].self, forKey: .sharedFolders) ?? []
+        macAddress = try c.decodeIfPresent(String.self, forKey: .macAddress) ?? VMConfig.randomMAC()
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        let token = try c.decodeIfPresent(String.self, forKey: .agentToken) ?? UUID().uuidString.lowercased()
+        agentToken = token
+        agentHostPort = try c.decodeIfPresent(Int.self, forKey: .agentHostPort) ?? VMConfig.agentPort(for: token)
     }
 }

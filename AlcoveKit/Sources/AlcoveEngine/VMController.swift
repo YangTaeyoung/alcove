@@ -4,6 +4,11 @@ import AlcoveQMP
 
 /// Lifecycle of one VM: launches the engine, owns the display connection and
 /// QMP client, and exposes state changes. One controller per bundle.
+///
+/// Concurrency: an operation that spans an `await` captures `generation` first
+/// and re-checks it afterwards. `shutdown()` bumps the generation, so a start or
+/// suspend interrupted by a stop unwinds without touching state it no longer
+/// owns, and a late exit notification from a superseded engine is ignored.
 public actor VMController {
     public enum State: Sendable, Equatable {
         case stopped
@@ -37,7 +42,12 @@ public actor VMController {
 
     public nonisolated let bundle: VMBundle
     public nonisolated let engine: EngineLocator.Engine
+    /// The configuration for the next cold start; see `update(config:)`.
     public private(set) var config: VMConfig
+    /// The configuration the engine was launched with, while it runs. QMP-driven
+    /// operations (snapshots, media changes) address this machine, not `config`,
+    /// which may already hold edits for the next start.
+    public private(set) var runningConfig: VMConfig?
     public private(set) var state: State = .stopped { didSet { if state != oldValue { stateContinuation.yield(state) } } }
     /// State changes, starting with the current state on subscription of a fresh stream is not
     /// provided; read `state` first, then observe.
@@ -55,6 +65,19 @@ public actor VMController {
     private var exitTask: Task<Void, Never>?
     private var expectingExit = false
     private var generation = 0
+    private var usbHotplugSerial = 0
+
+    /// Upper bound for loading a suspend-to-disk state (RAM-sized, so slow disks take a while).
+    public static let resumeTimeout: Duration = .seconds(600)
+
+    /// `tpm-tis-device` aborts under HVF in this engine build: its 0x5000-byte MMIO
+    /// region is not 16 KiB aligned and `hv_vm_unmap` fails with HV_BAD_ARGUMENT
+    /// (accel/hvf/hvf-all.c:123; reproduced with build/qemu-build). Refusing up
+    /// front beats a crashed engine and an opaque log tail.
+    private static let tpmSupported = false
+    static let savedSessionKeptHint = "The saved session was kept; discard it (discardSuspendState) to boot the VM from scratch."
+    public static let tpmUnavailableReason =
+        "TPM is not available in this engine build: tpm-tis-device aborts under HVF (HV_BAD_ARGUMENT). Turn the TPM off in the VM settings."
 
     public init(bundle: VMBundle, config: VMConfig, engine: EngineLocator.Engine) {
         self.bundle = bundle
@@ -65,7 +88,11 @@ public actor VMController {
         stateContinuation = c
     }
 
-    /// Replace the configuration (persisted by the caller); applies on next start.
+    /// Replace the configuration (persisted by the caller). It applies on the next
+    /// cold start: a running engine keeps `runningConfig`, and a suspended session
+    /// resumes with the configuration saved next to its state
+    /// (`VMBundle.suspendConfigURL`), because an `-incoming` stream only loads
+    /// into the machine that produced it.
     public func update(config: VMConfig) throws {
         try config.validate()
         self.config = config
@@ -75,73 +102,102 @@ public actor VMController {
 
     /// Launch the engine and wait until the guest is running (or resumed from disk).
     public func start() async throws {
+        try await start(bootFromCDROM: false)
+    }
+
+    /// `bootFromCDROM` asks the firmware to try the CD-ROMs first. Ignored when
+    /// resuming a suspended session, which must relaunch exactly as it was saved.
+    public func start(bootFromCDROM: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
-        state = .starting
         generation += 1
         let gen = generation
+        state = .starting
+        let resuming = bundle.isSuspended
+        var engineLaunched = false
         do {
             try config.validate()
+            let launch = resuming ? (bundle.loadSuspendedConfig() ?? config) : config
+            if launch.tpm {
+                guard Self.tpmSupported else { throw ControllerError.engineDidNotStart(Self.tpmUnavailableReason) }
+                guard engine.swtpm != nil else {
+                    throw ControllerError.engineDidNotStart("TPM is enabled but swtpm was not found (next to the engine, /opt/homebrew/bin or /usr/local/bin).")
+                }
+            }
+            try await stopOrphanedEngine()
+            try checkCurrent(gen)
             try bundle.prepareRunDirectory()
-            if config.tpm, let swtpmPath = engine.swtpm {
+            if launch.tpm, let swtpmPath = engine.swtpm {
                 try FileManager.default.createDirectory(at: bundle.tpmStateURL, withIntermediateDirectories: true)
+                // `lock`: never share the state directory with a stale instance;
+                // `terminate`: exit when QEMU, the control-channel client, goes away.
                 let t = ChildProcess(executable: swtpmPath, arguments: [
-                    "socket", "--tpm2", "--tpmstate", "dir=\(bundle.tpmStateURL.path)",
-                    "--ctrl", "type=unixio,path=\(bundle.swtpmSocketPath)",
+                    "socket", "--tpm2", "--tpmstate", "dir=\(bundle.tpmStateURL.path),lock",
+                    "--ctrl", "type=unixio,path=\(bundle.swtpmSocketPath),terminate",
                 ], logURL: bundle.runURL.appendingPathComponent("swtpm.log"))
                 try t.start()
                 swtpm = t
-                try await waitForFile(bundle.swtpmSocketPath, process: t, timeout: .seconds(10))
+                try await waitForFile(bundle.swtpmSocketPath, process: t, timeout: .seconds(10), generation: gen)
             }
             let display = try DisplayConnection(socketPath: bundle.displaySocketPath)
             self.display = display
-            let resuming = bundle.isSuspended
-            let options = QEMUCommandBuilder.Options(incomingStatePath: resuming ? bundle.suspendStateURL.path : nil)
-            let args = QEMUCommandBuilder(engine: engine).arguments(for: config, bundle: bundle, options: options)
+            let options = QEMUCommandBuilder.Options(incomingStatePath: resuming ? bundle.suspendStateURL.path : nil,
+                                                     bootFromCDROM: resuming ? false : bootFromCDROM)
+            let args = QEMUCommandBuilder(engine: engine).arguments(for: launch, bundle: bundle, options: options)
             let q = ChildProcess(executable: engine.qemuSystem, arguments: args, logURL: bundle.qemuLogURL)
             try q.start()
             qemu = q
+            runningConfig = launch
+            engineLaunched = true
             expectingExit = false
             exitTask = Task { [weak self] in
                 let status = await q.waitForExit()
                 await self?.engineExited(status: status, generation: gen)
             }
-            try await waitForFile(bundle.qmpSocketPath, process: q, timeout: .seconds(20))
+            try await waitForFile(bundle.qmpSocketPath, process: q, timeout: .seconds(20), generation: gen)
             let client = QMPClient()
-            try await client.connect(path: bundle.qmpSocketPath)
+            do {
+                try await client.connect(path: bundle.qmpSocketPath)
+                try checkCurrent(gen)
+            } catch {
+                await client.disconnect()
+                throw error
+            }
             qmp = client
             eventTask = Task { [weak self] in
                 for await event in client.events {
                     await self?.handle(event: event, generation: gen)
                 }
             }
-            // wait for the run state to settle (incoming migration takes a while)
-            let deadline = ContinuousClock.now + .seconds(120)
-            while ContinuousClock.now < deadline {
-                let s = try await client.queryStatus()
-                if s.running { break }
-                if s.state == "paused" || s.state == "shutdown" { break }
-                try await Task.sleep(for: .milliseconds(200))
-            }
             if resuming {
-                try? FileManager.default.removeItem(at: bundle.suspendStateURL)
+                try await waitForIncomingMigration(client, generation: gen)
+                // the stream is loaded; the saved session has served its purpose
+                try? bundle.discardSuspendState()
                 // the saved run state is "paused" (we stop before migrating); resume it
                 if try await !client.queryStatus().running { try await client.cont() }
+            } else {
+                try await waitForRunStateToSettle(client, generation: gen)
             }
             let s = try await client.queryStatus()
+            try checkCurrent(gen)
             state = s.running ? .running : .paused
         } catch {
-            var message = "\(error)"
+            // stop-during-start: shutdown() owns the state and the engine now
+            guard gen == generation else { throw ControllerError.notRunning }
+            // from here on a late exit notification from this engine is ignored
+            generation += 1
             if case .failed(let early) = state {
-                // the engine already died and engineExited() recorded its log
-                message += "\n\(early)"
-            } else {
-                // give a dying engine a moment to flush its error output
-                var status: Int32?
-                if let q = qemu { status = await q.waitForExit(timeout: .seconds(2)) }
-                let tail = qemu?.logTail() ?? ""
-                if let status { message += "\nengine exited with status \(status)" }
-                if !tail.isEmpty { message += "\n\(tail)" }
+                // the engine already died and engineExited() recorded its log: one report
+                await teardown()
+                throw ControllerError.engineDidNotStart(early)
             }
+            var message = "\(error)"
+            // give a dying engine a moment to flush its error output
+            var status: Int32?
+            if let q = qemu { status = await q.waitForExit(timeout: .seconds(2)) }
+            let tail = qemu?.logTail() ?? ""
+            if let status { message += "\nengine exited with status \(status)" }
+            if !tail.isEmpty { message += "\n\(tail)" }
+            if resuming, engineLaunched, bundle.isSuspended { message += "\n" + Self.savedSessionKeptHint }
             await teardown()
             state = .failed(message)
             throw ControllerError.engineDidNotStart(message)
@@ -149,20 +205,45 @@ public actor VMController {
     }
 
     /// ACPI/PSCI power-button shutdown; falls back to `quit` after `gracePeriod`.
+    /// While starting (including a resume still loading its state) it aborts the
+    /// start; while suspending only `force` is accepted and drops the partial state.
     public func shutdown(force: Bool = false, gracePeriod: Duration = .seconds(60)) async throws {
-        guard state.isActive, let q = qemu else { throw ControllerError.notRunning }
+        guard state.isActive else { throw ControllerError.notRunning }
+        let gen = generation
+        switch state {
+        case .starting:
+            generation += 1   // start() unwinds at its next checkpoint without touching the state
+            state = .stopping
+            await teardown()
+            state = .stopped
+            return
+        case .suspending:
+            guard force else { throw ControllerError.notRunning }
+            generation += 1   // suspendToDisk() rethrows without touching the state
+            state = .stopping
+            await teardown()
+            try? bundle.discardSuspendState()
+            state = .stopped
+            return
+        default:
+            break
+        }
+        guard let q = qemu else { throw ControllerError.notRunning }
+        let wasPaused = state == .paused
         state = .stopping
         expectingExit = true
         if !force, let qmp {
+            // stopped vCPUs cannot act on the power button
+            if wasPaused { try? await qmp.cont() }
             try? await qmp.systemPowerdown()
-            if await q.waitForExit(timeout: gracePeriod) != nil { await finalizeExpectedExit(); return }
+            if await q.waitForExit(timeout: gracePeriod) != nil { await finalizeExpectedExit(generation: gen); return }
         }
         if let qmp { try? await qmp.quit() }
         if await q.waitForExit(timeout: .seconds(10)) == nil {
             q.kill()
             _ = await q.waitForExit()
         }
-        await finalizeExpectedExit()
+        await finalizeExpectedExit(generation: gen)
     }
 
     public func pause() async throws {
@@ -183,25 +264,49 @@ public actor VMController {
     }
 
     /// Save all state to disk and stop the engine; the next `start()` resumes it.
+    /// On failure (disk full, migration error, timeout) nothing is kept and the
+    /// guest is left as it was.
     public func suspendToDisk() async throws {
-        guard state == .running || state == .paused, let qmp, let q = qemu else { throw ControllerError.notRunning }
+        guard state == .running || state == .paused, let qmp, let q = qemu, let launched = runningConfig else {
+            throw ControllerError.notRunning
+        }
+        let gen = generation
+        let previous = state
         state = .suspending
         expectingExit = true
-        try? FileManager.default.removeItem(at: bundle.suspendStateURL)
-        try await qmp.stop()
-        try await qmp.migrate(uri: "file:\(bundle.suspendStateURL.path)")
+        try? bundle.discardSuspendState()
+        do {
+            try launched.encoded().write(to: bundle.suspendConfigURL, options: .atomic)
+            try await qmp.stop()
+            try await qmp.migrate(uri: "file:\(bundle.suspendStateURL.path)")
+        } catch {
+            guard gen == generation else { throw error }   // a forced shutdown took over
+            try? bundle.discardSuspendState()
+            expectingExit = false
+            if previous == .running { try? await qmp.cont() }
+            let s = try? await qmp.queryStatus()
+            state = (s?.running ?? (previous == .running)) ? .running : .paused
+            throw error
+        }
         try? await qmp.quit()
         if await q.waitForExit(timeout: .seconds(15)) == nil {
             q.kill()
             _ = await q.waitForExit()
         }
-        await finalizeExpectedExit()
+        await finalizeExpectedExit(generation: gen)
+    }
+
+    /// Forget a suspended session so the next `start()` boots from scratch (the
+    /// way out after a resume failed). Refused while the engine is active.
+    public func discardSuspendState() throws {
+        guard !state.isActive else { throw ControllerError.alreadyRunning }
+        try bundle.discardSuspendState()
     }
 
     // MARK: - snapshots (qcow2 internal snapshots on every disk, vmstate on the first)
 
     public func snapshots() async throws -> [SnapshotInfo] {
-        guard let disk = config.disks.first else { return [] }
+        guard let disk = (runningConfig ?? config).disks.first else { return [] }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: engine.qemuImg)
         p.arguments = ["info", "-U", "--output=json", bundle.diskURL(disk).path]
@@ -229,17 +334,28 @@ public actor VMController {
 
     public func createSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
-        guard state == .running || state == .paused, let qmp, let vmstate = config.disks.first?.id else { throw ControllerError.notRunning }
-        try await qmp.snapshotSave(tag: name, vmstate: vmstate, devices: config.disks.map(\.id))
+        guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks, let vmstate = disks.first?.id else {
+            throw ControllerError.notRunning
+        }
+        try await qmp.snapshotSave(tag: name, vmstate: vmstate, devices: disks.map(\.id))
     }
 
+    /// Load a snapshot; a running guest is stopped for the load and resumed
+    /// afterwards, also when the load fails.
     public func restoreSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
-        guard state == .running || state == .paused, let qmp, let vmstate = config.disks.first?.id else { throw ControllerError.notRunning }
+        guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks, let vmstate = disks.first?.id else {
+            throw ControllerError.notRunning
+        }
         let wasRunning = state == .running
         try await qmp.stop()
         state = .paused
-        try await qmp.snapshotLoad(tag: name, vmstate: vmstate, devices: config.disks.map(\.id))
+        do {
+            try await qmp.snapshotLoad(tag: name, vmstate: vmstate, devices: disks.map(\.id))
+        } catch {
+            if wasRunning, (try? await qmp.cont()) != nil { state = .running }
+            throw error
+        }
         display?.send(.refresh(con: 0))
         if wasRunning {
             try await qmp.cont()
@@ -249,17 +365,19 @@ public actor VMController {
 
     public func deleteSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
-        guard state == .running || state == .paused, let qmp else { throw ControllerError.notRunning }
-        try await qmp.snapshotDelete(tag: name, devices: config.disks.map(\.id))
+        guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks else { throw ControllerError.notRunning }
+        try await qmp.snapshotDelete(tag: name, devices: disks.map(\.id))
     }
 
     // MARK: - devices
 
-    /// Attach a host USB device now (`usb-host` hot-plug). Returns the device id.
+    /// Attach a host USB device now (`usb-host` hot-plug). Returns the device id,
+    /// unique per attachment so identical devices (or a re-attach) never clash.
     @discardableResult
     public func attachUSB(_ selector: VMConfig.USBSelector) async throws -> String {
         guard state.isActive, let qmp else { throw ControllerError.notRunning }
-        let id = "usbhot-\(String(format: "%04x-%04x", selector.vendorID, selector.productID))"
+        usbHotplugSerial += 1
+        let id = "usbhot-\(String(format: "%04x-%04x", selector.vendorID, selector.productID))-\(usbHotplugSerial)"
         try await qmp.attachUSBHost(id: id, vendorID: selector.vendorID, productID: selector.productID, bus: QEMUCommandBuilder.usbBus)
         return id
     }
@@ -269,6 +387,30 @@ public actor VMController {
         try await qmp.deviceDel(id: id)
     }
 
+    /// Insert `isoPath` into the running VM's CD-ROM `cdromID` (eject when nil).
+    /// A tray the guest has locked is forced open. `config` and `runningConfig`
+    /// record the change so the next start and a later suspend match.
+    public func changeMedium(cdromID: String, isoPath: String?) async throws {
+        guard state.isActive, let qmp else { throw ControllerError.notRunning }
+        let device = QEMUCommandBuilder.cdromDeviceID(cdromID)
+        if let isoPath {
+            do {
+                try await qmp.changeMedium(deviceID: device, filename: isoPath, format: "raw")
+            } catch let error as QMPClient.QMPError where Self.isLockedTray(error) {
+                try await qmp.eject(deviceID: device, force: true)
+                try await qmp.changeMedium(deviceID: device, filename: isoPath, format: "raw")
+            }
+        } else {
+            do {
+                try await qmp.eject(deviceID: device)
+            } catch let error as QMPClient.QMPError where Self.isLockedTray(error) {
+                try await qmp.eject(deviceID: device, force: true)
+            }
+        }
+        if let i = config.cdroms.firstIndex(where: { $0.id == cdromID }) { config.cdroms[i].path = isoPath }
+        if let i = runningConfig?.cdroms.firstIndex(where: { $0.id == cdromID }) { runningConfig?.cdroms[i].path = isoPath }
+    }
+
     public func screenshot(to url: URL) async throws {
         guard state.isActive, let qmp else { throw ControllerError.notRunning }
         try await qmp.screendump(filename: url.path)
@@ -276,9 +418,20 @@ public actor VMController {
 
     // MARK: - internals
 
-    private func waitForFile(_ path: String, process: ChildProcess, timeout: Duration) async throws {
+    /// block/qapi-system.c `do_open_tray`: "Device '%s' is locked and force was not specified".
+    private static func isLockedTray(_ error: QMPClient.QMPError) -> Bool {
+        if case .command(_, _, let desc) = error { return desc.contains("is locked") }
+        return false
+    }
+
+    private func checkCurrent(_ gen: Int) throws {
+        guard gen == generation else { throw CancellationError() }
+    }
+
+    private func waitForFile(_ path: String, process: ChildProcess, timeout: Duration, generation gen: Int) async throws {
         let deadline = ContinuousClock.now + timeout
         while ContinuousClock.now < deadline {
+            try checkCurrent(gen)
             if FileManager.default.fileExists(atPath: path) { return }
             if !process.isRunning {
                 throw ControllerError.engineDidNotStart("process exited before creating \(path)\n\(process.logTail())")
@@ -288,19 +441,48 @@ public actor VMController {
         throw ControllerError.qmpUnavailable("timed out waiting for \(path)")
     }
 
+    /// A cold boot runs as soon as the machine is built; wait through `prelaunch` (bounded).
+    private func waitForRunStateToSettle(_ client: QMPClient, generation gen: Int) async throws {
+        let deadline = ContinuousClock.now + .seconds(120)
+        while ContinuousClock.now < deadline {
+            let s = try await client.queryStatus()
+            try checkCurrent(gen)
+            if s.running || s.state == "paused" || s.state == "shutdown" { return }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
+    /// Wait until the `-incoming` load has finished, i.e. the run state left
+    /// `inmigrate` (a failed load exits the engine instead, which surfaces as a
+    /// disconnected QMP client).
+    private func waitForIncomingMigration(_ client: QMPClient, generation gen: Int) async throws {
+        let deadline = ContinuousClock.now + Self.resumeTimeout
+        while true {
+            let s = try await client.queryStatus()
+            try checkCurrent(gen)
+            if s.state != "inmigrate" { return }
+            guard ContinuousClock.now < deadline else {
+                throw ControllerError.engineDidNotStart("resuming the saved session did not finish within \(Self.resumeTimeout)")
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
     private func handle(event: QMPClient.Event, generation gen: Int) {
         guard gen == generation else { return }
         switch event.name {
         case "STOP": if state == .running { state = .paused }
         case "RESUME": if state == .paused { state = .running }
-        case "SHUTDOWN": if state != .suspending { expectingExit = true; state = .stopping }
+        case "SHUTDOWN": if state == .running || state == .paused || state == .stopping { expectingExit = true; state = .stopping }
         default: break
         }
     }
 
     /// The engine exited because we asked it to: tear down now and ignore the
-    /// late exit notification.
-    private func finalizeExpectedExit() async {
+    /// late exit notification. A no-op when a newer generation (a start issued
+    /// by a `states` observer, say) already owns the controller.
+    private func finalizeExpectedExit(generation gen: Int) async {
+        guard gen == generation else { return }
         generation += 1
         await teardown()
         state = .stopped
@@ -310,11 +492,14 @@ public actor VMController {
         guard gen == generation else { return }
         let tail = qemu?.logTail() ?? ""
         let wasExpected = expectingExit
+        let resumeDied = state == .starting && bundle.isSuspended
         await teardown()
         if wasExpected || status == 0 {
             state = .stopped
         } else {
-            state = .failed("QEMU exited with status \(status)\n\(tail)")
+            var message = "QEMU exited with status \(status)\n\(tail)"
+            if resumeDied { message += "\n" + Self.savedSessionKeptHint }
+            state = .failed(message)
         }
     }
 
@@ -324,6 +509,52 @@ public actor VMController {
         display?.close(); display = nil
         if let q = qemu, q.isRunning { q.kill() }
         qemu = nil
-        if let t = swtpm { t.terminate(); swtpm = nil }
+        runningConfig = nil
+        if let t = swtpm {
+            swtpm = nil
+            t.terminate()
+            // its state-directory lock must be free before the next start
+            if await t.waitForExit(timeout: .seconds(3)) == nil { t.kill() }
+        }
+    }
+
+    // MARK: orphaned engines
+
+    /// An engine from a previous app instance (crash, force-quit) may still own
+    /// this VM's disks. QEMU holds a write lock on its pidfile while alive, so
+    /// the lock holder is the live process, never a reused pid. Stop it
+    /// (SIGTERM, then SIGKILL) before touching the run directory; swtpm follows
+    /// on its own (`--ctrl ...,terminate`).
+    private func stopOrphanedEngine() async throws {
+        let path = bundle.pidFileURL.path
+        guard let pid = Self.pidfileLockHolder(path) else { return }
+        Darwin.kill(pid, SIGTERM)
+        var deadline = ContinuousClock.now + .seconds(10)
+        var killed = false
+        while Self.pidfileLockHolder(path) != nil {
+            if ContinuousClock.now >= deadline {
+                guard !killed else {
+                    throw ControllerError.engineDidNotStart("an engine from a previous session (pid \(pid)) still owns this VM and could not be stopped")
+                }
+                Darwin.kill(pid, SIGKILL)
+                killed = true
+                deadline = ContinuousClock.now + .seconds(5)
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /// The pid holding a write lock on `path` (F_GETLK), or nil when unlocked or absent.
+    nonisolated static func pidfileLockHolder(_ path: String) -> pid_t? {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var lock = flock()
+        lock.l_type = Int16(F_WRLCK)
+        lock.l_whence = Int16(SEEK_SET)
+        lock.l_start = 0
+        lock.l_len = 0
+        guard fcntl(fd, F_GETLK, &lock) == 0, lock.l_type != Int16(F_UNLCK) else { return nil }
+        return lock.l_pid
     }
 }
