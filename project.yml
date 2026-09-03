@@ -30,6 +30,10 @@ targets:
         product: AlcoveQMP
       - package: AlcoveKit
         product: AlcoveEngine
+      - package: AlcoveKit
+        product: AlcoveAgent
+      - package: AlcoveKit
+        product: AlcoveControl
     info:
       path: Alcove/Info.plist
       properties:
