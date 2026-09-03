@@ -66,14 +66,29 @@ server.registerTool(
   "alcove_start_vm",
   {
     title: "Start VM",
-    description: "Boot a VM (or resume it from suspend). Returns when the guest is running; the OS may still be booting, so call alcove_wait_idle or take a screenshot before interacting.",
-    inputSchema: { name: vmName },
+    description:
+      "Boot a VM (or resume it from suspend). By default waits until the guest tools connect (the OS has booted and a user is logged in), up to wait_timeout_s; when the guest has no tools it returns after the wait and you should use alcove_wait_idle / screenshots to judge readiness.",
+    inputSchema: {
+      name: vmName,
+      wait_for_tools: z.boolean().optional().describe("Wait for the guest tools to connect (default true)"),
+      wait_timeout_s: z.number().int().min(0).max(900).optional().describe("How long to wait for the guest (default 180)"),
+    },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
-  async ({ name }) => {
+  async ({ name, wait_for_tools, wait_timeout_s }) => {
     try {
       const r = await client.call("vm.start", { name }, 300000);
-      return text(`${name}: ${r.state}`);
+      const wait = wait_for_tools ?? true;
+      const deadline = Date.now() + (wait_timeout_s ?? 180) * 1000;
+      let tools = false;
+      if (wait) {
+        while (Date.now() < deadline) {
+          const st = await client.call("vm.status", { name }, 60000);
+          if (st.tools === true) { tools = true; break; }
+          await new Promise((res) => setTimeout(res, 3000));
+        }
+      }
+      return text(`${name}: ${r.state}${wait ? (tools ? "; guest tools connected (desktop ready)" : "; guest tools did not connect in time (no tools installed, or still booting) — use alcove_wait_idle and alcove_screenshot") : ""}`);
     } catch (e) {
       return fail(e);
     }
