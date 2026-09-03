@@ -1,0 +1,11 @@
+# build artifacts and large downloads
+/build/
+/images/
+*.qcow2
+*.iso
+*.img
+.DS_Store
+xcuserdata/
+DerivedData/
+.build/
+*.xcodeproj/project.xcworkspace/xcshareddata/
