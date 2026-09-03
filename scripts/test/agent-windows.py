@@ -137,10 +137,17 @@ def main():
             fail(f"file digest mismatch in guest: {out!r}")
         log("file push OK ->", done["path"])
 
-        # resolution report
+        # resolution change through the agent (ChangeDisplaySettings); with the
+        # virtio-gpu display (viogpudo) the guest can switch modes, with ramfb it cannot
         agent.send({"t": "resolution.set", "w": 1024, "h": 768})
         res = agent.recv("resolution", 10)
-        log("guest resolution:", res.get("w"), "x", res.get("h"))
+        log("guest resolution after resolution.set 1024x768:", res.get("w"), "x", res.get("h"))
+        cfg = json.load(open(os.path.expanduser("~/Library/Application Support/Alcove/VMs/Windows 11.alcovevm/config.json")))
+        if cfg.get("display") == "virtio-gpu" and (res.get("w"), res.get("h")) != (1024, 768):
+            fail("virtio-gpu guest did not switch to 1024x768")
+        agent.send({"t": "resolution.set", "w": 1280, "h": 800})
+        res = agent.recv("resolution", 10)
+        log("guest resolution restored:", res.get("w"), "x", res.get("h"))
         print("PASS: guest agent verified in Windows 11")
     finally:
         try:
