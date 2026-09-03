@@ -124,13 +124,25 @@ public actor VMController {
             }
             if resuming {
                 try? FileManager.default.removeItem(at: bundle.suspendStateURL)
+                // the saved run state is "paused" (we stop before migrating); resume it
+                if try await !client.queryStatus().running { try await client.cont() }
             }
             let s = try await client.queryStatus()
             state = s.running ? .running : .paused
         } catch {
-            let tail = qemu?.logTail() ?? ""
+            var message = "\(error)"
+            if case .failed(let early) = state {
+                // the engine already died and engineExited() recorded its log
+                message += "\n\(early)"
+            } else {
+                // give a dying engine a moment to flush its error output
+                var status: Int32?
+                if let q = qemu { status = await q.waitForExit(timeout: .seconds(2)) }
+                let tail = qemu?.logTail() ?? ""
+                if let status { message += "\nengine exited with status \(status)" }
+                if !tail.isEmpty { message += "\n\(tail)" }
+            }
             await teardown()
-            let message = tail.isEmpty ? "\(error)" : "\(error)\n\(tail)"
             state = .failed(message)
             throw ControllerError.engineDidNotStart(message)
         }
@@ -143,13 +155,14 @@ public actor VMController {
         expectingExit = true
         if !force, let qmp {
             try? await qmp.systemPowerdown()
-            if await q.waitForExit(timeout: gracePeriod) != nil { return }
+            if await q.waitForExit(timeout: gracePeriod) != nil { await finalizeExpectedExit(); return }
         }
         if let qmp { try? await qmp.quit() }
         if await q.waitForExit(timeout: .seconds(10)) == nil {
             q.kill()
             _ = await q.waitForExit()
         }
+        await finalizeExpectedExit()
     }
 
     public func pause() async throws {
@@ -182,6 +195,7 @@ public actor VMController {
             q.kill()
             _ = await q.waitForExit()
         }
+        await finalizeExpectedExit()
     }
 
     // MARK: - snapshots (qcow2 internal snapshots on every disk, vmstate on the first)
@@ -282,6 +296,14 @@ public actor VMController {
         case "SHUTDOWN": if state != .suspending { expectingExit = true; state = .stopping }
         default: break
         }
+    }
+
+    /// The engine exited because we asked it to: tear down now and ignore the
+    /// late exit notification.
+    private func finalizeExpectedExit() async {
+        generation += 1
+        await teardown()
+        state = .stopped
     }
 
     private func engineExited(status: Int32, generation gen: Int) async {
