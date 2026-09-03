@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "AlcoveQMP", targets: ["AlcoveQMP"]),
         .library(name: "AlcoveEngine", targets: ["AlcoveEngine"]),
         .executable(name: "alcovectl", targets: ["alcovectl"]),
+        .library(name: "AlcoveAgent", targets: ["AlcoveAgent"]),
     ],
     targets: [
         // Wire format shared with the QEMU `alcove` display backend (docs/display-protocol.md).
@@ -17,6 +18,9 @@ let package = Package(
         .target(name: "AlcoveQMP"),
         // VM bundles, QEMU process lifecycle, VM controller. Depends on the two above.
         .target(name: "AlcoveEngine", dependencies: ["AlcoveDisplayProtocol", "AlcoveQMP"]),
+        // Host side of the guest agent protocol (docs/agent-protocol.md).
+        .target(name: "AlcoveAgent", dependencies: ["AlcoveQMP"]),
+        .testTarget(name: "AlcoveAgentTests", dependencies: ["AlcoveAgent"]),
         // Command-line front end used by scripts and the test harness.
         .executableTarget(name: "alcovectl", dependencies: ["AlcoveEngine"]),
         .testTarget(name: "AlcoveDisplayProtocolTests", dependencies: ["AlcoveDisplayProtocol"]),
