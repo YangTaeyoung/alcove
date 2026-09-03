@@ -97,7 +97,12 @@ def main():
     png = base64.b64decode(imgs[0]["data"])
     assert png[:4] == b"\x89PNG", "not a PNG"
     open(os.path.join(ROOT, "build", "mcp-shot.png"), "wb").write(png)
-    err, out, _ = m.call("alcove_vm_status", {"name": vm})
+    # the guest may still be booting/logging in: wait for the tools to connect
+    for _ in range(36):
+        err, out, _ = m.call("alcove_vm_status", {"name": vm})
+        if '"tools": true' in out:
+            break
+        time.sleep(5)
     print("status:", err, out.replace("\n", " ")[:300])
     err, out, _ = m.call("alcove_exec", {"name": vm, "command": "hostname"}, 200)
     print("exec hostname:", err, out.strip())

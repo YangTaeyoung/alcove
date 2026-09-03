@@ -219,8 +219,9 @@ public actor ControlHandler {
         return t
     }
 
+    /// The guest agent; waits a while because the guest may still be logging in.
     private func tools(_ t: VMTarget) async throws -> AgentClient {
-        guard let a = await t.agent(timeout: .seconds(3)) else { throw ControlError.noTools(t.name) }
+        guard let a = await t.agent(timeout: .seconds(25)) else { throw ControlError.noTools(t.name) }
         return a
     }
 
