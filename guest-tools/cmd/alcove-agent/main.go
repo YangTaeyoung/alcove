@@ -1,0 +1,59 @@
+// alcove-agent runs inside a guest and serves docs/agent-protocol.md on TCP 7645.
+//
+//	alcove-agent [--port 7645] [--allow-exec] [--token T]
+//	alcove-agent --install   (Windows: scheduled task at logon + firewall rule)
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/server"
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/token"
+)
+
+func main() {
+	port := flag.Int("port", 7645, "listen port")
+	allowExec := flag.Bool("allow-exec", false, "allow the exec message (test harness)")
+	tok := flag.String("token", "", "override the SMBIOS token")
+	install := flag.Bool("install", false, "install to start at logon (Windows) and exit")
+	logPath := flag.String("log", "", "log file (default: stderr)")
+	flag.Parse()
+
+	logger := log.Default()
+	if *logPath != "" {
+		_ = os.MkdirAll(filepath.Dir(*logPath), 0o755)
+		if f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			logger = log.New(f, "", log.LstdFlags)
+		}
+	}
+	if *install {
+		if err := installAtLogon(*port, *allowExec); err != nil {
+			fmt.Fprintln(os.Stderr, "install failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("installed")
+		return
+	}
+	if *tok == "" {
+		*tok = token.Read()
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port))
+	if err != nil {
+		logger.Fatalf("listen: %v", err)
+	}
+	logger.Printf("alcove-agent %s listening on %s (token %s, exec %v)", server.AgentVersion, l.Addr(), mask(*tok), *allowExec)
+	s := server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger})
+	logger.Fatal(s.Serve(l))
+}
+
+func mask(t string) string {
+	if len(t) < 8 {
+		return "(none)"
+	}
+	return t[:4] + "..." + t[len(t)-4:]
+}
