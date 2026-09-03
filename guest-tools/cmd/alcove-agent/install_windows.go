@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // installAtLogon registers a scheduled task that starts the agent in the
@@ -25,8 +26,22 @@ func installAtLogon(port int, allowExec bool) error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(dst, data, 0o755); err != nil {
-			return err
+		// a running copy locks the file: stop the task and any agent process first
+		_ = exec.Command("schtasks", "/End", "/TN", "AlcoveAgent").Run()
+		_ = exec.Command("taskkill", "/IM", "alcove-agent.exe", "/F").Run()
+		var werr error
+		for i := 0; i < 20; i++ {
+			werr = os.WriteFile(dst, data, 0o755)
+			if werr == nil {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if werr != nil {
+			return fmt.Errorf("copy to %s: %w", dst, werr)
+		}
+		if st, err := os.Stat(dst); err != nil || st.Size() != int64(len(data)) {
+			return fmt.Errorf("copy to %s verification failed", dst)
 		}
 	}
 	args := fmt.Sprintf(`--port %d --log "C:\ProgramData\Alcove\agent.log"`, port)

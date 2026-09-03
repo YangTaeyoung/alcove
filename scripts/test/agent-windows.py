@@ -80,10 +80,12 @@ def main():
                               "-o", "LogLevel=ERROR", AGENT, "alcove@127.0.0.1:C:/Users/alcove/alcove-agent.exe"], capture_output=True, text=True)
         if scp.returncode != 0:
             fail("scp: " + scp.stderr)
-        r = ssh(r'& "C:\Users\alcove\alcove-agent.exe" --install --allow-exec')
-        log("install:", r.returncode, (r.stdout + r.stderr).strip()[:300])
-        if r.returncode != 0:
-            fail("agent install failed")
+        # the agent is a GUI-subsystem binary, so PowerShell must be told to wait for it
+        r = ssh(r'$p = Start-Process -FilePath "C:\Users\alcove\alcove-agent.exe" -ArgumentList "--install","--allow-exec" -Wait -PassThru; '
+                r'"exit=$($p.ExitCode)"; (Get-Item "C:\Program Files\Alcove\alcove-agent.exe").Length')
+        log("install:", r.returncode, (r.stdout + r.stderr).strip().replace("\r\n", " | ")[:300])
+        if r.returncode != 0 or "exit=0" not in r.stdout or str(os.path.getsize(AGENT)) not in r.stdout:
+            fail("agent install failed or the installed binary does not match the build")
 
         # connect from the host
         agent = None
