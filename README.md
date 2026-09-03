@@ -7,7 +7,7 @@
 
 <p>
   <a href="#quick-start"><img alt="platform" src="https://img.shields.io/badge/platform-macOS%2015%2B%20·%20Apple%20silicon-0B84FF?style=flat-square"></a>
-  <a href="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/YangTaeyoung/alcove/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-MIT%20·%20GPL--2.0%20patches-6E7681?style=flat-square"></a>
   <a href="#automate-it-from-claude-code"><img alt="MCP" src="https://img.shields.io/badge/MCP-16%20tools-E8952E?style=flat-square"></a>
 </p>
@@ -54,6 +54,9 @@ clipboard and file sharing.
 | **USB passthrough** | Hot-plug host USB devices into a running guest. |
 | **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell, clipboard, file push. |
 | **No black boxes** | The engine is a pinned QEMU tag plus one readable patch. Build it yourself in one command. |
+
+Tested on an M3 Pro running macOS 26 with Windows 11 Pro ARM 25H2 and Ubuntu
+24.04 arm64 guests.
 
 ## Quick start
 
