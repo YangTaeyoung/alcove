@@ -40,6 +40,10 @@ final class VMSession: Identifiable {
     /// True while the guest tools (alcove-agent) answer on the forwarded port.
     private(set) var toolsConnected = false
 
+    /// The last size the window asked the guest to adopt, re-applied when the
+    /// guest tools connect: at boot the request goes out before the tools are
+    /// up, and a Windows driver picks its own largest mode from the EDID hint.
+    private(set) var lastRequestedResolution: (width: Int, height: Int)?
     @ObservationIgnored private var agent: AgentClient?
     @ObservationIgnored private var agentTask: Task<Void, Never>?
     @ObservationIgnored private var stateTask: Task<Void, Never>?
@@ -87,6 +91,9 @@ final class VMSession: Identifiable {
                     try await client.connect(port: port, expectedToken: token, timeout: .seconds(5))
                     self.agent = client
                     self.toolsConnected = true
+                    if let size = self.lastRequestedResolution {
+                        await client.setResolution(width: size.width, height: size.height)
+                    }
                     for await event in client.events where !Task.isCancelled {
                         if case .disconnected = event { break }
                     }
@@ -116,6 +123,7 @@ final class VMSession: Identifiable {
     /// had a moment to reach the guest.
     func requestGuestResolution(width: Int, height: Int) {
         guard width > 0, height > 0 else { return }
+        lastRequestedResolution = (width, height)
         display?.connection.send(.ui(con: 0, w: width, h: height))
         guard let agent else { return }
         Task {
@@ -247,6 +255,7 @@ final class VMSession: Identifiable {
             displayTask?.cancel(); displayTask = nil
             display = nil
             attachedUSB = [:]
+            lastRequestedResolution = nil
             disconnectTools()
             // A resume consumed (or a suspend produced) the image.
             suspendStateVersion += 1

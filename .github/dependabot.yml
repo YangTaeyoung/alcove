@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # MCP server: @modelcontextprotocol/sdk, zod, typescript (mcp/package.json).
+  - package-ecosystem: npm
+    directory: /mcp
+    schedule:
+      interval: weekly
+
+  # Guest agent module. It has no external dependencies today, so this mostly
+  # tracks the Go directive in guest-tools/go.mod.
+  - package-ecosystem: gomod
+    directory: /guest-tools
+    schedule:
+      interval: weekly
+
+  # Actions used by .github/workflows/ci.yml, batched into one PR.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']

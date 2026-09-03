@@ -1,0 +1,87 @@
+name: Feature request
+description: Propose a capability, a guest integration or an automation operation
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Alcove is early and deliberately narrow: Apple silicon, Windows 11 ARM64
+        and Linux ARM64 guests, no third-party Swift dependencies. Proposals that
+        widen that scope need to argue for it. The design and roadmap live in
+        `docs/superpowers/specs/` and `docs/superpowers/plans/` — worth a look
+        before writing.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do today, and where Alcove gets in the way.
+      placeholder: >
+        Copying a file into the guest means dragging it into a shared folder;
+        there is no way to do it from a script while the VM is headless.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: >
+        The behaviour, not the implementation — though if it touches a wire
+        format, sketch the message or operation.
+      placeholder: >
+        A `vm.push_file` variant that takes an explicit destination path in the
+        guest instead of "desktop"/"downloads".
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which part
+      options:
+        - Engine (patched QEMU / display backend)
+        - AlcoveKit library or alcovectl
+        - Alcove.app (UI, windows, settings)
+        - Guest tools (alcove-agent)
+        - Automation (control protocol / MCP server)
+        - Build, tests or docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: guest
+    attributes:
+      label: Guest OS this is about
+      options:
+        - Windows 11 ARM64
+        - Linux ARM64
+        - Both
+        - Host side only
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workaround you are using now
+      description: >
+        Including "none". If another VM app does this well, say how it behaves
+        there — that is useful prior art, not a demand for parity.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This works within Apple silicon plus ARM64 guests.
+          required: false
+        - label: This needs no new third-party Swift dependency.
+          required: false
+        - label: This changes a wire format in `docs/` (display, agent or control protocol).
+          required: false
+        - label: I would like to implement it.
+          required: false

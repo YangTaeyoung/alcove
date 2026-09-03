@@ -1,0 +1,7 @@
+# GitHub Discussions is not enabled on this repository, so there is no
+# discussion link here. Everything goes through the two forms above.
+blank_issues_enabled: false
+contact_links:
+  - name: Build and test setup
+    url: https://github.com/YangTaeyoung/alcove/blob/main/CONTRIBUTING.md
+    about: Prerequisites, building the QEMU engine, and how to run each test suite before filing.

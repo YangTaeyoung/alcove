@@ -21,8 +21,9 @@ targets:
     platform: macOS
     sources:
       - path: Alcove/Sources
-    resources:
-      - path: Alcove/Resources
+      # XcodeGen infers the resources build phase from the file type, so the
+      # asset catalogue belongs in `sources` (there is no `resources` key).
+      - path: Alcove/Resources/Assets.xcassets
     dependencies:
       - package: AlcoveKit
         product: AlcoveDisplayProtocol
@@ -49,5 +50,6 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.yangtaeyoung.Alcove
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_STRICT_CONCURRENCY: complete
         OTHER_LDFLAGS: ["-framework", "Metal", "-framework", "MetalKit"]

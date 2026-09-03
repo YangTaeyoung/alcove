@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch/PR; a new push cancels the previous one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Every job runs on macOS: it is the only host Alcove supports, and the Swift
+# package needs Xcode. macos-26 is the current macos-latest image (Apple
+# silicon, Xcode 26 by default), which satisfies AlcoveKit/Package.swift
+# (swift-tools-version 6.0, platforms .macOS(.v15), Swift 6 language mode).
+# The QEMU engine is never built here (scripts/build-qemu.sh takes ~20 min and
+# needs Homebrew deps), so CI covers everything that does not need it.
+
+jobs:
+  kit:
+    name: AlcoveKit (Swift)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version | tee .ci-swift-fingerprint
+
+      # SwiftPM has no external dependencies here, so this caches compiled
+      # artifacts only. The key carries the toolchain banner so a new Xcode on
+      # the image cannot restore stale modules; restore-keys give the previous
+      # build for incremental compilation.
+      - uses: actions/cache@v6
+        with:
+          path: AlcoveKit/.build
+          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.ci-swift-fingerprint') }}-${{ hashFiles('AlcoveKit/Package.swift', 'AlcoveKit/Sources/**', 'AlcoveKit/Tests/**') }}
+          restore-keys: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.ci-swift-fingerprint') }}-
+
+      - name: Build
+        working-directory: AlcoveKit
+        run: swift build --build-tests
+
+      # No filter needed: VMControllerTests calls XCTSkipIf in setUpWithError
+      # when EngineLocator finds no build/qemu-build, so its 3 end-to-end cases
+      # are skipped, not failed. Everything else (119 tests) runs against fakes
+      # — VMControllerFakeEngineTests drives a python3 stand-in for
+      # qemu-system-aarch64, and python3 is preinstalled on the image.
+      - name: Test
+        working-directory: AlcoveKit
+        run: swift test --skip-build
+
+  guest-tools:
+    name: guest-tools (Go)
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: guest-tools
+    steps:
+      - uses: actions/checkout@v7
+
+      # go.mod declares `go 1.22` as the module's minimum (still enforced as the
+      # language version by newer toolchains). CI builds with 1.25 because it is
+      # pre-cached on the runner image and because binaries linked by Go 1.22
+      # carry no LC_UUID, which macOS 26's dyld rejects ("missing LC_UUID load
+      # command") when `go test` runs them.
+      # The module has no external dependencies and therefore no go.sum; point
+      # the cache key at go.mod, otherwise setup-go fails when its default
+      # **/go.sum pattern matches nothing.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache-dependency-path: guest-tools/go.mod
+
+      - name: Vet (host)
+        run: go vet ./...
+
+      - name: Vet (linux guest)
+        run: GOOS=linux GOARCH=arm64 go vet ./...
+
+      # unsafeptr is off for the Windows build only: internal/clipboard/
+      # clipboard_windows.go turns the uintptr that GlobalLock returns through
+      # syscall.LazyProc.Call back into a pointer (2 findings), which is how the
+      # Win32 clipboard API has to be called. Every other analyzer still runs.
+      - name: Vet (windows guest, without unsafeptr)
+        run: GOOS=windows GOARCH=arm64 go vet -unsafeptr=false ./...
+
+      - name: Test
+        run: go test ./...
+
+      # Compile-only check of the two shipped guest targets (no output written
+      # when building several packages at once).
+      - name: Cross-compile guest agents
+        run: |
+          GOOS=windows GOARCH=arm64 go build ./...
+          GOOS=linux GOARCH=arm64 go build ./...
+
+  mcp:
+    name: MCP server (Node)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22' # mcp/package.json requires >=18
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+
+      - name: Install
+        working-directory: mcp
+        run: npm ci # mcp/package-lock.json is committed
+
+      - name: Build
+        working-directory: mcp
+        run: npm run build
+
+      # Starts the built server over stdio and checks initialize + tools/list.
+      # --list-only needs no VM, no control socket and no third-party Python
+      # packages, so the preinstalled python3 is enough.
+      - name: Smoke test (stdio, no VM)
+        run: python3 scripts/test/mcp-smoke.py --list-only

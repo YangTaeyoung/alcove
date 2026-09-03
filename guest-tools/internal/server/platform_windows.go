@@ -14,6 +14,7 @@ var (
 	user32                    = syscall.NewLazyDLL("user32.dll")
 	procGetSystemMetrics      = user32.NewProc("GetSystemMetrics")
 	procChangeDisplaySettings = user32.NewProc("ChangeDisplaySettingsW")
+	procEnumDisplaySettings   = user32.NewProc("EnumDisplaySettingsW")
 )
 
 func platformShutdown() error {
@@ -64,9 +65,34 @@ const (
 	dmPelsHeight = 0x00100000
 )
 
+// enumModes lists the display modes the driver offers for the primary adapter.
+func enumModes() [][2]int {
+	var modes [][2]int
+	var dm devMode
+	dm.Size = uint16(unsafe.Sizeof(dm))
+	for i := 0; ; i++ {
+		r, _, _ := procEnumDisplaySettings.Call(0, uintptr(uint32(i)), uintptr(unsafe.Pointer(&dm)))
+		if r == 0 {
+			break
+		}
+		if dm.BitsPerPel >= 24 {
+			modes = append(modes, [2]int{int(dm.PelsWidth), int(dm.PelsHeight)})
+		}
+	}
+	return modes
+}
+
 func setResolution(w, h int) error {
 	if w <= 0 || h <= 0 {
 		return errors.New("bad size")
+	}
+	modes := enumModes()
+	if len(modes) > 0 {
+		mw, mh, ok := nearestMode(w, h, modes)
+		if !ok {
+			return fmt.Errorf("no display mode offered for %dx%d", w, h)
+		}
+		w, h = mw, mh
 	}
 	var dm devMode
 	dm.Size = uint16(unsafe.Sizeof(dm))

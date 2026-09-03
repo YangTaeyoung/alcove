@@ -34,6 +34,11 @@ private struct VMContentView: View {
     @State private var pendingDiscard: VMSession?
     @State private var window: NSWindow?
     @State private var userResized = false
+    /// The content size this view last applied when fitting to the guest. A
+    /// live resize that ends on exactly this size was the app's own doing
+    /// (AppKit also posts didEndLiveResize for zoom and restoration), so only
+    /// a different size counts as the user taking over.
+    @State private var lastFittedContentSize: CGSize?
     /// The last screenshot written, shown transiently in the status bar.
     @State private var screenshotNotice: URL?
     @State private var screenshotNoticeTask: Task<Void, Never>?
@@ -59,7 +64,7 @@ private struct VMContentView: View {
             .frame(minWidth: 640, minHeight: 400)
             statusBar
         }
-        .background(WindowAccessor(onWindow: { window = $0 }, onUserResize: { userResized = true }))
+        .background(WindowAccessor(onWindow: { window = $0 }, onUserResize: { noteLiveResizeEnded() }))
         .navigationTitle(session.name)
         .navigationSubtitle(subtitle)
         .toolbar { toolbarContent }
@@ -337,13 +342,30 @@ private struct VMContentView: View {
 
     /// Fit the window to the guest surface (1 guest pixel = 1 point, scaled
     /// down to fit the screen) until the user resizes the window by hand.
+    /// A live resize finished: adopt it as the user's choice only when the
+    /// result is not the size this view asked for.
+    private func noteLiveResizeEnded() {
+        guard let content = window?.contentView?.frame.size else { userResized = true; return }
+        if let fitted = lastFittedContentSize,
+           abs(fitted.width - content.width) < 1.5, abs(fitted.height - content.height) < 1.5 {
+            return
+        }
+        userResized = true
+    }
+
     private func guestResolutionChanged(width: Int, height: Int) {
         guestSize = (width, height)
         guard !userResized, width > 0, height > 0, let window else { return }
+        // The guest adopted exactly what this window asked for: refitting now
+        // would change the view size, which would ask for another mode, and the
+        // two would chase each other. Only an unrequested size needs a fit.
+        if let asked = session.lastRequestedResolution, asked.width == width, asked.height == height { return }
         var content = CGSize(width: CGFloat(width), height: CGFloat(height) + statusBarHeight)
         if let screen = window.screen ?? NSScreen.main {
             let available = screen.visibleFrame
-            let chrome = window.frame.height - (window.contentView?.frame.height ?? 0)
+            // Ask AppKit for the title-bar height rather than measuring the
+            // content view, which is not laid out yet on the first fit.
+            let chrome = window.frameRect(forContentRect: .zero).height
             let maxWidth = available.width - 24
             let maxHeight = available.height - chrome - 24
             let scale = min(1, maxWidth / CGFloat(width), maxHeight / (CGFloat(height) + statusBarHeight))
@@ -352,6 +374,7 @@ private struct VMContentView: View {
                                  height: (CGFloat(height) * scale).rounded(.down) + statusBarHeight)
             }
         }
+        lastFittedContentSize = content
         window.setContentSize(content)
         // setContentSize keeps the top-left corner, so a taller window can hang
         // off the bottom of the screen; constrainFrameRect only pins the title

@@ -1,0 +1,36 @@
+The patch series in this directory is a derived work of QEMU.
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+
+Upstream project: QEMU -- https://www.qemu.org/
+Source:           https://gitlab.com/qemu-project/qemu.git
+Patched tag:      v11.1.1 (QEMU_TAG in scripts/build-qemu.sh)
+
+0001-ui-add-alcove-display-backend.patch adds one new QEMU source file,
+ui/alcove.c, and modifies five existing QEMU files: meson.build,
+meson_options.txt, qapi/ui.json, qemu-options.hx and ui/meson.build.
+
+The new file carries "SPDX-License-Identifier: GPL-2.0-or-later" in its own
+header (0001-ui-add-alcove-display-backend.patch line 136), with the copyright
+line "Copyright (c) 2026 Alcove contributors" (line 134).
+
+None of the five modified files carries any per-file licensing header
+(verified against the v11.1.1 tree). QEMU's own LICENSE, clause 2, covers that
+case: "Source files with no licensing information are released under the GNU
+General Public License, version 2 or (at your option) any later version."
+The modifications therefore inherit GPL-2.0-or-later as well, which is why the
+identifier above applies to the whole series.
+
+GPL-2.0-only in practice. Clause 1 of QEMU's LICENSE says "The QEMU emulator
+as a whole is released under the GNU General Public License, version 2", and
+its COPYING is the GNU GPL version 2, June 1991. Once this series is applied,
+the source tree and any qemu-system-aarch64 binary built from it are that
+whole: distributable under GPL-2.0-only. "or later" is the option this patch
+grants downstream, not a claim that the combined work is anything other than
+GPL-2.0.
+
+Anyone distributing a QEMU binary built with this patch takes on the GPL's
+obligations for it, including offering the corresponding source: the pinned
+upstream tag plus this directory.
+
+The MIT licence at the repository root does not apply to this directory.

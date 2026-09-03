@@ -330,9 +330,14 @@ final class DisplayNSView: MTKView {
     private func scheduleResolutionRequest() {
         resizeTask?.cancel()
         guard resolutionFollowsView, feed != nil else { return }
+        let scheduledSize = bounds.size
         resizeTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: DisplayNSView.resizeDebounce)
             guard !Task.isCancelled, let self, let connection = self.connection else { return }
+            // A surface switch makes SwiftUI re-lay out, and the view passes
+            // through its minimum size on the way. Only a size that is still
+            // there when the debounce fires is the size the user is looking at.
+            guard self.bounds.size == scheduledSize else { return }
             let w = Int(self.bounds.width.rounded()), h = Int(self.bounds.height.rounded())
             guard w > 0, h > 0 else { return }
             if let g = self.surfaceGeometry, g.w == w, g.h == h { return }

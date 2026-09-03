@@ -1,0 +1,177 @@
+name: Bug report
+description: Something in the engine, the app, the guest tools or the automation layer does not work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Alcove runs a patched QEMU as a separate process, so most failures leave
+        a trace in a log. The log fields at the bottom are worth more than a
+        careful prose description — please fill them in.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        Started the "Windows 11" VM from the library window. The window opened
+        black and stayed black; the VM showed as running. Expected the guest to
+        boot to the desktop as it did before.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Exact commands where possible. If it reproduces from the command line
+        (`alcovectl`, `scripts/test/ctl.py`, one of `scripts/test/*`), that is
+        far easier to chase than a click path.
+      placeholder: |
+        1. scripts/build-qemu.sh
+        2. cd AlcoveKit && swift build --product alcovectl
+        3. .build/debug/alcovectl run "Windows 11" --seconds 60
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which part
+      description: Best guess is fine.
+      options:
+        - Engine (patched QEMU / qemu-patches)
+        - AlcoveKit library or alcovectl
+        - Alcove.app (window, display, input, settings)
+        - Guest tools (alcove-agent, Go)
+        - Automation (control socket / MCP server)
+        - Test scripts (scripts/test/*)
+        - Build or docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      description: "`sw_vers -productVersion` (Alcove requires macOS 15 or later)"
+      placeholder: "26.0"
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Mac model and chip
+      description: "`sysctl -n hw.model machdep.cpu.brand_string` — Apple silicon only"
+      placeholder: "Mac15,6 / Apple M3 Pro"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: guest
+    attributes:
+      label: Guest OS
+      options:
+        - Windows 11 ARM64
+        - Linux ARM64 (Ubuntu 24.04 / noble cloud image)
+        - Linux ARM64 (other distribution)
+        - Firmware only, no OS installed
+        - No VM involved (host-side failure)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine-build
+    attributes:
+      label: How the engine was built
+      description: >
+        Alcove only runs a QEMU carrying the `alcove` display backend, so this
+        decides whether the bug can be reproduced at all.
+      options:
+        - "scripts/build-qemu.sh, no changes"
+        - "scripts/build-qemu.sh with overrides (QEMU_TAG / PYTHON / JOBS / ALCOVE_CONFIGURE_EXTRA)"
+        - "scripts/build-qemu.sh with local edits in build/qemu-src"
+        - "Another engine via ALCOVE_QEMU_DIR or an installed Alcove.app"
+        - "Engine not built yet / not applicable"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Alcove commit
+      description: "`git rev-parse --short HEAD` (add `-dirty` details below if your tree is modified)"
+      placeholder: "73bd6b4"
+    validations:
+      required: true
+
+  - type: input
+    id: engine-version
+    attributes:
+      label: Engine version
+      description: "`build/qemu-build/qemu-system-aarch64 --version | head -1`, or the QEMU_TAG you built"
+      placeholder: "QEMU emulator version 11.1.1"
+    validations:
+      required: false
+
+  - type: input
+    id: agent-version
+    attributes:
+      label: Guest agent version
+      description: >
+        Only for guest tools problems. `alcovectl agent <name>` prints the
+        handshake, or read the first line of the agent log.
+      placeholder: "0.1.0"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Paste the relevant part (a few dozen lines around the failure beats a full file).
+
+        A VM bundle lives at `~/Library/Application Support/Alcove/VMs/<name>.alcovevm`
+        (or under `$ALCOVE_VM_DIR`), and while a VM runs it writes:
+
+        - `<bundle>/run/qemu.log` — QEMU's own stdout/stderr; start failures land here
+        - `<bundle>/run/serial.log` — the guest serial console (Linux boot messages, panics)
+
+        Guest agent:
+
+        - Windows: `C:\ProgramData\Alcove\agent.log`, and `C:\ProgramData\Alcove\install.log` for `--install` results
+        - Linux: `journalctl -u alcove-agent`
+
+        Automation: run the MCP server or `alcovectl serve` in a terminal and paste its output.
+
+        Please redact the agent token if it appears (`alcove-token=...`).
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >
+        Screenshots, a `config.json` from the bundle (token redacted), whether
+        it used to work and at which commit.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: "I am on Apple silicon and macOS 15 or later."
+          required: true
+        - label: "I have included the log output above, or said why there is none."
+          required: false

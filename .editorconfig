@@ -1,0 +1,50 @@
+# Codifies what the tree already does; see CONTRIBUTING.md for the rest.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Swift (AlcoveKit/, Alcove/) and Python (scripts/) indent by four, as above.
+
+# Go is whatever gofmt says: tabs.
+[*.go]
+indent_style = tab
+
+[{go.mod,go.sum}]
+indent_style = tab
+
+# Bash scripts in scripts/ indent by two.
+[*.sh]
+indent_style = space
+indent_size = 2
+
+# TypeScript (mcp/), JSON, YAML and the unattended-install XML indent by two.
+[*.{ts,json,yml,yaml,xml}]
+indent_style = space
+indent_size = 2
+
+# Info.plist is Xcode's, and Xcode writes tabs.
+[*.plist]
+indent_style = tab
+
+# Markdown: a trailing double space is a line break.
+[*.md]
+trim_trailing_whitespace = false
+
+# Diffs against QEMU must stay byte-for-byte or `git apply` rejects them:
+# context lines of blank source lines carry a single trailing space.
+[qemu-patches/*.patch]
+indent_style = unset
+indent_size = unset
+trim_trailing_whitespace = false
+
+# Generated, and regenerated wholesale (npm, scripts/gen-qkeycode.py).
+[{package-lock.json,QKeyCode.swift}]
+indent_style = unset
+indent_size = unset
+trim_trailing_whitespace = unset
