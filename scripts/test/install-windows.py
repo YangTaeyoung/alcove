@@ -22,6 +22,8 @@ WORK = os.path.join(ROOT, "build", "test-windows")
 SSH_PORT = int(os.environ.get("SSH_PORT", "2222"))
 TIMEOUT_MIN = float(os.environ.get("TIMEOUT_MIN", "120"))
 KEEP_RUNNING = os.environ.get("KEEP_RUNNING") == "1"
+# tpm-tis-device fails under HVF on this host (HV_BAD_ARGUMENT); off by default.
+USE_TPM = os.environ.get("TPM") == "1"
 
 
 def log(*a):
@@ -96,15 +98,17 @@ def main():
             os.remove(os.path.join(WORK, f))
         except FileNotFoundError:
             pass
-    swtpm = subprocess.Popen([
-        "swtpm", "socket", "--tpm2", "--tpmstate", f"dir={os.path.join(WORK, 'tpm')}",
-        "--ctrl", f"type=unixio,path={os.path.join(WORK, 'swtpm.sock')}",
-        "--log", f"file={os.path.join(WORK, 'swtpm.log')},level=1",
-    ])
-    for _ in range(50):
-        if os.path.exists(os.path.join(WORK, "swtpm.sock")):
-            break
-        time.sleep(0.1)
+    swtpm = None
+    if USE_TPM:
+        swtpm = subprocess.Popen([
+            "swtpm", "socket", "--tpm2", "--tpmstate", f"dir={os.path.join(WORK, 'tpm')}",
+            "--ctrl", f"type=unixio,path={os.path.join(WORK, 'swtpm.sock')}",
+            "--log", f"file={os.path.join(WORK, 'swtpm.log')},level=1",
+        ])
+        for _ in range(50):
+            if os.path.exists(os.path.join(WORK, "swtpm.sock")):
+                break
+            time.sleep(0.1)
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(os.path.join(WORK, "display.sock"))
@@ -122,20 +126,23 @@ def main():
         "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{SSH_PORT}-:22",
         "-device", "virtio-net-pci,netdev=net0",
         "-device", "virtio-rng-pci",
-        "-chardev", f"socket,id=chrtpm,path={os.path.join(WORK, 'swtpm.sock')}",
-        "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
-        "-device", "tpm-tis-device,tpmdev=tpm0",
         "-display", f"alcove,socket={os.path.join(WORK, 'display.sock')}",
         "-qmp", f"unix:{os.path.join(WORK, 'qmp.sock')},server=on,wait=off",
         "-serial", f"file:{os.path.join(WORK, 'serial.log')}", "-monitor", "none",
     ]
+    if USE_TPM:
+        cmd += [
+            "-chardev", f"socket,id=chrtpm,path={os.path.join(WORK, 'swtpm.sock')}",
+            "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
+            "-device", "tpm-tis-device,tpmdev=tpm0",
+        ]
     if fresh:
         cmd += [
-            "-drive", f"if=none,id=cd0,format=raw,readonly=on,media=cdrom,file={WIN_ISO}",
+            "-drive", f"if=none,id=cd0,format=raw,readonly=on,media=cdrom,file.locking=off,file={WIN_ISO}",
             "-device", "usb-storage,drive=cd0,bus=xhci.0",
-            "-drive", f"if=none,id=cd1,format=raw,readonly=on,media=cdrom,file={VIRTIO_ISO}",
+            "-drive", f"if=none,id=cd1,format=raw,readonly=on,media=cdrom,file.locking=off,file={VIRTIO_ISO}",
             "-device", "usb-storage,drive=cd1,bus=xhci.0",
-            "-drive", f"if=none,id=cd2,format=raw,readonly=on,media=cdrom,file={os.path.join(WORK, 'unattend.iso')}",
+            "-drive", f"if=none,id=cd2,format=raw,readonly=on,media=cdrom,file.locking=off,file={os.path.join(WORK, 'unattend.iso')}",
             "-device", "usb-storage,drive=cd2,bus=xhci.0",
         ]
     log("starting QEMU")
@@ -230,7 +237,8 @@ def main():
     finally:
         if proc.poll() is None and not (ok and KEEP_RUNNING):
             proc.kill()
-        swtpm.terminate()
+        if swtpm:
+            swtpm.terminate()
         srv.close()
     sys.exit(0 if ok else 1)
 
