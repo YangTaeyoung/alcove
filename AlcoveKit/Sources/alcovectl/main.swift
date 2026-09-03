@@ -3,9 +3,12 @@
 //   alcovectl create --name NAME --os windows|linux|other [--iso PATH] [--disk-gib N] [--cpus N] [--memory-mib N] [--adopt-disk PATH] [--adopt-vars PATH] [--forward HOST:GUEST]... [--dir DIR]
 //   alcovectl list [--dir DIR]
 //   alcovectl args NAME [--dir DIR]          print the QEMU command line
-//   alcovectl run NAME [--dir DIR] [--seconds N]   start headless, keep running N seconds (default 30), then power down
+//   alcovectl run NAME [--dir DIR] [--seconds N] [--screenshot PATH --after N] [--resize WxH --resize-after N]
+//                 start headless, keep running N seconds (default 30), then power down;
+//                 optionally take a QMP screenshot and/or ask the guest to change resolution
 import Foundation
 import AlcoveEngine
+import AlcoveDisplayProtocol
 
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(Data((msg + "\n").utf8))
@@ -104,12 +107,36 @@ case "run":
     let c = try! b.loadConfig()
     let seconds = args.int("seconds") ?? 30
     let vm = VMController(bundle: b, config: c, engine: engine)
+    let screenshotPath = args.value("screenshot")
+    let screenshotAfter = args.int("after") ?? 60
+    let resize = args.value("resize")?.split(separator: "x").compactMap { Int($0) }
+    let resizeAfter = args.int("resize-after") ?? 45
     // top-level code is main-actor isolated; run the VM work detached and park the main thread
     Task.detached {
         do {
             try await vm.start()
             print("running (state \(await vm.state)); qmp \(b.qmpSocketPath)")
-            try await Task.sleep(for: .seconds(seconds))
+            // watch the display stream so resolution changes are visible in the log
+            if let display = await vm.display {
+                Task.detached {
+                    for await m in display.messages {
+                        if case .switchSurface(let sw) = m { print("display: \(sw.w)x\(sw.h)") }
+                    }
+                }
+            }
+            var elapsed = 0
+            while elapsed < seconds {
+                try await Task.sleep(for: .seconds(1))
+                elapsed += 1
+                if let resize, resize.count == 2, elapsed == resizeAfter, let display = await vm.display {
+                    display.send(.ui(con: 0, w: resize[0], h: resize[1]))
+                    print("sent ui \(resize[0])x\(resize[1])")
+                }
+                if let screenshotPath, elapsed == screenshotAfter {
+                    try await vm.screenshot(to: URL(fileURLWithPath: screenshotPath))
+                    print("screenshot \(screenshotPath)")
+                }
+            }
             try await vm.shutdown(force: false, gracePeriod: .seconds(60))
             print("stopped (state \(await vm.state))")
             exit(0)
