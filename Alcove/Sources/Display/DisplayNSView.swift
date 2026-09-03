@@ -55,6 +55,10 @@ final class DisplayNSView: MTKView {
 
     /// Called on the main actor whenever the guest surface size changes.
     var onGuestResolutionChange: ((Int, Int) -> Void)?
+    /// Asks the guest to adopt a display mode (view size in points). When nil
+    /// the view sends QEMU's resize hint itself; the app supplies a closure
+    /// that prefers the guest tools, which viogpudo actually honours.
+    var onResolutionRequest: ((Int, Int) -> Void)?
 
     /// Send `ui` requests so a virtio-gpu guest follows the view size (in
     /// points). Ignored by guests without a driver (ramfb).
@@ -332,7 +336,11 @@ final class DisplayNSView: MTKView {
             let w = Int(self.bounds.width.rounded()), h = Int(self.bounds.height.rounded())
             guard w > 0, h > 0 else { return }
             if let g = self.surfaceGeometry, g.w == w, g.h == h { return }
-            connection.send(.ui(con: DisplayNSView.console, w: w, h: h))
+            if let request = self.onResolutionRequest {
+                request(w, h)
+            } else {
+                connection.send(.ui(con: DisplayNSView.console, w: w, h: h))
+            }
         }
     }
 

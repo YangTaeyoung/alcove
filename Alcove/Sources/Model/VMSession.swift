@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AlcoveAgent
 import AlcoveDisplayProtocol
 import AlcoveEngine
 
@@ -36,6 +37,11 @@ final class VMSession: Identifiable {
     /// file-system check the observation machinery cannot see — refresh.
     private var suspendStateVersion = 0
 
+    /// True while the guest tools (alcove-agent) answer on the forwarded port.
+    private(set) var toolsConnected = false
+
+    @ObservationIgnored private var agent: AgentClient?
+    @ObservationIgnored private var agentTask: Task<Void, Never>?
     @ObservationIgnored private var stateTask: Task<Void, Never>?
     @ObservationIgnored private var displayTask: Task<Void, Never>?
 
@@ -57,7 +63,59 @@ final class VMSession: Identifiable {
     func invalidate() {
         stateTask?.cancel(); stateTask = nil
         displayTask?.cancel(); displayTask = nil
+        agentTask?.cancel(); agentTask = nil
+        let client = agent
+        agent = nil
+        toolsConnected = false
+        Task { await client?.disconnect() }
         onStateChange = nil
+    }
+
+    // MARK: - guest tools
+
+    /// Connect to the guest agent in the background while the VM runs, so the
+    /// window can show whether the tools are present and drive the guest's
+    /// display mode (viogpudo ignores QEMU's resize hint; the agent does not).
+    private func connectTools() {
+        guard agentTask == nil else { return }
+        let port = config.agentHostPort, token = config.agentToken
+        agentTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.state.isActive else { return }
+                let client = AgentClient()
+                do {
+                    try await client.connect(port: port, expectedToken: token, timeout: .seconds(5))
+                    self.agent = client
+                    self.toolsConnected = true
+                    for await event in client.events where !Task.isCancelled {
+                        if case .disconnected = event { break }
+                    }
+                    self.agent = nil
+                    self.toolsConnected = false
+                } catch {
+                    try? await Task.sleep(for: .seconds(3))
+                }
+            }
+        }
+    }
+
+    private func disconnectTools() {
+        agentTask?.cancel(); agentTask = nil
+        let client = agent
+        agent = nil
+        toolsConnected = false
+        Task { await client?.disconnect() }
+    }
+
+    /// Ask the guest to adopt this display mode. Uses the guest tools when
+    /// they are connected (exact), otherwise QEMU's resize hint.
+    func requestGuestResolution(width: Int, height: Int) {
+        guard width > 0, height > 0 else { return }
+        if let agent {
+            Task { await agent.setResolution(width: width, height: height) }
+        } else {
+            display?.connection.send(.ui(con: 0, w: width, h: height))
+        }
     }
 
     // MARK: - derived state
@@ -183,16 +241,20 @@ final class VMSession: Identifiable {
             displayTask?.cancel(); displayTask = nil
             display = nil
             attachedUSB = [:]
+            disconnectTools()
             // A resume consumed (or a suspend produced) the image.
             suspendStateVersion += 1
         case .failed(let message):
             displayTask?.cancel(); displayTask = nil
             display = nil
             attachedUSB = [:]
+            disconnectTools()
             suspendStateVersion += 1
             let text = ErrorText.humanize(message)
             if lastError != text { lastError = text }
-        case .running, .paused, .suspending, .stopping:
+        case .running:
+            connectTools()
+        case .paused, .suspending, .stopping:
             break
         }
         onStateChange?(self)

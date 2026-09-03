@@ -45,9 +45,13 @@ private struct VMContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
-                DisplayView(feed: session.display) { width, height in
-                    guestResolutionChanged(width: width, height: height)
-                }
+                DisplayView(feed: session.display,
+                            onGuestResolutionChange: { width, height in
+                                guestResolutionChanged(width: width, height: height)
+                            },
+                            onResolutionRequest: { [session] width, height in
+                                session.requestGuestResolution(width: width, height: height)
+                            })
                 if !session.state.isActive {
                     stoppedOverlay
                 }
@@ -263,6 +267,15 @@ private struct VMContentView: View {
                 .transition(.opacity)
             }
             Spacer()
+            if session.state.isActive {
+                Label(session.toolsConnected ? "Tools" : "No tools",
+                      systemImage: session.toolsConnected ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver")
+                    .labelStyle(.iconOnly)
+                    .foregroundStyle(session.toolsConnected ? .secondary : .tertiary)
+                    .help(session.toolsConnected
+                          ? "Alcove guest tools are connected: shell, clipboard, file drop and exact display modes are available."
+                          : "Alcove guest tools are not running in this guest. Install alcove-agent inside the guest to enable shell access, clipboard sync and file drop.")
+            }
             if let guestSize, session.state.isActive {
                 Text("\(guestSize.width) × \(guestSize.height)").monospacedDigit()
             }
@@ -340,8 +353,17 @@ private struct VMContentView: View {
             }
         }
         window.setContentSize(content)
-        if let screen = window.screen {
-            window.setFrame(window.constrainFrameRect(window.frame, to: screen), display: true)
+        // setContentSize keeps the top-left corner, so a taller window can hang
+        // off the bottom of the screen; constrainFrameRect only pins the title
+        // bar, so move the whole frame back inside the visible area.
+        if let screen = window.screen ?? NSScreen.main {
+            let available = screen.visibleFrame
+            var frame = window.frame
+            frame.origin.x = min(max(frame.minX, available.minX), max(available.minX, available.maxX - frame.width))
+            frame.origin.y = min(max(frame.minY, available.minY), max(available.minY, available.maxY - frame.height))
+            if frame != window.frame {
+                window.setFrame(frame, display: true)
+            }
         }
     }
 }

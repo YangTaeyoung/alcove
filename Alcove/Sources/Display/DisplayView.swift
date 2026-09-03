@@ -17,21 +17,27 @@ struct DisplayView: NSViewRepresentable {
     let feed: DisplayFeed?
     /// Invoked on the main actor when the guest switches to a new surface size.
     let onGuestResolutionChange: ((Int, Int) -> Void)?
+    /// Called with the view size in points when the guest should change mode.
+    let onResolutionRequest: ((Int, Int) -> Void)?
 
-    init(feed: DisplayFeed?, onGuestResolutionChange: ((Int, Int) -> Void)? = nil) {
+    init(feed: DisplayFeed?, onGuestResolutionChange: ((Int, Int) -> Void)? = nil,
+         onResolutionRequest: ((Int, Int) -> Void)? = nil) {
         self.feed = feed
         self.onGuestResolutionChange = onGuestResolutionChange
+        self.onResolutionRequest = onResolutionRequest
     }
 
     func makeNSView(context: Context) -> DisplayNSView {
         let view = DisplayNSView()
         view.onGuestResolutionChange = onGuestResolutionChange
+        view.onResolutionRequest = onResolutionRequest
         view.feed = feed
         return view
     }
 
     func updateNSView(_ view: DisplayNSView, context: Context) {
         view.onGuestResolutionChange = onGuestResolutionChange
+        view.onResolutionRequest = onResolutionRequest
         if view.feed !== feed {
             view.feed = feed
         }
@@ -40,5 +46,6 @@ struct DisplayView: NSViewRepresentable {
     static func dismantleNSView(_ view: DisplayNSView, coordinator: ()) {
         view.feed = nil
         view.onGuestResolutionChange = nil
+        view.onResolutionRequest = nil
     }
 }
