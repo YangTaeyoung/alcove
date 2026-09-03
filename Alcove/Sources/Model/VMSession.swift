@@ -107,14 +107,20 @@ final class VMSession: Identifiable {
         Task { await client?.disconnect() }
     }
 
-    /// Ask the guest to adopt this display mode. Uses the guest tools when
-    /// they are connected (exact), otherwise QEMU's resize hint.
+    /// Ask the guest to adopt this display mode.
+    ///
+    /// The QEMU hint is always sent: for virtio-gpu it updates the EDID the
+    /// guest sees, which is what puts the mode in the driver's list. Windows
+    /// drivers (viogpudo) do not act on it, so when the guest tools are
+    /// connected the mode is then applied with them, once the new EDID has
+    /// had a moment to reach the guest.
     func requestGuestResolution(width: Int, height: Int) {
         guard width > 0, height > 0 else { return }
-        if let agent {
-            Task { await agent.setResolution(width: width, height: height) }
-        } else {
-            display?.connection.send(.ui(con: 0, w: width, h: height))
+        display?.connection.send(.ui(con: 0, w: width, h: height))
+        guard let agent else { return }
+        Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            await agent.setResolution(width: width, height: height)
         }
     }
 

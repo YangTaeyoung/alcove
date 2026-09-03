@@ -4,6 +4,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -74,7 +75,29 @@ func setResolution(w, h int) error {
 	dm.PelsHeight = uint32(h)
 	r, _, _ := procChangeDisplaySettings.Call(uintptr(unsafe.Pointer(&dm)), 0)
 	if r != 0 { // DISP_CHANGE_SUCCESSFUL == 0
-		return errors.New("ChangeDisplaySettings failed")
+		return fmt.Errorf("ChangeDisplaySettings(%dx%d) returned %s", w, h, dispChangeName(int32(r)))
 	}
 	return nil
+}
+
+// dispChangeName names the DISP_CHANGE_* results of ChangeDisplaySettings.
+func dispChangeName(code int32) string {
+	switch code {
+	case 1:
+		return "DISP_CHANGE_RESTART"
+	case -1:
+		return "DISP_CHANGE_FAILED"
+	case -2:
+		return "DISP_CHANGE_BADMODE (the driver does not offer this mode)"
+	case -3:
+		return "DISP_CHANGE_NOTUPDATED"
+	case -4:
+		return "DISP_CHANGE_BADFLAGS"
+	case -5:
+		return "DISP_CHANGE_BADPARAM"
+	case -6:
+		return "DISP_CHANGE_BADDUALVIEW"
+	default:
+		return fmt.Sprintf("code %d", code)
+	}
 }

@@ -88,7 +88,12 @@ Tools: `alcove_list_vms`, `alcove_start_vm`, `alcove_stop_vm`, `alcove_vm_status
 When the Alcove app is not running the MCP server starts `alcovectl serve`
 (headless engine) itself; set `ALCOVE_CTL` if `alcovectl` is not in a standard
 place. `scripts/test/mcp-smoke.py --vm "Windows 11"` exercises the whole chain
-against a real guest (screenshot, exec, Win+R, typing into Notepad, clipboard).
+against a real guest (screenshot, exec, Win+R, typing into Notepad, clipboard),
+and `scripts/test/ctl.py <op> key=value …` is a one-shot client for the same
+socket. `alcovectl agent <name> --command "..."` probes a guest's tools.
+
+For UI testing, `ALCOVE_OPEN_VM=<name>` opens that VM's window at launch and
+`ALCOVE_AUTOSTART=1` starts it.
 
 ## Requirements
 
