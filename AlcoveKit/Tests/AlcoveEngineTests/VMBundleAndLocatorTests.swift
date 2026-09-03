@@ -107,6 +107,22 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(VMBundle.list(in: tmp).map(\.url.lastPathComponent), ["Fedora.alcovevm"])
     }
 
+    /// A config written before the agent fields existed must gain them on the
+    /// first load and keep them, or the token would differ between the process
+    /// that starts the VM and anyone talking to its guest agent.
+    func testLoadConfigPersistsSynthesizedAgentFields() throws {
+        let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
+        let b = try VMBundle.create(VMConfig.defaults(name: "Legacy", guestOS: .linux), in: tmp, engine: engine)
+        var raw = try JSONSerialization.jsonObject(with: try Data(contentsOf: b.configURL)) as! [String: Any]
+        raw.removeValue(forKey: "agentToken"); raw.removeValue(forKey: "agentHostPort")
+        try JSONSerialization.data(withJSONObject: raw).write(to: b.configURL)
+        let first = try b.loadConfig()
+        let second = try b.loadConfig()
+        XCTAssertEqual(first.agentToken, second.agentToken)
+        XCTAssertEqual(first.agentHostPort, second.agentHostPort)
+        XCTAssertFalse(VMConfig.needsMigration(try Data(contentsOf: b.configURL)))
+    }
+
     func testZeroFilledVarsWithoutTemplateAndCleanupOnFailure() throws {
         let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: false)]).locate()
         XCTAssertNil(engine.firmwareVarsTemplate)

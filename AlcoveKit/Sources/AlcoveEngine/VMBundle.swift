@@ -41,8 +41,18 @@ public struct VMBundle: Sendable, Equatable {
 
     public func diskURL(_ disk: VMConfig.Disk) -> URL { url.appendingPathComponent(disk.fileName) }
 
+    /// Load `config.json`. Fields added after the bundle was written (the guest
+    /// agent token and port) are synthesized by the decoder; they must be
+    /// written back at once, because a value regenerated on every load would
+    /// differ between the process that started the VM and anyone connecting to
+    /// its guest agent afterwards.
     public func loadConfig() throws -> VMConfig {
-        try VMConfig.decode(try Data(contentsOf: configURL))
+        let data = try Data(contentsOf: configURL)
+        let config = try VMConfig.decode(data)
+        if VMConfig.needsMigration(data) {
+            try? save(config)
+        }
+        return config
     }
 
     public func save(_ config: VMConfig) throws {

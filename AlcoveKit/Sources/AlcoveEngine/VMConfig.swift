@@ -208,6 +208,13 @@ extension VMConfig {
         return config
     }
 
+    /// True when the stored JSON lacks fields the decoder has to synthesize,
+    /// so the caller should save the migrated config back.
+    public static func needsMigration(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return object["agentToken"] == nil || object["agentHostPort"] == nil
+    }
+
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, name, guestOS, cpuCount, memoryMiB, disks, cdroms, network, display, tpm,
              usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort

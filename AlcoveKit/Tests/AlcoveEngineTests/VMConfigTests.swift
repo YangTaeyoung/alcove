@@ -62,7 +62,10 @@ final class VMConfigTests: XCTestCase {
         // an old config without the fields decodes with fresh values
         var obj = try JSONSerialization.jsonObject(with: try c.encoded()) as! [String: Any]
         obj.removeValue(forKey: "agentToken"); obj.removeValue(forKey: "agentHostPort")
-        let old = try VMConfig.decode(try JSONSerialization.data(withJSONObject: obj))
+        let oldData = try JSONSerialization.data(withJSONObject: obj)
+        XCTAssertTrue(VMConfig.needsMigration(oldData))
+        XCTAssertFalse(VMConfig.needsMigration(try c.encoded()))
+        let old = try VMConfig.decode(oldData)
         XCTAssertEqual(old.agentToken.count, 36)
         XCTAssertEqual(old.agentHostPort, VMConfig.agentPort(for: old.agentToken))
         XCTAssertEqual(try VMConfig.decode(try c.encoded()).agentToken, c.agentToken)

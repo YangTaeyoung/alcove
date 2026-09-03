@@ -26,7 +26,7 @@ let package = Package(
         .target(name: "AlcoveControl", dependencies: ["AlcoveEngine", "AlcoveAgent", "AlcoveDisplayProtocol", "AlcoveQMP"]),
         .testTarget(name: "AlcoveControlTests", dependencies: ["AlcoveControl"]),
         // Command-line front end used by scripts and the test harness.
-        .executableTarget(name: "alcovectl", dependencies: ["AlcoveEngine", "AlcoveDisplayProtocol", "AlcoveControl"]),
+        .executableTarget(name: "alcovectl", dependencies: ["AlcoveEngine", "AlcoveDisplayProtocol", "AlcoveControl", "AlcoveAgent"]),
         .testTarget(name: "AlcoveDisplayProtocolTests", dependencies: ["AlcoveDisplayProtocol"]),
         .testTarget(name: "AlcoveQMPTests", dependencies: ["AlcoveQMP"]),
         .testTarget(name: "AlcoveEngineTests", dependencies: ["AlcoveEngine"]),

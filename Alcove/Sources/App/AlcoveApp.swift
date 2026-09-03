@@ -59,6 +59,28 @@ struct AlcoveApp: App {
         guard !didPresentLibrary else { return }
         didPresentLibrary = true
         openWindow(id: LibraryView.windowID)
+        openRequestedVMWindow()
+    }
+
+    /// Development and test hook: `ALCOVE_OPEN_VM=<name>` opens that VM's
+    /// window at launch and `ALCOVE_AUTOSTART=1` also starts it, so a test can
+    /// exercise the window without UI scripting. Ignored when unset.
+    private func openRequestedVMWindow() {
+        let environment = ProcessInfo.processInfo.environment
+        guard let name = environment["ALCOVE_OPEN_VM"], !name.isEmpty else { return }
+        Task { @MainActor in
+            for _ in 0..<50 {
+                if let session = model.sessions.first(where: { $0.name == name }) {
+                    openWindow(value: session.id)
+                    if environment["ALCOVE_AUTOSTART"] == "1", session.canStart {
+                        await session.start()
+                    }
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            model.pendingError = "ALCOVE_OPEN_VM is set to “\(name)”, but no virtual machine with that name was found."
+        }
     }
 }
 

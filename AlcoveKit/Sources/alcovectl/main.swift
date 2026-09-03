@@ -3,6 +3,7 @@
 //   alcovectl create --name NAME --os windows|linux|other [--iso PATH] [--disk-gib N] [--cpus N] [--memory-mib N] [--adopt-disk PATH] [--adopt-vars PATH] [--forward HOST:GUEST]... [--dir DIR]
 //   alcovectl list [--dir DIR]
 //   alcovectl args NAME [--dir DIR]          print the QEMU command line
+//   alcovectl agent NAME [--dir DIR] [--command CMD]   probe the guest agent of a running VM
 //   alcovectl serve [--dir DIR] [--socket PATH]   headless control server (docs/control-protocol.md) until SIGTERM
 //   alcovectl run NAME [--dir DIR] [--seconds N] [--screenshot PATH --after N] [--resize WxH --resize-after N]
 //                 start headless, keep running N seconds (default 30), then power down;
@@ -11,6 +12,7 @@ import Foundation
 import AlcoveEngine
 import AlcoveDisplayProtocol
 import AlcoveControl
+import AlcoveAgent
 
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(Data((msg + "\n").utf8))
@@ -146,6 +148,30 @@ case "run":
             FileHandle.standardError.write(Data("run failed: \(error)\n".utf8))
             exit(1)
         }
+    }
+    dispatchMain()
+case "agent":
+    guard args.positional.count > 1 else { fail("usage: alcovectl agent NAME [--command CMD]") }
+    let b = bundle(named: args.positional[1])
+    let c = try! b.loadConfig()
+    let command = args.value("command")
+    let sem = DispatchSemaphore(value: 0)
+    Task.detached {
+        let client = AgentClient()
+        do {
+            try await client.connect(port: c.agentHostPort, expectedToken: c.agentToken, timeout: .seconds(8))
+            let hello = await client.hello
+            print("connected on port \(c.agentHostPort): os=\(hello?.os ?? "?") agent=\(hello?.agentVersion ?? "?") caps=\(hello?.capabilities ?? [])")
+            if let command {
+                let r = try await client.exec(command)
+                print("exit \(r.code)\n\(r.output)")
+            }
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("agent probe failed (port \(c.agentHostPort), token \(c.agentToken)): \(error)\n".utf8))
+            exit(1)
+        }
+        sem.signal()
     }
     dispatchMain()
 case "serve":
