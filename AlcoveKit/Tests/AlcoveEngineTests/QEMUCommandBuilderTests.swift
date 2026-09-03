@@ -23,7 +23,7 @@ final class QEMUCommandBuilderTests: XCTestCase {
             "-drive", "if=pflash,format=raw,file=/vms/Test.alcovevm/efi-vars.fd",
             "-device", "ramfb",
             "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd", "-device", "usb-tablet",
-            "-display", "alcove,socket=/vms/Test.alcovevm/run/display.sock,shmdir=/vms/Test.alcovevm/run",
+            "-display", "alcove,socket=\(bundle.displaySocketPath),shmdir=/vms/Test.alcovevm/run",
             "-blockdev", "driver=file,node-name=disk0-file,filename=/vms/Test.alcovevm/disk0.qcow2,discard=unmap",
             "-blockdev", "driver=qcow2,node-name=disk0,file=disk0-file,discard=unmap",
             "-device", "nvme,drive=disk0,id=disk0-dev,serial=alcove-disk0,bootindex=1",
@@ -34,7 +34,7 @@ final class QEMUCommandBuilderTests: XCTestCase {
             "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc",
             "-device", "virtio-rng-pci",
             "-device", "virtio-serial-pci,id=vser0",
-            "-qmp", "unix:/vms/Test.alcovevm/run/qmp.sock,server=on,wait=off",
+            "-qmp", "unix:\(bundle.qmpSocketPath),server=on,wait=off",
             "-serial", "file:/vms/Test.alcovevm/run/serial.log", "-monitor", "none",
             "-rtc", "base=utc,clock=host",
         ]

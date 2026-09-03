@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// A VM on disk: `<name>.alcovevm/` holding `config.json`, disk images, the
 /// UEFI variable store and a scratch `run/` directory used while running.
@@ -17,9 +18,16 @@ public struct VMBundle: Sendable, Equatable {
     public var efiVarsURL: URL { url.appendingPathComponent("efi-vars.fd") }
     public var runURL: URL { url.appendingPathComponent("run") }
     public var suspendStateURL: URL { url.appendingPathComponent("suspend.state") }
-    public var displaySocketPath: String { runURL.appendingPathComponent("display.sock").path }
-    public var qmpSocketPath: String { runURL.appendingPathComponent("qmp.sock").path }
-    public var swtpmSocketPath: String { runURL.appendingPathComponent("swtpm.sock").path }
+    /// Unix socket paths are limited to 104 bytes on macOS, so sockets live in a
+    /// short per-VM directory under /tmp keyed by a hash of the bundle path.
+    public var socketDirectory: String {
+        let digest = SHA256.hash(data: Data(url.standardizedFileURL.path.utf8))
+        let short = digest.prefix(6).map { String(format: "%02x", $0) }.joined()
+        return "/tmp/alcove-\(getuid())/\(short)"
+    }
+    public var displaySocketPath: String { socketDirectory + "/display.sock" }
+    public var qmpSocketPath: String { socketDirectory + "/qmp.sock" }
+    public var swtpmSocketPath: String { socketDirectory + "/swtpm.sock" }
     public var tpmStateURL: URL { url.appendingPathComponent("tpm") }
     public var serialLogURL: URL { runURL.appendingPathComponent("serial.log") }
     public var qemuLogURL: URL { runURL.appendingPathComponent("qemu.log") }
@@ -89,10 +97,13 @@ public struct VMBundle: Sendable, Equatable {
         }
     }
 
-    /// Empty the scratch directory (stale sockets, shared framebuffer files, logs).
+    /// Empty the scratch directory (shared framebuffer files, logs) and the
+    /// socket directory (stale sockets), creating both.
     public func prepareRunDirectory(fileManager fm: FileManager = .default) throws {
         if fm.fileExists(atPath: runURL.path) { try fm.removeItem(at: runURL) }
         try fm.createDirectory(at: runURL, withIntermediateDirectories: true)
+        if fm.fileExists(atPath: socketDirectory) { try fm.removeItem(atPath: socketDirectory) }
+        try fm.createDirectory(atPath: socketDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     }
 
     /// Bundles found directly inside `directory`.

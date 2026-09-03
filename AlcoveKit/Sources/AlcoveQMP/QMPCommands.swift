@@ -115,9 +115,14 @@ extension QMPClient {
         let jobID = "alcove-\(command)-\(UUID().uuidString.prefix(8))"
         var args: [String: JSON] = ["job-id": .string(jobID), "tag": .string(tag), "devices": .array(devices.map(JSON.string))]
         if let vmstate { args["vmstate"] = .string(vmstate) }
-        async let concluded: Void = awaitJobConcluded(id: jobID, timeout: timeout)
-        _ = try await execute(command, arguments: .object(args))
-        try await concluded
+        let signal = jobConcludedSignal(id: jobID)
+        do {
+            _ = try await execute(command, arguments: .object(args))
+        } catch {
+            cancelJobSignal(id: jobID)
+            throw error
+        }
+        try await awaitJobConcluded(signal, id: jobID, timeout: timeout)
         let jobs = try await execute("query-jobs")
         let info = jobs.arrayValue?.first { $0["id"]?.stringValue == jobID }
         let error = info?["error"]?.stringValue

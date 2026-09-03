@@ -52,6 +52,10 @@ final class VMBundleAndLocatorTests: XCTestCase {
         try Data().write(to: b.runURL.appendingPathComponent("fb0-3.bgra"))
         try b.prepareRunDirectory()
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: b.runURL.path), [])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: b.socketDirectory))
+        XCTAssertLessThan(b.displaySocketPath.utf8.count, 104)
+        XCTAssertTrue(b.displaySocketPath.hasPrefix("/tmp/alcove-"))
+        XCTAssertEqual(b.socketDirectory, VMBundle(url: b.url).socketDirectory)
         // listing ignores non-bundles
         try FileManager.default.createDirectory(at: tmp.appendingPathComponent("junk.alcovevm"), withIntermediateDirectories: true)
         XCTAssertEqual(VMBundle.list(in: tmp).map(\.url.lastPathComponent), ["Fedora.alcovevm"])

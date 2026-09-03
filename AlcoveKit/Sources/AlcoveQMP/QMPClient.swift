@@ -36,8 +36,7 @@ public actor QMPClient {
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSON, Error>] = [:]
     private var greetingWaiter: CheckedContinuation<JSON, Error>?
-    private var jobWaiters: [String: CheckedContinuation<Void, Error>] = [:]
-    private var concludedJobs: Set<String> = []
+    private var jobSignals: [String: AsyncStream<Void>.Continuation] = [:]
     public private(set) var greeting: JSON?
     public private(set) var isConnected = false
 
@@ -105,18 +104,30 @@ public actor QMPClient {
         }
     }
 
-    /// Wait until the job with `id` reaches the `concluded` state.
-    /// Registered before the job is started so no status change is missed.
-    func awaitJobConcluded(id: String, timeout: Duration) async throws {
-        if concludedJobs.remove(id) != nil { return }
-        let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
-            await self?.timeOutJob(id: id)
+    /// A stream that yields once when job `id` reaches `concluded`. Call this
+    /// BEFORE starting the job so the status change cannot be missed.
+    func jobConcludedSignal(id: String) -> AsyncStream<Void> {
+        var c: AsyncStream<Void>.Continuation!
+        let stream = AsyncStream<Void>(bufferingPolicy: .bufferingNewest(1)) { c = $0 }
+        jobSignals[id] = c
+        return stream
+    }
+
+    func cancelJobSignal(id: String) {
+        jobSignals.removeValue(forKey: id)?.finish()
+    }
+
+    /// Wait for a job signal with a timeout.
+    func awaitJobConcluded(_ signal: AsyncStream<Void>, id: String, timeout: Duration) async throws {
+        let done = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { for await _ in signal { return true }; return false }
+            group.addTask { try? await Task.sleep(for: timeout); return false }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
         }
-        defer { timeoutTask.cancel() }
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            jobWaiters[id] = cont
-        }
+        jobSignals.removeValue(forKey: id)?.finish()
+        if !done { throw QMPError.timeout("job \(id)") }
     }
 
     // MARK: - internals
@@ -137,8 +148,9 @@ public actor QMPClient {
                               seconds: Int64(ts?["seconds"]?.intValue ?? 0),
                               microseconds: Int64(ts?["microseconds"]?.intValue ?? 0))
             if name == "JOB_STATUS_CHANGE", let id = event.data["id"]?.stringValue,
-               event.data["status"]?.stringValue == "concluded" {
-                if let w = jobWaiters.removeValue(forKey: id) { w.resume() } else { concludedJobs.insert(id) }
+               event.data["status"]?.stringValue == "concluded", let c = jobSignals[id] {
+                c.yield(())
+                c.finish()
             }
             eventContinuation.yield(event)
             return
@@ -161,8 +173,8 @@ public actor QMPClient {
         if let w = greetingWaiter { greetingWaiter = nil; w.resume(throwing: err) }
         for (_, c) in pending { c.resume(throwing: err) }
         pending.removeAll()
-        for (_, c) in jobWaiters { c.resume(throwing: err) }
-        jobWaiters.removeAll()
+        for (_, c) in jobSignals { c.finish() }
+        jobSignals.removeAll()
         eventContinuation.finish()
     }
 
@@ -174,7 +186,4 @@ public actor QMPClient {
         if let c = pending.removeValue(forKey: id) { c.resume(throwing: QMPError.timeout(command)) }
     }
 
-    private func timeOutJob(id: String) {
-        if let c = jobWaiters.removeValue(forKey: id) { c.resume(throwing: QMPError.timeout("job \(id)")) }
-    }
 }
