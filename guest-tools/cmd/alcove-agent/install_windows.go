@@ -28,7 +28,8 @@ func installAtLogon(port int, allowExec bool) error {
 		}
 		// a running copy locks the file: stop the task and any agent process first
 		_ = exec.Command("schtasks", "/End", "/TN", "AlcoveAgent").Run()
-		_ = exec.Command("taskkill", "/IM", "alcove-agent.exe", "/F").Run()
+		// kill running agents, but not this installer (same image name)
+		_ = exec.Command("taskkill", "/F", "/FI", "IMAGENAME eq alcove-agent.exe", "/FI", fmt.Sprintf("PID ne %d", os.Getpid())).Run()
 		var werr error
 		for i := 0; i < 20; i++ {
 			werr = os.WriteFile(dst, data, 0o755)

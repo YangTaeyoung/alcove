@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/server"
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/token"
@@ -34,9 +35,11 @@ func main() {
 	if *install {
 		if err := installAtLogon(*port, *allowExec); err != nil {
 			fmt.Fprintln(os.Stderr, "install failed:", err)
+			writeInstallLog("install failed: " + err.Error())
 			os.Exit(1)
 		}
 		fmt.Println("installed")
+		writeInstallLog("installed")
 		return
 	}
 	if *tok == "" {
@@ -57,3 +60,20 @@ func mask(t string) string {
 	}
 	return t[:4] + "..." + t[len(t)-4:]
 }
+
+// writeInstallLog records the install result where a GUI-subsystem build can be
+// inspected afterwards (stdout/stderr are invisible on Windows).
+func writeInstallLog(msg string) {
+	dir := os.Getenv("ProgramData")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	path := filepath.Join(dir, "Alcove", "install.log")
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		fmt.Fprintf(f, "%s %s\n", timeNow(), msg)
+		f.Close()
+	}
+}
+
+func timeNow() string { return time.Now().Format(time.RFC3339) }
