@@ -122,6 +122,25 @@ folder sharing (Linux: virtio-9p; Windows: WebDAV server in the app mapped
 by the inbox WebDAV client), drag and drop (file push), time sync, graceful
 shutdown hook.
 
+### Automation and MCP (added 2026-09-03 on the user's request)
+
+Coding agents on the Mac (Claude Code first) must be able to use the guests:
+screenshots, mouse, keyboard, and a shell (PowerShell / sh). Design:
+
+- `AlcoveControl` (AlcoveKit): a unix-socket JSON API
+  (`docs/control-protocol.md`) implemented once and hosted by whoever owns the
+  VMs: the app while it runs, or `alcovectl serve` headless. Screenshots come
+  from QMP `screendump`; mouse/keyboard go through the display protocol
+  (`abs`/`btn`/`key` with macOS keycodes, `KeyNames` maps names and US-layout
+  characters); shell, clipboard and file push go through the guest agent.
+- `mcp/` (TypeScript, `@modelcontextprotocol/sdk`): `alcove-mcp-server`, stdio,
+  16 tools prefixed `alcove_`, screenshots returned as image content, auto
+  starts the headless server when the app is not running.
+- Guest agent auth: SMBIOS type 11 string `alcove-token=<uuid>` from the VM
+  config; the agent must echo it in `hello`.
+- Verified end to end on the Windows 11 image: list/start/screenshot/status/
+  exec/win+r/type through an MCP client (`scripts/test/mcp-smoke.py`).
+
 ### Coherence (SP3)
 
 Guest tool reports top-level window rects and z-order; the app shows each as
