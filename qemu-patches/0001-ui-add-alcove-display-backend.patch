@@ -1,0 +1,740 @@
+diff --git a/meson.build b/meson.build
+index 40e3f4e..79ea292 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1225,6 +1225,10 @@ cocoa = dependency('appleframeworks',
+                    required: get_option('cocoa'))
+ 
+ vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
++alcove = get_option('alcove') \
++  .require(host_os != 'windows', error_message: 'alcove display needs a POSIX host') \
++  .require(pixman.found(), error_message: 'alcove display needs pixman') \
++  .allowed()
+ if vmnet.found() and not cc.has_header_symbol('vmnet/vmnet.h',
+                                               'VMNET_BRIDGED_MODE',
+                                               dependencies: vmnet)
+@@ -2435,6 +2439,7 @@ config_host_data.set('CONFIG_BSD', host_os in bsd_oses)
+ config_host_data.set('CONFIG_FREEBSD', host_os == 'freebsd')
+ config_host_data.set('CONFIG_CAPSTONE', capstone.found())
+ config_host_data.set('CONFIG_COCOA', cocoa.found())
++config_host_data.set('CONFIG_ALCOVE', alcove)
+ config_host_data.set('CONFIG_DARWIN', host_os == 'darwin')
+ config_host_data.set('CONFIG_FDT', fdt.found())
+ config_host_data.set('CONFIG_FUZZ', get_option('fuzzing'))
+@@ -4900,6 +4905,7 @@ if host_os == 'darwin'
+   summary_info += {'Cocoa support':           cocoa}
+ endif
+ summary_info += {'D-Bus display':     dbus_display}
++summary_info += {'Alcove display':    alcove}
+ summary_info += {'SDL support':       sdl}
+ summary_info += {'SDL image support': sdl_image}
+ summary_info += {'GTK support':       gtk}
+diff --git a/meson_options.txt b/meson_options.txt
+index a07cb47..b66bf27 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -156,6 +156,8 @@ option('bpf', type : 'feature', value : 'auto',
+         description: 'eBPF support')
+ option('cocoa', type : 'feature', value : 'auto',
+        description: 'Cocoa user interface (macOS only)')
++option('alcove', type : 'feature', value : 'auto',
++       description: 'Alcove display backend (shared memory + unix socket)')
+ option('curl', type : 'feature', value : 'auto',
+        description: 'CURL block device driver')
+ option('gio', type : 'feature', value : 'auto',
+diff --git a/qapi/ui.json b/qapi/ui.json
+index b2c42a7..9be78a7 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1459,6 +1459,23 @@
+       '*zoom-interpolation': 'bool'
+   } }
+ 
++##
++# @DisplayAlcove:
++#
++# Alcove display options.
++#
++# @socket: Path of the unix stream socket the Alcove host
++#     application listens on.  Required.
++#
++# @shmdir: Directory in which the shared framebuffer files are
++#     created.  Defaults to the directory containing @socket.
++#
++# Since: 11.1
++##
++{ 'struct': 'DisplayAlcove',
++  'data': { '*socket': 'str',
++            '*shmdir': 'str' } }
++
+ ##
+ # @HotKeyMod:
+ #
+@@ -1517,6 +1534,8 @@
+ #
+ # @dbus: Start a D-Bus service for the display.  (Since 7.0)
+ #
++# @alcove: The Alcove host application display.  (Since 11.1)
++#
+ # Since: 2.12
+ ##
+ { 'enum'    : 'DisplayType',
+@@ -1529,7 +1548,8 @@
+     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
+     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
+     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
+-    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
++    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
++    { 'name': 'alcove', 'if': 'CONFIG_ALCOVE' }
+   ]
+ }
+ 
+@@ -1567,7 +1587,8 @@
+       'egl-headless': { 'type': 'DisplayEGLHeadless',
+                         'if': 'CONFIG_OPENGL' },
+       'dbus': { 'type': 'DisplayDBus', 'if': 'CONFIG_DBUS_DISPLAY' },
+-      'sdl': { 'type': 'DisplaySDL', 'if': 'CONFIG_SDL' }
++      'sdl': { 'type': 'DisplaySDL', 'if': 'CONFIG_SDL' },
++      'alcove': { 'type': 'DisplayAlcove', 'if': 'CONFIG_ALCOVE' }
+   }
+ }
+ 
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 34970ff..5dc6f8d 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -2265,6 +2265,9 @@ DEF("display", HAS_ARG, QEMU_OPTION_display,
+ #if defined(CONFIG_OPENGL)
+     "-display egl-headless[,rendernode=<file>]\n"
+ #endif
++#if defined(CONFIG_ALCOVE)
++    "-display alcove,socket=<path>[,shmdir=<dir>]\n"
++#endif
+ #if defined(CONFIG_DBUS_DISPLAY)
+     "-display dbus[,addr=<dbusaddr>]\n"
+     "             [,gl=on|core|es|off][,rendernode=<file>]\n"
+diff --git a/ui/alcove.c b/ui/alcove.c
+new file mode 100644
+index 0000000..51771a8
+--- /dev/null
++++ b/ui/alcove.c
+@@ -0,0 +1,605 @@
++/*
++ * Alcove display backend.
++ *
++ * Shares the guest framebuffer with the Alcove host application (a separate
++ * process) through file-backed shared memory and a unix stream socket that
++ * carries newline-delimited JSON in both directions.  The wire format is
++ * documented in Alcove's docs/display-protocol.md.
++ *
++ * Everything here runs on the QEMU main loop with the BQL held: the socket
++ * is serviced through qemu_set_fd_handler() and the DisplayChangeListener
++ * callbacks are invoked by the console layer.  No threads are created.
++ *
++ * Copyright (c) 2026 Alcove contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "qemu/main-loop.h"
++#include "qemu/error-report.h"
++#include "qapi/error.h"
++#include "qobject/qdict.h"
++#include "qobject/qjson.h"
++#include "ui/console.h"
++#include "ui/surface.h"
++#include "ui/input.h"
++#include "ui/kbd-state.h"
++#include "ui/qemu-pixman.h"
++
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++
++#define ALCOVE_PROTOCOL_VERSION 1
++/* Outbound bytes we are willing to queue before coalescing updates. */
++#define ALCOVE_OUT_HIGH_WATER   (256 * 1024)
++#define ALCOVE_IN_MAX_LINE      (64 * 1024)
++#define ALCOVE_REFRESH_MS       16
++
++typedef struct AlcoveShm {
++    char *path;
++    void *map;
++    size_t size;
++} AlcoveShm;
++
++typedef struct AlcoveDisplay {
++    DisplayChangeListener dcl;
++    QKbdState *kbd;
++    int con_index;
++    DisplaySurface *surface;    /* current console surface, owned by the console */
++    pixman_image_t *shadow;     /* PIXMAN_x8r8g8b8 view over fb.map */
++    AlcoveShm fb;
++    unsigned fb_gen;
++    AlcoveShm cursor;
++    unsigned cursor_gen;
++    int width, height, stride;
++    /* dirty rectangle accumulated while the socket is backpressured */
++    bool dirty;
++    int dx0, dy0, dx1, dy1;
++} AlcoveDisplay;
++
++static struct {
++    int fd;
++    char *shmdir;
++    GString *out;
++    GString *in;
++    bool write_handler;
++    AlcoveDisplay *dpy;
++} alcove = { .fd = -1 };
++
++/* ---------------------------------------------------------------- socket */
++
++static void alcove_read(void *opaque);
++static void alcove_write(void *opaque);
++static void alcove_flush_dirty(AlcoveDisplay *d);
++
++static void alcove_disconnect(const char *why)
++{
++    if (alcove.fd < 0) {
++        return;
++    }
++    warn_report("alcove: display connection lost (%s); continuing headless", why);
++    qemu_set_fd_handler(alcove.fd, NULL, NULL, NULL);
++    close(alcove.fd);
++    alcove.fd = -1;
++    alcove.write_handler = false;
++    g_string_truncate(alcove.out, 0);
++    g_string_truncate(alcove.in, 0);
++}
++
++static void alcove_update_handlers(void)
++{
++    bool want_write = alcove.out->len > 0;
++    if (alcove.fd < 0 || want_write == alcove.write_handler) {
++        return;
++    }
++    qemu_set_fd_handler(alcove.fd, alcove_read, want_write ? alcove_write : NULL, NULL);
++    alcove.write_handler = want_write;
++}
++
++/* Try to push the queued bytes out; returns false if the socket died. */
++static bool alcove_drain(void)
++{
++    while (alcove.fd >= 0 && alcove.out->len > 0) {
++        ssize_t n = send(alcove.fd, alcove.out->str, alcove.out->len, 0);
++        if (n > 0) {
++            g_string_erase(alcove.out, 0, n);
++            continue;
++        }
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            break;
++        }
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        alcove_disconnect(n == 0 ? "closed by peer" : strerror(errno));
++        return false;
++    }
++    alcove_update_handlers();
++    return alcove.fd >= 0;
++}
++
++static void alcove_send(const char *line, size_t len)
++{
++    if (alcove.fd < 0) {
++        return;
++    }
++    g_string_append_len(alcove.out, line, len);
++    alcove_drain();
++}
++
++static void alcove_send_dict(QDict *dict)
++{
++    GString *json = qobject_to_json(QOBJECT(dict));
++    g_string_append_c(json, '\n');
++    alcove_send(json->str, json->len);
++    g_string_free(json, TRUE);
++    qobject_unref(dict);
++}
++
++static bool alcove_backpressured(void)
++{
++    return alcove.out->len >= ALCOVE_OUT_HIGH_WATER;
++}
++
++static void alcove_write(void *opaque)
++{
++    if (!alcove_drain()) {
++        return;
++    }
++    if (alcove.dpy && !alcove_backpressured()) {
++        alcove_flush_dirty(alcove.dpy);
++    }
++}
++
++/* ---------------------------------------------------------- shared memory */
++
++static void alcove_shm_release(AlcoveShm *shm)
++{
++    if (shm->map) {
++        munmap(shm->map, shm->size);
++        shm->map = NULL;
++    }
++    if (shm->path) {
++        unlink(shm->path);
++        g_free(shm->path);
++        shm->path = NULL;
++    }
++    shm->size = 0;
++}
++
++static bool alcove_shm_create(AlcoveShm *shm, const char *path, size_t size)
++{
++    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
++    if (fd < 0) {
++        error_report("alcove: cannot create %s: %s", path, strerror(errno));
++        return false;
++    }
++    if (ftruncate(fd, size) < 0) {
++        error_report("alcove: cannot size %s: %s", path, strerror(errno));
++        close(fd);
++        unlink(path);
++        return false;
++    }
++    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    close(fd);
++    if (map == MAP_FAILED) {
++        error_report("alcove: cannot map %s: %s", path, strerror(errno));
++        unlink(path);
++        return false;
++    }
++    shm->path = g_strdup(path);
++    shm->map = map;
++    shm->size = size;
++    return true;
++}
++
++static size_t alcove_page_round(size_t n)
++{
++    size_t page = qemu_real_host_page_size();
++    return QEMU_ALIGN_UP(n, page);
++}
++
++/* ------------------------------------------------------- frame updates */
++
++static void alcove_send_update(AlcoveDisplay *d, int x, int y, int w, int h)
++{
++    char line[128];
++    int n = snprintf(line, sizeof(line),
++                     "{\"t\":\"update\",\"con\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}\n",
++                     d->con_index, x, y, w, h);
++    alcove_send(line, n);
++}
++
++static void alcove_flush_dirty(AlcoveDisplay *d)
++{
++    if (!d->dirty) {
++        return;
++    }
++    d->dirty = false;
++    alcove_send_update(d, d->dx0, d->dy0, d->dx1 - d->dx0, d->dy1 - d->dy0);
++}
++
++static void alcove_mark(AlcoveDisplay *d, int x, int y, int w, int h)
++{
++    if (!alcove_backpressured()) {
++        alcove_flush_dirty(d);
++        alcove_send_update(d, x, y, w, h);
++        return;
++    }
++    if (!d->dirty) {
++        d->dirty = true;
++        d->dx0 = x; d->dy0 = y; d->dx1 = x + w; d->dy1 = y + h;
++        return;
++    }
++    d->dx0 = MIN(d->dx0, x);
++    d->dy0 = MIN(d->dy0, y);
++    d->dx1 = MAX(d->dx1, x + w);
++    d->dy1 = MAX(d->dy1, y + h);
++}
++
++static void alcove_blit(AlcoveDisplay *d, int x, int y, int w, int h)
++{
++    if (!d->shadow || !d->surface) {
++        return;
++    }
++    pixman_image_composite(PIXMAN_OP_SRC, d->surface->image, NULL, d->shadow,
++                           x, y, 0, 0, x, y, w, h);
++}
++
++static void alcove_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h)
++{
++    AlcoveDisplay *d = container_of(dcl, AlcoveDisplay, dcl);
++    if (w <= 0 || h <= 0) {
++        return;
++    }
++    alcove_blit(d, x, y, w, h);
++    if (alcove.fd >= 0) {
++        alcove_mark(d, x, y, w, h);
++    }
++}
++
++static void alcove_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *surface)
++{
++    AlcoveDisplay *d = container_of(dcl, AlcoveDisplay, dcl);
++    int w = surface_width(surface);
++    int h = surface_height(surface);
++    int stride = w * 4;
++    size_t need = alcove_page_round((size_t)stride * (size_t)h);
++
++    d->surface = surface;
++    d->width = w;
++    d->height = h;
++    d->stride = stride;
++    d->dirty = false;
++
++    if (d->shadow) {
++        pixman_image_unref(d->shadow);
++        d->shadow = NULL;
++    }
++    if (!d->fb.map || d->fb.size < need) {
++        AlcoveShm old = d->fb;
++        char *path = g_strdup_printf("%s/fb%d-%u.bgra", alcove.shmdir,
++                                     d->con_index, ++d->fb_gen);
++        memset(&d->fb, 0, sizeof(d->fb));
++        if (!alcove_shm_create(&d->fb, path, need)) {
++            g_free(path);
++            d->fb = old;
++            return;
++        }
++        g_free(path);
++        alcove_shm_release(&old);
++    }
++    d->shadow = pixman_image_create_bits(PIXMAN_x8r8g8b8, w, h, d->fb.map, stride);
++    alcove_blit(d, 0, 0, w, h);
++
++    if (alcove.fd < 0) {
++        return;
++    }
++    QDict *msg = qdict_new();
++    qdict_put_str(msg, "t", "switch");
++    qdict_put_int(msg, "con", d->con_index);
++    qdict_put_int(msg, "w", w);
++    qdict_put_int(msg, "h", h);
++    qdict_put_int(msg, "stride", stride);
++    qdict_put_str(msg, "fmt", "bgra8");
++    qdict_put_str(msg, "shm", d->fb.path);
++    qdict_put_int(msg, "size", d->fb.size);
++    alcove_send_dict(msg);
++    /* console.c does not follow a real switch with an update; we do. */
++    alcove_send_update(d, 0, 0, w, h);
++}
++
++static void alcove_refresh(DisplayChangeListener *dcl)
++{
++    qemu_console_hw_update(dcl->con);
++}
++
++static void alcove_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
++{
++    AlcoveDisplay *d = container_of(dcl, AlcoveDisplay, dcl);
++    char line[128];
++    if (alcove.fd < 0) {
++        return;
++    }
++    int n = snprintf(line, sizeof(line),
++                     "{\"t\":\"mouse\",\"con\":%d,\"x\":%d,\"y\":%d,\"on\":%s}\n",
++                     d->con_index, x, y, on ? "true" : "false");
++    alcove_send(line, n);
++}
++
++static void alcove_cursor_define(DisplayChangeListener *dcl, QEMUCursor *c)
++{
++    AlcoveDisplay *d = container_of(dcl, AlcoveDisplay, dcl);
++    if (alcove.fd < 0 || !c || c->width == 0 || c->height == 0) {
++        return;
++    }
++    size_t bytes = (size_t)c->width * c->height * 4;
++    AlcoveShm old = d->cursor;
++    char *path = g_strdup_printf("%s/cursor%d-%u.argb", alcove.shmdir,
++                                 d->con_index, ++d->cursor_gen);
++    memset(&d->cursor, 0, sizeof(d->cursor));
++    if (!alcove_shm_create(&d->cursor, path, alcove_page_round(bytes))) {
++        g_free(path);
++        d->cursor = old;
++        return;
++    }
++    g_free(path);
++    memcpy(d->cursor.map, c->data, bytes);
++    alcove_shm_release(&old);
++
++    QDict *msg = qdict_new();
++    qdict_put_str(msg, "t", "cursor");
++    qdict_put_int(msg, "con", d->con_index);
++    qdict_put_int(msg, "w", c->width);
++    qdict_put_int(msg, "h", c->height);
++    qdict_put_int(msg, "hx", c->hot_x);
++    qdict_put_int(msg, "hy", c->hot_y);
++    qdict_put_str(msg, "shm", d->cursor.path);
++    qdict_put_int(msg, "size", bytes);
++    alcove_send_dict(msg);
++}
++
++static const DisplayChangeListenerOps alcove_dcl_ops = {
++    .dpy_name             = "alcove",
++    .dpy_refresh          = alcove_refresh,
++    .dpy_gfx_update       = alcove_gfx_update,
++    .dpy_gfx_switch       = alcove_gfx_switch,
++    .dpy_gfx_check_format = qemu_pixman_check_format,
++    .dpy_mouse_set        = alcove_mouse_set,
++    .dpy_cursor_define    = alcove_cursor_define,
++};
++
++/* --------------------------------------------------------------- input */
++
++static void alcove_handle_key(AlcoveDisplay *d, QDict *m)
++{
++    unsigned lnx = 0;
++    bool down = qdict_get_try_bool(m, "down", false);
++    int64_t mac = qdict_get_try_int(m, "mac", -1);
++    int64_t q = qdict_get_try_int(m, "q", -1);
++
++    if (mac >= 0 && mac < qemu_input_map_osx_to_linux_len) {
++        lnx = qemu_input_map_osx_to_linux[mac];
++    } else if (q >= 0 && q < qemu_input_map_qcode_to_linux_len) {
++        lnx = qemu_input_map_qcode_to_linux[q];
++    }
++    if (lnx) {
++        qkbd_state_key_event(d->kbd, lnx, down);
++    }
++}
++
++static void alcove_handle_line(const char *line)
++{
++    AlcoveDisplay *d = alcove.dpy;
++    Error *err = NULL;
++    QObject *obj = qobject_from_json(line, &err);
++    QDict *m = qobject_to(QDict, obj);
++    const char *t;
++
++    if (!m) {
++        warn_report("alcove: ignoring malformed message: %s",
++                    err ? error_get_pretty(err) : "not an object");
++        error_free(err);
++        qobject_unref(obj);
++        return;
++    }
++    t = qdict_get_try_str(m, "t");
++    if (!t || !d) {
++        /* unknown or no display yet: ignore for forward compatibility */
++    } else if (!strcmp(t, "key")) {
++        alcove_handle_key(d, m);
++    } else if (!strcmp(t, "abs")) {
++        qemu_input_queue_abs(d->dcl.con, INPUT_AXIS_X,
++                             qdict_get_try_int(m, "x", 0), 0, INPUT_EVENT_ABS_MAX);
++        qemu_input_queue_abs(d->dcl.con, INPUT_AXIS_Y,
++                             qdict_get_try_int(m, "y", 0), 0, INPUT_EVENT_ABS_MAX);
++    } else if (!strcmp(t, "rel")) {
++        qemu_input_queue_rel(d->dcl.con, INPUT_AXIS_X, qdict_get_try_int(m, "dx", 0));
++        qemu_input_queue_rel(d->dcl.con, INPUT_AXIS_Y, qdict_get_try_int(m, "dy", 0));
++    } else if (!strcmp(t, "btn")) {
++        int64_t b = qdict_get_try_int(m, "b", -1);
++        if (b >= 0 && b < INPUT_BUTTON__MAX) {
++            qemu_input_queue_btn(d->dcl.con, b, qdict_get_try_bool(m, "down", false));
++        }
++    } else if (!strcmp(t, "sync")) {
++        qemu_input_event_sync();
++    } else if (!strcmp(t, "lift")) {
++        qkbd_state_lift_all_keys(d->kbd);
++    } else if (!strcmp(t, "ui")) {
++        QemuUIInfo info = {
++            .width = qdict_get_try_int(m, "w", 0),
++            .height = qdict_get_try_int(m, "h", 0),
++        };
++        if (info.width > 0 && info.height > 0) {
++            qemu_console_set_ui_info(d->dcl.con, &info, false);
++        }
++    } else if (!strcmp(t, "refresh")) {
++        if (d->surface) {
++            alcove_blit(d, 0, 0, d->width, d->height);
++            alcove_mark(d, 0, 0, d->width, d->height);
++        }
++    }
++    qobject_unref(obj);
++}
++
++static void alcove_read(void *opaque)
++{
++    char buf[4096];
++    ssize_t n;
++
++    for (;;) {
++        n = recv(alcove.fd, buf, sizeof(buf), 0);
++        if (n > 0) {
++            g_string_append_len(alcove.in, buf, n);
++            if (alcove.in->len > ALCOVE_IN_MAX_LINE) {
++                alcove_disconnect("input line too long");
++                return;
++            }
++            continue;
++        }
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            break;
++        }
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        alcove_disconnect(n == 0 ? "closed by peer" : strerror(errno));
++        return;
++    }
++    for (;;) {
++        char *nl = memchr(alcove.in->str, '\n', alcove.in->len);
++        if (!nl) {
++            break;
++        }
++        *nl = '\0';
++        if (nl != alcove.in->str) {
++            alcove_handle_line(alcove.in->str);
++        }
++        g_string_erase(alcove.in, 0, nl - alcove.in->str + 1);
++        if (alcove.fd < 0) {
++            break;
++        }
++    }
++}
++
++/* ------------------------------------------------------------ lifecycle */
++
++static int alcove_connect(const char *path)
++{
++    struct sockaddr_un addr;
++    int fd, one = 1;
++
++    if (strlen(path) >= sizeof(addr.sun_path)) {
++        error_report("alcove: socket path too long: %s", path);
++        return -1;
++    }
++    fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0) {
++        error_report("alcove: socket(): %s", strerror(errno));
++        return -1;
++    }
++#ifdef SO_NOSIGPIPE
++    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++#endif
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strcpy(addr.sun_path, path);
++    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
++        error_report("alcove: cannot connect to %s: %s", path, strerror(errno));
++        close(fd);
++        return -1;
++    }
++    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
++    fcntl(fd, F_SETFD, FD_CLOEXEC);
++    return fd;
++}
++
++static int alcove_count_consoles(void)
++{
++    int n = 0;
++    while (qemu_console_lookup_by_index(n)) {
++        n++;
++    }
++    return n;
++}
++
++static void alcove_display_init(DisplayState *ds, DisplayOptions *opts)
++{
++    const char *socket_path = opts->u.alcove.socket;
++    QemuConsole *con;
++    AlcoveDisplay *d;
++
++    if (!socket_path) {
++        error_report("alcove: -display alcove requires socket=<path>");
++        exit(1);
++    }
++    alcove.out = g_string_sized_new(4096);
++    alcove.in = g_string_sized_new(4096);
++    alcove.shmdir = opts->u.alcove.shmdir ? g_strdup(opts->u.alcove.shmdir)
++                                          : g_path_get_dirname(socket_path);
++    alcove.fd = alcove_connect(socket_path);
++    if (alcove.fd < 0) {
++        exit(1);
++    }
++
++    con = qemu_console_lookup_default();
++    d = g_new0(AlcoveDisplay, 1);
++    d->con_index = con ? qemu_console_get_index(con) : 0;
++    d->dcl.update_interval = ALCOVE_REFRESH_MS;
++    alcove.dpy = d;
++
++    {
++        QDict *hello = qdict_new();
++        qdict_put_str(hello, "t", "hello");
++        qdict_put_int(hello, "v", ALCOVE_PROTOCOL_VERSION);
++        qdict_put_int(hello, "consoles", alcove_count_consoles());
++        qdict_put_bool(hello, "abs", con ? qemu_input_is_absolute(con) : false);
++        alcove_send_dict(hello);
++    }
++
++    qemu_console_register_listener(con, &d->dcl, &alcove_dcl_ops);
++    d->kbd = qkbd_state_init(d->dcl.con);
++    qemu_set_fd_handler(alcove.fd, alcove_read, NULL, NULL);
++}
++
++static void alcove_display_cleanup(void)
++{
++    AlcoveDisplay *d = alcove.dpy;
++    if (!d) {
++        return;
++    }
++    if (alcove.fd >= 0) {
++        static const char bye[] = "{\"t\":\"bye\"}\n";
++        alcove_send(bye, sizeof(bye) - 1);
++        qemu_set_fd_handler(alcove.fd, NULL, NULL, NULL);
++        close(alcove.fd);
++        alcove.fd = -1;
++    }
++    qemu_console_unregister_listener(&d->dcl);
++    g_clear_pointer(&d->kbd, qkbd_state_free);
++    if (d->shadow) {
++        pixman_image_unref(d->shadow);
++    }
++    alcove_shm_release(&d->fb);
++    alcove_shm_release(&d->cursor);
++    g_free(d);
++    alcove.dpy = NULL;
++}
++
++static QemuDisplay qemu_display_alcove = {
++    .type    = DISPLAY_TYPE_ALCOVE,
++    .init    = alcove_display_init,
++    .cleanup = alcove_display_cleanup,
++};
++
++static void register_alcove(void)
++{
++    qemu_display_register(&qemu_display_alcove);
++}
++
++type_init(register_alcove);
+diff --git a/ui/meson.build b/ui/meson.build
+index d345f6c..2446b9e 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -71,6 +71,9 @@ if host_os == 'linux'
+   system_ss.add(files('input-linux.c', 'udmabuf.c'))
+ endif
+ system_ss.add(when: cocoa, if_true: files('cocoa.m'))
++if alcove
++  system_ss.add([files('alcove.c'), pixman])
++endif
+ 
+ vnc_ss = ss.source_set()
+ vnc_ss.add(files(

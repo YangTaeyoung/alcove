@@ -48,6 +48,7 @@ if [ ! -f "$BLD/build.ninja" ]; then
       --enable-hvf --enable-cocoa --enable-slirp --enable-libusb --enable-tpm \
       --enable-virtfs --enable-fdt=system --enable-capstone --enable-zstd --enable-vnc \
       --disable-gtk --disable-sdl --disable-docs --disable-guest-agent --disable-werror \
+      -Dalcove=enabled \
       ${ALCOVE_CONFIGURE_EXTRA:-} )
 fi
 ninja -C "$BLD" -j "$JOBS"
