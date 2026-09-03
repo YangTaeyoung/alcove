@@ -68,7 +68,8 @@ registered through QEMU's `QemuDisplay` interface. It is a normal
   later.
 - Cursor: `dpy_cursor_define` copies the cursor ARGB into a second region,
   `dpy_mouse_set` sends position and visibility.
-- Input from the app: `{"t":"key","q":<qcode>,"down":bool}`,
+- Input from the app: `{"t":"key","mac":<macOS keycode>,"down":bool}` (QEMU maps
+  it with its built-in `qemu_input_map_osx_to_linux` table; `q` QKeyCode also accepted),
   `{"t":"abs","x","y"}` in 0..32767, `{"t":"rel","dx","dy"}`, `{"t":"btn","b","down"}`,
   `{"t":"scroll","dy"}`, `{"t":"ui","w","h"}` (resolution request via
   `dpy_set_ui_info`).
@@ -98,12 +99,16 @@ snapshots (`snapshot-save/load/delete` jobs on qcow2), suspend to disk
 
 ```
 config.json      # AlcoveKit.VMConfig (versioned)
-disk0.qcow2      # system disk
-efi-vars.fd      # UEFI variable store (copy of edk2-aarch64-vars.fd)
-tpm/             # swtpm state (Windows)
-snapshots.json   # cache of snapshot list (source of truth is qcow2)
-suspend.state    # present while suspended to disk
+disk0.qcow2      # system disk (qcow2, node name "disk0")
+efi-vars.fd      # UEFI variable store (copy of edk2-arm-vars.fd, else zero-filled 64 MiB)
+tpm/             # swtpm state (only when TPM is enabled; see SP0 results)
+run/             # scratch: shared framebuffer files, qemu.log, serial.log (cleared on start)
+suspend.state    # present while suspended to disk (QEMU migration stream)
 ```
+
+Sockets (`display.sock`, `qmp.sock`, `swtpm.sock`) are NOT in the bundle: unix
+socket paths are limited to 104 bytes on macOS, so they live in
+`/tmp/alcove-<uid>/<hash of bundle path>/`.
 
 ### Guest tools (SP2)
 
@@ -111,8 +116,8 @@ One Go binary per guest OS (`guest-tools/`), cross-compiled from macOS
 (`GOOS=linux GOARCH=arm64`, `GOOS=windows GOARCH=arm64`). Transport is a
 host-side listener reachable from the guest through the user-mode network
 (`10.0.2.2:<port>` over slirp), chosen because it needs no guest drivers on
-either OS. vsock is not available on macOS hosts (to be confirmed by the
-research notes). Features: clipboard both ways, resolution follow, host
+either OS. vsock is not available on macOS hosts (confirmed: vhost-vsock is
+Linux-only), and the Windows guest already reaches `10.0.2.2` through NetKVM. Features: clipboard both ways, resolution follow, host
 folder sharing (Linux: virtio-9p; Windows: WebDAV server in the app mapped
 by the inbox WebDAV client), drag and drop (file push), time sync, graceful
 shutdown hook.
@@ -155,8 +160,13 @@ and is designed separately when SP4 starts. Linux gets virgl + ANGLE first.
 
 ## Open questions
 
-- Windows 11 ARM64 ISO acquisition must be automated or documented for the
-  user (Microsoft's download API changed; see SP0 notes).
+- Windows 11 ARM64 ISO acquisition: Microsoft's bot check refuses the final
+  download link from scripts; the app will guide the user to the download page
+  (see `scripts/fetch-windows-iso.sh` and SP0 results).
+- TPM: `tpm-tis-device` fails under HVF on this host; investigate a fix in QEMU
+  (16 KiB page alignment of the TIS MMIO region) before offering TPM in the UI.
 - Whether zero-copy DisplaySurface allocation inside shared memory is
-  safe with all display devices (ramfb, virtio-gpu).
+  safe with all display devices (ramfb, virtio-gpu); v1 copies via pixman.
 - Nested virtualization on HVF in QEMU 11.1.1.
+
+See `docs/superpowers/plans/2026-09-03-sp0-results.md` for what SP0 verified.
