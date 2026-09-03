@@ -55,7 +55,13 @@ public struct QEMUCommandBuilder: Sendable {
             guard let path = cd.path else { continue }
             a += ["-blockdev", "driver=file,node-name=\(cd.id)-file,filename=\(path),read-only=on,locking=off"]
             a += ["-blockdev", "driver=raw,node-name=\(cd.id),file=\(cd.id)-file,read-only=on"]
-            a += ["-device", "usb-storage,drive=\(cd.id),id=\(cd.id)-dev,bus=\(Self.usbBus),removable=on,bootindex=\(options.bootFromCDROM ? 0 : 10)"]
+            let bootindex = options.bootFromCDROM ? 0 : 10
+            switch cd.bus ?? (config.guestOS == .windows ? .usb : .virtio) {
+            case .usb:
+                a += ["-device", "usb-storage,drive=\(cd.id),id=\(cd.id)-dev,bus=\(Self.usbBus),removable=on,bootindex=\(bootindex)"]
+            case .virtio:
+                a += ["-device", "virtio-blk-pci,drive=\(cd.id),id=\(cd.id)-dev,bootindex=\(bootindex)"]
+            }
         }
 
         // network

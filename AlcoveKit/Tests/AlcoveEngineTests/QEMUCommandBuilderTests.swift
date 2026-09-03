@@ -58,11 +58,22 @@ final class QEMUCommandBuilderTests: XCTestCase {
         let a = args(c, .init(incomingStatePath: "/vms/Test.alcovevm/suspend.state", bootFromCDROM: true))
         let joined = a.joined(separator: " ")
         XCTAssertTrue(joined.contains("-incoming file:/vms/Test.alcovevm/suspend.state"))
-        XCTAssertTrue(joined.contains("usb-storage,drive=cd0,id=cd0-dev,bus=xhci.0,removable=on,bootindex=0"))
+        XCTAssertTrue(joined.contains("virtio-blk-pci,drive=cd0,id=cd0-dev,bootindex=0"), "linux guests get virtio CD-ROMs")
+        XCTAssertFalse(joined.contains("usb-storage"))
         XCTAssertTrue(joined.contains("virtio-blk-pci,drive=disk0,id=disk0-dev,bootindex=20"))
         XCTAssertTrue(joined.contains("-tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis-device,tpmdev=tpm0"))
         XCTAssertTrue(joined.contains("usb-host,bus=xhci.0,id=usbhost0,vendorid=0x05ac,productid=0x12a8"))
         XCTAssertFalse(joined.contains("-netdev"))
+    }
+
+    func testCDROMBusOverride() {
+        var c = VMConfig.defaults(name: "B", guestOS: .linux, installISO: "/i.iso")
+        c.cdroms[0].bus = .usb
+        XCTAssertTrue(args(c).joined(separator: " ").contains("usb-storage,drive=cd0"))
+        var w = VMConfig.defaults(name: "W", guestOS: .windows, installISO: "/w.iso")
+        XCTAssertTrue(args(w).joined(separator: " ").contains("usb-storage,drive=cd0"))
+        w.cdroms[0].bus = .virtio
+        XCTAssertTrue(args(w).joined(separator: " ").contains("virtio-blk-pci,drive=cd0"))
     }
 
     func testTPMIsSkippedWithoutSwtpm() {

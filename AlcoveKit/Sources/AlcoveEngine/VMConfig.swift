@@ -28,11 +28,21 @@ public struct VMConfig: Codable, Sendable, Equatable {
         }
     }
 
+    public enum CDBus: String, Codable, Sendable, CaseIterable {
+        /// USB mass storage on the xHCI controller: what Windows Setup expects.
+        case usb
+        /// A read-only virtio-blk device: visible to Linux without USB storage
+        /// drivers, which cloud images may lack early in boot.
+        case virtio
+    }
+
     public struct CDROM: Codable, Sendable, Equatable, Identifiable {
         public var id: String
         /// Absolute path of the ISO, or nil for an empty drive.
         public var path: String?
-        public init(id: String, path: String?) { self.id = id; self.path = path }
+        /// Bus to attach on; nil means "USB for Windows guests, virtio otherwise".
+        public var bus: CDBus?
+        public init(id: String, path: String?, bus: CDBus? = nil) { self.id = id; self.path = path; self.bus = bus }
     }
 
     public struct PortForward: Codable, Sendable, Equatable {
