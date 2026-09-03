@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import AlcoveEngine
 import AlcoveAgent
 import AlcoveQMP
@@ -182,19 +181,22 @@ public actor ControlHandler {
                 return ["guestPath": .string(guestPath)]
             } catch { throw ControlError.failed("push failed: \(error)") }
         case "vm.wait_idle":
+            // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
+            // than 0.5% of thumbnail pixels changing between samples
             let t = try await running(params)
             let stable = Duration.seconds(params["seconds"]?.intValue ?? 2)
             let deadline = ContinuousClock.now + .seconds(params["timeout"]?.intValue ?? 30)
-            var last = SHA256.hash(data: try await screenshot(t))
+            var last = PNGInfo.thumbnail(try await screenshot(t)) ?? []
             var since = ContinuousClock.now
             while ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(500))
-                let now = SHA256.hash(data: try await screenshot(t))
-                if now == last {
+                let now = PNGInfo.thumbnail(try await screenshot(t)) ?? []
+                if PNGInfo.changedFraction(last, now) < 0.005 {
                     if ContinuousClock.now - since >= stable { return ["idle": true] }
                 } else {
-                    last = now; since = ContinuousClock.now
+                    since = ContinuousClock.now
                 }
+                last = now
             }
             return ["idle": false]
         default:

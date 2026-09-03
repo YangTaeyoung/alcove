@@ -148,6 +148,15 @@ final class ControlHandlerTests: XCTestCase {
         }
     }
 
+    func testChangedFractionIgnoresSmallChanges() {
+        let a = PNGInfo.thumbnail(makePNG(width: 800, height: 600, gray: 10))!
+        let b = PNGInfo.thumbnail(makePNG(width: 800, height: 600, gray: 12))!   // tiny colour drift everywhere
+        XCTAssertEqual(PNGInfo.changedFraction(a, b), 0)
+        let c = PNGInfo.thumbnail(makePNG(width: 800, height: 600, gray: 200))!
+        XCTAssertGreaterThan(PNGInfo.changedFraction(a, c), 0.9)
+        XCTAssertEqual(PNGInfo.changedFraction(a, []), 1)
+    }
+
     func testWaitIdle() async throws {
         let (h, t) = setup()
         let r = try await h.handle(op: "vm.wait_idle", params: ["name": "Win", "seconds": 1, "timeout": 5])
