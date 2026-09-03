@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "AlcoveEngine", targets: ["AlcoveEngine"]),
         .executable(name: "alcovectl", targets: ["alcovectl"]),
         .library(name: "AlcoveAgent", targets: ["AlcoveAgent"]),
+        .library(name: "AlcoveControl", targets: ["AlcoveControl"]),
     ],
     targets: [
         // Wire format shared with the QEMU `alcove` display backend (docs/display-protocol.md).
@@ -21,8 +22,11 @@ let package = Package(
         // Host side of the guest agent protocol (docs/agent-protocol.md).
         .target(name: "AlcoveAgent", dependencies: ["AlcoveQMP"]),
         .testTarget(name: "AlcoveAgentTests", dependencies: ["AlcoveAgent"]),
+        // Automation API over a unix socket (docs/control-protocol.md): screenshots, input, exec.
+        .target(name: "AlcoveControl", dependencies: ["AlcoveEngine", "AlcoveAgent", "AlcoveDisplayProtocol", "AlcoveQMP"]),
+        .testTarget(name: "AlcoveControlTests", dependencies: ["AlcoveControl"]),
         // Command-line front end used by scripts and the test harness.
-        .executableTarget(name: "alcovectl", dependencies: ["AlcoveEngine", "AlcoveDisplayProtocol"]),
+        .executableTarget(name: "alcovectl", dependencies: ["AlcoveEngine", "AlcoveDisplayProtocol", "AlcoveControl"]),
         .testTarget(name: "AlcoveDisplayProtocolTests", dependencies: ["AlcoveDisplayProtocol"]),
         .testTarget(name: "AlcoveQMPTests", dependencies: ["AlcoveQMP"]),
         .testTarget(name: "AlcoveEngineTests", dependencies: ["AlcoveEngine"]),

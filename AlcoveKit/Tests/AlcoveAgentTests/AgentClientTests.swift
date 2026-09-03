@@ -65,6 +65,7 @@ final class AgentClientTests: XCTestCase {
             switch m["t"]?.stringValue {
             case "exec": return [["t": "exec.result", "code": 0, "out": .string("ran: " + (m["cmd"]?.stringValue ?? ""))]]
             case "file.end": return [["t": "file.done", "id": m["id"] ?? .null, "path": "C:\\Users\\alcove\\Desktop\\x.bin"]]
+            case "clipboard.get": return [["t": "clipboard.text", "text": "guest text"]]
             case "ping": return [["t": "pong"]]
             default: return []
             }
@@ -76,6 +77,8 @@ final class AgentClientTests: XCTestCase {
         let (code, out) = try await client.exec("dir")
         XCTAssertEqual(code, 0); XCTAssertEqual(out, "ran: dir")
         await client.setClipboard(text: "hi")
+        let clip = try await client.getClipboard()
+        XCTAssertEqual(clip, "guest text")
         await client.setResolution(width: 1024, height: 768)
 
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("x.bin")

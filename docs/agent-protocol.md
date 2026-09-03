@@ -24,6 +24,8 @@ connection on mismatch. The host replies `{"t":"welcome","v":1}`.
 |---|---|---|---|
 | both | `ping` / `pong` | — | keepalive every 10 s |
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
+| host → agent | `clipboard.get` | — | ask for the current text; answered with `clipboard.text` |
+| agent → host | `clipboard.text` | `text` | reply to `clipboard.get` |
 | agent → host | `clipboard.changed` | `text` | the guest clipboard changed (text only in v1; polled via the clipboard sequence number on Windows, `wl-paste --watch`/`xclip` polling on Linux) |
 | host → agent | `resolution.set` | `w`, `h` | ask the guest to switch its primary display mode |
 | agent → host | `resolution` | `w`, `h` | current primary display mode (sent after hello and on change) |

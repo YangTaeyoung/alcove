@@ -131,6 +131,12 @@ func (s *Server) handle(c net.Conn) {
 		case "ping":
 			send(proto.Message{"t": "pong"})
 		case "pong", "welcome":
+		case "clipboard.get":
+			text, err := s.opt.Clipboard.Text()
+			if err != nil {
+				lg.Printf("clipboard.get: %v", err)
+			}
+			send(proto.Message{"t": "clipboard.text", "text": text})
 		case "clipboard.set":
 			if err := s.opt.Clipboard.SetText(m.String("text")); err != nil {
 				lg.Printf("clipboard.set: %v", err)

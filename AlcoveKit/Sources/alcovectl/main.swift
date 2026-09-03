@@ -3,12 +3,14 @@
 //   alcovectl create --name NAME --os windows|linux|other [--iso PATH] [--disk-gib N] [--cpus N] [--memory-mib N] [--adopt-disk PATH] [--adopt-vars PATH] [--forward HOST:GUEST]... [--dir DIR]
 //   alcovectl list [--dir DIR]
 //   alcovectl args NAME [--dir DIR]          print the QEMU command line
+//   alcovectl serve [--dir DIR] [--socket PATH]   headless control server (docs/control-protocol.md) until SIGTERM
 //   alcovectl run NAME [--dir DIR] [--seconds N] [--screenshot PATH --after N] [--resize WxH --resize-after N]
 //                 start headless, keep running N seconds (default 30), then power down;
 //                 optionally take a QMP screenshot and/or ask the guest to change resolution
 import Foundation
 import AlcoveEngine
 import AlcoveDisplayProtocol
+import AlcoveControl
 
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(Data((msg + "\n").utf8))
@@ -145,6 +147,28 @@ case "run":
             exit(1)
         }
     }
+    dispatchMain()
+case "serve":
+    let socketPath = args.value("socket") ?? ControlServer.defaultSocketPath
+    if ControlServer.isAlive(at: socketPath) {
+        fail("a control server is already running at \(socketPath) (the Alcove app, or another alcovectl serve)")
+    }
+    let registry = HeadlessRegistry(directory: vmDir, engine: engine)
+    let server = ControlServer(handler: ControlHandler(registry: registry, hostKind: "headless"), socketPath: socketPath)
+    do { try server.start() } catch { fail("cannot start control server: \(error)") }
+    print("alcove control server (headless) listening at \(socketPath); VMs in \(vmDir.path)")
+    let stop = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    signal(SIGTERM, SIG_IGN); signal(SIGINT, SIG_IGN)
+    let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    let shutdown: @Sendable () -> Void = {
+        Task.detached {
+            await registry.stopAll()
+            server.stop()
+            exit(0)
+        }
+    }
+    stop.setEventHandler(handler: shutdown); sigint.setEventHandler(handler: shutdown)
+    stop.resume(); sigint.resume()
     dispatchMain()
 default:
     fail("usage: alcovectl create|list|args|run ...")

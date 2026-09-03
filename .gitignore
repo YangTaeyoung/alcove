@@ -11,3 +11,5 @@ DerivedData/
 *.xcodeproj/project.xcworkspace/xcshareddata/
 /Alcove.xcodeproj/
 /AlcoveKit/.build*/
+/mcp/node_modules/
+/mcp/dist/

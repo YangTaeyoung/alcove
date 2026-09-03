@@ -1,0 +1,23 @@
+{
+  "name": "alcove-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server that lets coding agents drive Alcove virtual machines (screenshots, mouse, keyboard, shell)",
+  "type": "module",
+  "bin": { "alcove-mcp": "dist/index.js" },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node --test dist/*.test.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

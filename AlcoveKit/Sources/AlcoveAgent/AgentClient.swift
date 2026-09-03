@@ -93,6 +93,12 @@ public actor AgentClient {
         send(["t": "clipboard.set", "text": .string(text)])
     }
 
+    /// Read the guest clipboard text.
+    public func getClipboard(timeout: Duration = .seconds(10)) async throws -> String {
+        let r = try await request(["t": "clipboard.get"], waitFor: "clipboard.text", timeout: timeout)
+        return r["text"]?.stringValue ?? ""
+    }
+
     public func setResolution(width: Int, height: Int) {
         send(["t": "resolution.set", "w": .int(Int64(width)), "h": .int(Int64(height))])
     }

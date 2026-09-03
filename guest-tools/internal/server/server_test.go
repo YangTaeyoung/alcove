@@ -82,6 +82,12 @@ func TestHelloClipboardAndFiles(t *testing.T) {
 		t.Fatalf("changed %v", m)
 	}
 
+	// explicit read
+	w.Send(proto.Message{"t": "clipboard.get"})
+	if got := expect(t, r, "clipboard.text"); got.String("text") != "typed in guest" {
+		t.Fatalf("clipboard.get %v", got)
+	}
+
 	// file push
 	payload := []byte("hello file")
 	sum := sha256.Sum256(payload)
