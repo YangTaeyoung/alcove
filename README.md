@@ -30,8 +30,17 @@ under the same license. The Alcove app runs QEMU as a separate process and
 talks to it over sockets, so the app itself is licensed independently
 (license to be decided before the first public release).
 
+## Building
+
+```
+scripts/build-qemu.sh          # engine: build/qemu-build/qemu-system-aarch64
+scripts/test/boot-ubuntu.sh    # engine smoke test (Ubuntu cloud image, HVF, serial login prompt)
+(cd AlcoveKit && swift test)   # library tests
+xcodegen generate && xcodebuild -project Alcove.xcodeproj -scheme Alcove build
+```
+
 ## Requirements
 
 - Apple silicon Mac, macOS 15 or later (developed on macOS 26)
 - Xcode 26
-- Homebrew packages: `meson pkgconf ninja glib pixman dtc libslirp capstone libusb zstd swtpm`
+- Homebrew packages: `meson pkgconf ninja glib pixman dtc libslirp capstone libusb zstd swtpm xcodegen`

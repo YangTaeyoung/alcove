@@ -1,0 +1,49 @@
+name: Alcove
+options:
+  bundleIdPrefix: io.github.yangtaeyoung
+  deploymentTarget:
+    macOS: "15.0"
+  xcodeVersion: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: NO
+packages:
+  AlcoveKit:
+    path: AlcoveKit
+targets:
+  Alcove:
+    type: application
+    platform: macOS
+    sources:
+      - path: Alcove/Sources
+    resources:
+      - path: Alcove/Resources
+    dependencies:
+      - package: AlcoveKit
+        product: AlcoveDisplayProtocol
+      - package: AlcoveKit
+        product: AlcoveQMP
+      - package: AlcoveKit
+        product: AlcoveEngine
+    info:
+      path: Alcove/Info.plist
+      properties:
+        CFBundleName: Alcove
+        CFBundleDisplayName: Alcove
+        CFBundleIdentifier: io.github.yangtaeyoung.Alcove
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "15.0"
+        NSPrincipalClass: NSApplication
+        NSHighResolutionCapable: true
+        LSApplicationCategoryType: public.app-category.developer-tools
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.yangtaeyoung.Alcove
+        SWIFT_STRICT_CONCURRENCY: complete
+        OTHER_LDFLAGS: ["-framework", "Metal", "-framework", "MetalKit"]
