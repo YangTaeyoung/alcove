@@ -143,6 +143,11 @@ final class ControlStateTests: XCTestCase {
                        "the guest tools could not be reached (refused); check vm.status")
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.handshake("bad hello"), fallback: "x"),
                        "the guest tools handshake failed (bad hello); reinstall alcove-agent in the guest")
+        XCTAssertEqual(ControlHandler.failureReason(POSIXError(.ENOSPC), fallback: "x"), POSIXError(.ENOSPC).localizedDescription)
+        XCTAssertFalse(ControlHandler.failureReason(POSIXError(.ENOSPC), fallback: "x").contains("Error Domain"))
+        let written = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+        XCTAssertEqual(ControlHandler.failureReason(written, fallback: "x"), written.localizedDescription)
+        XCTAssertFalse(ControlHandler.failureReason(written, fallback: "x").contains("Error Domain"))
         XCTAssertEqual(ControlHandler.failureReason(FrameError.undecodable, fallback: "x"), "the screendump image could not be decoded")
         XCTAssertEqual(ControlHandler.failureReason(UnknownFailure(), fallback: "fallback sentence"), "fallback sentence")
     }

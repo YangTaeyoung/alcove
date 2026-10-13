@@ -225,6 +225,8 @@ class Run:
 
     def stop_vm(self, name=None):
         r = self.c.call("vm.stop", 300, name=name or self.vm)
+        if (name or self.vm) == self.vm:
+            self.jobs.clear()
         expect(r["state"] == "stopped", f"vm.stop left '{name or self.vm}' {r['state']}")
 
     def vm_row(self, name):
@@ -312,6 +314,7 @@ class Run:
             print(f"cleanup warning: '{self.vm}' is still leased by '{status['leasedBy']}'; the guest restore will be refused until the lease ends")
         if status.get("ephemeral"):
             attempt("vm.stop", 300)
+            self.jobs.clear()
             status = c.call("vm.status", 60, name=self.vm)
         if status.get("state") != "running":
             if attempt("vm.start", 300) is None:
@@ -320,9 +323,17 @@ class Run:
         if self.link_down:
             attempt("vm.set_network", up=True)
         end = time.time() + 300
-        while not (attempt("vm.status", 60) or {}).get("tools"):
+        last_error = None
+        while True:
+            try:
+                if c.call("vm.status", 60, name=self.vm).get("tools"):
+                    break
+                last_error = None
+            except ControlError as e:
+                last_error = e
             if time.time() > end:
-                self.cleanup_error(f"the guest tools of '{self.vm}' are not connected; the guest was not cleaned")
+                self.cleanup_error(f"the guest tools of '{self.vm}' are not connected"
+                                   f"{f' (vm.status answered {last_error})' if last_error else ''}; the guest was not cleaned")
                 return
             time.sleep(2)
         if self.snapshot_made:
@@ -332,7 +343,11 @@ class Run:
             if port in listed:
                 attempt("vm.forward.remove", hostPort=port)
         for job in self.jobs:
-            attempt("vm.exec.kill", job=job)
+            try:
+                c.call("vm.exec.kill", 120, name=self.vm, job=job)
+            except ControlError as e:
+                if not str(e).startswith("no job '"):
+                    self.cleanup_error(f"vm.exec.kill of job {job} answered {e}")
         settings = {}
         if self.theme:
             settings["theme"] = self.theme
@@ -343,11 +358,16 @@ class Run:
         if self.dpi:
             settings["dpiScale"] = self.dpi
         if settings:
-            attempt("vm.set_environment", 200, **settings)
+            applied = attempt("vm.set_environment", 200, **settings)
+            for row in (applied or {}).get("applied", []):
+                if row.get("ok") is not True:
+                    self.cleanup_error(f"{row.get('setting')}: {row.get('detail')}")
         if self.resolution:
             attempt("vm.set_resolution", width=self.resolution[0], height=self.resolution[1])
         if self.firewall_rule:
-            attempt("vm.exec", command=f"Remove-NetFirewallRule -DisplayName '{FIREWALL_RULE}' -ErrorAction SilentlyContinue", timeout=60)
+            removed = attempt("vm.exec", command=f"Remove-NetFirewallRule -DisplayName '{FIREWALL_RULE}' -ErrorAction SilentlyContinue", timeout=60)
+            if removed and removed.get("code") != 0:
+                print(f"cleanup warning: removing the firewall rule '{FIREWALL_RULE}' exited with {removed.get('code')}; remove it in the guest by hand")
         attempt("vm.fs.delete", path=GUEST, recursive=True)
 
 
@@ -905,6 +925,8 @@ def main():
         interrupted = True
         raise
     finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         if interrupted:
             print("interrupted; restoring the guest...", flush=True)
         try:

@@ -254,6 +254,8 @@ extension ControlHandler {
         case KeyNames.KeyError.unknownKey(let key): return "unknown key '\(key)'; use a key name such as ctrl, shift, enter or a letter"
         case KeyNames.KeyError.untypableCharacter(let ch): return "cannot type '\(ch)' with the US keyboard layout"
         case let e as LocalizedError where e.errorDescription != nil: return e.errorDescription ?? fallback
+        case let e as POSIXError: return e.localizedDescription
+        case let e where type(of: e) is NSError.Type: return e.localizedDescription
         case let e as CustomStringConvertible: return e.description
         default: return fallback
         }
