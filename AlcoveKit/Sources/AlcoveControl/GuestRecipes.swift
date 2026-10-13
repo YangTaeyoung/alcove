@@ -326,7 +326,10 @@ enum GuestRecipes {
                 [void]$parts.Add($json)
               }
             } catch {
-              [Console]::Error.WriteLine("could not read the event log '$log': " + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated, or read the log with vm.exec')
+              $base = $_.Exception.GetBaseException()
+              $hint = '; read the log with vm.exec to see the full error'
+              if ($base -is [System.UnauthorizedAccessException] -or $base -is [System.Security.SecurityException]) { $hint = '; check that alcove-agent runs elevated, or read the log with vm.exec' }
+              [Console]::Error.WriteLine("could not read the event log '$log': " + ($base.Message -replace '\\s+', ' ') + $hint)
               exit 2
             }
             '{"entries":[' + ($parts -join ',') + '],"truncated":' + $(if ($truncated) { 'true' } else { 'false' }) + '}'
@@ -353,7 +356,9 @@ enum GuestRecipes {
         "$hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)"
 
     /// Windows only: creates `dumpFolder`, grants the Users group modify rights on it and sets the Windows Error Reporting
-    /// local dump values for `exe` (`DumpFolder`, `DumpCount` 5, `DumpType` 1 mini or 2 full). Prints `{"folder": ...}`.
+    /// local dump values for `exe` (`DumpFolder`, `DumpCount` 5, `DumpType` 1 mini or 2 full). A `LocalDumps` key that
+    /// does not exist yet is created with the value `AlcoveCreated` (DWord 1). Prints `{"folder": ..., "createdKey": ...}`
+    /// where `createdKey` tells whether it created the `LocalDumps` key.
     /// A failure prints one sentence on stderr and exits with 2.
     static func enableDumps(exe: String, full: Bool, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
@@ -367,6 +372,14 @@ enum GuestRecipes {
           $ErrorActionPreference = 'Stop'
           if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('could not make \(dumpFolder) writable for the Users group; check that alcove-agent runs elevated and may change the permissions of that folder'); exit 2 }
           \(openLocalMachine)
+          $existing = $hklm.OpenSubKey($root)
+          if ($existing) { $existing.Close() }
+          $createdKey = -not $existing
+          if ($createdKey) {
+            $parent = $hklm.CreateSubKey($root)
+            $parent.SetValue('AlcoveCreated', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+            $parent.Close()
+          }
           $key = $hklm.CreateSubKey($sub)
           $key.SetValue('DumpFolder', $folder, [Microsoft.Win32.RegistryValueKind]::ExpandString)
           $key.SetValue('DumpCount', 5, [Microsoft.Win32.RegistryValueKind]::DWord)
@@ -376,12 +389,12 @@ enum GuestRecipes {
           [Console]::Error.WriteLine('could not set up crash dumps: ' + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated')
           exit 2
         }
-        [pscustomobject]@{ folder = $folder } | ConvertTo-Json -Compress
+        [pscustomobject]@{ folder = $folder; createdKey = $createdKey } | ConvertTo-Json -Compress
         """
     }
 
-    /// Windows only: removes the local dump key of `exe`, then the `LocalDumps` key itself when it holds no other key
-    /// and no value; other images keep theirs. A failure prints one sentence on stderr and exits with 2.
+    /// Windows only: removes the local dump key of `exe`, then the `LocalDumps` key itself when its only value is
+    /// `AlcoveCreated` and it holds no subkey; other images keep theirs. A failure to remove the `LocalDumps` key is ignored. A failure prints one sentence on stderr and exits with 2.
     static func disableDumps(exe: String, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         return windowsPrelude + localDumpsKey(exe) + """
@@ -391,9 +404,9 @@ enum GuestRecipes {
           if ($hklm.OpenSubKey($sub)) { [Console]::Error.WriteLine('the crash dump setting is still there after its removal; check that alcove-agent runs elevated'); exit 2 }
           $parent = $hklm.OpenSubKey($root)
           if ($parent) {
-            $empty = $parent.SubKeyCount -eq 0 -and $parent.ValueCount -eq 0
+            $owned = $null -ne $parent.GetValue('AlcoveCreated') -and $parent.ValueCount -eq 1 -and $parent.SubKeyCount -eq 0
             $parent.Close()
-            if ($empty) { $hklm.DeleteSubKey($root, $false) }
+            if ($owned) { try { $hklm.DeleteSubKey($root, $false) } catch { } }
           }
         } catch {
           [Console]::Error.WriteLine('could not remove the crash dump setting: ' + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated')

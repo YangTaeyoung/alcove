@@ -332,7 +332,11 @@ extension ControlHandler {
         let result = await runRecipeOutput(agent, script, vm: t.name, op: "vm.event_log")
         guard result.ok else {
             if result.timedOut {
-                throw ControlError.failed("the guest took more than \(ControlHandler.recipeTimeoutMilliseconds / 1000) s to read the event log; narrow it with level, provider, contains or a smaller sinceMinutes")
+                let seconds = ControlHandler.recipeTimeoutMilliseconds / 1000
+                if contains != nil {
+                    throw ControlError.failed("the guest did not finish reading the event log within \(seconds) s; contains is searched in every entry of the time window, so pass a smaller sinceMinutes, a level or a provider")
+                }
+                throw ControlError.failed("the guest took more than \(seconds) s to read the event log; narrow it with level, provider or a smaller sinceMinutes")
             }
             if os == .linux, result.detail.contains("unrecognized option") || result.detail.contains("invalid option") {
                 throw ControlError.failed("journalctl in the guest is too old for these filters; read the logs with vm.exec instead")
@@ -448,7 +452,9 @@ extension ControlHandler {
         guard result.ok else { throw ControlError.failed(result.detail) }
         switch op {
         case "vm.crash_dumps.enable":
-            return ["folder": .string(Self.lastJSONObject(result.stdout)?["folder"]?.stringValue ?? GuestRecipes.dumpFolder)]
+            let reply = Self.lastJSONObject(result.stdout)
+            return ["folder": .string(reply?["folder"]?.stringValue ?? GuestRecipes.dumpFolder),
+                    "createdKey": .bool(reply?["createdKey"]?.boolValue ?? false)]
         case "vm.crash_dumps.disable":
             return [:]
         default:

@@ -161,7 +161,22 @@ final class GuestEvidenceTests: XCTestCase {
         let text = await failure(h, "vm.event_log", ["name": "Win", "log": "Security"])
         XCTAssertEqual(text, sentence)
         let script = try XCTUnwrap(commands(agent).first)
-        XCTAssertTrue(script.contains("} catch {\n  [Console]::Error.WriteLine(\"could not read the event log '$log': \" + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated, or read the log with vm.exec')\n  exit 2\n}"), script)
+        XCTAssertTrue(script.contains("""
+        } catch {
+          $base = $_.Exception.GetBaseException()
+          $hint = '; read the log with vm.exec to see the full error'
+          if ($base -is [System.UnauthorizedAccessException] -or $base -is [System.Security.SecurityException]) { $hint = '; check that alcove-agent runs elevated, or read the log with vm.exec' }
+          [Console]::Error.WriteLine("could not read the event log '$log': " + ($base.Message -replace '\\s+', ' ') + $hint)
+          exit 2
+        }
+        """), script)
+    }
+
+    func testEventLogReadFailureOtherThanAccessDeniedPassesThrough() async throws {
+        let sentence = "could not read the event log 'WMPSyncEngine': The log can be read only in the forward chronological order.; read the log with vm.exec to see the full error"
+        let (h, _) = try await setup(stdout: "", code: 2, stderr: sentence + "\r\n")
+        let text = await failure(h, "vm.event_log", ["name": "Win", "log": "WMPSyncEngine"])
+        XCTAssertEqual(text, sentence)
     }
 
     func testEventLogRefusesTextTheGuestShellCannotTake() async throws {
@@ -261,7 +276,13 @@ final class GuestEvidenceTests: XCTestCase {
     func testEventLogTimeoutNamesTheNextStep() async throws {
         let (h, _) = try await setup(stdout: "", code: -1, timedOut: true)
         let text = await failure(h, "vm.event_log", ["name": "Win"])
-        XCTAssertEqual(text, "the guest took more than 60 s to read the event log; narrow it with level, provider, contains or a smaller sinceMinutes")
+        XCTAssertEqual(text, "the guest took more than 60 s to read the event log; narrow it with level, provider or a smaller sinceMinutes")
+    }
+
+    func testEventLogTimeoutWithContainsNamesTheCostOfContains() async throws {
+        let (h, _) = try await setup(stdout: "", code: -1, timedOut: true)
+        let text = await failure(h, "vm.event_log", ["name": "Win", "contains": "denied"])
+        XCTAssertEqual(text, "the guest did not finish reading the event log within 60 s; contains is searched in every entry of the time window, so pass a smaller sinceMinutes, a level or a provider")
     }
 
     func testEventLogOnAnOldJournalctlNamesTheNextStep() async throws {
@@ -297,9 +318,9 @@ final class GuestEvidenceTests: XCTestCase {
     // MARK: - crash dumps
 
     func testEnableDumpsWritesKeysForExe() async throws {
-        let (h, agent) = try await setup(stdout: "{\"folder\":\"C:\\\\alcove-dumps\"}")
+        let (h, agent) = try await setup(stdout: "{\"folder\":\"C:\\\\alcove-dumps\",\"createdKey\":false}")
         let r = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "My App.exe"])
-        XCTAssertEqual(r, ["folder": "C:\\alcove-dumps", "eventSeq": 0])
+        XCTAssertEqual(r, ["folder": "C:\\alcove-dumps", "createdKey": false, "eventSeq": 0])
         let script = try XCTUnwrap(commands(agent).first)
         XCTAssertTrue(script.contains("$root = 'SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps'\n$sub = $root + '\\' + 'My App.exe'\n"), script)
         XCTAssertTrue(script.contains("C:\\alcove-dumps"), script)
@@ -312,15 +333,61 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(commands(full.1).first).contains("SetValue('DumpType', 2,"))
     }
 
-    func testDisableDumpsRemovesThatImageAndAnEmptyLocalDumpsKey() async throws {
+    func testDisableDumpsRemovesThatImageAndTheLocalDumpsKeyAlcoveCreated() async throws {
         let (h, agent) = try await setup()
         let r = try await h.handle(op: "vm.crash_dumps.disable", params: ["name": "Win", "exe": "MyApp.exe"])
         XCTAssertEqual(r, ["eventSeq": 0])
         let script = try XCTUnwrap(commands(agent).first)
         XCTAssertTrue(script.contains("$sub = $root + '\\' + 'MyApp.exe'\n"), script)
-        XCTAssertTrue(script.contains("$hklm.DeleteSubKeyTree($sub, $false)\n  if ($hklm.OpenSubKey($sub)) { [Console]::Error.WriteLine('the crash dump setting is still there after its removal; check that alcove-agent runs elevated'); exit 2 }"), script)
-        XCTAssertTrue(script.contains("$empty = $parent.SubKeyCount -eq 0 -and $parent.ValueCount -eq 0"), script)
-        XCTAssertTrue(script.contains("if ($empty) { $hklm.DeleteSubKey($root, $false) }"), script)
+        func position(_ needle: String) -> String.Index? { script.range(of: needle)?.lowerBound }
+        let steps = ["$hklm.DeleteSubKeyTree($sub, $false)",
+                     "if ($hklm.OpenSubKey($sub)) { [Console]::Error.WriteLine('the crash dump setting is still there after its removal; check that alcove-agent runs elevated'); exit 2 }",
+                     "$parent = $hklm.OpenSubKey($root)",
+                     "$owned = $null -ne $parent.GetValue('AlcoveCreated') -and $parent.ValueCount -eq 1 -and $parent.SubKeyCount -eq 0",
+                     "$parent.Close()",
+                     "if ($owned) { try { $hklm.DeleteSubKey($root, $false) } catch { } }"]
+        let positions = steps.map(position)
+        XCTAssertFalse(positions.contains { $0 == nil }, script)
+        XCTAssertEqual(positions.compactMap { $0 }, positions.compactMap { $0 }.sorted(), script)
+        XCTAssertFalse(script.contains("DeleteSubKeyTree($root"), script)
+        XCTAssertFalse(script.contains("$empty"), script)
+    }
+
+    func testDisableDumpsChecksTheParentWhetherOrNotTheImageKeyExisted() async throws {
+        let (h, agent) = try await setup()
+        _ = try await h.handle(op: "vm.crash_dumps.disable", params: ["name": "Win", "exe": "Never.exe"])
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("$parent = $hklm.OpenSubKey($root)\n"), script)
+        XCTAssertTrue(script.contains("if ($parent) {"), script)
+        XCTAssertFalse(script.contains("$existed"), script)
+    }
+
+    func testEnableDumpsMarksALocalDumpsKeyThatItCreates() async throws {
+        let (h, agent) = try await setup(stdout: "{\"folder\":\"C:\\\\alcove-dumps\",\"createdKey\":true}")
+        let r = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "a.exe"])
+        XCTAssertEqual(r, ["folder": "C:\\alcove-dumps", "createdKey": true, "eventSeq": 0])
+        let script = try XCTUnwrap(commands(agent).first)
+        let steps = ["$createdKey = -not $existing",
+                     "if ($createdKey) {\n    $parent = $hklm.CreateSubKey($root)\n    $parent.SetValue('AlcoveCreated', 1, [Microsoft.Win32.RegistryValueKind]::DWord)\n    $parent.Close()\n  }",
+                     "$key = $hklm.CreateSubKey($sub)"]
+        let positions = steps.map { script.range(of: $0)?.lowerBound }
+        XCTAssertFalse(positions.contains { $0 == nil }, script)
+        XCTAssertEqual(positions.compactMap { $0 }, positions.compactMap { $0 }.sorted(), script)
+        XCTAssertTrue(script.contains("$existing = $hklm.OpenSubKey($root)"), script)
+        XCTAssertTrue(script.contains("[pscustomobject]@{ folder = $folder; createdKey = $createdKey } | ConvertTo-Json -Compress"), script)
+        XCTAssertEqual(script.components(separatedBy: "AlcoveCreated").count - 1, 1, script)
+    }
+
+    func testEnableDumpsReportsThatItLeftAnExistingLocalDumpsKeyAlone() async throws {
+        let (h, _) = try await setup(stdout: "{\"folder\":\"C:\\\\alcove-dumps\",\"createdKey\":false}")
+        let r = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "a.exe"])
+        XCTAssertEqual(r, ["folder": "C:\\alcove-dumps", "createdKey": false, "eventSeq": 0])
+    }
+
+    func testEnableDumpsWithoutCreatedKeyInTheReplyReportsFalse() async throws {
+        let (h, _) = try await setup(stdout: "{\"folder\":\"C:\\\\alcove-dumps\"}")
+        let r = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "a.exe"])
+        XCTAssertEqual(r["createdKey"], false)
     }
 
     func testExeValidation() async throws {
