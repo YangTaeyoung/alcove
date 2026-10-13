@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -22,17 +23,21 @@ var (
 	procSetNamedSecurityInfo = advapi32.NewProc("SetNamedSecurityInfoW")
 	procLocalFree            = kernel32.NewProc("LocalFree")
 	procGetSystemDirectory   = kernel32.NewProc("GetSystemDirectoryW")
+	procGetFileAttributes    = kernel32.NewProc("GetFileAttributesW")
 )
 
 const (
-	seFileObject           = 1
-	ownerSecurityInfo      = 0x00000001
-	daclSecurityInfo       = 0x00000004
-	protectedDaclInfo      = 0x80000000
-	unprotectedDaclInfo    = 0x20000000
-	sddlRevision1          = 1
-	errorAlreadyExists     = syscall.Errno(183)
-	emptyACLRevisionAndLen = 0x00080002
+	seFileObject            = 1
+	ownerSecurityInfo       = 0x00000001
+	daclSecurityInfo        = 0x00000004
+	protectedDaclInfo       = 0x80000000
+	unprotectedDaclInfo     = 0x20000000
+	sddlRevision1           = 1
+	errorAlreadyExists      = syscall.Errno(183)
+	emptyACLRevisionAndLen  = 0x00080002
+	invalidFileAttributes   = 0xFFFFFFFF
+	fileAttributeReparse    = 0x00000400
+	fileAttributeDirectory  = 0x00000010
 )
 
 // lockedDescriptor is lockedSDDL as a security descriptor with its owner and
@@ -40,7 +45,7 @@ const (
 type lockedDescriptor struct {
 	sd    uintptr
 	owner uintptr
-	dacl  uintptr
+	dacl  unsafe.Pointer
 }
 
 func newLockedDescriptor() (*lockedDescriptor, error) {
@@ -90,23 +95,55 @@ func ownerAndDACL(path string) (string, error) {
 	return syscall.UTF16ToString(units), nil
 }
 
-func setSecurity(path string, info uintptr, owner, dacl uintptr) error {
+func setSecurity(path string, info uintptr, owner uintptr, dacl unsafe.Pointer) error {
 	name, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return err
 	}
-	if r, _, _ := procSetNamedSecurityInfo.Call(uintptr(unsafe.Pointer(name)), seFileObject, info, owner, 0, dacl, 0); r != 0 {
+	if r, _, _ := procSetNamedSecurityInfo.Call(uintptr(unsafe.Pointer(name)), seFileObject, info, owner, 0, uintptr(dacl), 0); r != 0 {
 		return fmt.Errorf("SetNamedSecurityInfo(%s): %v", path, syscall.Errno(r))
 	}
 	return nil
 }
 
-// secureDir makes dir a directory that only Administrators and SYSTEM can
-// read or change. A new directory is created that way. An existing directory
-// with any other owner or access list gets lockedSDDL; its helper scripts and
-// compiled helpers are then deleted and its other files take their access
-// from the directory. An error means the directory is not known to be locked.
-func secureDir(dir string) error {
+// fileAttributes returns the attribute bits of a path, or invalidFileAttributes
+// when the path does not exist or cannot be read.
+func fileAttributes(path string) uint32 {
+	name, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return invalidFileAttributes
+	}
+	r, _, _ := procGetFileAttributes.Call(uintptr(unsafe.Pointer(name)))
+	return uint32(r)
+}
+
+// isReparsePoint reports whether the path is a reparse point (a junction or a
+// symbolic link), which the lock must not follow.
+func isReparsePoint(path string) bool {
+	a := fileAttributes(path)
+	return a != invalidFileAttributes && a&fileAttributeReparse != 0
+}
+
+// LockHelperFolders locks the uia folder and the parent Alcove folder to
+// Administrators and SYSTEM so that no one else can read or change them. The
+// parent keeps its files (the agent logs); the uia folder keeps only its logs.
+// An error means a folder is not known to be locked and the helper must not be
+// started from it.
+func LockHelperFolders(parent, dir string) error {
+	if err := secureDir(parent, nil); err != nil {
+		return err
+	}
+	return secureDir(dir, map[string]bool{"helper.log": true, "helper.log.1": true})
+}
+
+// secureDir makes dir a directory that only Administrators and SYSTEM can read
+// or change. A new directory is created that way. An existing directory with
+// any other owner or access list gets lockedSDDL. A reparse point at dir is
+// refused rather than followed. When keep is non-nil the directory is pruned:
+// every entry except the kept names is deleted; when keep is nil only reparse
+// points are deleted and the other entries take their access from the
+// directory. An error means the directory is not known to be locked.
+func secureDir(dir string, keep map[string]bool) error {
 	d, err := newLockedDescriptor()
 	if err != nil {
 		return err
@@ -114,6 +151,9 @@ func secureDir(dir string) error {
 	defer d.free()
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return err
+	}
+	if isReparsePoint(dir) {
+		return fmt.Errorf("%s is a reparse point; remove it", dir)
 	}
 	name, err := syscall.UTF16PtrFromString(dir)
 	if err != nil {
@@ -125,24 +165,24 @@ func secureDir(dir string) error {
 	if err != nil && err != errorAlreadyExists {
 		return fmt.Errorf("create %s: %v", dir, err)
 	}
-	if st, serr := os.Lstat(dir); serr != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+	a := fileAttributes(dir)
+	if a == invalidFileAttributes || a&fileAttributeDirectory == 0 || a&fileAttributeReparse != 0 {
 		return fmt.Errorf("%s is not a directory", dir)
 	}
 	have, err := ownerAndDACL(dir)
 	if err != nil {
 		return err
 	}
-	if isLockedSDDL(have) {
-		return nil
-	}
-	if err := setSecurity(dir, ownerSecurityInfo|daclSecurityInfo|protectedDaclInfo, d.owner, d.dacl); err != nil {
-		return err
-	}
-	if have, err = ownerAndDACL(dir); err != nil {
-		return err
-	}
 	if !isLockedSDDL(have) {
-		return fmt.Errorf("%s still has the access list %s", dir, have)
+		if err := setSecurity(dir, ownerSecurityInfo|daclSecurityInfo|protectedDaclInfo, d.owner, d.dacl); err != nil {
+			return err
+		}
+		if have, err = ownerAndDACL(dir); err != nil {
+			return err
+		}
+		if !isLockedSDDL(have) {
+			return fmt.Errorf("%s still has the access list %s", dir, have)
+		}
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -151,16 +191,22 @@ func secureDir(dir string) error {
 	emptyACL := [2]uint32{emptyACLRevisionAndLen, 0}
 	for _, e := range entries {
 		path := filepath.Join(dir, e.Name())
-		lower := strings.ToLower(e.Name())
-		if lower == "bootstrap.ps1" || lower == "helper.cs" || (strings.HasPrefix(lower, "helper-") && strings.HasSuffix(lower, ".dll")) {
+		if isReparsePoint(path) {
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			continue
+		}
+		if keep != nil && !keep[strings.ToLower(e.Name())] {
 			if err := os.RemoveAll(path); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := setSecurity(path, ownerSecurityInfo|daclSecurityInfo|unprotectedDaclInfo, d.owner, uintptr(unsafe.Pointer(&emptyACL))); err != nil {
+		if err := setSecurity(path, ownerSecurityInfo|daclSecurityInfo|unprotectedDaclInfo, d.owner, unsafe.Pointer(&emptyACL)); err != nil {
 			return err
 		}
+		runtime.KeepAlive(&emptyACL)
 	}
 	return nil
 }

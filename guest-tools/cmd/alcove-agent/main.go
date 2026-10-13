@@ -29,7 +29,9 @@ func main() {
 	logger := log.Default()
 	if *logPath != "" {
 		_ = os.MkdirAll(filepath.Dir(*logPath), 0o755)
-		if f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		if err := refuseReparse(*logPath); err != nil {
+			fmt.Fprintln(os.Stderr, "log:", err)
+		} else if f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 			logger = log.New(f, "", log.LstdFlags)
 		}
 	}
@@ -58,7 +60,11 @@ func main() {
 		if base == "" {
 			base = os.TempDir()
 		}
-		uiaDir := filepath.Join(base, "Alcove", "uia")
+		alcoveDir := filepath.Join(base, "Alcove")
+		uiaDir := filepath.Join(alcoveDir, "uia")
+		if err := uia.LockHelperFolders(alcoveDir, uiaDir); err != nil {
+			logger.Printf("the helper folders are not locked (%v); the UI helper will not start until they can be locked", err)
+		}
 		helper := uia.New(uia.DefaultLauncher(uiaDir),
 			func(name string, fields map[string]any) { s.HandleUIEvent(name, fields) })
 		helper.SetLogger(logger)
@@ -66,6 +72,7 @@ func main() {
 		ui = helper
 	}
 	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui})
+	defer s.Close()
 	logger.Fatal(s.Serve(l))
 }
 
@@ -85,6 +92,9 @@ func writeInstallLog(msg string) {
 	}
 	path := filepath.Join(dir, "Alcove", "install.log")
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	if refuseReparse(path) != nil {
+		return
+	}
 	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 		fmt.Fprintf(f, "%s %s\n", timeNow(), msg)
 		f.Close()

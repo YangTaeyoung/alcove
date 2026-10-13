@@ -8,6 +8,9 @@ import (
 	"os/exec"
 )
 
+// refuseReparse never refuses outside Windows; there are no junctions to plant.
+func refuseReparse(string) error { return nil }
+
 // installAtLogon installs a systemd system unit on Linux.
 func installAtLogon(port int, allowExec bool) error {
 	exe, err := os.Executable()

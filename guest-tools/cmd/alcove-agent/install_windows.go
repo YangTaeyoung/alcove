@@ -3,12 +3,34 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
+
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/uia"
 )
+
+// refuseReparse reports an error when path is a reparse point (a junction or
+// symbolic link), so a log file is not opened through a planted link.
+func refuseReparse(path string) error {
+	name, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	const invalid = 0xFFFFFFFF
+	const reparse = 0x00000400
+	r, _, _ := syscall.NewLazyDLL("kernel32.dll").NewProc("GetFileAttributesW").Call(uintptr(unsafe.Pointer(name)))
+	if uint32(r) != invalid && uint32(r)&reparse != 0 {
+		return errors.New(path + " is a reparse point; remove it")
+	}
+	return nil
+}
 
 // installAtLogon registers a scheduled task that starts the agent in the
 // interactive session at logon (the clipboard is per session, so a service
@@ -57,6 +79,13 @@ func installAtLogon(port int, allowExec bool) error {
 	_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=AlcoveAgent").Run()
 	if out, err := exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=AlcoveAgent", "dir=in", "action=allow", "protocol=TCP", fmt.Sprintf("localport=%d", port)).CombinedOutput(); err != nil {
 		return fmt.Errorf("netsh: %v: %s", err, out)
+	}
+	// lock the data folders before the agent (and any helper) uses them
+	if base := os.Getenv("ProgramData"); base != "" {
+		alcoveDir := filepath.Join(base, "Alcove")
+		if err := uia.LockHelperFolders(alcoveDir, filepath.Join(alcoveDir, "uia")); err != nil {
+			return fmt.Errorf("lock %s: %w", alcoveDir, err)
+		}
 	}
 	// start it now in this session too
 	if out, err := exec.Command("schtasks", "/Run", "/TN", "AlcoveAgent").CombinedOutput(); err != nil {

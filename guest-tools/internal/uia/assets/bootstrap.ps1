@@ -22,57 +22,52 @@ try {
     $references = 'UIAutomationClient', 'UIAutomationTypes', 'WindowsBase', 'System.Web.Extensions'
     $code = Get-Content -Raw -Encoding UTF8 -LiteralPath $source
 
-    if ($env:ALCOVE_UIA_CACHE -eq '0') {
-        Add-Type -TypeDefinition $code -ReferencedAssemblies $references
-        Write-HelperLog ('compiled in memory after ' + $watch.ElapsedMilliseconds + ' ms')
-    } else {
-        # A temp file belongs to a running compile when the PowerShell process named in it started before the file was created.
-        Get-ChildItem -LiteralPath $dir -Filter 'helper-*.tmp.dll' | ForEach-Object {
-            $running = $false
-            try {
-                if ($_.Name -match '\.(\d+)\.tmp\.dll$') {
-                    $owner = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
-                    if ($owner -and $owner.ProcessName -eq 'powershell' -and $owner.StartTime -le $_.CreationTime) {
-                        $running = $true
-                    }
+    # A temp file belongs to a running compile when the PowerShell process named in it started before the file was created.
+    Get-ChildItem -LiteralPath $dir -Filter 'helper-*.tmp.dll' | ForEach-Object {
+        $running = $false
+        try {
+            if ($_.Name -match '\.(\d+)\.tmp\.dll$') {
+                $owner = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
+                if ($owner -and $owner.ProcessName -eq 'powershell' -and $owner.StartTime -le $_.CreationTime) {
+                    $running = $true
                 }
-            } catch {
-                $running = $true
             }
-            if (-not $running) {
-                try { Remove-Item -LiteralPath $_.FullName -Force } catch { }
-            }
+        } catch {
+            $running = $true
         }
-
-        $loaded = $false
-        if (Test-Path -LiteralPath $dll) {
-            try {
-                [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($dll)) | Out-Null
-                $loaded = $true
-                Write-HelperLog ('loaded ' + $name + ' after ' + $watch.ElapsedMilliseconds + ' ms')
-            } catch {
-                Write-HelperLog ('cannot load ' + $name + ': ' + $_.Exception.Message)
-                try { Remove-Item -LiteralPath $dll -Force } catch { }
-            }
-        }
-        if (-not $loaded) {
-            # The helper runs from the bytes of this compile; the file is stored for later starts.
-            $tmp = Join-Path $dir ($stem + '.' + $PID + '.tmp.dll')
-            Add-Type -TypeDefinition $code -ReferencedAssemblies $references -OutputAssembly $tmp
-            $compiled = $watch.ElapsedMilliseconds
-            [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($tmp)) | Out-Null
-            try {
-                Move-Item -LiteralPath $tmp -Destination $dll -Force
-                Write-HelperLog ('compiled ' + $name + ' after ' + $compiled + ' ms')
-            } catch {
-                Write-HelperLog ('compiled after ' + $compiled + ' ms; ' + $name + ' is in use and was not replaced')
-                try { Remove-Item -LiteralPath $tmp -Force } catch { }
-            }
-        }
-
-        Get-ChildItem -LiteralPath $dir -Filter 'helper-*.dll' | Where-Object { $_.Name -ne $name -and $_.Name -notlike '*.tmp.dll' } | ForEach-Object {
+        if (-not $running) {
             try { Remove-Item -LiteralPath $_.FullName -Force } catch { }
         }
+    }
+
+    $loaded = $false
+    if (Test-Path -LiteralPath $dll) {
+        try {
+            [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($dll)) | Out-Null
+            $loaded = $true
+            Write-HelperLog ('loaded ' + $name + ' after ' + $watch.ElapsedMilliseconds + ' ms')
+        } catch {
+            Write-HelperLog ('cannot load ' + $name + ': ' + $_.Exception.Message)
+            try { Remove-Item -LiteralPath $dll -Force } catch { }
+        }
+    }
+    if (-not $loaded) {
+        # The helper runs from the bytes of this compile; the file is stored for later starts.
+        $tmp = Join-Path $dir ($stem + '.' + $PID + '.tmp.dll')
+        Add-Type -TypeDefinition $code -ReferencedAssemblies $references -OutputAssembly $tmp
+        $compiled = $watch.ElapsedMilliseconds
+        [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($tmp)) | Out-Null
+        try {
+            Move-Item -LiteralPath $tmp -Destination $dll -Force
+            Write-HelperLog ('compiled ' + $name + ' after ' + $compiled + ' ms')
+        } catch {
+            Write-HelperLog ('compiled after ' + $compiled + ' ms; ' + $name + ' is in use and was not replaced')
+            try { Remove-Item -LiteralPath $tmp -Force } catch { }
+        }
+    }
+
+    Get-ChildItem -LiteralPath $dir -Filter 'helper-*.dll' | Where-Object { $_.Name -ne $name -and $_.Name -notlike '*.tmp.dll' } | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force } catch { }
     }
 
     [Alcove.UiaHelper]::Run()
