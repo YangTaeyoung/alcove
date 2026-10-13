@@ -280,7 +280,7 @@ The helper's environment is the agent's without `COR_*`, `COMPlus_*`,
 folder. Measured on the Windows 11 ARM64 test guest: the first `ui.ping` after
 an agent start answers after 0.59–0.60 s (1.1–2.0 s for the first one after a
 boot), of which the compile takes 0.35 s; a helper that was killed is replaced
-in 0.6–0.85 s. The helper, and an app launched through `app.launch`, inherit
+in 0.6–1.1 s. The helper, and an app launched through `app.launch`, inherit
 the agent's elevated token. `alcove-agent --install` locks the folders before
 it copies or registers anything and fails when they cannot be locked
 (`the Alcove data folder <dir> could not be locked (<reason>); fix its owner and access list with icacls, then run alcove-agent --install again`)
