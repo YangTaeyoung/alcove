@@ -147,7 +147,7 @@ extension ControlHandler {
 
     /// Waits for the screen to settle after `op` and sets `observation` in `out`, or `observationError`
     /// when a frame cannot be read. Cancellation is thrown.
-    private func addObservation(to out: inout [String: JSON], _ t: VMTarget, after op: String, before: Frame,
+    func addObservation(to out: inout [String: JSON], _ t: VMTarget, after op: String, before: Frame,
                                 _ options: ObserveOptions) async throws {
         do {
             let result = try await observe(t, before: before, level: options.level, settleMs: options.settleMs,

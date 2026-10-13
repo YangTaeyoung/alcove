@@ -6,12 +6,12 @@ import Vision
 import AlcoveEngine
 
 /// Black text on white, drawn with CoreText into a BGRA frame; `rects` are the drawn glyph bounds in top-left pixels.
-private struct DrawnText {
+struct DrawnText {
     let frame: Frame
     let rects: [Frame.Rect]
 }
 
-private func drawText(_ items: [(String, Int, Int)], width: Int = 1280, height: Int = 800, size: CGFloat = 28) -> DrawnText {
+func drawText(_ items: [(String, Int, Int)], width: Int = 1280, height: Int = 800, size: CGFloat = 28) -> DrawnText {
     var data = Data(count: width * height * 4)
     var rects: [Frame.Rect] = []
     data.withUnsafeMutableBytes { buffer in

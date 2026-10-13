@@ -28,6 +28,18 @@ enum GuestRecipes {
 
     private static let powerShellQuotes: Set<UInt32> = [0x27, 0x2018, 0x2019, 0x201A, 0x201B]
 
+    /// Prints `1` when the guest has a TCP listener on `port`, `0` otherwise.
+    static func portListening(_ port: Int, os: VMConfig.GuestOS) -> String? {
+        switch os {
+        case .windows:
+            return "if (Get-NetTCPConnection -State Listen -LocalPort \(port) -ErrorAction SilentlyContinue) { '1' } else { '0' }"
+        case .linux:
+            return "ss -ltn \"sport = :\(port)\" | tail -n +2 | grep -q . && echo 1 || echo 0"
+        case .other:
+            return nil
+        }
+    }
+
     static func setClock(unixSeconds: Int, os: VMConfig.GuestOS) -> String? {
         switch os {
         case .windows:

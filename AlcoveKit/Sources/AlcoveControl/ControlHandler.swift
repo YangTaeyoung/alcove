@@ -83,7 +83,7 @@ public actor ControlHandler {
         "vm.snapshot.list", "vm.snapshot.create", "vm.snapshot.restore", "vm.snapshot.delete",
         "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network",
         "vm.lease.acquire", "vm.lease.release", "vm.set_resolution",
-        "vm.wait_idle", "vm.set_environment", "vm.doctor", "vm.find_text",
+        "vm.wait_idle", "vm.wait_for", "vm.set_environment", "vm.doctor", "vm.find_text",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -95,6 +95,7 @@ public actor ControlHandler {
         "hello", "vm.list", "vm.status", "vm.screenshot", "vm.wait_idle", "vm.clipboard.get", "vm.exec.read",
         "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
         "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
+        "vm.wait_for",
     ]
 
     /// Whether `op` runs outside the per-connection request order.
@@ -191,6 +192,8 @@ public actor ControlHandler {
             return try await leaseOrResolution(op: op, params: params)
         case "vm.set_environment", "vm.doctor":
             return try await guest(op: op, params: params)
+        case "vm.wait_for":
+            return try await waitFor(params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of the frame's tiles changing between samples 250 ms apart

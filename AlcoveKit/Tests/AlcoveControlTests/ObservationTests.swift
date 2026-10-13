@@ -432,7 +432,7 @@ final class ObservationTests: XCTestCase {
 
         sent = await t.sent
         let waitFor = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.wait_for", "text": "Ready"], ["op": "vm.key.press", "keys": "a"]]])
-        XCTAssertEqual(waitFor, ["completed": 0, "results": [], "failedStep": 0, "error": "unknown op 'vm.wait_for'"])
+        XCTAssertEqual(waitFor, ["completed": 0, "results": [], "failedStep": 0, "error": "missing or invalid parameter 'conditions'"])
         let after = await t.sent
         XCTAssertEqual(after, sent)
     }
