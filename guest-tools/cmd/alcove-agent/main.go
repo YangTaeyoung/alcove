@@ -54,9 +54,15 @@ func main() {
 	var s *server.Server
 	var ui server.UI
 	if uia.Available() {
-		helper := uia.New(uia.DefaultLauncher(filepath.Join(os.Getenv("ProgramData"), "Alcove", "uia")),
+		base := os.Getenv("ProgramData")
+		if base == "" {
+			base = os.TempDir()
+		}
+		uiaDir := filepath.Join(base, "Alcove", "uia")
+		helper := uia.New(uia.DefaultLauncher(uiaDir),
 			func(name string, fields map[string]any) { s.HandleUIEvent(name, fields) })
 		helper.SetLogger(logger)
+		helper.SetLogPath(filepath.Join(uiaDir, "helper.log"))
 		ui = helper
 	}
 	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui})

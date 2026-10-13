@@ -17,6 +17,7 @@ namespace Alcove
             output.NewLine = "\n";
             JavaScriptSerializer json = new JavaScriptSerializer();
             json.MaxJsonLength = int.MaxValue;
+            output.WriteLine("{\"ev\":\"ready\"}");
 
             string line;
             while ((line = input.ReadLine()) != null)

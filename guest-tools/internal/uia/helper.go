@@ -38,17 +38,27 @@ type child struct {
 	wmu sync.Mutex // serializes request lines on stdin
 
 	// guarded by Helper.mu
-	pending map[int64]chan result
-	dead    bool
+	pending    map[int64]chan result
+	dead       bool
+	isReady    bool
+	err        error // why the child ended; set before done is closed
+	startTimer *time.Timer
 
+	ready      chan struct{} // closed when the helper announced "ready"
+	done       chan struct{} // closed when the child was terminated
 	readerDone chan struct{}
 }
+
+const defaultStartTimeout = 120 * time.Second
 
 // Helper manages the helper child: it starts lazily, serves one child at a
 // time and starts a new one after the child exits or times out.
 type Helper struct {
 	launch  Launcher
 	onEvent func(name string, fields map[string]any)
+
+	startTimeout time.Duration
+	logPath      string
 
 	mu     sync.Mutex
 	logger *log.Logger
@@ -60,7 +70,14 @@ type Helper struct {
 // New returns a Helper that starts the child through launch on the first Call.
 // onEvent receives helper events with the "ev" key removed; it may be nil.
 func New(launch Launcher, onEvent func(name string, fields map[string]any)) *Helper {
-	return &Helper{launch: launch, onEvent: onEvent, logger: log.Default()}
+	return &Helper{launch: launch, onEvent: onEvent, logger: log.Default(), startTimeout: defaultStartTimeout}
+}
+
+// SetLogPath sets the helper log file named in start-timeout errors.
+func (h *Helper) SetLogPath(path string) {
+	h.mu.Lock()
+	h.logPath = path
+	h.mu.Unlock()
 }
 
 // SetLogger sets the logger used for lines the helper writes that are not JSON.
@@ -85,9 +102,30 @@ func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (
 			h.mu.Unlock()
 			return nil, fmt.Errorf("could not start the UI helper through PowerShell: %v", err)
 		}
-		c = &child{stdin: stdin, stdout: stdout, kill: kill, pending: map[int64]chan result{}, readerDone: make(chan struct{})}
+		c = &child{stdin: stdin, stdout: stdout, kill: kill, pending: map[int64]chan result{},
+			ready: make(chan struct{}), done: make(chan struct{}), readerDone: make(chan struct{})}
 		h.cur = c
+		logPath := h.logPath
+		if logPath == "" {
+			logPath = "helper.log in the agent's uia folder"
+		}
+		startErr := fmt.Errorf("UI helper did not start within %s s; see %s",
+			strconv.FormatFloat(h.startTimeout.Seconds(), 'f', -1, 64), logPath)
+		c.startTimer = time.AfterFunc(h.startTimeout, func() { h.terminate(c, startErr) })
 		go h.readLoop(c)
+	}
+	h.mu.Unlock()
+
+	select {
+	case <-c.ready:
+	case <-c.done:
+		return nil, c.err
+	}
+
+	h.mu.Lock()
+	if c.dead {
+		h.mu.Unlock()
+		return nil, c.err
 	}
 	h.nextID++
 	id := h.nextID
@@ -161,6 +199,11 @@ func (h *Helper) terminate(c *child, err error) {
 		return
 	}
 	c.dead = true
+	c.err = err
+	close(c.done)
+	if c.startTimer != nil {
+		c.startTimer.Stop()
+	}
 	if h.cur == c {
 		h.cur = nil
 	}
@@ -232,6 +275,16 @@ func (h *Helper) handleLine(c *child, line []byte) {
 		return
 	}
 	delete(m, "ev")
+	if name == "ready" {
+		h.mu.Lock()
+		if !c.isReady {
+			c.isReady = true
+			c.startTimer.Stop()
+			close(c.ready)
+		}
+		h.mu.Unlock()
+		return
+	}
 	if name == "fatal" {
 		msg, _ := m["error"].(string)
 		h.terminate(c, fmt.Errorf("UI helper failed to start through PowerShell: %s", msg))

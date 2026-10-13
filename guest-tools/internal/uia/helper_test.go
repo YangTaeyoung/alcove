@@ -20,6 +20,7 @@ const longWait = 10 * time.Second
 type fakeHelper struct {
 	launches atomic.Int32
 	play     func(n int, in io.Reader, out io.Writer)
+	noReady  bool // the child announces "ready" itself
 	killed   [8]chan struct{}
 }
 
@@ -36,7 +37,12 @@ func (f *fakeHelper) launcher() Launcher {
 		n := int(f.launches.Add(1)) - 1
 		reqR, reqW := io.Pipe()
 		resR, resW := io.Pipe()
-		go f.play(n, reqR, resW)
+		go func() {
+			if !f.noReady {
+				sendReady(resW)
+			}
+			f.play(n, reqR, resW)
+		}()
 		var once sync.Once
 		kill := func() {
 			once.Do(func() {
@@ -67,6 +73,8 @@ func writeLine(out io.Writer, m map[string]any) {
 	b, _ := json.Marshal(m)
 	out.Write(append(b, '\n'))
 }
+
+func sendReady(out io.Writer) { writeLine(out, map[string]any{"ev": "ready"}) }
 
 func echoPlay(n int, in io.Reader, out io.Writer) {
 	readRequests(in, func(req map[string]any) bool {
@@ -333,14 +341,13 @@ func TestLaunchFailureIsReported(t *testing.T) {
 func TestFatalEventIsLaunchFailure(t *testing.T) {
 	f := newFake(func(n int, in io.Reader, out io.Writer) {
 		if n == 0 {
-			readRequests(in, func(map[string]any) bool {
-				writeLine(out, map[string]any{"ev": "fatal", "error": "compile failed: CS1002"})
-				return false
-			})
+			writeLine(out, map[string]any{"ev": "fatal", "error": "compile failed: CS1002"})
 			return
 		}
+		sendReady(out)
 		echoPlay(n, in, out)
 	})
+	f.noReady = true
 	h := New(f.launcher(), nil)
 	defer h.Close()
 	_, err := h.Call("ping", nil, longWait)
@@ -349,6 +356,108 @@ func TestFatalEventIsLaunchFailure(t *testing.T) {
 	}
 	if _, err := h.Call("ping", nil, longWait); err != nil {
 		t.Fatalf("retry: %v", err)
+	}
+}
+
+func TestCallWaitsForSlowReady(t *testing.T) {
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		time.Sleep(200 * time.Millisecond)
+		sendReady(out)
+		echoPlay(n, in, out)
+	})
+	f.noReady = true
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	if _, err := h.Call("ping", map[string]any{"x": 1}, 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStartTimeoutKillsAndRestarts(t *testing.T) {
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		if n == 0 {
+			readRequests(in, func(map[string]any) bool { return true })
+			return
+		}
+		sendReady(out)
+		echoPlay(n, in, out)
+	})
+	f.noReady = true
+	h := New(f.launcher(), nil)
+	h.startTimeout = 100 * time.Millisecond
+	h.SetLogPath("C:\\uia\\helper.log")
+	defer h.Close()
+	_, err := h.Call("ping", nil, longWait)
+	want := "UI helper did not start within 0.1 s; see C:\\uia\\helper.log"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err %v", err)
+	}
+	select {
+	case <-f.killed[0]:
+	case <-time.After(longWait):
+		t.Fatal("child not killed")
+	}
+	if _, err := h.Call("ping", map[string]any{"x": 1}, longWait); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if got := f.launches.Load(); got != 2 {
+		t.Fatalf("launches %d", got)
+	}
+}
+
+func TestStartTimeoutNamesLogFolderWithoutPath(t *testing.T) {
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		readRequests(in, func(map[string]any) bool { return true })
+	})
+	f.noReady = true
+	h := New(f.launcher(), nil)
+	h.startTimeout = 50 * time.Millisecond
+	defer h.Close()
+	_, err := h.Call("ping", nil, longWait)
+	if err == nil || !strings.Contains(err.Error(), "helper.log in the agent's uia folder") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestConcurrentCallsDuringStartShareOneChild(t *testing.T) {
+	release := make(chan struct{})
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		<-release
+		sendReady(out)
+		echoPlay(n, in, out)
+	})
+	f.noReady = true
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := h.Call("ping", map[string]any{"x": 1}, longWait)
+			errs <- err
+		}()
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := f.launches.Load(); got != 1 {
+		t.Fatalf("launches %d", got)
+	}
+}
+
+func TestReadyIsNotForwarded(t *testing.T) {
+	events := make(chan string, 4)
+	h := New(newFake(echoPlay).launcher(), func(name string, _ map[string]any) { events <- name })
+	if _, err := h.Call("ping", nil, longWait); err != nil {
+		t.Fatal(err)
+	}
+	h.Close()
+	select {
+	case name := <-events:
+		t.Fatalf("forwarded event %q", name)
+	default:
 	}
 }
 

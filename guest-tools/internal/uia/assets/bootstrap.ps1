@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 try {
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     [Console]::InputEncoding = $utf8
@@ -11,23 +12,36 @@ try {
     $name = 'helper-' + $hash.Substring(0, 16) + '.dll'
     $dll = Join-Path $dir $name
 
+    $started = (Get-Date).AddSeconds(-1)
+    Get-ChildItem -LiteralPath $dir -Filter 'helper-*.tmp.dll' | Where-Object { $_.LastWriteTime -lt $started } | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force } catch { }
+    }
+
+    $loaded = $false
     if (Test-Path -LiteralPath $dll) {
-        [System.Reflection.Assembly]::LoadFrom($dll) | Out-Null
-    } else {
+        try {
+            [System.Reflection.Assembly]::LoadFrom($dll) | Out-Null
+            $loaded = $true
+        } catch {
+            try { Remove-Item -LiteralPath $dll -Force } catch { }
+        }
+    }
+    if (-not $loaded) {
+        $tmp = Join-Path $dir ('helper-' + $hash.Substring(0, 16) + '.' + $PID + '.tmp.dll')
         $code = Get-Content -Raw -Encoding UTF8 -LiteralPath $source
-        Add-Type -TypeDefinition $code -ReferencedAssemblies UIAutomationClient, UIAutomationTypes, WindowsBase, System.Web.Extensions -OutputAssembly $dll
+        Add-Type -TypeDefinition $code -ReferencedAssemblies UIAutomationClient, UIAutomationTypes, WindowsBase, System.Web.Extensions -OutputAssembly $tmp
+        Move-Item -LiteralPath $tmp -Destination $dll -Force
         [System.Reflection.Assembly]::LoadFrom($dll) | Out-Null
     }
 
-    Get-ChildItem -LiteralPath $dir -Filter 'helper-*.dll' | Where-Object { $_.Name -ne $name } | ForEach-Object {
+    Get-ChildItem -LiteralPath $dir -Filter 'helper-*.dll' | Where-Object { $_.Name -ne $name -and $_.Name -notlike '*.tmp.dll' } | ForEach-Object {
         try { Remove-Item -LiteralPath $_.FullName -Force } catch { }
     }
 
     [Alcove.UiaHelper]::Run()
 } catch {
-    $msg = $_.Exception.Message
-    $json = '{"ev":"fatal","error":"' + ($msg -replace '\\', '\\\\' -replace '"', '\"' -replace "`r", ' ' -replace "`n", ' ') + '"}'
-    [Console]::Out.WriteLine($json)
+    $text = $_.Exception.Message
+    [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @{ ev = 'fatal'; error = $text }))
     [Console]::Out.Flush()
     exit 1
 }
