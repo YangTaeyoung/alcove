@@ -368,6 +368,7 @@ namespace Alcove
         }
 
         public const int ERROR_ACCESS_DENIED = 5;
+        public const int ERROR_INVALID_WINDOW_HANDLE = 1400;
         public const uint GW_OWNER = 4;
         public const uint GA_ROOT = 2;
         public const int SW_MAXIMIZE = 3;
@@ -541,12 +542,14 @@ namespace Alcove
         const long FailureLogMs = 60000;
 
         Dictionary<IntPtr, Dictionary<string, object>> known = new Dictionary<IntPtr, Dictionary<string, object>>();
-        IntPtr foreground;
-        // The last title compared and the last title emitted per window, with the time it was
-        // emitted, so at most one window.title per window per second reaches the connections.
+        // Per window: the title of the previous comparison, the title of the last window.title
+        // (or the title the window had when it was first compared) and the time of that event.
         readonly Dictionary<IntPtr, string> lastSeenTitle = new Dictionary<IntPtr, string>();
         readonly Dictionary<IntPtr, string> lastTitleSent = new Dictionary<IntPtr, string>();
         readonly Dictionary<IntPtr, long> titleSentAt = new Dictionary<IntPtr, long>();
+        // The window the last window.foreground named (or the one in front at the first
+        // comparison) and, per window, the time of its last window.foreground.
+        IntPtr foregroundSent;
         readonly Dictionary<IntPtr, long> foregroundSentAt = new Dictionary<IntPtr, long>();
         readonly Stopwatch clock = Stopwatch.StartNew();
         long lastFailureLog = -FailureLogMs;
@@ -608,52 +611,57 @@ namespace Alcove
                         lastSeenTitle.Remove(old.Key);
                         lastTitleSent.Remove(old.Key);
                         titleSentAt.Remove(old.Key);
-                        foregroundSentAt.Remove(old.Key);
                     }
                 }
-                foreach (IntPtr hwnd in order)
+            }
+            foreach (IntPtr hwnd in order)
+            {
+                Dictionary<string, object> window = windows[hwnd];
+                string title = (string)window["title"];
+                if (!known.ContainsKey(hwnd))
                 {
-                    Dictionary<string, object> window = windows[hwnd];
-                    string title = (string)window["title"];
-                    Dictionary<string, object> old;
-                    if (!known.TryGetValue(hwnd, out old))
+                    if (report)
                     {
                         Emit("window.opened", window);
                         if ((bool)window["modal"] || (string)window["class"] == "#32770")
                         {
                             Emit("dialog.opened", window);
                         }
-                        lastTitleSent[hwnd] = title;
-                        titleSentAt[hwnd] = now;
                     }
-                    else
-                    {
-                        MaybeEmitTitle(hwnd, title, window, now);
-                    }
-                    lastSeenTitle[hwnd] = title;
+                    lastTitleSent[hwnd] = title;
                 }
-                if (front != foreground && front != IntPtr.Zero)
+                else if (report)
+                {
+                    MaybeEmitTitle(hwnd, title, window, now);
+                }
+                lastSeenTitle[hwnd] = title;
+            }
+            ForgetClosedForeground();
+            if (!report)
+            {
+                foregroundSent = front;
+            }
+            else if (front != IntPtr.Zero && front != foregroundSent)
+            {
+                long last;
+                if (!foregroundSentAt.TryGetValue(front, out last) || now - last >= EventCapMs)
                 {
                     Dictionary<string, object> window;
                     if (!windows.TryGetValue(front, out window))
                     {
                         window = Session.WindowObject(front, front);
                     }
-                    long last;
-                    if (!foregroundSentAt.TryGetValue(front, out last) || now - last >= EventCapMs)
-                    {
-                        Emit("window.foreground", window);
-                        foregroundSentAt[front] = now;
-                    }
+                    Emit("window.foreground", window);
+                    foregroundSent = front;
+                    foregroundSentAt[front] = now;
                 }
             }
             known = windows;
-            foreground = front;
         }
 
-        // Emits window.title at most once per window per second: a title emits once it has been
-        // quiet for one comparison or the second since the last emit has passed, and the latest
-        // title is the one emitted.
+        // Emits window.title when the title differs from the one last sent for the window, is the
+        // same as in the previous comparison and at least a second has passed since the window's
+        // last window.title.
         void MaybeEmitTitle(IntPtr hwnd, string title, Dictionary<string, object> window, long now)
         {
             string sent;
@@ -662,14 +670,45 @@ namespace Alcove
                 return;
             }
             string seen;
-            bool quiet = lastSeenTitle.TryGetValue(hwnd, out seen) && seen == title;
-            long last;
-            bool secondPassed = !titleSentAt.TryGetValue(hwnd, out last) || now - last >= EventCapMs;
-            if (quiet || secondPassed)
+            if (!lastSeenTitle.TryGetValue(hwnd, out seen) || seen != title)
             {
-                Emit("window.title", window);
-                lastTitleSent[hwnd] = title;
-                titleSentAt[hwnd] = now;
+                return;
+            }
+            long last;
+            if (titleSentAt.TryGetValue(hwnd, out last) && now - last < EventCapMs)
+            {
+                return;
+            }
+            Emit("window.title", window);
+            lastTitleSent[hwnd] = title;
+            titleSentAt[hwnd] = now;
+        }
+
+        // Drops the foreground state of windows that no longer exist.
+        void ForgetClosedForeground()
+        {
+            List<IntPtr> gone = null;
+            foreach (IntPtr hwnd in foregroundSentAt.Keys)
+            {
+                if (!Native.IsWindow(hwnd))
+                {
+                    if (gone == null)
+                    {
+                        gone = new List<IntPtr>();
+                    }
+                    gone.Add(hwnd);
+                }
+            }
+            if (gone != null)
+            {
+                foreach (IntPtr hwnd in gone)
+                {
+                    foregroundSentAt.Remove(hwnd);
+                }
+            }
+            if (foregroundSent != IntPtr.Zero && !Native.IsWindow(foregroundSent))
+            {
+                foregroundSent = IntPtr.Zero;
             }
         }
 
@@ -720,6 +759,8 @@ namespace Alcove
         int budgetMs;
         readonly Dictionary<string, ControlType> rolesByName = new Dictionary<string, ControlType>(StringComparer.OrdinalIgnoreCase);
         readonly HashSet<ControlType> interactiveTypes = new HashSet<ControlType>();
+
+        const string PasswordSentence = "the element is a password field; its text is not read; it cannot be read through UI Automation";
 
         const int MaxActThreadsPerApp = 8;
         static readonly object actLock = new object();
@@ -1026,8 +1067,8 @@ namespace Alcove
             return WindowObject(hwnd, Native.ForegroundWindow());
         }
 
-        // True when the window's thread handles a message within the given time. A window of a
-        // higher integrity level denies the message with access denied but is not hung.
+        // True when the window's thread handles a message within the given time or the message
+        // is denied with access denied.
         static bool Responds(IntPtr hwnd, int ms)
         {
             IntPtr result;
@@ -1079,8 +1120,8 @@ namespace Alcove
             return true;
         }
 
-        // The sentence for a show-state change that did not take: the window is named as not
-        // responding only when it really is hung, otherwise the app is said to decline it.
+        // The sentence for a show-state change that did not take: it names proc.kill for a window
+        // that is hung and win.list for one that answers messages.
         static string NotChanged(IntPtr hwnd, string what)
         {
             string head = "window " + HwndId(hwnd) + " " + Json.Write(WindowTitle(hwnd)) + " " + what + " within " + (WindowStateMs / 1000) + " s; ";
@@ -1088,7 +1129,7 @@ namespace Alcove
             {
                 return head + "check responding in win.list, then retry or end its process with proc.kill";
             }
-            return head + "the app may not allow it";
+            return head + "the app may not allow it; use win.list to see its state";
         }
 
         // Asks the window to change its show state and waits until it has.
@@ -1204,11 +1245,22 @@ namespace Alcove
                     string cls = WindowClass(hwnd);
                     if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd")
                     {
-                        throw new HelperException("window " + HwndId(hwnd) + " is part of the Windows shell and is not closed");
+                        throw new HelperException("window " + HwndId(hwnd) + " is part of the Windows shell and is not closed; close app windows only");
                     }
                     if (!Native.PostMessageW(hwnd, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero))
                     {
-                        throw new HelperException("window " + HwndId(hwnd) + " belongs to a process the helper cannot send to");
+                        int code = Marshal.GetLastWin32Error();
+                        if (code == Native.ERROR_INVALID_WINDOW_HANDLE)
+                        {
+                            r["closed"] = true;
+                            r["window"] = null;
+                            return r;
+                        }
+                        if (code == Native.ERROR_ACCESS_DENIED)
+                        {
+                            throw new HelperException("window " + HwndId(hwnd) + " belongs to a process the helper cannot send to");
+                        }
+                        throw new HelperException("window " + HwndId(hwnd) + " could not be asked to close (error " + code + "); retry");
                     }
                     r["closed"] = WaitUntil(delegate { return !Native.IsWindow(hwnd) || !Native.IsWindowVisible(hwnd); }, CloseWaitMs);
                     break;
@@ -1376,11 +1428,11 @@ namespace Alcove
             }
             AutomationElement element = Target(req);
             IntPtr hwnd = scopeWindow;
-            bool passwordLineage = HasPasswordAncestor(element);
+            bool belowPassword = HasPasswordAncestor(element);
             Dictionary<string, object> before = Node(element, 0);
-            if (passwordLineage)
+            if (belowPassword)
             {
-                MarkPassword(before);
+                MarkBelowPassword(before);
             }
             if (((List<object>)before["flags"]).Contains("disabled"))
             {
@@ -1430,8 +1482,9 @@ namespace Alcove
             worker.IsBackground = true;
             worker.SetApartmentState(ApartmentState.MTA);
             worker.Start();
-            // The action counts as done when it returned, or when the window stopped taking input for a window it opened.
-            WaitUntil(delegate { return worker.Join(0) || (wasEnabled && !Native.IsWindowEnabled(hwnd)); }, ActWaitMs);
+            // The wait ends when the action returned, when the window is gone, or when the window
+            // stopped taking input for a window it opened; the last counts as done.
+            WaitUntil(delegate { return worker.Join(0) || (known && !Native.IsWindow(hwnd)) || (wasEnabled && !Native.IsWindowEnabled(hwnd)); }, ActWaitMs);
             bool joined = worker.Join(0);
             bool modalOpened = wasEnabled && known && Native.IsWindow(hwnd) && !Native.IsWindowEnabled(hwnd);
             bool returned = joined || modalOpened;
@@ -1445,9 +1498,13 @@ namespace Alcove
                 {
                     throw new HelperException("the element is disabled; wait until it is enabled");
                 }
-                if (failure is ElementNotAvailableException)
+                if (failure is ElementNotAvailableException || failure is COMException)
                 {
-                    throw new HelperException("element " + before["ref"] + " no longer exists; call ui.tree again");
+                    UiaHelper.Log("'ui.act' " + action + " ended with " + failure.GetType().Name + ": " + failure.Message);
+                    Dictionary<string, object> ended = new Dictionary<string, object>();
+                    ended["node"] = before;
+                    ended["gone"] = true;
+                    return ended;
                 }
                 if (failure is InvalidOperationException)
                 {
@@ -1459,6 +1516,12 @@ namespace Alcove
 
             Dictionary<string, object> r = new Dictionary<string, object>();
             Thread.Sleep(ActSettleMs);
+            if (known && !Native.IsWindow(hwnd))
+            {
+                r["node"] = before;
+                r["gone"] = true;
+                return r;
+            }
             if (hwnd != IntPtr.Zero && Native.IsWindow(hwnd) && !Responds(hwnd, ActRespondMs))
             {
                 r["node"] = before;
@@ -1475,9 +1538,9 @@ namespace Alcove
             try
             {
                 Dictionary<string, object> node = Node(element.GetUpdatedCache(nodeCacheControl), 0);
-                if (passwordLineage)
+                if (belowPassword)
                 {
-                    MarkPassword(node);
+                    MarkBelowPassword(node);
                 }
                 r["node"] = node;
             }
@@ -1668,7 +1731,7 @@ namespace Alcove
         }
 
         // Whether the element is a password field, from its cached IsPassword. A read that fails
-        // counts as a password field so its text is never exposed.
+        // counts as a password field.
         static bool IsPasswordElement(AutomationElement element)
         {
             try
@@ -1682,38 +1745,48 @@ namespace Alcove
             }
         }
 
-        // Whether a bounded number of the element's parents is a password field, read live. An
-        // element below a password field is treated as a password field itself.
+        // Whether one of the element's parents is a password field, read live. A parent that
+        // cannot be read and a chain of more than MaxWalkDepth parents count as a password field.
         static bool HasPasswordAncestor(AutomationElement element)
         {
-            AutomationElement current = TreeWalker.RawViewWalker.GetParent(element);
-            for (int i = 0; i < 64 && current != null; i++)
+            try
             {
-                try
+                AutomationElement current = TreeWalker.RawViewWalker.GetParent(element);
+                for (int i = 0; i < MaxWalkDepth; i++)
                 {
+                    if (current == null)
+                    {
+                        return false;
+                    }
                     object v = current.GetCurrentPropertyValue(AutomationElement.IsPasswordProperty);
                     if (v is bool && (bool)v)
                     {
                         return true;
                     }
+                    current = TreeWalker.RawViewWalker.GetParent(current);
                 }
-                catch (InvalidOperationException)
-                {
-                    return true;
-                }
-                catch (ElementNotAvailableException)
-                {
-                    return false;
-                }
-                current = TreeWalker.RawViewWalker.GetParent(current);
+                return current != null;
             }
-            return false;
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+            catch (ElementNotAvailableException)
+            {
+                return true;
+            }
+            catch (COMException)
+            {
+                return true;
+            }
         }
 
-        // Marks a node as a password field: the password flag is set and the value is removed.
-        static void MarkPassword(Dictionary<string, object> node)
+        // Marks a node as lying below a password field: the password flag is set, the name is
+        // emptied and the value is removed.
+        static void MarkBelowPassword(Dictionary<string, object> node)
         {
             node.Remove("value");
+            node["name"] = "";
             List<object> flags = (List<object>)node["flags"];
             if (!flags.Contains("password"))
             {
@@ -1844,6 +1917,10 @@ namespace Alcove
             if (rootRef != null)
             {
                 root = ResolveRef(rootRef).GetUpdatedCache(walk.Cache);
+                if (HasPasswordAncestor(root))
+                {
+                    throw new HelperException(PasswordSentence);
+                }
                 hwnd = TopWindow(root);
             }
             else
@@ -1854,7 +1931,10 @@ namespace Alcove
             scopeWindow = hwnd;
 
             walk.Nodes.Add(Node(root, 0));
-            WalkChildren(walk, root, 0, 1);
+            if (!IsPasswordElement(root))
+            {
+                WalkChildren(walk, root, 0, 1);
+            }
 
             Dictionary<string, object> r = new Dictionary<string, object>();
             r["window"] = WindowObjectOrNull(hwnd);
@@ -1902,7 +1982,7 @@ namespace Alcove
                     {
                         walk.Nodes.Add(Node(child, nodeDepth));
                     }
-                    // The children of a password field are not listed, so a bullet row cannot expose the text.
+                    // The children of a password field are not listed.
                     if (!IsPasswordElement(child))
                     {
                         WalkChildren(walk, child, level + 1, listed ? nodeDepth + 1 : nodeDepth);
@@ -2178,7 +2258,7 @@ namespace Alcove
             AutomationElement element = Target(req);
             if (IsPasswordElement(element) || HasPasswordAncestor(element))
             {
-                throw new HelperException("the element is a password field; its text is not read; it cannot be read through UI Automation");
+                throw new HelperException(PasswordSentence);
             }
 
             string text = null;
@@ -2352,7 +2432,7 @@ namespace Alcove
             Dictionary<string, object> node = Node(element, 0);
             if (HasPasswordAncestor(element))
             {
-                MarkPassword(node);
+                MarkBelowPassword(node);
             }
             int x = (int)node["x"], y = (int)node["y"], w = (int)node["w"], h = (int)node["h"];
             int cx = x + w / 2, cy = y + h / 2;
@@ -2429,7 +2509,7 @@ namespace Alcove
             Dictionary<string, object> node = Node(element, 0);
             if (HasPasswordAncestor(element))
             {
-                MarkPassword(node);
+                MarkBelowPassword(node);
             }
             Dictionary<string, object> r = new Dictionary<string, object>();
             r["node"] = node;
