@@ -14,6 +14,8 @@ actor FakeTarget: VMTarget {
     /// Frames served one per `frame()` call; the last one repeats. Empty: `frame()` decodes `png`.
     var frames: [Frame] = []
     var frameCalls = 0
+    /// The `frame()` calls, counted from 0, that throw `FrameUnavailable`.
+    var failingFrameCalls: Set<Int> = []
     var agentClient: AgentClient?
     var startCount = 0, stopCount = 0
     var agentWait: Duration = .zero
@@ -41,6 +43,7 @@ actor FakeTarget: VMTarget {
     func screenshotPNG() async throws -> Data { png }
     func frame() async throws -> Frame {
         frameCalls += 1
+        if failingFrameCalls.contains(frameCalls - 1) { throw FrameUnavailable() }
         if frames.count > 1 { return frames.removeFirst() }
         if let last = frames.first { return last }
         guard let f = Frame(png: png) else { throw NSError(domain: "FakeTarget", code: 1) }
@@ -79,7 +82,13 @@ actor FakeTarget: VMTarget {
     func setAgentWait(_ d: Duration) { agentWait = d }
     func setPNG(_ d: Data) { png = d }
     func setFrames(_ f: [Frame]) { frames = f }
+    func setFailingFrameCalls(_ calls: Set<Int>) { failingFrameCalls = calls }
     func setState(_ s: VMController.State) { stateValue = s }
+}
+
+/// What `FakeTarget.frame()` throws for a call listed in `failingFrameCalls`.
+struct FrameUnavailable: Error, CustomStringConvertible {
+    var description: String { "no surface is mapped" }
 }
 
 struct FakeRegistry: VMRegistry {

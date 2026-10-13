@@ -248,6 +248,96 @@ final class ObservationTests: XCTestCase {
         XCTAssertEqual(sent, [])
     }
 
+    func testSettleMsAboveSettleTimeoutMsIsRejected() async throws {
+        let base = solid(320, 192, 40)
+        let (h, t) = await setup(frames: [base])
+        let step: JSON = ["op": "vm.key.down", "key": "shift"]
+        for extra: JSON in [["settleMs": 500, "settleTimeoutMs": 400], ["observe": "summary", "settleMs": 2001], ["settleTimeoutMs": 200]] {
+            var params = extra.objectValue ?? [:]
+            params["name"] = "Win"; params["x"] = 0; params["y"] = 0; params["steps"] = [step]
+            let click = await failure(h, "vm.mouse.click", .object(params))
+            XCTAssertEqual(click, "settleMs must not exceed settleTimeoutMs")
+            let batch = await failure(h, "vm.batch", .object(params))
+            XCTAssertEqual(batch, "settleMs must not exceed settleTimeoutMs")
+        }
+        let sent = await t.sent
+        XCTAssertEqual(sent, [])
+        let equal = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift", "observe": "summary", "settleMs": 100, "settleTimeoutMs": 100])
+        XCTAssertNotNil(equal["observation"])
+    }
+
+    func testClickWhoseScreenCannotBeReadAfterwardsReturnsObservationError() async throws {
+        let base = solid(320, 192, 40)
+        let (h, t) = await setup(frames: [base, paint(base, tileX: 2, tileY: 1)])
+        await t.setFailingFrameCalls([1])
+        let r = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 0, "y": 0, "hold": 1, "observe": "summary", "settleMs": 60])
+        XCTAssertEqual(r, ["observationError": "the screen could not be read after vm.mouse.click: no surface is mapped; call vm.screenshot to see the result"])
+        let sent = await t.sent
+        XCTAssertEqual(sent, [.abs(con: 0, x: 0, y: 0), .btn(con: 0, button: .left, down: true), .sync,
+                              .btn(con: 0, button: .left, down: false), .sync])
+
+        await t.setFailingFrameCalls([4])
+        let later = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift", "observe": "image", "settleMs": 200])
+        XCTAssertEqual(later.objectValue?.keys.sorted(), ["observationError"])
+        let after = await t.sent
+        XCTAssertEqual(after.last, .key(mac: ObservationTests.shift, q: nil, down: true))
+    }
+
+    func testBatchWhoseScreenCannotBeReadAfterwardsStillReportsItsSteps() async throws {
+        let base = solid(320, 192, 40)
+        let (h, t) = await setup(frames: [base, paint(base, tileX: 2, tileY: 1)])
+        let shift = ObservationTests.shift
+        let observationError = "the screen could not be read after vm.batch: no surface is mapped; call vm.screenshot to see the result"
+        await t.setFailingFrameCalls([1])
+        let steps: JSON = [["op": "vm.key.down", "key": "shift"], ["op": "vm.key.press", "keys": "hyper+x"], ["op": "vm.key.up", "key": "shift"]]
+        let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": steps, "observe": "summary", "settleMs": 60])
+        XCTAssertEqual(r.objectValue?.keys.sorted(), ["completed", "error", "failedStep", "observationError", "results"])
+        XCTAssertEqual(r["completed"]?.intValue, 1)
+        XCTAssertEqual(r["results"], [[:]])
+        XCTAssertEqual(r["failedStep"]?.intValue, 1)
+        XCTAssertTrue(r["error"]?.stringValue?.hasPrefix("bad key spec 'hyper+x'") ?? false, "\(r)")
+        XCTAssertEqual(r["observationError"]?.stringValue, observationError)
+        var sent = await t.sent
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true)])
+
+        await t.setFailingFrameCalls([3])
+        let finished = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.up", "key": "shift"]], "observe": "diff", "settleMs": 60])
+        XCTAssertEqual(finished, ["completed": 1, "results": [[:]], "observationError": .string(observationError)])
+        sent = await t.sent
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
+    }
+
+    func testFailedBeforeCaptureSendsNoInput() async throws {
+        let (h, t) = await setup(frames: [solid(320, 192, 40)])
+        await t.setFailingFrameCalls([0, 1])
+        let click = await failure(h, "vm.mouse.click", ["name": "Win", "x": 0, "y": 0, "observe": "summary"])
+        XCTAssertEqual(click, "the screen could not be read before vm.mouse.click, so no input was sent: no surface is mapped")
+        let batch = await failure(h, "vm.batch", ["name": "Win", "steps": [["op": "vm.key.down", "key": "shift"]], "observe": "summary"])
+        XCTAssertEqual(batch, "the screen could not be read before vm.batch, so no input was sent: no surface is mapped")
+        let sent = await t.sent
+        XCTAssertEqual(sent, [])
+        let frameCalls = await t.frameCalls
+        XCTAssertEqual(frameCalls, 2)
+    }
+
+    func testBatchRejectsAStepNamedForAnotherVM() async throws {
+        let (h, t) = await setup(frames: [solid(320, 192, 40)])
+        let shift = ObservationTests.shift
+        let down: JSON = ["op": "vm.key.down", "key": "shift"]
+        for name: JSON in ["Other", 5, nil] {
+            let error = await failure(h, "vm.batch", ["name": "Win", "steps": [down, ["op": "vm.key.up", "key": "shift", "name": name]]])
+            XCTAssertEqual(error, "step 1: 'name' must not differ from the batch's VM")
+        }
+        var sent = await t.sent
+        XCTAssertEqual(sent, [])
+        let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [down, ["op": "vm.key.up", "key": "shift", "name": "Win"]]])
+        XCTAssertEqual(r, ["completed": 2, "results": [[:], [:]]])
+        sent = await t.sent
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
+        let noName = await failure(h, "vm.batch", ["steps": [["op": "vm.key.down", "key": "shift", "name": "Win"]]])
+        XCTAssertEqual(noName, "missing or invalid parameter 'name'")
+    }
+
     func testMouseDownUpSendButtons() async throws {
         let (h, t) = await setup(frames: [solid(320, 192, 40)])
         let down = try await h.handle(op: "vm.mouse.down", params: ["name": "Win", "x": 319, "y": 191, "button": "right"])

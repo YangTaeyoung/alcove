@@ -38,10 +38,12 @@ extension ControlHandler {
             guard let ms = value.intValue, (100...30000).contains(ms) else { throw ControlError.failed("settleTimeoutMs must be between 100 and 30000") }
             options.settleTimeoutMs = ms
         }
+        guard options.settleMs <= options.settleTimeoutMs else { throw ControlError.failed("settleMs must not exceed settleTimeoutMs") }
         return options
     }
 
-    /// Runs one action op; unless the level is `none`, the result carries what the screen did afterwards.
+    /// Runs one action op; unless the level is `none`, the result carries what the screen did afterwards,
+    /// or `observationError` when the screen could not be read after the input was sent.
     func action(op: String, params: JSON) async throws -> JSON {
         let options = try observeOptions(params)
         let t = try await running(params)
@@ -49,17 +51,19 @@ extension ControlHandler {
             try await send(op, to: t, params)
             return [:]
         }
-        let before = try await screenshot(t)
+        let before = try await frame(of: t, before: op)
         try await send(op, to: t, params)
-        return ["observation": try await observation(t, after: op, before: before, options)]
+        var out: [String: JSON] = [:]
+        try await addObservation(to: &out, t, after: op, before: before, options)
+        return .object(out)
     }
 
     /// Runs the steps of a batch in order and stops at the first one that throws.
     func batch(_ params: JSON) async throws -> JSON {
         let options = try observeOptions(params)
-        let steps = try batchSteps(params)
+        let steps = try batchSteps(params, vm: try string(params, "name"))
         let t = try await running(params)
-        let before = options.level == .none ? nil : try await screenshot(t)
+        let before = options.level == .none ? nil : try await frame(of: t, before: "vm.batch")
         var results: [JSON] = []
         var failure: (step: Int, message: String)?
         for (index, step) in steps.enumerated() {
@@ -78,7 +82,7 @@ extension ControlHandler {
             out["failedStep"] = .int(Int64(failure.step))
             out["error"] = .string(failure.message)
         }
-        if let before { out["observation"] = try await observation(t, after: "vm.batch", before: before, options) }
+        if let before { try await addObservation(to: &out, t, after: "vm.batch", before: before, options) }
         return .object(out)
     }
 
@@ -87,8 +91,8 @@ extension ControlHandler {
         let params: [String: JSON]
     }
 
-    /// The validated `steps` parameter; step numbers in errors count from 0.
-    private nonisolated func batchSteps(_ params: JSON) throws -> [BatchStep] {
+    /// The validated `steps` parameter of a batch for `vm`; step numbers in errors count from 0.
+    private nonisolated func batchSteps(_ params: JSON, vm: String) throws -> [BatchStep] {
         guard let list = params["steps"]?.arrayValue else { throw ControlError.missing("steps") }
         guard !list.isEmpty else { throw ControlError.failed("steps is empty; pass at least one step") }
         guard list.count <= ControlHandler.maxBatchSteps else {
@@ -101,6 +105,9 @@ extension ControlHandler {
             }
             guard ControlHandler.actionOps.contains(op) || ControlHandler.batchOnlyStepOps.contains(op) else {
                 throw ControlError.failed("step \(index): '\(op)' cannot run in a batch")
+            }
+            if let name = fields["name"], name.stringValue != vm {
+                throw ControlError.failed("step \(index): 'name' must not differ from the batch's VM")
             }
             if op == "sleep" {
                 guard let ms = fields["ms"]?.intValue, (1...10000).contains(ms) else {
@@ -124,18 +131,34 @@ extension ControlHandler {
         return try await perform(op: step.op, params: .object(params))
     }
 
-    /// The JSON observation of the screen settling after `op`, compared with `before`.
-    private func observation(_ t: VMTarget, after op: String, before: Frame, _ options: ObserveOptions) async throws -> JSON {
-        let result: Observation
+    /// The current frame of `t`, read before `op` sends any input.
+    private func frame(of t: VMTarget, before op: String) async throws -> Frame {
+        let frame: Frame
         do {
-            result = try await observe(t, before: before, level: options.level, settleMs: options.settleMs, settleTimeoutMs: options.settleTimeoutMs)
+            frame = try await t.frame()
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw ControlError.failed("the screen could not be read after \(op): \(error); call vm.screenshot to see the result")
+            throw ControlError.failed("the screen could not be read before \(op), so no input was sent: \(error)")
         }
-        lastSize[t.name] = (result.width, result.height)
-        return result.json()
+        lastSize[t.name] = (frame.width, frame.height)
+        return frame
+    }
+
+    /// Waits for the screen to settle after `op` and sets `observation` in `out`, or `observationError`
+    /// when a frame cannot be read. Cancellation is thrown.
+    private func addObservation(to out: inout [String: JSON], _ t: VMTarget, after op: String, before: Frame,
+                                _ options: ObserveOptions) async throws {
+        do {
+            let result = try await observe(t, before: before, level: options.level, settleMs: options.settleMs,
+                                           settleTimeoutMs: options.settleTimeoutMs)
+            lastSize[t.name] = (result.width, result.height)
+            out["observation"] = result.json()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            out["observationError"] = .string("the screen could not be read after \(op): \(error); call vm.screenshot to see the result")
+        }
     }
 
     /// Sends the display messages of one action op to `t`.
