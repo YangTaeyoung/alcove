@@ -21,10 +21,12 @@ let package = Package(
         .target(name: "AlcoveEngine", dependencies: ["AlcoveDisplayProtocol", "AlcoveQMP"]),
         // Host side of the guest agent protocol (docs/agent-protocol.md).
         .target(name: "AlcoveAgent", dependencies: ["AlcoveQMP"]),
-        .testTarget(name: "AlcoveAgentTests", dependencies: ["AlcoveAgent"]),
+        // Fakes shared by the test targets.
+        .target(name: "AlcoveTestSupport", dependencies: ["AlcoveQMP"], path: "Tests/AlcoveTestSupport"),
+        .testTarget(name: "AlcoveAgentTests", dependencies: ["AlcoveAgent", "AlcoveTestSupport"]),
         // Automation API over a unix socket (docs/control-protocol.md): screenshots, input, exec.
         .target(name: "AlcoveControl", dependencies: ["AlcoveEngine", "AlcoveAgent", "AlcoveDisplayProtocol", "AlcoveQMP"]),
-        .testTarget(name: "AlcoveControlTests", dependencies: ["AlcoveControl"]),
+        .testTarget(name: "AlcoveControlTests", dependencies: ["AlcoveControl", "AlcoveTestSupport"]),
         // Command-line front end used by scripts and the test harness.
         .executableTarget(name: "alcovectl", dependencies: ["AlcoveEngine", "AlcoveDisplayProtocol", "AlcoveControl", "AlcoveAgent"]),
         .testTarget(name: "AlcoveDisplayProtocolTests", dependencies: ["AlcoveDisplayProtocol"]),

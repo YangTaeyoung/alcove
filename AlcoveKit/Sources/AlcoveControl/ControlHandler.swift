@@ -14,6 +14,8 @@ public actor ControlHandler {
         case noDisplay(String)
         case noTools(String)
         case untypable(String)
+        case oneOf(String, String)
+        case toolsTooOld(vm: String, op: String)
         case failed(String)
 
         public var description: String {
@@ -25,6 +27,8 @@ public actor ControlHandler {
             case .noDisplay(let n): return "VM '\(n)' has no display connection (start it first)"
             case .noTools(let n): return "guest tools are not connected in '\(n)'; install alcove-agent in the guest"
             case .untypable(let s): return "cannot type \(s) with the US keyboard layout; use vm.clipboard.set + ctrl+v or connect guest tools"
+            case .oneOf(let a, let b): return "missing parameter; pass '\(a)' or '\(b)'"
+            case .toolsTooOld(let vm, let op): return "guest tools in '\(vm)' are too old for \(op); update alcove-agent in the guest"
             case .failed(let m): return m
             }
         }
@@ -34,13 +38,33 @@ public actor ControlHandler {
     public let hostKind: String
     /// Guest frame size per VM from the latest screenshot (for coordinate scaling).
     private var lastSize: [String: (Int, Int)] = [:]
+    private let inputGate = InputGate()
 
     public init(registry: VMRegistry, hostKind: String) {
         self.registry = registry
         self.hostKind = hostKind
     }
 
+    /// Whether `op` runs outside the per-connection request order.
+    public static func isConcurrent(op: String) -> Bool {
+        op.hasPrefix("vm.exec") || op.hasPrefix("vm.process.") || op.hasPrefix("vm.fs.")
+            || op == "vm.push_file" || op == "vm.pull_file" || op == "vm.sync_dir"
+    }
+
+    /// Whether `op` sends mouse or keyboard input to a guest.
+    static func isInput(op: String) -> Bool {
+        op.hasPrefix("vm.mouse.") || op.hasPrefix("vm.key.") || op == "vm.type"
+    }
+
+    /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
     public func handle(op: String, params: JSON) async throws -> JSON {
+        if ControlHandler.isInput(op: op), let vm = params["name"]?.stringValue {
+            return try await inputGate.withLock(vm) { try await self.perform(op: op, params: params) }
+        }
+        return try await perform(op: op, params: params)
+    }
+
+    private func perform(op: String, params: JSON) async throws -> JSON {
         switch op {
         case "hello":
             return ["version": 1, "host": .string(hostKind)]
@@ -152,17 +176,9 @@ public actor ControlHandler {
                 try await sendKeys(t, try KeyNames.pressSequence("ctrl+v"), gap: 20, holdBeforeRelease: 0)
             }
             return [:]
-        case "vm.exec":
-            let t = try await running(params)
-            guard let cmd = params["command"]?.stringValue else { throw ControlError.missing("command") }
-            let agent = try await tools(t)
-            let timeout = Duration.seconds(params["timeout"]?.intValue ?? 120)
-            do {
-                let r = try await agent.exec(cmd, timeout: timeout)
-                return ["code": .int(Int64(r.code)), "output": .string(r.output)]
-            } catch {
-                throw ControlError.failed("exec failed: \(error)")
-            }
+        case "vm.exec", "vm.exec.start", "vm.exec.read", "vm.exec.write", "vm.exec.kill", "vm.exec.list",
+             "vm.process.list", "vm.process.kill":
+            return try await shell(op: op, params: params)
         case "vm.clipboard.get":
             let t = try await running(params)
             let agent = try await tools(t)
@@ -172,14 +188,8 @@ public actor ControlHandler {
             guard let text = params["text"]?.stringValue else { throw ControlError.missing("text") }
             await (try await tools(t)).setClipboard(text: text)
             return [:]
-        case "vm.push_file":
-            let t = try await running(params)
-            guard let path = params["path"]?.stringValue else { throw ControlError.missing("path") }
-            let dest: AgentClient.Destination = params["dest"]?.stringValue == "downloads" ? .downloads : .desktop
-            do {
-                let guestPath = try await (try await tools(t)).pushFile(URL(fileURLWithPath: path), to: dest)
-                return ["guestPath": .string(guestPath)]
-            } catch { throw ControlError.failed("push failed: \(error)") }
+        case "vm.push_file", "vm.pull_file", "vm.sync_dir", "vm.fs.list", "vm.fs.read", "vm.fs.write", "vm.fs.delete":
+            return try await files(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of thumbnail pixels changing between samples
@@ -212,7 +222,7 @@ public actor ControlHandler {
         return t
     }
 
-    private func running(_ params: JSON) async throws -> VMTarget {
+    func running(_ params: JSON) async throws -> VMTarget {
         let t = try await target(params)
         let st = await t.state()
         guard st == .running || st == .paused else { throw ControlError.notRunning(t.name, st) }
@@ -220,9 +230,28 @@ public actor ControlHandler {
     }
 
     /// The guest agent; waits a while because the guest may still be logging in.
-    private func tools(_ t: VMTarget) async throws -> AgentClient {
+    func tools(_ t: VMTarget) async throws -> AgentClient {
         guard let a = await t.agent(timeout: .seconds(25)) else { throw ControlError.noTools(t.name) }
         return a
+    }
+
+    /// The control error for a failure of `op` against the agent of `vm`.
+    nonisolated func agentFailure(_ error: Error, vm: String, op: String) -> ControlError {
+        switch error {
+        case let e as ControlError: return e
+        case AgentClient.AgentError.unsupported: return .toolsTooOld(vm: vm, op: op)
+        case AgentClient.AgentError.remote(let message): return .failed(message)
+        case AgentClient.AgentError.timeout: return .failed("guest tools in '\(vm)' did not answer \(op) in time; check vm.status and retry")
+        case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected:
+            return .failed("guest tools in '\(vm)' disconnected during \(op); retry once the guest is back")
+        default: return .failed("\(op) failed: \(error)")
+        }
+    }
+
+    /// The string parameter `key`.
+    nonisolated func string(_ params: JSON, _ key: String) throws -> String {
+        guard let v = params[key]?.stringValue else { throw ControlError.missing(key) }
+        return v
     }
 
     private func int(_ params: JSON, _ key: String) throws -> Int {

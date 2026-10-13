@@ -5,7 +5,7 @@ import AlcoveAgent
 import AlcoveQMP
 import AlcoveDisplayProtocol
 
-/// A scripted VM: records display messages, serves a fixed PNG, no agent.
+/// A scripted VM: records display messages, serves a fixed PNG, and hands out the agent set with `setAgent`.
 actor FakeTarget: VMTarget {
     nonisolated let name: String
     var stateValue: VMController.State
@@ -13,6 +13,8 @@ actor FakeTarget: VMTarget {
     var png: Data
     var agentClient: AgentClient?
     var startCount = 0, stopCount = 0
+    var agentWait: Duration = .zero
+    var agentWaits = 0, cancelledAgentWaits = 0
 
     init(name: String, state: VMController.State, png: Data) { self.name = name; self.stateValue = state; self.png = png }
     func guestOS() async -> VMConfig.GuestOS { .windows }
@@ -24,7 +26,16 @@ actor FakeTarget: VMTarget {
     func resume() async throws { stateValue = .running }
     func screenshotPNG() async throws -> Data { png }
     @discardableResult func sendDisplay(_ message: ToQEMU) async -> Bool { sent.append(message); return true }
-    func agent(timeout: Duration) async -> AgentClient? { agentClient }
+    func agent(timeout: Duration) async -> AgentClient? {
+        if agentWait > .zero {
+            agentWaits += 1
+            try? await Task.sleep(for: agentWait)
+            if Task.isCancelled { cancelledAgentWaits += 1 }
+        }
+        return agentClient
+    }
+    func setAgent(_ a: AgentClient?) { agentClient = a }
+    func setAgentWait(_ d: Duration) { agentWait = d }
     func setPNG(_ d: Data) { png = d }
     func setState(_ s: VMController.State) { stateValue = s }
 }

@@ -3,7 +3,10 @@ import AlcoveQMP
 
 /// Unix-socket server for the control protocol: newline-delimited JSON
 /// requests `{"id", "op", ...}` answered with `{"id", "ok", ...}`.
-/// Multiple clients; requests on one connection run sequentially.
+/// Multiple clients. Each connection has two lanes: operations for which
+/// `ControlHandler.isConcurrent` is true start at once in their own task and
+/// answer when they finish; all other operations run one after another in the
+/// order they arrived. Closing a connection cancels its tasks.
 public final class ControlServer: @unchecked Sendable {
     public enum ServerError: Error, Equatable { case socket(errno: Int32), bind(path: String, errno: Int32), listen(errno: Int32), pathTooLong(String) }
 
@@ -17,13 +20,23 @@ public final class ControlServer: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var listenSource: DispatchSourceRead?
     private var clients: [Int32: Client] = [:]
+    private var nextTaskID = 0
 
     private final class Client {
         let fd: Int32
         var source: DispatchSourceRead?
         var pending = Data()
+        /// The newest task of the serial lane.
         var task: Task<Void, Never>?
+        /// The running tasks of the concurrent lane by server-wide task id.
+        var concurrent: [Int: Task<Void, Never>] = [:]
         init(fd: Int32) { self.fd = fd }
+
+        func cancelTasks() {
+            task?.cancel()
+            for (_, t) in concurrent { t.cancel() }
+            concurrent.removeAll()
+        }
     }
 
     public init(handler: ControlHandler, socketPath: String = ControlServer.defaultSocketPath) {
@@ -66,16 +79,19 @@ public final class ControlServer: @unchecked Sendable {
     }
 
     public func stop() {
-        queue.sync {
-            listenSource?.cancel(); listenSource = nil
-            if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1 }
-            for (_, c) in clients { c.source?.cancel(); c.task?.cancel(); Darwin.close(c.fd) }
-            clients.removeAll()
-            unlink(socketPath)
-        }
+        queue.sync { shutDown() }
     }
 
-    deinit { stop() }
+    deinit { shutDown() }
+
+    /// Closes the listener and every connection, cancels their tasks and removes the socket file.
+    private func shutDown() {
+        listenSource?.cancel(); listenSource = nil
+        if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1 }
+        for (_, c) in clients { c.source?.cancel(); c.cancelTasks(); Darwin.close(c.fd) }
+        clients.removeAll()
+        unlink(socketPath)
+    }
 
     private func acceptClients() {
         while true {
@@ -113,16 +129,35 @@ public final class ControlServer: @unchecked Sendable {
         }
     }
 
-    /// Requests on one connection are serialized by chaining tasks.
+    /// Starts a concurrent operation in its own tracked task; chains any other request behind the connection's previous serial task.
     private func enqueue(_ line: Data, for client: Client) {
-        let previous = client.task
         let fd = client.fd
         let handler = self.handler
+        if let op = (try? JSON.parse(line))?["op"]?.stringValue, ControlHandler.isConcurrent(op: op) {
+            let id = nextTaskID
+            nextTaskID += 1
+            client.concurrent[id] = Task { [weak self] in
+                let reply = await ControlServer.process(line, handler: handler)
+                self?.write(reply, to: fd)
+                self?.forgetConcurrentTask(id, of: fd)
+            }
+            return
+        }
+        let previous = client.task
         client.task = Task { [weak self] in
             await previous?.value
             let reply = await ControlServer.process(line, handler: handler)
             self?.write(reply, to: fd)
         }
+    }
+
+    private func forgetConcurrentTask(_ id: Int, of fd: Int32) {
+        queue.async { [self] in clients[fd]?.concurrent[id] = nil }
+    }
+
+    /// The number of concurrent-lane tasks that are still tracked, over all connections.
+    func concurrentTaskCount() -> Int {
+        queue.sync { clients.values.reduce(0) { $0 + $1.concurrent.count } }
     }
 
     static func process(_ line: Data, handler: ControlHandler) async -> Data {
@@ -167,7 +202,7 @@ public final class ControlServer: @unchecked Sendable {
 
     private func closeClient(_ client: Client) {
         client.source?.cancel(); client.source = nil
-        client.task?.cancel()
+        client.cancelTasks()
         Darwin.close(client.fd)
         clients[client.fd] = nil
     }

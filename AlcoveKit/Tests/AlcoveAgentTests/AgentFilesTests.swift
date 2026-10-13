@@ -1,6 +1,7 @@
 import XCTest
 @testable import AlcoveAgent
 import AlcoveQMP
+import AlcoveTestSupport
 
 final class AgentFilesTests: XCTestCase {
     private func randomData(_ count: Int) -> Data {
