@@ -12,6 +12,7 @@ public actor AgentClient {
         case notConnected
         case timeout(String)
         case remote(String)
+        case unsupported(String)
     }
 
     public struct Hello: Sendable, Equatable {
@@ -19,11 +20,13 @@ public actor AgentClient {
         public let os: String
         public let agentVersion: String
         public let capabilities: [String]
+        public let rpcVersion: Int
     }
 
     public enum Event: Sendable, Equatable {
         case clipboardChanged(text: String)
         case resolution(width: Int, height: Int)
+        case agent(name: String, payload: JSON)
         case disconnected
     }
 
@@ -31,6 +34,8 @@ public actor AgentClient {
     private let eventContinuation: AsyncStream<Event>.Continuation
     private var transport: TCPLineTransport?
     private var helloWaiter: CheckedContinuation<JSON, Error>?
+    private var pendingCalls: [Int: CheckedContinuation<JSON, Error>] = [:]
+    private var nextCallID = 1
     private var waiters: [String: [CheckedContinuation<JSON, Error>]] = [:]
     public private(set) var hello: Hello?
     public private(set) var isConnected = false
@@ -77,7 +82,8 @@ public actor AgentClient {
             throw AgentError.tokenMismatch
         }
         hello = Hello(version: 1, os: h["os"]?.stringValue ?? "?", agentVersion: h["agent"]?.stringValue ?? "?",
-                      capabilities: h["caps"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+                      capabilities: h["caps"]?.arrayValue?.compactMap(\.stringValue) ?? [],
+                      rpcVersion: h["proto"]?.intValue ?? 1)
         send(["t": "welcome", "v": 1])
         isConnected = true
     }
@@ -135,6 +141,32 @@ public actor AgentClient {
         return r["path"]?.stringValue ?? ""
     }
 
+    /// Send `{"t":"req","id":n,"op":op, ...params}` and return the matching `res` object.
+    /// Throws `.remote` on `ok:false` and `.unsupported` when the agent has no RPC layer.
+    public func call(_ op: String, _ params: [String: JSON] = [:], timeout: Duration = .seconds(30)) async throws -> JSON {
+        guard transport != nil else { throw AgentError.notConnected }
+        guard (hello?.rpcVersion ?? 1) >= 2 else { throw AgentError.unsupported(op) }
+        let id = nextCallID
+        nextCallID += 1
+        let timeoutTask = Task { [weak self] in
+            do { try await Task.sleep(for: timeout) } catch { return }
+            await self?.timeOutCall(id: id, op: op)
+        }
+        defer { timeoutTask.cancel() }
+        let res = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<JSON, Error>) in
+            pendingCalls[id] = cont
+            var message = params
+            message["t"] = "req"
+            message["id"] = .int(Int64(id))
+            message["op"] = .string(op)
+            send(.object(message))
+        }
+        if res["ok"]?.boolValue == false {
+            throw AgentError.remote(res["error"]?.stringValue ?? "request '\(op)' failed")
+        }
+        return res
+    }
+
     // MARK: - internals
 
     private func send(_ message: JSON) {
@@ -170,6 +202,10 @@ public actor AgentClient {
             eventContinuation.yield(.clipboardChanged(text: m["text"]?.stringValue ?? ""))
         case "resolution":
             eventContinuation.yield(.resolution(width: m["w"]?.intValue ?? 0, height: m["h"]?.intValue ?? 0))
+        case "res":
+            if let id = m["id"]?.intValue, let c = pendingCalls.removeValue(forKey: id) { c.resume(returning: m) }
+        case "ev":
+            eventContinuation.yield(.agent(name: m["name"]?.stringValue ?? "", payload: m))
         default:
             let idKey = m["id"]?.stringValue.map { "\(t)#\($0)" }
             if let idKey, var list = waiters[idKey], !list.isEmpty {
@@ -186,11 +222,18 @@ public actor AgentClient {
         if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: AgentError.disconnected) }
         for (_, list) in waiters { for c in list { c.resume(throwing: AgentError.disconnected) } }
         waiters.removeAll()
+        let calls = pendingCalls
+        pendingCalls.removeAll()
+        for (_, c) in calls { c.resume(throwing: AgentError.disconnected) }
         eventContinuation.yield(.disconnected)
     }
 
     private func failHello(_ error: AgentError) {
         if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: error) }
+    }
+
+    private func timeOutCall(id: Int, op: String) {
+        if let c = pendingCalls.removeValue(forKey: id) { c.resume(throwing: AgentError.timeout(op)) }
     }
 
     private func timeOut(key: String, type: String) {

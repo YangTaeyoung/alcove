@@ -3,13 +3,14 @@ import XCTest
 import AlcoveQMP
 
 /// A scripted stand-in for the Go agent: TCP server sending hello and replying per handler.
-private final class FakeAgent: @unchecked Sendable {
+final class FakeAgent: @unchecked Sendable {
     let port: Int
     private let listenFD: Int32
     private var clientFD: Int32 = -1
     private let lock = NSLock()
     private(set) var received: [JSON] = []
     var token = "tok"
+    var proto: Int? = 2
     var handler: (@Sendable (JSON, FakeAgent) -> [JSON])?
 
     init() {
@@ -31,7 +32,9 @@ private final class FakeAgent: @unchecked Sendable {
         let fd = accept(listenFD, nil, nil)
         guard fd >= 0 else { return }
         lock.lock(); clientFD = fd; lock.unlock()
-        sendLine(["t": "hello", "v": 1, "os": "windows", "agent": "0.1.0", "token": .string(token), "caps": ["clipboard", "files", "exec"]])
+        var hello: JSON = ["t": "hello", "v": 1, "os": "windows", "agent": "0.1.0", "token": .string(token), "caps": ["clipboard", "files", "exec"]]
+        if let proto, case .object(var o) = hello { o["proto"] = .int(Int64(proto)); hello = .object(o) }
+        sendLine(hello)
         var pending = Data(); var buf = [UInt8](repeating: 0, count: 65536)
         while true {
             let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
@@ -53,8 +56,105 @@ private final class FakeAgent: @unchecked Sendable {
         _ = d.withUnsafeBytes { write(clientFD, $0.baseAddress, $0.count) }
     }
 
+    func receivedCount() -> Int { lock.lock(); defer { lock.unlock() }; return received.count }
     func drop() { lock.lock(); if clientFD >= 0 { Darwin.close(clientFD); clientFD = -1 }; lock.unlock() }
     func stop() { drop(); Darwin.close(listenFD) }
+}
+
+/// A value guarded by a lock, shared between test code and the fake agent thread.
+final class LockedBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: T
+    init(_ value: T) { stored = value }
+    var value: T {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
+}
+
+/// In-memory guest file system answering the `fs.*` requests of the agent contract.
+final class FakeFS: @unchecked Sendable {
+    private let lock = NSLock()
+    private var store: [String: Data] = [:]
+    private var writtenPaths: [String] = []
+    var corruptWrites = false
+
+    subscript(path: String) -> Data? {
+        get { lock.lock(); defer { lock.unlock() }; return store[path] }
+        set { lock.lock(); defer { lock.unlock() }; store[path] = newValue }
+    }
+
+    func paths() -> [String] { lock.lock(); defer { lock.unlock() }; return store.keys.sorted() }
+    func written() -> [String] { lock.lock(); defer { lock.unlock() }; return writtenPaths }
+
+    func install(on agent: FakeAgent) {
+        agent.handler = { [self] m, _ in
+            guard m["t"]?.stringValue == "req" else { return [] }
+            return [handle(m)]
+        }
+    }
+
+    private static func separator(for path: String) -> String { path.contains("\\") ? "\\" : "/" }
+
+    private func reply(_ m: JSON, _ fields: [String: JSON]) -> JSON {
+        var o = fields; o["t"] = "res"; o["id"] = m["id"] ?? .null; o["ok"] = true
+        return .object(o)
+    }
+
+    private func fail(_ m: JSON, _ text: String) -> JSON { ["t": "res", "id": m["id"] ?? .null, "ok": false, "error": .string(text)] }
+
+    private func handle(_ m: JSON) -> JSON {
+        lock.lock(); defer { lock.unlock() }
+        let path = m["path"]?.stringValue ?? ""
+        switch m["op"]?.stringValue {
+        case "fs.stat":
+            let sep = Self.separator(for: path)
+            if let data = store[path] {
+                var f: [String: JSON] = ["exists": true, "dir": false, "size": .int(Int64(data.count)), "path": .string(path)]
+                if m["sha256"]?.boolValue == true { f["sha256"] = .string(SHA256Digest.hex(of: data)) }
+                return reply(m, f)
+            }
+            if store.keys.contains(where: { $0.hasPrefix(path + sep) }) { return reply(m, ["exists": true, "dir": true, "size": 0, "path": .string(path)]) }
+            return reply(m, ["exists": false])
+        case "fs.list":
+            let sep = Self.separator(for: path)
+            let prefix = path + sep
+            let found = store.filter { $0.key.hasPrefix(prefix) }
+            if found.isEmpty { return fail(m, "'\(path)' does not exist") }
+            let entries: [JSON] = found.keys.sorted().map { key in
+                let name = String(key.dropFirst(prefix.count)).replacingOccurrences(of: sep, with: "/")
+                let data = found[key]!
+                return ["name": .string(name), "dir": false, "size": .int(Int64(data.count)), "mtime": "2026-01-01T00:00:00Z", "sha256": .string(SHA256Digest.hex(of: data))]
+            }
+            return reply(m, ["entries": .array(entries), "truncated": false])
+        case "fs.read":
+            guard let data = store[path] else { return fail(m, "'\(path)' does not exist") }
+            let offset = min(m["offset"]?.intValue ?? 0, data.count)
+            let end = min(offset + (m["length"]?.intValue ?? 262144), data.count)
+            return reply(m, ["data": .string(data[offset..<end].base64EncodedString()), "size": .int(Int64(data.count)), "eof": .bool(end >= data.count)])
+        case "fs.write":
+            var piece = Data(base64Encoded: m["data"]?.stringValue ?? "") ?? Data()
+            if corruptWrites, !piece.isEmpty { piece[piece.startIndex] ^= 0xFF }
+            var data = m["truncate"]?.boolValue == true ? Data() : (store[path] ?? Data())
+            let offset = m["offset"]?.intValue ?? 0
+            if data.count < offset { data.append(Data(count: offset - data.count)) }
+            data.replaceSubrange(offset..<min(offset + piece.count, data.count), with: piece)
+            store[path] = data
+            writtenPaths.append(path)
+            return reply(m, ["size": .int(Int64(data.count))])
+        case "fs.rename":
+            let from = m["from"]?.stringValue ?? "", to = m["to"]?.stringValue ?? ""
+            guard let data = store[from] else { return fail(m, "'\(from)' does not exist") }
+            if store[to] != nil, m["overwrite"]?.boolValue != true { return fail(m, "'\(to)' exists; pass overwrite") }
+            store[to] = data; store[from] = nil
+            return reply(m, ["path": .string(to)])
+        case "fs.delete":
+            let existed = store.removeValue(forKey: path) != nil
+            return reply(m, ["deleted": .bool(existed)])
+        default:
+            return fail(m, "unknown op '\(m["op"]?.stringValue ?? "")'; update alcove-agent")
+        }
+    }
 }
 
 final class AgentClientTests: XCTestCase {
@@ -128,5 +228,99 @@ final class AgentClientTests: XCTestCase {
         let client = AgentClient()
         do { try await client.connect(port: 1, expectedToken: nil); XCTFail("expected connect error") }
         catch AgentClient.AgentError.connect {}
+    }
+
+    func testCallRoundTrip() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true, "pong": true]] : [] }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let r = try await client.call("ping")
+        XCTAssertEqual(r["pong"]?.boolValue, true)
+        let req = agent.received.first { $0["t"]?.stringValue == "req" }
+        XCTAssertNotNil(req?["id"]?.intValue)
+        XCTAssertEqual(req?["op"]?.stringValue, "ping")
+        let hello = await client.hello
+        XCTAssertEqual(hello?.rpcVersion, 2)
+    }
+
+    func testCallsAreMatchedByID() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let first = LockedBox<JSON?>(nil)
+        agent.handler = { m, _ in
+            guard m["t"]?.stringValue == "req" else { return [] }
+            if let earlier = first.value {
+                return [["t": "res", "id": m["id"] ?? .null, "ok": true, "who": m["op"] ?? .null],
+                        ["t": "res", "id": earlier["id"] ?? .null, "ok": true, "who": earlier["op"] ?? .null]]
+            }
+            first.value = m
+            return []
+        }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let a = Task { try await client.call("alpha") }
+        while agent.receivedCount() < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        let b = Task { try await client.call("beta") }
+        let (ra, rb) = try await (a.value, b.value)
+        XCTAssertEqual(ra["who"]?.stringValue, "alpha")
+        XCTAssertEqual(rb["who"]?.stringValue, "beta")
+    }
+
+    func testCallRemoteError() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "boom"]] : [] }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        do { _ = try await client.call("ping"); XCTFail("expected remote error") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, "boom") }
+    }
+
+    func testCallUnsupportedOnV1Agent() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.proto = nil
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let hello = await client.hello
+        XCTAssertEqual(hello?.rpcVersion, 1)
+        do { _ = try await client.call("ping"); XCTFail("expected unsupported") }
+        catch AgentClient.AgentError.unsupported(let op) { XCTAssertEqual(op, "ping") }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "req" })
+    }
+
+    func testCallTimeout() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        do { _ = try await client.call("ping", timeout: .milliseconds(150)); XCTFail("expected timeout") }
+        catch AgentClient.AgentError.timeout(let op) { XCTAssertEqual(op, "ping") }
+        let req = agent.received.first { $0["t"]?.stringValue == "req" }
+        agent.sendLine(["t": "res", "id": req?["id"] ?? .null, "ok": true])
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true, "n": 2]] : [] }
+        let next = try await client.call("again")
+        XCTAssertEqual(next["n"]?.intValue, 2)
+    }
+
+    func testDisconnectFailsPendingCalls() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let pending = Task { try await client.call("ping", timeout: .seconds(10)) }
+        while agent.receivedCount() < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        agent.drop()
+        do { _ = try await pending.value; XCTFail("expected disconnect") } catch AgentClient.AgentError.disconnected {}
+    }
+
+    func testAgentEvent() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        agent.sendLine(["t": "ev", "name": "job.exited", "job": "j1", "code": 0])
+        var it = client.events.makeAsyncIterator()
+        let e = await it.next()
+        guard case .agent(let name, let payload)? = e else { return XCTFail("expected agent event, got \(String(describing: e))") }
+        XCTAssertEqual(name, "job.exited")
+        XCTAssertEqual(payload["job"]?.stringValue, "j1")
+        XCTAssertEqual(payload["code"]?.intValue, 0)
     }
 }
