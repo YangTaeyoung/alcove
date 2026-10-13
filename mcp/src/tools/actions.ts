@@ -2,7 +2,7 @@
 // condition waits and batches.
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
-import { actionResult, actionTimeout, observeParams, observePayload, type ObserveArgs } from "../observation.js";
+import { actionResult, actionTimeout, batchResult, observeParams, observePayload, waitForResult, type ObserveArgs } from "../observation.js";
 import { fail, text, vmName, type Registrar } from "../toolkit.js";
 
 const buttonEnum = z.enum(["left", "right", "middle"]);
@@ -139,7 +139,7 @@ export function register(r: Registrar, client: ControlClient): void {
         "Wait until one of several conditions becomes true, or the timeout passes. Each condition is an object with a `type` and its fields: " +
         "screen_idle {seconds}, region_changed {region}, text_visible {text, regex?, region?}, text_gone {text, regex?, region?}, " +
         "process_started {process_name}, process_exited {pid | process_name}, file_exists {path}, port_listening {port}, " +
-        "log_matches {path, pattern}, job_output_matches {job, pattern}. Returns the index and type of the first true condition; running out of time is not an error.",
+        "log_matches {path, pattern}, job_output_matches {job, pattern}. Condition indices are 0-based. Returns the index and type of the first true condition; running out of time is not an error.",
       inputSchema: {
         name: vmName,
         conditions: z.array(z.object({ type: z.string() }).passthrough()).min(1).max(8),
@@ -157,16 +157,7 @@ export function register(r: Registrar, client: ControlClient): void {
           timeout,
           ...observePayload(a as ObserveArgs, "none"),
         }, (timeout + 30) * 1000);
-        const matched = Number(reply.matched ?? -1);
-        let line: string;
-        if (matched < 0) {
-          line = `no condition matched within ${timeout} s`;
-        } else {
-          const d = reply.detail;
-          const detail = d === undefined || d === null ? "" : `: ${typeof d === "string" ? d : JSON.stringify(d)}`;
-          line = `matched condition ${matched} (${reply.type ?? "?"}) after ${reply.waited} s${detail}`;
-        }
-        return actionResult(line, reply, a.settle_timeout_ms);
+        return waitForResult(reply, timeout, a.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }
@@ -178,7 +169,7 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Run several actions in one call",
       description:
-        "Run a sequence of input steps against one VM without interruption from other callers, then report the screen once. Each step is an object with `op` (click, move, drag, scroll, type, press_keys, mouse_down, mouse_up, key_down, key_up, wait_idle, wait_for, sleep) and that tool's parameters without `name`; sleep takes `ms` (1-10000). Stops at the first failing step. At most 50 steps.",
+        "Run a sequence of input steps against one VM without interruption from other callers, then report the screen once. Each step is an object with `op` (click, move, drag, scroll, type, press_keys, mouse_down, mouse_up, key_down, key_up, wait_idle, wait_for, sleep) and that tool's parameters without `name`; sleep takes `ms` (1-10000). Step indices in the result and in errors are 0-based. Stops at the first failing step. At most 50 steps.",
       inputSchema: {
         name: vmName,
         steps: z.array(z.object({ op: z.string() }).passthrough()).min(1).max(50),
@@ -191,13 +182,7 @@ export function register(r: Registrar, client: ControlClient): void {
         const sent = a.steps as Array<Record<string, unknown>>;
         const steps = sent.map((s, i) => mapBatchStep(s, i));
         const reply = await client.call("vm.batch", { name: a.name, steps, ...observePayload(a as ObserveArgs, "summary") }, 600000);
-        const failedStep = typeof reply.failedStep === "number" ? reply.failedStep : undefined;
-        const done = Number(reply.completed ?? (reply.results as unknown[] | undefined)?.length ?? 0);
-        const lines: string[] = [];
-        for (let i = 0; i < done && i < sent.length; i++) lines.push(`ok ${i} ${sent[i].op}`);
-        if (failedStep !== undefined) lines.push(`FAILED ${failedStep} ${sent[failedStep]?.op}: ${reply.error ?? "step failed"}`);
-        const result = actionResult(lines.join("\n"), reply, a.settle_timeout_ms);
-        return failedStep !== undefined ? { ...result, isError: true } : result;
+        return batchResult(sent, reply, a.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }

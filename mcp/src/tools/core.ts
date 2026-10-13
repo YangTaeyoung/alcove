@@ -1,7 +1,7 @@
 // The core toolset: VM lifecycle, screen, pointer, keyboard, clipboard, exec and file push.
 import { z } from "zod";
 import type { ControlClient } from "../control.js";
-import { actionResult, actionTimeout, observeParams, observePayload, type ObserveArgs } from "../observation.js";
+import { actionResult, actionTimeout, observeParams, observePayload, screenshotCaption, type ObserveArgs } from "../observation.js";
 import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, type Registrar } from "../toolkit.js";
 
 export function register(r: Registrar, client: ControlClient): void {
@@ -124,11 +124,9 @@ export function register(r: Registrar, client: ControlClient): void {
           ...(quality !== undefined ? { quality } : {}),
         }, 60000);
         const jpeg = typeof r.jpeg === "string";
-        const origin = `(${r.x ?? 0}, ${r.y ?? 0})`;
-        const imgScale = Math.round(Number(r.scale ?? 1) * 1000) / 1000;
         return {
           content: [
-            { type: "text", text: `${name}: guest frame ${r.width}x${r.height}; image ${r.sentWidth}x${r.sentHeight} with origin ${origin} and scale ${imgScale}; guest = origin + image_pixel / scale` },
+            { type: "text", text: screenshotCaption(name, r) },
             jpeg ? { type: "image", data: r.jpeg as string, mimeType: "image/jpeg" } : { type: "image", data: r.png as string, mimeType: "image/png" },
           ],
         };

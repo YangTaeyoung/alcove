@@ -12,6 +12,27 @@ export const DEFAULT_SETTLE_TIMEOUT_MS = 2000;
 
 type Rect = { x: number; y: number; w: number; h: number };
 
+/** An image scale with four decimals. */
+export function formatScale(scale: unknown): string {
+  return String(Math.round(Number(scale ?? 1) * 10000) / 10000);
+}
+
+/** A string as is, any other present value as compact JSON, nothing for an absent or empty one. */
+function field(v: unknown): string | undefined {
+  if (v === undefined || v === null || v === "") return undefined;
+  return typeof v === "string" ? v : JSON.stringify(v);
+}
+
+/** The text part of an `alcove_screenshot` result. */
+export function screenshotCaption(name: string, r: Record<string, unknown>): string {
+  const x = Number(r.x ?? 0), y = Number(r.y ?? 0);
+  const scale = Number(r.scale ?? 1) || 1;
+  const sentWidth = Number(r.sentWidth), sentHeight = Number(r.sentHeight);
+  let w = Math.round(sentWidth / scale), h = Math.round(sentHeight / scale);
+  if (x === 0 && y === 0 && w === Number(r.width)) h = Number(r.height);
+  return `${name}: guest frame ${r.width}x${r.height}; image ${sentWidth}x${sentHeight} shows guest (${x},${y}) ${w}x${h} at scale ${formatScale(scale)}; guest = origin + image_pixel / scale`;
+}
+
 /** Text and optional image content for an observation object from the control protocol. */
 export function renderObservation(o: Record<string, unknown> | undefined, settleTimeoutMs = DEFAULT_SETTLE_TIMEOUT_MS): Array<TextContent | ImageContent> {
   if (!o) return [];
@@ -27,13 +48,16 @@ export function renderObservation(o: Record<string, unknown> | undefined, settle
   const png = typeof o.png === "string" ? o.png : undefined;
   const rect = o.imageRect as Rect | undefined;
   if (png && rect) {
-    const scale = Math.round(Number(o.imageScale ?? 1) * 1000) / 1000;
-    lines.push(`image shows guest (${rect.x},${rect.y}) ${rect.w}x${rect.h} at scale ${scale}`);
+    lines.push(`image shows guest (${rect.x},${rect.y}) ${rect.w}x${rect.h} at scale ${formatScale(o.imageScale)}`);
   }
-  if (typeof o.foreground === "string" && o.foreground) lines.push(`foreground: ${o.foreground}`);
-  if (typeof o.focused === "string" && o.focused) lines.push(`focused: ${o.focused}`);
-  if (typeof o.events === "string" && o.events) lines.push(`events: ${o.events}`);
-  if (typeof o.tree === "string" && o.tree) lines.push(o.tree);
+  const foreground = field(o.foreground);
+  if (foreground) lines.push(`foreground: ${foreground}`);
+  const focused = field(o.focused);
+  if (focused) lines.push(`focused: ${focused}`);
+  const events = field(o.events);
+  if (events) lines.push(`events: ${events}`);
+  const tree = field(o.tree);
+  if (tree) lines.push(tree);
   const out: Array<TextContent | ImageContent> = [{ type: "text", text: lines.join("\n") }];
   if (png) out.push({ type: "image", data: png, mimeType: "image/png" });
   return out;
@@ -41,10 +65,44 @@ export function renderObservation(o: Record<string, unknown> | undefined, settle
 
 /** Tool result: `line` followed by the rendered `observation` of the control reply, when it has one. */
 export function actionResult(line: string, reply: Record<string, unknown>, settleTimeoutMs?: number): ToolResult {
+  if (typeof reply.observationError === "string") {
+    return { content: [{ type: "text", text: `${line}\nscreen not read after the action: ${reply.observationError}` }] };
+  }
   const obs = renderObservation(reply.observation as Record<string, unknown> | undefined, settleTimeoutMs);
   if (obs.length === 0) return { content: [{ type: "text", text: line }] };
   const [head, ...rest] = obs;
   return { content: [{ type: "text", text: `${line}\n${(head as TextContent).text}` }, ...rest] };
+}
+
+/** Tool result of `alcove_wait_for` for a `vm.wait_for` reply. */
+export function waitForResult(reply: Record<string, unknown>, timeoutS: number, settleTimeoutMs?: number): ToolResult {
+  const matched = Number(reply.matched ?? -1);
+  const lines: string[] = [];
+  if (matched >= 0) {
+    const d = reply.detail;
+    const detail = d === undefined || d === null ? "" : `: ${typeof d === "string" ? d : JSON.stringify(d)}`;
+    lines.push(`matched condition ${matched} (${reply.type ?? "?"}) after ${reply.waited} s${detail}`);
+  } else {
+    const d = reply.detail;
+    lines.push(d === undefined || d === null
+      ? `no condition matched within ${timeoutS} s`
+      : `no condition matched: ${typeof d === "string" ? d : JSON.stringify(d)} (after ${reply.waited} s)`);
+    for (const p of (reply.problems as Array<Record<string, unknown>> | undefined) ?? []) {
+      lines.push(`condition ${p.condition} (${p.type}) could not be evaluated: ${p.error} (${p.failures} times in a row)`);
+    }
+  }
+  return actionResult(lines.join("\n"), reply, settleTimeoutMs);
+}
+
+/** Tool result of `alcove_batch` for a `vm.batch` reply to the `sent` steps. */
+export function batchResult(sent: Array<Record<string, unknown>>, reply: Record<string, unknown>, settleTimeoutMs?: number): ToolResult {
+  const failedStep = typeof reply.failedStep === "number" ? reply.failedStep : undefined;
+  const done = Number(reply.completed ?? (reply.results as unknown[] | undefined)?.length ?? 0);
+  const lines: string[] = [];
+  for (let i = 0; i < done && i < sent.length; i++) lines.push(`ok ${i} ${sent[i].op}`);
+  if (failedStep !== undefined) lines.push(`FAILED ${failedStep} ${sent[failedStep]?.op}: ${reply.error ?? "step failed"}`);
+  const result = actionResult(lines.join("\n"), reply, settleTimeoutMs);
+  return failedStep !== undefined ? { ...result, isError: true } : result;
 }
 
 export const observeParams = {
