@@ -576,27 +576,56 @@ guest` and counts as ok.
 
 ## Scripts
 
-`script.run` replays a JSON script of control ops without a model.
+`script.run` replays a JSON script of control ops without a model. It runs in
+the concurrent lane.
 
-Parameters: `path` (script file on the host), `name` (VM; overrides the script's
-`vm`), `variables` (object of strings that override the script's defaults),
-`snapshot` (restored before the first step) and `lease` (the VM's current lease
-token). Without `lease` the run holds a lease of its own (owner
-`script:<file name>`, 600 s, renewed every 200 s) and releases it at the end.
-The op runs in the concurrent lane.
+Parameters: `path` (script file on the host; use an absolute path, a relative
+one resolves against the server's working directory), `name` (VM; overrides the
+script's `vm`), `variables` (object of strings that override the script's
+defaults), `snapshot` (restored before the first step) and `lease`. The VM
+comes from `name` or the script's `vm`; with neither the op fails.
+
+Leases: without `lease` the run holds a lease of its own (owner
+`script:<file name>`, 600 s, renewed every 200 s), checks before each step that
+it still holds it and releases it at the end, also after a failure. When the
+run loses its lease it stops before the next step. If the final release fails,
+`error` says so and that the lease expires by itself within 600 s. A passed
+`lease` must be the VM's current token; otherwise the op fails with `lease
+token is not the current lease of '<vm>' (expired, released or unknown); acquire
+a new lease or omit lease`. A passed lease is used for every step and is
+neither renewed nor released; the caller keeps it alive. A VM leased by someone
+else is refused with the owner's name, whether the VM came from `name` or from
+the script.
 
 Script format version 1: `{"version": 1, "vm", "variables": {name: text},
-"steps": [{"label", "op", "params", "expect", "timeout"}]}`. `${name}` in any
-string of `params` and `expect` is replaced; `$${` stands for a literal `${`.
-`params` never holds `name` or `lease`. A step may use any control op except
-`vm.lease.*`, `vm.record.*`, `script.*`, `vm.clone` and `vm.delete`. Each
-`expect` entry is a `vm.wait_for` condition; every one must hold within the
-step's `timeout` (default 10 s, 1 to 600). A `vm.wait_for` step fails when it
-matches nothing. The run stops at the first failing step.
+"steps": [{"label", "op", "params", "expect", "timeout"}]}`. Unknown keys are
+refused. `${name}` in any string of `params` and `expect` is replaced (a value
+is not expanded again); `$${` stands for a literal `${`. `vm` and `label` are
+not substituted. `params` never holds `name` or `lease`. A step may use any
+control op except `vm.lease.*`, `vm.record.*`, `script.*`, `vm.clone` and
+`vm.delete`. Each `expect` entry is a `vm.wait_for` condition, checked with the
+condition parser of `vm.wait_for` (like the `conditions` of a `vm.wait_for`
+step) before any step runs. Every expectation must hold: each is waited for
+with its own `vm.wait_for`, for up to the step's `timeout` (default 10 s, 1 to
+600) counted from the end of the op, and at least 1 s. A `vm.wait_for` step
+fails when it matches nothing. The run stops at the first failing step.
 
-Result: `{passed, stepsRun, steps, failedStep?, label?, error?, seconds,
-failure?: {png, width, height}}`. Step numbers start at 1. `failure` is a
-screenshot taken after the failing step.
+Errors and results: everything that prevents step 1 from starting answers with
+an error (`ok: false`): an unreadable, oversized (over 4 MiB) or malformed
+script, an undefined variable, a condition that does not parse, no VM, a lease
+refusal, a failed snapshot restore, a cancellation before step 1. Otherwise the
+op answers with `{passed, stepsRun, steps, failedStep?, label?, error?, seconds,
+failure?: {png, width, height}}`; `passed: false` means a step ran and failed
+(or the run was cancelled or lost its lease after it started). Step numbers
+start at 1. `stepsRun` counts the steps that started, including the failed one.
+`failure` is a screenshot taken after the failing step and is complete.
+
+Each entry of `steps` is `{step, op, label?, seconds, ok, result?, error?}`.
+`result` is a copy of the op's result in which a string under a key named `png`
+becomes `<omitted: N bytes>` and any other string over 2048 characters is cut
+to its first 2048 characters followed by `… (N more characters)`. Once the
+encoded entries pass 256 KiB, later entries keep only `{step, op, label?, ok,
+seconds}` (and `error` for the failing step).
 
 ## Shell, processes and files
 

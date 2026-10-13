@@ -3,23 +3,36 @@ import AlcoveQMP
 
 /// `script.run`: replays a script file against a VM.
 extension ControlHandler {
-    /// The refusal text when `token` does not hold the lease of `vm`; nil when the VM is free to it.
-    func leaseRefusal(vm: String, token: String?) -> String? {
-        leases.refusal(vm: vm, token: token, now: clock())
+    /// The refusal text when `token` is not the current lease of `vm`; nil when it is.
+    func leaseRefusal(vm: String, token: String) -> String? {
+        if let refusal = leases.refusal(vm: vm, token: token, now: clock()) { return refusal }
+        guard leases.active(vm: vm, now: clock())?.token == token else {
+            return "lease token is not the current lease of '\(vm)' (expired, released or unknown); acquire a new lease or omit lease"
+        }
+        return nil
+    }
+
+    /// Whether `token` is the unexpired lease of `vm`.
+    func holdsLease(vm: String, token: String) -> Bool {
+        leases.active(vm: vm, now: clock())?.token == token
     }
 
     func scriptRun(_ params: JSON) async throws -> JSON {
         let path = try string(params, "path")
-        let data: Data
-        do { data = try Data(contentsOf: URL(fileURLWithPath: (path as NSString).expandingTildeInPath)) } catch {
-            throw ControlError.failed("cannot read the script '\(path)'; check that the file exists on the host")
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let unreadable = ControlError.failed("cannot read the script '\(path)'; check that it is a file on the host and use an absolute path")
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]), values.isRegularFile == true,
+              let size = values.fileSize else { throw unreadable }
+        guard size <= ScriptLimits.fileBytes else {
+            throw ControlError.failed("the script is larger than 4 MiB; split it into several scripts")
         }
+        guard let data = try? Data(contentsOf: url) else { throw unreadable }
         let script: Script
         do { script = try Script.parse(data) } catch { throw ControlError.failed("\(error)") }
 
         var variables: [String: String] = [:]
         if let value = params["variables"], value != .null {
-            guard let object = value.objectValue else { throw ControlError.failed("'variables' must be an object of names to string values") }
+            guard let object = value.objectValue else { throw ControlError.failed("'variables' must be an object of names to string values, for example {\"message\": \"hello\"}") }
             for (name, item) in object {
                 guard let text = item.stringValue else { throw ControlError.failed("variable '\(name)' must be a string; quote its value") }
                 variables[name] = text
@@ -38,6 +51,7 @@ extension ControlHandler {
         let owner = "script:" + URL(fileURLWithPath: path).lastPathComponent
         let result = await ScriptRunner(handler: self).run(script, vm: vm, variables: variables, lease: params["lease"]?.stringValue,
                                                            owner: owner, snapshot: snapshot, progress: nil)
+        if result.couldNotStart { throw ControlError.failed(result.error ?? "the run could not start") }
 
         var out: [String: JSON] = ["passed": .bool(result.passed), "stepsRun": .int(Int64(result.stepsRun)),
                                    "steps": .array(result.stepResults), "seconds": .double(result.seconds)]

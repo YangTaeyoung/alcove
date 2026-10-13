@@ -36,6 +36,9 @@ struct Script: Sendable, Equatable {
 
     // MARK: - parsing
 
+    private static let scriptKeys = ["version", "vm", "variables", "steps"]
+    private static let stepKeys = ["label", "op", "params", "expect", "timeout"]
+
     static func parse(_ data: Data) throws -> Script {
         let root: JSON
         do { root = try JSON.parse(data) } catch {
@@ -50,6 +53,9 @@ struct Script: Sendable, Equatable {
         guard version.intValue == Script.version else {
             throw ScriptError(step: nil, message: "script version \(describe(version)) is not supported; this build reads version \(Script.version)")
         }
+        if let unknown = fields.keys.sorted().first(where: { !scriptKeys.contains($0) }) {
+            throw ScriptError(step: nil, message: "the script has unknown key '\(unknown)'; allowed keys are \(scriptKeys.joined(separator: ", "))")
+        }
         var vm: String?
         if let value = fields["vm"], value != .null {
             guard let name = value.stringValue, !name.isEmpty else {
@@ -60,7 +66,7 @@ struct Script: Sendable, Equatable {
         var variables: [String: String] = [:]
         if let value = fields["variables"], value != .null {
             guard let object = value.objectValue else {
-                throw ScriptError(step: nil, message: "'variables' must be an object of names to string values")
+                throw ScriptError(step: nil, message: "'variables' must be an object of names to string values, for example {\"message\": \"hello\"}")
             }
             for (name, item) in object {
                 guard let text = item.stringValue else {
@@ -69,21 +75,29 @@ struct Script: Sendable, Equatable {
                 variables[name] = text
             }
         }
-        guard let list = fields["steps"]?.arrayValue, !list.isEmpty else {
+        guard let steps = fields["steps"], steps != .null else {
             throw ScriptError(step: nil, message: "the script has no steps; add a 'steps' array with at least one step")
         }
-        var steps: [Step] = []
-        for (offset, item) in list.enumerated() { steps.append(try parseStep(item, number: offset + 1)) }
-        return Script(vm: vm, variables: variables, steps: steps)
+        guard let list = steps.arrayValue else {
+            throw ScriptError(step: nil, message: "'steps' must be an array of steps")
+        }
+        guard !list.isEmpty else {
+            throw ScriptError(step: nil, message: "the script has no steps; add a 'steps' array with at least one step")
+        }
+        var parsed: [Step] = []
+        for (offset, item) in list.enumerated() { parsed.append(try parseStep(item, number: offset + 1)) }
+        return Script(vm: vm, variables: variables, steps: parsed)
     }
 
     private static func parseStep(_ item: JSON, number: Int) throws -> Step {
         func fail(_ message: String) -> ScriptError { ScriptError(step: number, message: "step \(number) \(message)") }
         guard let fields = item.objectValue else { throw fail("is not an object; write each step as {\"op\": ..., \"params\": ...}") }
+        if let unknown = fields.keys.sorted().first(where: { !stepKeys.contains($0) }) {
+            throw fail("has unknown key '\(unknown)'; allowed keys are \(stepKeys.joined(separator: ", "))")
+        }
         guard let op = fields["op"]?.stringValue, !op.isEmpty else {
             throw fail("has no op; every step needs an op such as vm.type")
         }
-        try check(op: op, number: number)
         var label: String?
         if let value = fields["label"], value != .null {
             guard let text = value.stringValue else { throw fail("has a label that is not a string; quote it") }
@@ -94,42 +108,69 @@ struct Script: Sendable, Equatable {
             guard let object = value.objectValue else { throw fail("has params that are not an object; write them as {\"key\": value}") }
             params = object
         }
-        for key in ["name", "lease"] where params[key] != nil {
-            throw fail("passes '\(key)' in params; remove it, the runner supplies the VM name and its own lease")
-        }
         var expect: [JSON] = []
         if let value = fields["expect"], value != .null {
             guard let list = value.arrayValue else { throw fail("has an expect that is not an array; write it as a list of wait conditions") }
-            for condition in list where condition.objectValue == nil {
-                throw fail("has an expectation that is not an object; write each as {\"type\": ...}")
-            }
             expect = list
         }
         var timeout = defaultTimeout
         if let value = fields["timeout"], value != .null {
-            guard let seconds = value.intValue, (1...maxTimeout).contains(seconds) else {
-                throw fail("has a timeout outside 1 to \(maxTimeout) seconds; use a whole number of seconds")
-            }
+            guard let seconds = value.intValue else { throw fail(timeoutProblem) }
             timeout = seconds
         }
-        return Step(label: label, op: op, params: params, expect: expect, timeout: timeout)
+        let step = Step(label: label, op: op, params: params, expect: expect, timeout: timeout)
+        try check(step, number: number)
+        return step
     }
 
-    private static func check(op: String, number: Int) throws {
-        guard allows(op: op) else {
-            throw ScriptError(step: number, message: "step \(number) uses op '\(op)', which scripts may not run; remove the step or use another op")
+    private static let timeoutProblem = "has a timeout outside 1 to \(maxTimeout) seconds; use a whole number of seconds"
+
+    /// The checks every step passes, whether parsed or built in code.
+    private static func check(_ step: Step, number: Int) throws {
+        func fail(_ message: String) -> ScriptError { ScriptError(step: number, message: "step \(number) \(message)") }
+        guard allows(op: step.op) else {
+            throw fail("uses op '\(step.op)', which scripts may not run; remove the step or use another op")
         }
-        guard ControlHandler.knownOps.contains(op) else {
-            throw ScriptError(step: number, message: "step \(number) uses unknown op '\(op)'; use one of the control ops such as vm.type")
+        guard ControlHandler.knownOps.contains(step.op) else {
+            throw fail("uses unknown op '\(step.op)'; use one of the control ops such as vm.type")
+        }
+        for key in ["name", "lease"] where step.params[key] != nil {
+            throw fail("passes '\(key)' in params; remove it, the runner supplies the VM name and its own lease")
+        }
+        guard (1...maxTimeout).contains(step.timeout) else { throw fail(timeoutProblem) }
+        for condition in step.expect where condition.objectValue == nil {
+            throw fail("has an expectation that is not an object; write each as {\"type\": ...}")
         }
     }
 
-    /// Fails with the first step whose op a script may not run.
+    /// Fails with the first problem any step has.
     func validate() throws {
         if steps.isEmpty {
             throw ScriptError(step: nil, message: "the script has no steps; add a 'steps' array with at least one step")
         }
-        for (offset, step) in steps.enumerated() { try Script.check(op: step.op, number: offset + 1) }
+        for (offset, step) in steps.enumerated() { try Script.check(step, number: offset + 1) }
+    }
+
+    /// Checks the wait conditions of every expectation and every `vm.wait_for` step with the parser `vm.wait_for` uses.
+    func validateConditions() throws {
+        for (offset, step) in steps.enumerated() {
+            let number = offset + 1
+            for (index, condition) in step.expect.enumerated() {
+                do { _ = try WaitCondition.parse(condition, index: index) } catch {
+                    let prefix = "condition \(index): "
+                    let sentence = "\(error)"
+                    throw ScriptError(step: number, message: "step \(number) expectation \(index + 1): \(sentence.hasPrefix(prefix) ? String(sentence.dropFirst(prefix.count)) : sentence)")
+                }
+            }
+            if step.op == "vm.wait_for" {
+                do {
+                    _ = try WaitCondition.parseList(.object(step.params))
+                    _ = try WaitCondition.parseTimeout(.object(step.params))
+                } catch {
+                    throw ScriptError(step: number, message: "step \(number): \(error)")
+                }
+            }
+        }
     }
 
     private static func describe(_ value: JSON) -> String {
