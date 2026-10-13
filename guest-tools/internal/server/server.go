@@ -41,6 +41,7 @@ type Server struct {
 	ops    map[string]opEntry
 	connMu sync.Mutex
 	conns  map[*conn]struct{}
+	jobs   *jobTable
 }
 
 func New(opt Options) *Server {
@@ -53,7 +54,7 @@ func New(opt Options) *Server {
 	if opt.HomeDir == "" {
 		opt.HomeDir, _ = os.UserHomeDir()
 	}
-	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable()}
 	s.registerBuiltins()
 	return s
 }
@@ -107,10 +108,10 @@ func (s *Server) handle(c net.Conn) {
 		}
 	}
 	cn := &conn{send: send}
-	s.addConn(cn)
-	defer s.removeConn(cn)
 	send(proto.Message{"t": "hello", "v": proto.Version, "proto": proto.RPCVersion, "os": runtime.GOOS, "agent": AgentVersion,
 		"token": s.opt.Token, "caps": s.caps()})
+	s.addConn(cn)
+	defer s.removeConn(cn)
 
 	done := make(chan struct{})
 	defer close(done)
@@ -293,12 +294,11 @@ func (s *Server) watchClipboard(send func(proto.Message), done chan struct{}) {
 }
 
 func runShell(cmd string) (string, int) {
-	var c *exec.Cmd
-	if runtime.GOOS == "windows" {
-		c = exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd)
-	} else {
-		c = exec.Command("/bin/sh", "-c", cmd)
+	c, err := buildCommand(proto.Message{"cmd": cmd}, runtime.GOOS)
+	if err != nil {
+		return err.Error(), 1
 	}
+	hideWindow(c)
 	out, err := c.CombinedOutput()
 	code := 0
 	if err != nil {

@@ -107,6 +107,4 @@ func (s *Server) registerBuiltins() {
 	s.registerFiles()
 }
 
-func (s *Server) registerShell() {}
-
 func (s *Server) registerFiles() {}

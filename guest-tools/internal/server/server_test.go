@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,15 +16,29 @@ import (
 )
 
 type fakeClipboard struct {
+	mu   sync.Mutex
 	text string
 	seq  uint64
 }
 
-func (f *fakeClipboard) Available() bool        { return true }
-func (f *fakeClipboard) Text() (string, error)  { return f.text, nil }
-func (f *fakeClipboard) SetText(s string) error { f.text = s; f.seq++; return nil }
-func (f *fakeClipboard) Sequence() uint64       { return f.seq }
-func (f *fakeClipboard) external(s string)      { f.text = s; f.seq++ }
+func (f *fakeClipboard) Available() bool { return true }
+func (f *fakeClipboard) Text() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.text, nil
+}
+func (f *fakeClipboard) SetText(s string) error { f.external(s); return nil }
+func (f *fakeClipboard) Sequence() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.seq
+}
+func (f *fakeClipboard) external(s string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.text = s
+	f.seq++
+}
 
 func startServer(t *testing.T, opt Options) (*proto.Reader, *proto.Writer, net.Conn) {
 	t.Helper()
@@ -72,8 +87,8 @@ func TestHelloClipboardAndFiles(t *testing.T) {
 	// host -> guest clipboard
 	w.Send(proto.Message{"t": "clipboard.set", "text": "from host"})
 	time.Sleep(600 * time.Millisecond)
-	if cb.text != "from host" {
-		t.Fatalf("clipboard not set: %q", cb.text)
+	if got, _ := cb.Text(); got != "from host" {
+		t.Fatalf("clipboard not set: %q", got)
 	}
 	// guest -> host clipboard (a foreign change must be reported, our own must not)
 	cb.external("typed in guest")
