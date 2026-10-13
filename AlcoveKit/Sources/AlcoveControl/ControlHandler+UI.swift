@@ -4,9 +4,10 @@ import AlcoveQMP
 
 /// The clocks of the UI ops.
 enum UITiming {
-    /// Longest the host waits for the agent's answer to one window or element op, counted from the moment it is sent:
-    /// longer than the agent's own limit for a call that follows a helper start, or a wait in the agent's queue.
-    nonisolated(unsafe) static var callTimeout = Duration.seconds(160)
+    /// Longest the host waits for the agent's answer to one window or element op, counted from the moment it is sent.
+    /// It covers what the agent may spend on one call: 60 s in its queue for the helper, 120 s for a helper start and
+    /// 30 s for the call itself, and leaves 5 s for the answer's way back.
+    nonisolated(unsafe) static var callTimeout = Duration.seconds(215)
     /// Longest a window or element op waits for its turn at the UI helper.
     nonisolated(unsafe) static var queueTimeout = Duration.seconds(60)
     /// Longest an observation spends on the foreground window and the focused element, the wait for the helper's turn included.
@@ -138,30 +139,67 @@ enum UISelector {
     static func isRef(_ text: String) -> Bool {
         text.hasPrefix("e") && text.count > 1 && text.dropFirst().allSatisfy { $0.isASCII && $0.isNumber }
     }
+}
 
-    /// Whether an agent error says that the element behind `ref` no longer exists.
-    static func isStaleRef(_ message: String, ref: String) -> Bool {
-        message.hasPrefix("element \(ref) no longer exists")
-    }
+/// What an error sentence of the guest agent's `ui.*` and `win.*` operations says, told by a part of the sentence that
+/// stays the same. Every place that reads such a sentence goes through this type.
+enum HelperSentence: Equatable {
+    /// `element <ref> no longer exists; …`
+    case staleRef(String)
+    /// `no element matches <selector>; …`
+    case noMatch
+    /// `no window has "…" in its title; …` or `window 0x… no longer exists; …`
+    case windowGone
+    /// `the element is a password field; …`
+    case passwordField
+    /// `window 0x… "…" is not responding; …`
+    case notResponding
+    /// `the UI helper is shut down; …`
+    case shutDown
+    /// `… the UI helper folder <dir> could not be locked (…); fix its owner and access list, then retry` or
+    /// `… <dir> is a reparse point; remove it`
+    case cannotStart
+    /// `the request was cancelled`
+    case cancelled
+    /// Any other sentence.
+    case other
 
-    /// Whether an agent error says that the window a selector names does not exist: `no window has "…" in its title; …`
-    /// or `window 0x… no longer exists; …`.
-    static func isWindowGone(_ message: String) -> Bool {
-        if message.hasPrefix("no window has \"") { return true }
+    init(_ message: String) {
         let words = message.split(separator: " ", maxSplits: 2)
-        return words.count == 3 && words[0] == "window" && words[1].hasPrefix("0x") && words[2].hasPrefix("no longer exists")
+        if words.count == 3, words[0] == "element", UISelector.isRef(String(words[1])), words[2].hasPrefix("no longer exists") {
+            self = .staleRef(String(words[1]))
+        } else if message.hasPrefix("no element matches ") {
+            self = .noMatch
+        } else if message.hasPrefix("no window has \"") {
+            self = .windowGone
+        } else if words.count == 3, words[0] == "window", words[1].hasPrefix("0x"), words[2].hasPrefix("no longer exists") {
+            self = .windowGone
+        } else if message.hasPrefix("the element is a password field") {
+            self = .passwordField
+        } else if message.hasPrefix("window 0x"), message.contains(" is not responding; ") {
+            self = .notResponding
+        } else if message.hasPrefix("the UI helper is shut down") {
+            self = .shutDown
+        } else if message.hasPrefix("the request was cancelled") {
+            self = .cancelled
+        } else if message.contains("the UI helper folder "), message.contains(" could not be locked ("),
+                  message.hasSuffix("; fix its owner and access list, then retry") {
+            self = .cannotStart
+        } else if message.hasSuffix(" is a reparse point; remove it") {
+            self = .cannotStart
+        } else {
+            self = .other
+        }
     }
 
-    /// Whether an agent error to a text read says that the element is a password field, whose text is never read.
-    static func isPasswordRefusal(_ message: String) -> Bool {
-        message.hasPrefix("the element is a password field")
-    }
+    /// Whether asking the helper again cannot bring another answer: it is shut down or cannot start.
+    var isPermanent: Bool { self == .shutDown || self == .cannotStart }
 
-    /// Whether an agent error to a read of an element says that the element is gone: the stale-ref sentence for `ref`,
-    /// or, for a selector whose element was read before, the no-match sentence or a sentence about its window being gone.
-    static func isGone(_ message: String, ref: String?, wasRead: Bool) -> Bool {
-        if let ref { return isStaleRef(message, ref: ref) }
-        return wasRead && (message.hasPrefix("no element matches ") || isWindowGone(message))
+    /// Whether the sentence says that an element is not there: for `ref` the stale-ref sentence of that ref, for
+    /// selector fields a sentence about their window being gone, or with `orNoMatch` the no-match sentence.
+    func saysAbsent(ref: String?, orNoMatch: Bool = false) -> Bool {
+        if let ref { return self == .staleRef(ref) }
+        return self == .windowGone || (orNoMatch && self == .noMatch)
     }
 }
 
@@ -493,7 +531,7 @@ extension ControlHandler {
         return try await observed(t, op: op, options) {
             let r = try await self.uiCall(agent, "ui.act", fields, vm: t.name, op: op)
             var out: [String: JSON] = ["node": r["node"] ?? .null]
-            for key in ["unresponsive", "gone"] { if let flag = r[key] { out[key] = flag } }
+            for key in ["unresponsive", "gone", "pending"] { if let flag = r[key] { out[key] = flag } }
             return out
         }
     }
@@ -564,8 +602,10 @@ extension ControlHandler {
     }
 
     /// The event name followed by its window title in quotes (the window's process when the title is empty), or by the
-    /// file name of its `path` or its `job`, and by `code <n>` when it has a code.
+    /// file name of its `path` or its `job`, and by `code <n>` when it has a code; `events.dropped (<count>)` for the
+    /// event that counts the events a connection lost.
     static func eventLine(_ event: GuestEvent) -> String {
+        if event.name == "events.dropped", let count = event.payload["count"]?.intValue { return "\(event.name) (\(count))" }
         var line = event.name
         if let title = event.windowTitle {
             let process = title.isEmpty ? event.payload["window"]?["process"]?.stringValue : nil

@@ -493,8 +493,15 @@ final class ControlUITests: XCTestCase {
     func testWindowAndElementActionsPassTheAgentsFlagsAndSentences() async throws {
         let disabled = "the element is disabled; wait until it is enabled"
         let unsupported = "the element does not support toggle; it supports invoke, focus; click it through the display for anything else"
-        let hung = "window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait for it or end its process with proc.kill"
+        let hung = "window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait and retry, or end its process with proc.kill "
+            + "when win.list still shows responding false after 10 s"
+        let crowded = "9 earlier ui.act calls are still running in the app; wait for them or end its process with proc.kill"
+        let unlocked = "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
+            + "(SetNamedSecurityInfo(C:\\ProgramData\\Alcove\\uia): Access is denied.); fix its owner and access list, then retry"
+        let reparse = "C:\\ProgramData\\Alcove\\uia is a reparse point; remove it"
+        let shutDown = "the UI helper is shut down; restart alcove-agent"
         let (h, _, _) = try await rig([
+            "ui.tree": { _, n in .fail([unlocked, reparse, shutDown][min(n, 2)]) },
             "win.action": { m, _ in
                 switch (m["action"]?.stringValue, m["window"]?.stringValue) {
                 case ("close", "0x50"): return .ok(["closed": true, "window": .null])
@@ -509,6 +516,8 @@ final class ControlUITests: XCTestCase {
                 case "e2": return .ok(["node": sendButton, "gone": true])
                 case "e3": return .fail(disabled)
                 case "e4": return .fail(unsupported)
+                case "e8": return .fail(crowded)
+                case "e9": return .ok(["node": sendButton, "pending": true])
                 default: return .fail(hung)
                 }
             },
@@ -529,13 +538,59 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(gone["gone"], true)
         XCTAssertNil(gone["unresponsive"])
         XCTAssertEqual(gone["observation"]?["settled"]?.boolValue, true)
-        for (ref, sentence) in [("e3", disabled), ("e4", unsupported), ("e7", hung)] {
+        let pending = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e9", "action": "invoke"])
+        XCTAssertEqual(pending, ["node": sendButton, "pending": true, "eventSeq": 0])
+        for (ref, sentence) in [("e3", disabled), ("e4", unsupported), ("e7", hung), ("e8", crowded)] {
             let text = await failure(h, "vm.ui.action", ["name": "Win", "ref": .string(ref), "action": "toggle"])
+            XCTAssertEqual(text, sentence)
+        }
+        for sentence in [unlocked, reparse, shutDown] {
+            let text = await failure(h, "vm.ui.tree", ["name": "Win"])
             XCTAssertEqual(text, sentence)
         }
     }
 
     // MARK: - launch
+
+    func testHelperSentencesAreToldByTheirStableParts() {
+        let cases: [(String, HelperSentence)] = [
+            ("element e12 no longer exists; call ui.tree again", .staleRef("e12")),
+            ("element e6000535 no longer exists; call ui.tree again", .staleRef("e6000535")),
+            ("no element matches {\"name\":\"x is a reparse point; remove it\"}; call ui.tree to see what exists", .noMatch),
+            ("no window has \"Chat is not responding; \" in its title; call win.list to see the open windows", .windowGone),
+            ("window 0x50 no longer exists; call win.list again", .windowGone),
+            ("the element is a password field; its text is not read; it cannot be read through UI Automation", .passwordField),
+            ("the element is a password field; its text is not read", .passwordField),
+            ("window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait and retry, or end its process with proc.kill "
+                + "when win.list still shows responding false after 10 s", .notResponding),
+            ("window 0x9 \"File no longer exists\" is not responding; wait for it or end its process with proc.kill", .notResponding),
+            ("the UI helper is shut down; restart alcove-agent", .shutDown),
+            ("could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
+                + "(SetNamedSecurityInfo(C:\\ProgramData\\Alcove\\uia): Access is denied.); fix its owner and access list, then retry", .cannotStart),
+            ("the UI helper folder D:\\x could not be locked (denied); fix its owner and access list, then retry", .cannotStart),
+            ("C:\\ProgramData\\Alcove\\uia is a reparse point; remove it", .cannotStart),
+            ("the request was cancelled", .cancelled),
+            ("UI helper is closed", .other),
+            ("UI helper exited; retry", .other),
+            ("the UI helper is busy with 'ui.tree'; retry", .other),
+            ("UI helper did not answer 'ui.find' within 20 s; it was restarted", .other),
+            ("window 0x1 \"T\" was not minimized within 2 s; the app may not allow it", .other),
+            ("element five no longer exists", .other),
+            ("", .other),
+        ]
+        for (message, expected) in cases { XCTAssertEqual(HelperSentence(message), expected, message) }
+        for (message, expected) in cases {
+            XCTAssertEqual(HelperSentence(message).isPermanent, expected == .shutDown || expected == .cannotStart, message)
+        }
+        XCTAssertTrue(HelperSentence.staleRef("e5").saysAbsent(ref: "e5"))
+        XCTAssertFalse(HelperSentence.staleRef("e5").saysAbsent(ref: "e6"))
+        XCTAssertFalse(HelperSentence.staleRef("e5").saysAbsent(ref: nil, orNoMatch: true))
+        XCTAssertFalse(HelperSentence.windowGone.saysAbsent(ref: "e5"))
+        XCTAssertTrue(HelperSentence.windowGone.saysAbsent(ref: nil))
+        XCTAssertFalse(HelperSentence.noMatch.saysAbsent(ref: nil))
+        XCTAssertTrue(HelperSentence.noMatch.saysAbsent(ref: nil, orNoMatch: true))
+        XCTAssertFalse(HelperSentence.notResponding.saysAbsent(ref: nil, orNoMatch: true))
+    }
 
     func testAppLaunch() async throws {
         let (h, _, agent) = try await rig(["app.launch": { m, n in
@@ -1288,6 +1343,24 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(r["events"]?.arrayValue?.count, EventBuffer.capacity)
     }
 
+    func testAnEventThatCountsDroppedEventsIsKeptLikeAnyOther() async throws {
+        let (h, t, agent) = try await rig(["ui.focused": { _, _ in .ok(["node": messageEdit, "window": fixtureWindow]) }])
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20])
+        agent.sendLine(["t": "ev", "name": "window.opened", "window": fixtureWindow])
+        agent.sendLine(["t": "ev", "name": "events.dropped", "count": 37])
+        let arrived = await eventually { await t.events(since: 0).next == 2 }
+        XCTAssertTrue(arrived)
+
+        let listed = try await h.handle(op: "vm.events", params: ["name": "Win", "since": 1])
+        XCTAssertEqual(listed["events"], [["seq": 2, "time": listed["events"]?[0]?["time"] ?? .null, "name": "events.dropped", "count": 37]])
+        let matched = try await waitFor(h, [["type": "event", "event": "window.closed"], ["type": "event", "event": "events.dropped"]])
+        XCTAssertEqual(matched["matched"]?.intValue, 1)
+        XCTAssertEqual(matched["detail"]?["seq"]?.intValue, 2)
+        XCTAssertEqual(matched["detail"]?["count"]?.intValue, 37)
+        let observed = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "a", "observe": "summary", "settleMs": 20])
+        XCTAssertEqual(observed["observation"]?["events"], ["window.opened \"Alcove Fixture\"", "events.dropped (37)"])
+    }
+
     func testRepliesOfChangingOpsCarryTheEventSequence() async throws {
         let (h, t, agent) = try await rig([
             "win.list": { _, _ in .ok(["windows": []]) },
@@ -1529,6 +1602,34 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(exists["problems"]?[0]?["error"]?.stringValue, "UI helper exited; retry")
     }
 
+    func testAHelperThatCannotStartOrIsShutDownEndsTheWait() async throws {
+        let sentences = [
+            "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
+                + "(SetNamedSecurityInfo(C:\\ProgramData\\Alcove\\uia): Access is denied.); fix its owner and access list, then retry",
+            "C:\\ProgramData\\Alcove\\uia is a reparse point; remove it",
+            "the UI helper is shut down; restart alcove-agent",
+        ]
+        let conditions: [JSON] = [
+            ["type": "ui_exists", "name": "Send"], ["type": "ui_gone", "name": "Send"], ["type": "ui_enabled", "ref": "e5"],
+            ["type": "window_title", "contains": "Fixture"], ["type": "ui_text_stable", "ref": "e4"],
+        ]
+        for sentence in sentences {
+            let (h, _, agent) = try await rig([
+                "ui.find": { _, _ in .fail(sentence) }, "ui.rect": { _, _ in .fail(sentence) },
+                "win.list": { _, _ in .fail(sentence) }, "ui.text": { _, _ in .fail(sentence) },
+            ])
+            for condition in conditions {
+                do {
+                    _ = try await waitFor(h, [["type": "event", "event": "window.opened"], condition], timeout: 300)
+                    XCTFail("the wait went on: \(condition)")
+                } catch {
+                    XCTAssertEqual("\(error)", sentence)
+                }
+            }
+            XCTAssertEqual(requestOps(agent).count, conditions.count)
+        }
+    }
+
     func testWaitUIConditionsTakeARef() async throws {
         let (h, _, agent) = try await rig(["ui.rect": { m, n in
             switch m["ref"]?.stringValue {
@@ -1633,7 +1734,7 @@ final class ControlUITests: XCTestCase {
     }
 
     func testTextStableOnAPasswordFieldFailsTheWait() async throws {
-        let refusal = "the element is a password field; its text is not read"
+        let refusal = "the element is a password field; its text is not read; it cannot be read through UI Automation"
         let (h, _, agent) = try await rig(["ui.text": { _, _ in .fail(refusal) }])
         do {
             _ = try await waitFor(h, [["type": "window_title", "contains": "never"], ["type": "ui_text_stable", "role": "Edit", "name": "Secret"]])

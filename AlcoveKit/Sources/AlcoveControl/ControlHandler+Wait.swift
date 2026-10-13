@@ -373,9 +373,13 @@ extension ControlHandler {
         return try judge(condition, outcome.result, state: &state, at: outcome.at)
     }
 
-    /// What the helper's answer to the call of a UI condition means; `at` is when the answer arrived.
+    /// What the helper's answer to the call of a UI condition means; `at` is when the answer arrived. A sentence that
+    /// says the helper is shut down or cannot start ends the wait.
     private func judge(_ condition: WaitCondition, _ result: Result<JSON, Error>, state: inout WaitState,
                        at now: ContinuousClock.Instant) throws -> Verdict {
+        if case .failure(let error) = result, case AgentClient.AgentError.remote(let message) = error, HelperSentence(message).isPermanent {
+            throw HardFailure(error: .failed(message))
+        }
         switch condition {
         case .uiExists(let element), .uiGone(let element), .uiEnabled(let element):
             var found: JSON?
@@ -383,8 +387,7 @@ extension ControlHandler {
                 let r = try result.get()
                 found = element["ref"] != nil ? r["node"] ?? .null : r["nodes"]?.arrayValue?.first
             } catch AgentClient.AgentError.remote(let message) {
-                let absent = element["ref"]?.stringValue.map { UISelector.isStaleRef(message, ref: $0) } ?? UISelector.isWindowGone(message)
-                guard absent else { throw AgentClient.AgentError.remote(message) }
+                guard HelperSentence(message).saysAbsent(ref: element["ref"]?.stringValue) else { throw AgentClient.AgentError.remote(message) }
             }
             switch condition {
             case .uiGone: return found == nil ? .holds(nil) : .pending
@@ -410,10 +413,12 @@ extension ControlHandler {
         case .uiTextStable(let element, let quietMs):
             let r: JSON
             do { r = try result.get() }
-            catch AgentClient.AgentError.remote(let message) where UISelector.isPasswordRefusal(message) {
+            catch AgentClient.AgentError.remote(let message) where HelperSentence(message) == .passwordField {
                 throw HardFailure(error: .failed(message))
-            } catch AgentClient.AgentError.remote(let message)
-                where UISelector.isGone(message, ref: element["ref"]?.stringValue, wasRead: state.lastText != nil) {
+            } catch AgentClient.AgentError.remote(let message) where element["ref"] != nil || state.lastText != nil {
+                guard HelperSentence(message).saysAbsent(ref: element["ref"]?.stringValue, orNoMatch: true) else {
+                    throw AgentClient.AgentError.remote(message)
+                }
                 return .over(.string(message))
             }
             let text = r["text"]?.stringValue ?? ""
