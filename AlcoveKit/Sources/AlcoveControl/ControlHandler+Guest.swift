@@ -39,7 +39,6 @@ extension ControlHandler {
             case "theme": script = dark.flatMap { GuestRecipes.setTheme(dark: $0, os: os) }
             default:
                 script = scale.flatMap { GuestRecipes.setDPIScale(percent: $0, os: os) }
-                takesEffect = os == .windows ? "sign-out" : "now"
             }
             guard let script else {
                 rows.append(["setting": .string(setting), "ok": false, "detail": .string(unsupportedDetail(os)), "takesEffect": "now"])
@@ -251,7 +250,7 @@ extension ControlHandler {
         rows.append(check("network", dns, dns ? "example.com resolves" : "example.com does not resolve",
                           hint: "call vm.set_network up=true and check the guest DNS settings"))
         if let scale = probe["scale"]?.intValue {
-            rows.append(check("scale", true, "\(scale) % (applied at sign-in)"))
+            rows.append(check("scale", true, "\(scale) %"))
         } else {
             rows.append(check("scale", true, notChecked))
         }

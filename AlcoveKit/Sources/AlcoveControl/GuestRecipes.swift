@@ -100,18 +100,19 @@ enum GuestRecipes {
         return script
     }
 
-    /// Writes the per-monitor scaling step for the percentage nearest to `percent`; Windows applies it at the next sign-in.
+    /// Sets the display scaling to the entry of `dpiSteps` nearest to `percent`; Windows redraws at the new scale at once.
     static func setDPIScale(percent: Int, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         let step = dpiSteps.indices.min { abs(dpiSteps[$0] - percent) < abs(dpiSteps[$1] - percent) } ?? 0
         return windowsPrelude + """
         Add-Type -Namespace Alcove -Name Dpi -MemberDefinition '[DllImport("user32.dll", SetLastError = true)] public static extern bool SystemParametersInfo(uint action, int param, IntPtr pvParam, uint flags);'
         if (-not [Alcove.Dpi]::SystemParametersInfo(0x009F, \(step), [IntPtr]::Zero, 3)) { throw 'SystemParametersInfo failed' }
-        'scale: \(dpiSteps[step]) %, applied at the next sign-in'
+        'scale: \(dpiSteps[step]) %'
         """
     }
 
-    /// Prints one JSON object: `user`, `freeBytes`, `utc`, `dns` and, where the guest can tell, `locked` and `scale`.
+    /// Prints one JSON object: `user`, `freeBytes`, `utc`, `dns` and, where the guest can tell, `locked` and `scale`
+    /// (on Windows the system DPI a DPI-aware process reads, as a percentage of 96).
     static func doctorProbe(os: VMConfig.GuestOS) -> String? {
         switch os {
         case .windows:
@@ -127,8 +128,12 @@ enum GuestRecipes {
               utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
               dns = $dns
             }
-            $applied = (Get-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop\\WindowMetrics' -Name AppliedDPI).AppliedDPI
-            if ($applied) { $o.scale = [int]($applied * 100 / 96) }
+            try {
+              Add-Type -Namespace Alcove -Name Scale -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern uint GetDpiForSystem();'
+              [void][Alcove.Scale]::SetProcessDPIAware()
+              $dpi = [Alcove.Scale]::GetDpiForSystem()
+              if ($dpi) { $o.scale = [int]($dpi * 100 / 96) }
+            } catch { }
             [pscustomobject]$o | ConvertTo-Json -Compress
             """
         case .linux:

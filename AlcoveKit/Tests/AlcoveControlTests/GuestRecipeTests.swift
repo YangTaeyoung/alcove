@@ -110,6 +110,10 @@ final class GuestRecipeTests: XCTestCase {
         let at150 = try XCTUnwrap(GuestRecipes.setDPIScale(percent: 150, os: .windows))
         XCTAssertTrue(at100.contains("0x009F, 0,"), at100)
         XCTAssertTrue(at150.contains("0x009F, 2,"), at150)
+        XCTAssertTrue(at150.hasSuffix("'scale: 150 %'"), at150)
+        let probe = try XCTUnwrap(GuestRecipes.doctorProbe(os: .windows))
+        XCTAssertTrue(probe.contains("SetProcessDPIAware") && probe.contains("GetDpiForSystem"), probe)
+        XCTAssertFalse(probe.contains("AppliedDPI"), probe)
     }
 
     // MARK: - vm.set_environment
@@ -130,7 +134,7 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(rows.compactMap { $0["ok"]?.boolValue }, [true, true, true, true, false, true])
         XCTAssertEqual(rows[0]["detail"]?.stringValue, "done")
         XCTAssertEqual(rows[4]["detail"]?.stringValue, "access denied")
-        XCTAssertEqual(rows.compactMap { $0["takesEffect"]?.stringValue }, ["now", "now", "app restart", "now", "now", "sign-out"])
+        XCTAssertEqual(rows.compactMap { $0["takesEffect"]?.stringValue }, ["now", "now", "app restart", "now", "now", "now"])
         let sent = commands(agent)
         XCTAssertEqual(sent.count, 6)
         XCTAssertTrue(sent[0].contains("Set-Date"))
@@ -290,7 +294,7 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(check(r, "clock")?["ok"]?.boolValue, false)
         XCTAssertEqual(check(r, "clock")?["hint"]?.stringValue, "vm.set_environment clock=host")
         XCTAssertEqual(check(r, "network")?["ok"]?.boolValue, true)
-        XCTAssertEqual(check(r, "scale")?["detail"]?.stringValue, "125 % (applied at sign-in)")
+        XCTAssertEqual(check(r, "scale")?["detail"]?.stringValue, "125 %")
         XCTAssertEqual(commands(agent).count, 1)
         XCTAssertEqual(commands(agent).first, GuestRecipes.doctorProbe(os: .windows))
     }
