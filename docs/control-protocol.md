@@ -24,19 +24,21 @@ Each connection has two lanes.
 
 - **Concurrent lane**: every op whose name starts with `vm.exec`,
   `vm.process.` or `vm.fs.`, and `vm.push_file`, `vm.pull_file`,
-  `vm.sync_dir`. Such a request starts as soon as it arrives and answers when
+  `vm.sync_dir`, `vm.find_text`. Such a request starts as soon as it arrives and answers when
   it finishes, so several can be in flight and their replies arrive in any
   order. Match replies by `id`. Pipelined requests of this lane are unordered
   among themselves: two `vm.fs.write` requests to one file sent back to back
   may be applied in either order. A caller that needs an order sends the
   second request after the reply to the first.
 - **Serial lane**: every other op (`hello`, `vm.list`, `vm.status`, power,
-  screenshot, mouse, keyboard, clipboard, `vm.wait_idle`). These run one after
-  another in the order they arrived, and their replies come in that order.
+  screenshot, mouse, keyboard, clipboard, `vm.batch`, `vm.wait_idle`,
+  `vm.wait_for`). These run one after another in the order they arrived, and
+  their replies come in that order; a long `vm.wait_for` or `vm.batch` holds
+  back the later requests of the serial lane of its connection.
 
 The lanes do not wait for each other: a screenshot or a click is answered
 while a `vm.exec` of the same connection is still running. Mouse and keyboard
-ops for one VM run one at a time across all connections.
+ops (and `vm.batch`) for one VM run one at a time across all connections.
 
 Closing a connection discards the replies to its unfinished requests. A
 command that `vm.exec` already started in the guest keeps running until it
@@ -54,14 +56,18 @@ affected. The control socket carries no events: a job's exit is seen through
 | `vm.start` | `name` | `{state}` after the guest is running |
 | `vm.stop` | `name`, `force?` | `{state}` after the engine exited (graceful ACPI first) |
 | `vm.pause` / `vm.resume` | `name` | `{state}` |
-| `vm.screenshot` | `name`, `format?` ("png"), `maxWidth?` | `{png: base64, width, height}` — the full guest frame via QMP screendump; `maxWidth` downsamples (aspect kept) to save tokens |
-| `vm.mouse.move` | `name`, `x`, `y` | `{}` |
-| `vm.mouse.click` | `name`, `x`, `y`, `button?` ("left"/"right"/"middle"), `count?` (1 or 2), `hold?` ms | `{}` — moves, presses, releases |
-| `vm.mouse.drag` | `name`, `fromX`, `fromY`, `toX`, `toY`, `button?` | `{}` |
-| `vm.mouse.scroll` | `name`, `x`, `y`, `dx?`, `dy?` (notches, +down) | `{}` |
-| `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms | `{}` — presses modifiers then the key, releases in reverse |
-| `vm.key.down` / `vm.key.up` | `name`, `key` | `{}` |
-| `vm.type` | `name`, `text`, `delay?` ms per key | `{}` — US-layout text typing; characters outside the layout use the guest clipboard + paste when tools are connected |
+| `vm.screenshot` | `name`, `region?`, `scale?`, `format?`, `quality?`, `maxWidth?` | `{png | jpeg, mime, width, height, sentWidth, sentHeight, x, y, scale}` — see [Screenshots](#screenshots) |
+| `vm.mouse.move` | `name`, `x`, `y`, observe params | `{}` or `{observation}` |
+| `vm.mouse.click` | `name`, `x`, `y`, `button?` ("left"/"right"/"middle"), `count?` (1 to 3), `hold?` ms (default 60), observe params | `{}` or `{observation}` — moves, presses, releases |
+| `vm.mouse.drag` | `name`, `fromX`, `fromY`, `toX`, `toY`, `button?`, observe params | `{}` or `{observation}` |
+| `vm.mouse.scroll` | `name`, `x`, `y`, `dx?`, `dy?` (notches, +down), observe params | `{}` or `{observation}` |
+| `vm.mouse.down` / `vm.mouse.up` | `name`, `button?` ("left" default), `x?` and `y?` together, observe params | `{}` or `{observation}` — presses or releases the button and leaves it so; with `x`/`y` the pointer moves there first |
+| `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms, observe params | `{}` or `{observation}` — presses modifiers then the key, releases in reverse |
+| `vm.key.down` / `vm.key.up` | `name`, `key`, observe params | `{}` or `{observation}` |
+| `vm.type` | `name`, `text`, `delay?` ms per key (default 12), observe params | `{}` or `{observation}` — US-layout text typing; characters outside the layout use the guest clipboard + paste when tools are connected |
+| `vm.batch` | `name`, `steps`, observe params | `{completed, results, failedStep?, error?, observation?}` — see [Batches](#batches) |
+| `vm.find_text` | `name`, `query?`, `regex?`, `region?`, `languages?` | `{matches, lines}` — see [Finding text](#finding-text) |
+| `vm.wait_for` | `name`, `conditions`, `timeout?`, observe params | `{matched, waited, type?, detail?, problems?, observation?}` — see [Waiting for conditions](#waiting-for-conditions) |
 | `vm.exec` | `name`, `command` or `argv`, `timeout?` s, `cwd?`, `env?`, `stdin?`, `shell?` | `{code, output, stdout, stderr, timedOut, truncated}` — runs a command through the guest agent and waits for it; `output` is `stdout` followed by `stderr` |
 | `vm.exec.start` | `name`, `command` or `argv`, `cwd?`, `env?`, `shell?` | `{job, pid}` — starts a background job and returns at once |
 | `vm.exec.read` | `name`, `job`, `outOffset?`, `errOffset?`, `max?` | `{state, code?, pid, out, err, outNext, errNext, dropped}` — output from the given byte offsets |
@@ -78,13 +84,184 @@ affected. The control socket carries no events: a job's exit is seen through
 | `vm.fs.read` | `name`, `path`, `offset?`, `length?` (≤ 262144), `tail?` (lines) | `{text, size, eof}` |
 | `vm.fs.write` | `name`, `path`, `text`, `append?` | `{size}` |
 | `vm.fs.delete` | `name`, `path`, `recursive?` | `{deleted}` |
-| `vm.wait_idle` | `name`, `seconds?` (stable period), `timeout?` | `{}` — returns when the frame stops changing |
+| `vm.wait_idle` | `name`, `seconds?` (stable period, default 2), `timeout?` (default 30) | `{idle: bool}` — `true` when fewer than 0.5% of the frame's 32x32 tiles changed between samples 250 ms apart for the whole period, `false` at the timeout |
 
 Key names: letters, digits, `enter return tab space esc escape backspace delete
 insert home end pageup pagedown up down left right f1..f20 capslock
 printscreen`, modifiers `ctrl control alt option shift win cmd meta super`,
 punctuation by character (`-` `=` `[` `]` `;` `'` `,` `.` `/` `` ` `` `\`).
 Combos use `+`. Names are case-insensitive.
+
+## Screenshots
+
+`vm.screenshot` reads the current guest frame and returns it, optionally
+cropped and shrunk.
+
+- `region` `{x, y, w, h}` (guest pixels, `w` and `h` above 0) crops to the part
+  inside the frame; a region partly outside is cut to the frame, one fully
+  outside answers `region is outside the <W>x<H> frame`.
+- `scale` is a number from 0.1 to 1 (default 1) applied to the cropped area.
+- `maxWidth` shrinks the image to that width when it is below the scaled
+  width; there is no default.
+- `format` is `png` (default) or `jpeg`; `quality` is from 0.1 to 1 (default
+  0.8) and only affects JPEG. Other values answer
+  `format must be 'png' or 'jpeg'` / `quality must be between 0.1 and 1`.
+- The result holds the image base64-encoded under `png` or `jpeg`, `mime`
+  (`image/png` or `image/jpeg`), `width` and `height` of the whole guest frame,
+  `sentWidth` and `sentHeight` of the image, `x` and `y` of the top-left corner
+  of the area the image shows (0 without `region`), and `scale`, the image
+  pixels per guest pixel (`sentWidth` divided by the width of the area).
+  A guest pixel is `x + image_x / scale`, `y + image_y / scale`.
+
+## Observing the screen after input
+
+Every action op (`vm.mouse.move`, `.click`, `.drag`, `.scroll`, `.down`, `.up`,
+`vm.key.press`, `.down`, `.up`, `vm.type`), `vm.batch` and `vm.wait_for` accept
+three parameters:
+
+- `observe`: `none` (default), `summary`, `diff` or `image`. Any other value
+  answers `observe must be one of none, summary, diff, image`.
+- `settleMs`: whole milliseconds from 0 to 10000 (default 300).
+- `settleTimeoutMs`: whole milliseconds from 100 to 30000 (default 2000).
+  `settleMs` above `settleTimeoutMs` answers
+  `settleMs (<a>) must not exceed settleTimeoutMs (<b>); lower settleMs or raise settleTimeoutMs`
+  before any input is sent.
+
+With `observe` `none` the result has no observation and no frame is read.
+Otherwise the op reads the frame before it sends input; if that fails it sends
+nothing and answers `the screen could not be read before <op>, so no input was
+sent: <reason>`. After the input it samples the screen every 50 ms; the screen
+has settled once no 32x32 tile differs between consecutive samples for
+`settleMs`, and sampling ends unsettled after `settleTimeoutMs`. The result
+carries `observation`:
+
+| field | meaning |
+|---|---|
+| `settled` | whether the screen settled before `settleTimeoutMs` |
+| `changed` | `{x, y, w, h}`, the bounding box in guest pixels of the tiles that differ from the frame before the input; absent when none differ |
+| `changedFraction` | share of the frame's tiles that differ, 0 to 1 |
+| `width`, `height` | size of the settled frame |
+| `png`, `imageRect`, `imageScale` | with `diff` (only when something changed) or `image`: the PNG, the guest rectangle it shows, and image pixels per guest pixel. `diff` shows the changed box plus 16 pixels on every side, cut to the frame; `image` shows the whole frame. An image wider than 1280 pixels is shrunk to 1280 |
+
+When the screen cannot be read after the input was sent, the input stands and
+the result carries `observationError` (a sentence of the form `the screen could
+not be read after <op>: <reason>; call vm.screenshot to see the result`)
+instead of `observation`.
+
+## Batches
+
+`vm.batch` runs `steps` (an array of 1 to 50 objects) in order for one VM
+while holding that VM's input gate once, so no other connection's input
+interleaves. A step is an object with `op` and the parameters of that op
+without `name` (a `name` that differs from the batch's VM is refused).
+Allowed `op` values: the action ops (`vm.mouse.move`, `.click`, `.drag`,
+`.scroll`, `.down`, `.up`, `vm.key.press`, `.down`, `.up`, `vm.type`),
+`vm.wait_idle`, `vm.wait_for` and `sleep` (`ms`, a whole number from 1 to
+10000). Any other `op` is refused. The whole batch is validated before
+anything runs; refusals name the step as `step <i>: ...`. Step indices count
+from 0 everywhere: in refusals, in `results` and in `failedStep`.
+
+Each step runs with `observe` `none`; `observe`, `settleMs` and
+`settleTimeoutMs` on the batch itself ask for one observation after the last
+step (compared with the frame before the first step), with the same
+`observation` / `observationError` fields as an action op.
+
+The result is `{completed, results, observation?}`: `completed` steps ran
+and `results[i]` is the result of step `i` (`{}` for input and `sleep`,
+`{idle}` for `vm.wait_idle`, the `vm.wait_for` result for `vm.wait_for`).
+The first step that fails ends the batch; the reply is still a success and adds
+`failedStep` (its index) and `error` (its message). Steps after it do not
+run; steps before it keep their effect.
+
+## Finding text
+
+`vm.find_text` reads the text on the screen with the macOS Vision framework.
+
+- `query` (default empty): a case-insensitive substring; with `regex: true`
+  a case-insensitive regular expression (an invalid one answers
+  `'<query>' is not a valid regular expression`). An empty query returns every
+  recognized line.
+- `region` is as for `vm.screenshot`.
+- `languages` is a non-empty array of recognition languages, default
+  `["ko-KR", "en-US"]`; an unsupported one answers
+  `language '<l>' is not supported; supported: ...`.
+- The result is `{matches, lines}`. `matches` lists the matching lines in
+  reading order (top to bottom, then left to right) as `{text, x, y, w, h, cx,
+  cy, confidence}`: the rectangle in guest pixels of the whole frame, its centre
+  (`cx`, `cy`, the point to click) and a confidence from 0 to 1 with two
+  decimals. `lines` is the number of lines recognized in the area before the
+  filter. Frames narrower than 400 pixels are enlarged twofold for recognition.
+- When recognition throws, the op waits 150 ms and tries once more on the same
+  frame; a second failure answers `text recognition failed twice; call
+  vm.find_text again or use vm.screenshot`.
+
+## Waiting for conditions
+
+`vm.wait_for` waits until one of 1 to 8 `conditions` holds or `timeout`
+seconds (a number from 1 to 600, default 30) pass. It is an op of the serial
+lane that takes no input gate. Conditions are numbered from 0.
+
+| `type` | fields | holds when | `detail` of a match |
+|---|---|---|---|
+| `screen_idle` | `seconds?` (0 to 600, default 2) | fewer than 0.5% of the frame's tiles changed between consecutive samples for `seconds` | none |
+| `region_changed` | `region` | a tile inside the region differs from the region at the start of the wait, or the region no longer fits the frame | none |
+| `text_visible` | `text`, `regex?`, `region?`, `languages?` | a recognized line contains `text` (case-insensitive substring, or regular expression with `regex: true`) | `{text, x, y, w, h, cx, cy}` of the first matching line |
+| `text_gone` | as `text_visible` | no recognized line matches | none |
+| `process_started` | `processName` | a guest process with that name exists (case-insensitive, `.exe` ignored) | `{pid, name}` |
+| `process_exited` | `pid` or `processName` | no guest process has that `pid` (or, without `pid`, that name) | none |
+| `file_exists` | `path` | the guest file or folder exists | `{path, size}` |
+| `port_listening` | `port` (1 to 65535) | a TCP port listens in the guest | none |
+| `log_matches` | `path`, `pattern` | one of the last 400 lines of the guest file matches the regular expression | the line, cut to 500 characters |
+| `job_output_matches` | `job`, `pattern` | the stdout or stderr of the job (last 64 KiB of each, read from the start) matches the regular expression, with `^` and `$` matching at line breaks | none |
+
+`process_exited` with a `pid` that does not exist holds at once, because the
+condition is "no such process". `screen_idle` compares each sample with the
+previous sample, not with the frame at the start. The conditions that read the
+screen take the screen at the start of the wait as their reference
+(`region_changed`) or first sample (`screen_idle`).
+
+Conditions are evaluated in a loop with a 250 ms tick; each condition has its
+own period: 250 ms for `screen_idle` and `region_changed`, 700 ms for
+`text_visible` and `text_gone`, 500 ms for the conditions that call the guest
+tools. Conditions that read the screen share one frame per tick, and equal
+text searches share one recognition. A condition that needs guest tools
+(`process_*`, `file_exists`, `port_listening`, `log_matches`,
+`job_output_matches`) answers `guest tools are not connected in '<vm>'; ...`
+when they are not connected after a wait of up to 25 s. If several conditions hold on the same tick, the
+one with the lowest index wins.
+
+The result is `{matched, waited, type?, detail?, problems?, observation?}`:
+
+- `matched` is the index of the condition that held, or `-1`. `waited` is the
+  elapsed time in seconds with one decimal. `type` is its `type`; `detail` is
+  as in the table. Running out of time is a success with `matched: -1`.
+- `job exited`: when a `job_output_matches` condition sees the job exited and
+  all its output read without a match, it can no longer become true and the wait
+  ends at once with `matched: -1`, `type: "job_output_matches"` and
+  `detail: "job exited"`.
+- A failing evaluation (a frame, recognition or guest call that errors or times
+  out) does not end the wait: the condition is tried again at its next period.
+  `problems` appears only when `matched` is `-1` and lists
+  `{condition, type, error, failures}` for each condition whose latest
+  evaluations failed, `failures` being the number in a row. Errors that make the
+  condition meaningless end the wait with an error instead: a guest-tools
+  connection that is lost or too old, a `region` outside the frame
+  (`condition <i>: region is outside the <W>x<H> frame`), an unknown job, a
+  `port_listening` on a guest OS that is not supported.
+- `observe` at a level above `none` adds `observation` or `observationError`
+  as for an action op, comparing the final screen with the screen at the start
+  of the wait.
+
+## Leases and read-only ops
+
+An op that is not read-only is refused while another connection holds a lease
+on the VM, unless it passes the lease's token as `lease`. The read-only ops,
+which ignore leases, are `hello`, `vm.list`, `vm.status`, `vm.screenshot`,
+`vm.wait_idle`, `vm.wait_for`, `vm.find_text`, `vm.clipboard.get`,
+`vm.exec.read`, `vm.exec.list`, `vm.process.list`, `vm.fs.list`, `vm.fs.read`,
+`vm.pull_file`, `vm.snapshot.list`, `vm.forward.list`, `vm.lease.acquire`,
+`vm.lease.release` and `vm.doctor`. The action ops and `vm.batch` are not
+read-only; a batch checks the lease once, for the whole batch.
 
 ## Shell, processes and files
 
