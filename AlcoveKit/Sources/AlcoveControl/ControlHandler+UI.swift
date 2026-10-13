@@ -82,6 +82,8 @@ actor HelperAnswer {
 struct HelperProbe: Sendable {
     /// The agent op of the call.
     let op: String
+    /// When the call began to wait for its turn.
+    let started: ContinuousClock.Instant
     let answer: HelperAnswer
     let task: Task<Void, Never>
 
@@ -263,6 +265,7 @@ extension ControlHandler {
     nonisolated func startHelperCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
                                      turnBy: ContinuousClock.Instant) -> HelperProbe {
         let answer = HelperAnswer()
+        let started = ContinuousClock.now
         let task = Task {
             let result: Result<JSON, Error>
             do {
@@ -272,7 +275,7 @@ extension ControlHandler {
             }
             await answer.finish(result)
         }
-        return HelperProbe(op: agentOp, answer: answer, task: task)
+        return HelperProbe(op: agentOp, started: started, answer: answer, task: task)
     }
 
     /// One helper call on behalf of the control op `op`, which waits `UITiming.queueTimeout` for its turn; failures become control errors.

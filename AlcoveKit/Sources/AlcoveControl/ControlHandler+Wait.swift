@@ -41,7 +41,7 @@ extension ControlHandler {
         var lastTotal: JSON?
         /// The helper call of a UI condition whose outcome has not been collected.
         var probe: HelperProbe?
-        /// Whether the latest helper call ended without getting its turn at the helper.
+        /// Whether the latest helper call waited `WaitTiming.reportedSilence` or longer for its turn at the helper and did not get it.
         var helperWasBusy = false
         /// The sequence number of the newest guest event this condition has looked at.
         var eventCursor = 0
@@ -179,16 +179,25 @@ extension ControlHandler {
         return .object(out)
     }
 
-    /// Why a UI condition without a recorded failure got no answer from the helper: its call was sent and not answered,
-    /// or never got its turn. Nil when its latest call was answered.
+    static let busyHelper = "the UI helper was busy with other requests"
+
+    /// Why a UI condition without a recorded failure got no answer from the helper: its call was sent and has not been
+    /// answered, or did not get its turn, for `WaitTiming.reportedSilence` or longer. Nil for an answered call and for a
+    /// shorter silence.
     private func helperSilence(_ state: WaitState, now: ContinuousClock.Instant) async -> String? {
-        let busy = "the UI helper was busy with other requests"
-        guard let probe = state.probe else { return state.helperWasBusy ? busy : nil }
+        guard let probe = state.probe else { return state.helperWasBusy ? ControlHandler.busyHelper : nil }
         switch await probe.answer.phase {
-        case .queued: return busy
-        case .sent(let at): return "the UI helper has not answered \(probe.op) for \(max(0, (now - at).components.seconds)) s"
-        case .done(.failure(let error), _): return error is HelperBusy ? busy : nil
-        case .done: return nil
+        case .queued:
+            return now - probe.started >= WaitTiming.reportedSilence ? ControlHandler.busyHelper : nil
+        case .sent(let at):
+            let silent = now - at
+            guard silent >= WaitTiming.reportedSilence else { return nil }
+            let seconds = (Double(silent.components.seconds) + Double(silent.components.attoseconds) / 1e18).rounded()
+            return "the UI helper has not answered \(probe.op) for \(Int(seconds)) s"
+        case .done(.failure(let error), let at):
+            return error is HelperBusy && at - probe.started >= WaitTiming.reportedSilence ? ControlHandler.busyHelper : nil
+        case .done:
+            return nil
         }
     }
 
@@ -354,10 +363,11 @@ extension ControlHandler {
             outcome = await probe.answer.outcome(until: min(now + WaitTiming.agentCallTimeout, deadline))
         }
         guard let outcome else { return .unanswered }
+        let started = state.probe?.started ?? outcome.at
         state.probe = nil
         state.nextDue = outcome.at + condition.period
         if case .failure(let error) = outcome.result, error is HelperBusy {
-            state.helperWasBusy = true
+            state.helperWasBusy = outcome.at - started >= WaitTiming.reportedSilence
             return .unanswered
         }
         return try judge(condition, outcome.result, state: &state, at: outcome.at)

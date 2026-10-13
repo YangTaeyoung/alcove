@@ -1805,8 +1805,21 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "ui.find").count, 1)
     }
 
+    func testAProbeInFlightWhenTheWaitEndsIsNotReportedAsSilence() async throws {
+        let (h, _, agent) = try await rig()
+        agent.handler = { m, a in
+            guard m["op"]?.stringValue == "ui.find" else { return [] }
+            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(60)) { a.sendLine(agentReply(m, ["nodes": []])) }
+            return []
+        }
+        for _ in 0..<4 {
+            let r = try await waitFor(h, [["type": "ui_exists", "name": "Never"]], timeout: 1)
+            XCTAssertEqual(r["matched"]?.intValue, -1)
+            XCTAssertNil(r["problems"])
+        }
+    }
+
     func testAnUnansweredProbeKeepsTheFailuresRecordedBefore() async throws {
-        WaitTiming.agentCallTimeout = .milliseconds(50)
         let (h, _, agent) = try await rig([
             "ui.find": { _, n in n == 0 ? .fail("UI helper exited; retry") : .silent },
             "fs.stat": { m, n in m["path"]?.stringValue == "C:\\denied" && n == 0 ? .fail("access denied") : .silent },
@@ -1911,7 +1924,7 @@ final class ControlUITests: XCTestCase {
 
     func testObservationFactsShareOneBudgetAndTheHelperStaysTakenUntilItAnswers() async throws {
         UITiming.factBudget = .milliseconds(50)
-        UITiming.treeFactBudget = .milliseconds(50)
+        UITiming.treeFactBudget = .seconds(3)
         let (h, _, agent) = try await rig([
             "ui.focused": { _, _ in .ok(["node": messageEdit, "window": fixtureWindow]) },
             "ui.tree": { _, _ in .silent },
