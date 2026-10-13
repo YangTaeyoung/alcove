@@ -100,13 +100,13 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("http", "alcove_http_requests", {
     title: "List or read captured requests",
-    description: "Without id: list the newest captured exchanges (limit, default 50), one per line as `#id time METHOD url -> status (ms, request/response bytes) [rule n]`, filtered by host, path or status; tunnelled hosts appear as TUNNEL rows. With id: read one exchange part (request or response) as headers and body, paged with offset and length. Prefer a list with filters over reading everything. With clear: true (alone) the captured exchanges are discarded and capture continues.",
+    description: "Without id: list the newest captured exchanges (limit, default 50), one per line as `#id time METHOD url -> status (ms, request/response bytes) [rule n]`, filtered by host, path or status; tunnelled hosts appear as TUNNEL rows. With id: read one exchange part (request or response) as headers and body, paged with offset and length, which count bytes of that part (length defaults to 60000, at most 200000; the text shows at most 60000 characters per call and ends with the offset to continue from). Prefer a list with filters over reading everything. With clear: true (alone) the captured exchanges are discarded and capture continues.",
     inputSchema: {
       name: vmName,
       id: z.number().int().min(0).optional().describe("Exchange id to read; with it the list filters are ignored"),
       part: z.enum(["request", "response"]).optional().describe("With id: which side to read (default response)"),
-      offset: z.number().int().min(0).optional().describe("With id: first body character to return"),
-      length: z.number().int().min(1).max(200000).optional().describe("With id: body characters to return (default and maximum 200000)"),
+      offset: z.number().int().min(0).optional().describe("With id: first body byte to return (default 0)"),
+      length: z.number().int().min(1).max(200000).optional().describe("With id: body bytes to return (default 60000, maximum 200000)"),
       since: z.number().int().min(0).optional().describe("List only exchanges with an id above this"),
       host: z.string().optional().describe("List only URLs containing this host text"),
       path: z.string().optional().describe("List only URLs containing this path text"),

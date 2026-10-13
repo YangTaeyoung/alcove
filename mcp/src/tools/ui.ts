@@ -24,6 +24,8 @@ function nodeLabel(n: Obj | undefined): string {
   return `${n.ref ?? ""} ${n.role ?? ""} "${n.name ?? ""}"`.trim();
 }
 
+const WAIT_WINDOW_DEFAULT_S = 20;
+
 const windowRef = z.string().min(1).describe("Window id from alcove_list_windows, \"foreground\", or a part of the title");
 
 export function register(r: Registrar, client: ControlClient): void {
@@ -265,20 +267,20 @@ export function register(r: Registrar, client: ControlClient): void {
       args: z.array(z.string()).optional().describe("Command-line arguments"),
       cwd: z.string().optional().describe("Working directory inside the guest"),
       env: z.record(z.string()).optional().describe("Extra environment variables"),
-      wait_window_s: z.number().min(0).max(300).optional().describe("Seconds to wait for a window of the new process (default 20)"),
+      wait_window_s: z.number().min(0).max(300).optional().describe(`Seconds to wait for a window of the new process (default ${WAIT_WINDOW_DEFAULT_S}; 0 skips the wait)`),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, async (a) => {
     try {
-      const wait = a.wait_window_s;
+      const wait = a.wait_window_s ?? WAIT_WINDOW_DEFAULT_S;
       const reply = await client.call("vm.app.launch", {
         name: a.name,
         path: a.path,
         ...(a.args !== undefined ? { args: a.args } : {}),
         ...(a.cwd !== undefined ? { cwd: a.cwd } : {}),
         ...(a.env !== undefined ? { env: a.env } : {}),
-        ...(wait !== undefined ? { waitWindow: wait } : {}),
-      }, ((wait ?? 20) + 60) * 1000);
+        waitWindow: wait,
+      }, (wait + 60) * 1000);
       const w = reply.window as Obj | undefined;
       const body = `started pid ${reply.pid}${w ? `\n${windowLine(w)}` : "\nno window appeared yet; check alcove_list_windows"}`;
       return text(body, { pid: reply.pid, window: w });
@@ -305,7 +307,7 @@ export function register(r: Registrar, client: ControlClient): void {
         env: z.record(z.string()).optional(),
         cwd: z.string().optional(),
       }).optional().describe("Program to start after the copy and install"),
-      wait_window_s: z.number().min(0).max(300).optional().describe("Seconds to wait for the launched app's window (default 20)"),
+      wait_window_s: z.number().min(0).max(300).optional().describe(`Seconds to wait for the launched app's window (default ${WAIT_WINDOW_DEFAULT_S}; 0 skips the wait)`),
       kill_running: z.boolean().optional().describe("Stop processes running from guest_dir before copying (default true)"),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },

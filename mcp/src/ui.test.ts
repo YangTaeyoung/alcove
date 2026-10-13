@@ -92,6 +92,14 @@ test("alcove_launch_app maps wait_window_s to waitWindow", async () => {
   assert.deepEqual(t.calls[0].params, { name: "vm", path: "C:\\a.exe", waitWindow: 7 });
 });
 
+test("alcove_launch_app always sends waitWindow: 20 by default and passes 0 through", async () => {
+  const t = rig(register, { pid: 4 });
+  await t.run("alcove_launch_app", { name: "vm", path: "C:\\a.exe" });
+  assert.equal(t.calls[0].params.waitWindow, 20);
+  await t.run("alcove_launch_app", { name: "vm", path: "C:\\a.exe", wait_window_s: 0 });
+  assert.equal(t.calls[1].params.waitWindow, 0);
+});
+
 test("alcove_deploy maps snake_case fields", async () => {
   const t = rig(register, { guestDir: "C:\\a", sent: ["x"], skipped: 0, bytes: 3, pid: 9 });
   const r = await t.run("alcove_deploy", { name: "vm", path: "/b", guest_dir: "C:\\a", wait_window_s: 5, kill_running: false });
