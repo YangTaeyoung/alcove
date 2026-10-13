@@ -214,16 +214,29 @@ run; steps before it keep their effect.
   `'<query>' is not a valid regular expression`). An empty query returns every
   recognized line.
 - `region` is as for `vm.screenshot`.
-- `languages` is a non-empty array of recognition languages, default
-  `["ko-KR", "en-US"]`. Any other value answers
+- `languages` is a non-empty array of recognition languages. Any other value
+  answers
   `languages must be an array of language codes such as ["en-US","ko-KR"]`;
   an unsupported language is refused before any recognition and answers
   `language '<l>' is not supported; supported: ...`.
-- The first language selects the recognizer. With `ko-KR` first, Hangul is
-  read well and small Latin text with mistakes (`Alcove OCR check` in 11-point
-  Consolas at 100 % scale came back as `Alcove OR check`); with `en-US` first
-  or alone, Latin text is read well and Hangul not at all. Pass `["en-US"]`
-  when the text looked for has Latin letters only.
+- Without `languages` the area is recognized twice, with `["ko-KR", "en-US"]`
+  and with `["en-US"]`, and the two results are merged line by line: a line
+  that contains Hangul is read by the Korean recognizer, every other line by
+  the Latin recognizer. Two lines count as the same line when their rectangles
+  intersect horizontally and overlap vertically by at least half the height of
+  the less tall one. A line only the Korean recognizer found is kept; a line
+  only the Latin recognizer found is left out. In a line that mixes both
+  scripts the Latin letters are the Korean recognizer's reading.
+- With `languages` the area is recognized once with exactly that list. Pass
+  `["en-US"]` when the screen has no Hangul you need: it is one recognition
+  instead of two, and it reads the Latin part of a line that also holds Hangul
+  with the Latin recognizer (the Hangul part comes back as other characters).
+  Pass another list for other scripts, such as `["ja-JP", "en-US"]`. In the
+  measurements of `docs/superpowers/plans/2026-10-13-at3-results.md` a list
+  with `ko-KR` first read Hangul well and small Latin text with mistakes
+  (`Alcove OCR check` in 11-point Consolas at 100 % scale came back as
+  `Alcove OR check`), and a list with `en-US` first read Latin text well and
+  no Hangul.
 - The result is `{matches, lines}`. `matches` lists the matching lines in
   reading order (top to bottom, then left to right) as `{text, x, y, w, h, cx,
   cy, confidence}`: the rectangle in guest pixels of the whole frame, its centre
@@ -231,8 +244,17 @@ run; steps before it keep their effect.
   decimals. Every rectangle lies inside the searched area. `lines` is the
   number of lines recognized in the area before the filter. Areas narrower
   than 400 pixels are enlarged twofold for recognition.
-- The first recognition with a recognizer after the server starts loads it and
-  can take tens of seconds; later ones take a fraction of a second.
+- Recognitions run one at a time for the whole server, in the order they were
+  asked for, `vm.find_text` and the text conditions of `vm.wait_for` alike. A
+  request for the frame and `languages` of a recognition that is running or
+  waiting shares it. A request that is cancelled or, in a wait, runs out of
+  time before its turn is taken out of the line and never recognized.
+- When the server starts it reads a small image with both recognizers in the
+  background, which loads them. Loading takes a fraction of a second, and tens
+  of seconds the first time a server binary runs from a path where it has not
+  read text before. A `vm.find_text` that arrives meanwhile waits behind it; a
+  text condition of `vm.wait_for` waits until its timeout and is then listed
+  in `problems` (see [Waiting for conditions](#waiting-for-conditions)).
 - When the Vision request itself fails (`text recognition failed: <reason>`),
   the op waits 150 ms and tries once more on the same frame; a second failure
   answers `text recognition failed twice; call vm.find_text again or use
@@ -283,6 +305,8 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
 - `matched` is the index of the condition that held, or `-1`. `waited` is the
   elapsed time in seconds with one decimal. `type` is its `type`; `detail` is
   as in the table. Running out of time is a success with `matched: -1`.
+  `waited` can exceed `timeout` by up to one second when a text recognition is
+  finishing.
 - `job exited`: when a `job_output_matches` condition sees the job exited and
   all its output read without a match, it can no longer become true and the wait
   ends at once with `matched: -1`, `type: "job_output_matches"` and
@@ -292,13 +316,17 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   `problems` appears only when `matched` is `-1` and lists
   `{condition, type, error, failures}` for each condition whose latest
   evaluations failed, `failures` being the number in a row. A text recognition
-  that is still running at the timeout and one second after its start is
-  given up: the wait ends and the condition is listed with `text recognition
-  did not finish within the timeout; call vm.wait_for again with a longer
-  timeout`. A port check whose guest command fails is listed with `the port
-  check failed: <what the command printed>`, or, when it printed nothing,
-  `the port check failed: the guest command exited with code <n> and printed
-  nothing; run vm.doctor to check the guest shell`. Errors that make the
+  that has not finished at the timeout and one second after the wait asked for
+  it is given up: the wait ends, leaves the line of recognitions, and the
+  condition is listed with `text recognition did not finish within the
+  timeout; call vm.wait_for again with a longer timeout`. A port check whose
+  guest command fails or prints nothing on stdout is listed with `the port
+  check failed: the guest command exited with code <n>: <line>; run vm.doctor
+  to check the guest shell`, `<line>` being the first line of what the command
+  wrote to stderr, or to stdout when stderr is empty, cut at 200 characters;
+  when both are empty the sentence is `the port check failed: the guest
+  command exited with code <n> and printed nothing; run vm.doctor to check the
+  guest shell`. Errors that make the
   condition meaningless end the wait with an error instead: a guest-tools
   connection that is lost or too old, a `region` outside the frame
   (`condition <i>: region is outside the <W>x<H> frame`), an unknown job, a
