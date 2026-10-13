@@ -65,7 +65,7 @@ Rules:
 
 - Output streams of `exec.run` keep the last 200000 bytes each; `truncated` is true when bytes were dropped. Invalid UTF-8 is replaced with U+FFFD.
 - A job keeps the last 1 MiB per stream. Offsets count bytes since the job started; reading below the retained window sets `dropped` and returns from the oldest retained byte. The server keeps 64 jobs and forgets the oldest exited job first. Jobs belong to the server, not to a connection. A job exit emits `{"t":"ev","name":"job.exited","job":..,"code":..}` on every open connection.
-- On Windows every child process starts without a console window, and PowerShell commands run as `[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; <cmd>` through `powershell.exe -NoProfile -NonInteractive -Command`.
+- On Windows every child process starts without a console window, and PowerShell commands run as `[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; <cmd>` through `powershell.exe -NoProfile -NonInteractive -Command`.
 - A timeout or kill removes the process tree: Windows `taskkill /F /T /PID <pid>`; elsewhere the child runs in its own process group and the group receives SIGKILL.
 - Paths: `~` and `~/x` resolve against `Options.HomeDir`; a relative path resolves against `Options.HomeDir`; results report absolute paths.
 

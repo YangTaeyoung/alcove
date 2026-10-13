@@ -184,9 +184,9 @@ def _(a, run):
 
 @check("exec.run applies cwd, env and stdin")
 def _(a, run):
-    r = a.call("exec.run", cwd="C:\\Windows", env={"ALCOVE_E2E": "값 1"}, stdin="from stdin\n",
+    r = a.call("exec.run", cwd="C:\\Windows", env={"ALCOVE_E2E": "값 1"}, stdin="표준 입력\n",
                cmd="(Get-Location).Path; $env:ALCOVE_E2E; [Console]::In.ReadLine()")
-    expect(lines(r["stdout"]) == ["C:\\Windows", "값 1", "from stdin"], f"stdout is {r['stdout']!r}, stderr {r['stderr']!r}")
+    expect(lines(r["stdout"]) == ["C:\\Windows", "값 1", "표준 입력"], f"stdout is {r['stdout']!r}, stderr {r['stderr']!r}")
     expect(r["code"] == 0, f"code is {r['code']!r}")
 
 
@@ -286,10 +286,14 @@ def _(a, run):
     out, err, r = run.read_until(job, lambda o, e, r: "axb" in o or r["state"] == "exited", 10)
     expect(r is not None and r["state"] == "running" and lines(out) == ["axb"],
            f"exec.read did not show 'axb' from the running job; state {r and r['state']!r}, out {out!r}, err {err!r}")
+    a.call("exec.write", job=job, data="한글 x 줄\r\n아님\r\n")
+    out, err, r = run.read_until(job, lambda o, e, r: len(lines(o)) >= 2 or r["state"] == "exited", 10)
+    expect(r is not None and r["state"] == "running" and lines(out) == ["axb", "한글 x 줄"],
+           f"exec.read did not show the Korean line from the running job; state {r and r['state']!r}, out {out!r}, err {err!r}")
     a.call("exec.write", job=job, data="cxd\r\n", eof=True)
     out, err, r = run.read_until(job, exited, 10)
     expect(r is not None, "the line filter did not exit within 10 s of eof")
-    expect(r["code"] == 0 and lines(out) == ["axb", "cxd"], f"code {r['code']!r}, out {out!r}, err {err!r}")
+    expect(r["code"] == 0 and lines(out) == ["axb", "한글 x 줄", "cxd"], f"code {r['code']!r}, out {out!r}, err {err!r}")
 
 
 @check("exec.kill ends a job and its process tree")

@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	powershellUTF8Prefix = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; "
+	powershellUTF8Prefix = "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; "
 	runStreamBytes       = 200000
 	defaultRunTimeout    = 120 * time.Second
 	pipeWaitDelay        = 2 * time.Second

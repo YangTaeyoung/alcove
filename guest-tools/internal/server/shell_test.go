@@ -90,7 +90,7 @@ func (c *rpcClient) event(name string) proto.Message {
 }
 
 func TestBuildCommandForms(t *testing.T) {
-	const prefix = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; "
+	const prefix = "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; "
 
 	cmd, err := buildCommand(proto.Message{"cmd": "dir"}, "windows")
 	if err != nil {
