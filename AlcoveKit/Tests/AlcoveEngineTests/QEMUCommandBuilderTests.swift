@@ -138,7 +138,9 @@ final class QEMUCommandBuilderTests: XCTestCase {
         XCTAssertTrue(a.contains("scsi-cd,id=cd0-dev,bus=cd0-bot.0,bootindex=100"))
     }
     func testCDROMVirtioBusOption() {
-        let l = VMConfig.defaults(name: "L", guestOS: .linux, installISO: "/i.iso")
+        var l = VMConfig.defaults(name: "L", guestOS: .linux, installISO: "/i.iso")
+        l.agentToken = "00000000-0000-0000-0000-000000000000"
+        l.macAddress = "52:54:00:aa:bb:cc"
         XCTAssertTrue(args(l).joined(separator: " ").contains("scsi-cd,drive=cd0"), "USB CD by default")
         var seed = l
         seed.cdroms[0].bus = .virtio
