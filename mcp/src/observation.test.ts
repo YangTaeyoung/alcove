@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderObservation, actionResult, screenshotCaption, waitForResult, batchResult } from "./observation.js";
+import { z } from "zod";
+import { observeParams, renderObservation, actionResult, screenshotCaption, waitForResult, batchResult } from "./observation.js";
 import { camelKeys, mapBatchStep } from "./tools/actions.js";
 
 const base = { settled: true, changedFraction: 0, width: 1920, height: 1080 };
@@ -147,4 +148,21 @@ test("non-string foreground, focused, events and tree render as compact JSON", (
     'events: [{"type":"dialog","title":"Save"}]',
     '{"role":"window","children":[{"role":"button"}]}',
   ].join("\n"));
+});
+
+test("screenshot caption derives the area from the image size and scale when the area fields are absent", () => {
+  const caption = screenshotCaption("Win", { width: 1920, height: 1080, sentWidth: 200, sentHeight: 100, x: 40, y: 50, scale: 0.5 });
+  assert.match(caption, /image 200x100 shows guest \(40,50\) 400x200 at scale 0\.5;/);
+  assert.doesNotMatch(caption, /undefined|NaN/);
+});
+
+test("settle parameters accept the ranges of the control ops", () => {
+  const schema = z.object(observeParams);
+  assert.ok(schema.safeParse({ settle_timeout_ms: 100 }).success);
+  assert.ok(schema.safeParse({ settle_timeout_ms: 30000 }).success);
+  assert.ok(!schema.safeParse({ settle_timeout_ms: 99 }).success);
+  assert.ok(!schema.safeParse({ settle_timeout_ms: 30001 }).success);
+  assert.ok(schema.safeParse({ settle_ms: 0 }).success);
+  assert.ok(schema.safeParse({ settle_ms: 10000 }).success);
+  assert.ok(!schema.safeParse({ settle_ms: 10001 }).success);
 });

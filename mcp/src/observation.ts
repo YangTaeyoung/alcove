@@ -28,7 +28,7 @@ export function screenshotCaption(name: string, r: Record<string, unknown>): str
   const x = Number(r.x ?? 0), y = Number(r.y ?? 0);
   const scale = Number(r.scale ?? 1);
   const sentWidth = Number(r.sentWidth), sentHeight = Number(r.sentHeight);
-  const w = r.areaWidth, h = r.areaHeight;
+  const w = r.areaWidth ?? Math.round(sentWidth / scale), h = r.areaHeight ?? Math.round(sentHeight / scale);
   return `${name}: guest frame ${r.width}x${r.height}; image ${sentWidth}x${sentHeight} shows guest (${x},${y}) ${w}x${h} at scale ${formatScale(scale)}; guest = origin + image_pixel / scale`;
 }
 
@@ -107,7 +107,7 @@ export function batchResult(sent: Array<Record<string, unknown>>, reply: Record<
 export const observeParams = {
   observe: z.enum(["none", "summary", "diff", "image"]).optional().describe("What to report about the screen after the action: none, summary (settled or not, changed rectangle), diff (summary plus an image of the changed area) or image (summary plus the full frame)"),
   settle_ms: z.number().int().min(0).max(10000).optional().describe("The screen counts as settled after this long without change (default 300)"),
-  settle_timeout_ms: z.number().int().min(0).max(30000).optional().describe("Stop waiting for the screen to settle after this long (default 2000)"),
+  settle_timeout_ms: z.number().int().min(100).max(30000).optional().describe("Stop waiting for the screen to settle after this long (default 2000)"),
 };
 
 export interface ObserveArgs { observe?: ObserveLevel; settle_ms?: number; settle_timeout_ms?: number }
