@@ -432,7 +432,8 @@ final class GuestEvidenceTests: XCTestCase {
     func testDumpPullRefusesOtherFiles() async throws {
         let (h, agent) = try await setup(fs: FakeFS())
         let message = "file must be the name of a .dmp file listed by vm.crash_dumps.list, without a folder"
-        for file in ["..\\Windows\\win.ini", "../x.dmp", "C:\\alcove-dumps\\a.dmp", "sub/a.dmp", "..", "a.dmp:stream", "a.txt", ".dmp", "a\\..\\b.dmp", "", "CON.dmp", "nul.dmp", "Com1.dmp", "LPT9.dmp", "aux.x.dmp"] {
+        for file in ["..\\Windows\\win.ini", "../x.dmp", "C:\\alcove-dumps\\a.dmp", "sub/a.dmp", "..", "a.dmp:stream", "a.txt", ".dmp", "a\\..\\b.dmp", "", "CON.dmp", "nul.dmp", "Com1.dmp", "LPT9.dmp", "aux.x.dmp",
+                     "CON.\u{301}.dmp", "CON .dmp", "nul  .x.dmp", "COM\u{B9}.dmp", "lpt\u{B3}.dmp", "COM0.dmp", "a.dmp ", "a.dmp."] {
             let text = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": .string(file), "path": "/tmp/x.dmp"])
             XCTAssertEqual(text, message, file)
         }
@@ -451,6 +452,12 @@ final class GuestEvidenceTests: XCTestCase {
         let (h, _) = try await setup(fs: FakeFS(), statError: "cannot hash 'C:\\alcove-dumps\\alcove-fixture.exe.10128.dmp': open C:\\alcove-dumps\\alcove-fixture.exe.10128.dmp: The process cannot access the file because it is being used by another process.")
         let text = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": "alcove-fixture.exe.10128.dmp", "path": "/tmp/alcove-test-never-written.dmp"])
         XCTAssertEqual(text, "the dump 'alcove-fixture.exe.10128.dmp' is still being written; retry in a few seconds")
+    }
+
+    func testDumpPullAcceptsNamesThatOnlyResembleDeviceNames() async throws {
+        for file in ["Console.exe.1.dmp", "COM10.exe.2.dmp", "a.con.dmp", "alcove-fixture.exe(1).5648.dmp", "My App [x].exe.7.dmp"] {
+            XCTAssertTrue(ControlHandler.isWindowsFileName(file, suffix: ".dmp"), file)
+        }
     }
 
     func testDumpsOnLinux() async throws {

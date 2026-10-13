@@ -463,16 +463,19 @@ extension ControlHandler {
     }
 
     /// Whether `s` is a bare Windows file name ending in `suffix` (any case) with a non-empty stem and no character
-    /// a Windows file name cannot hold, whose part before the first dot is no reserved device name.
+    /// a Windows file name cannot hold, whose Unicode scalars before the first dot, without trailing spaces, are no
+    /// reserved device name.
     static func isWindowsFileName(_ s: String, suffix: String) -> Bool {
         let invalid = Set("<>:\"/\\|?*".unicodeScalars)
         guard s.lowercased().hasSuffix(suffix), s.count > suffix.count, s.utf16.count <= 255 else { return false }
         guard s.unicodeScalars.allSatisfy({ $0.value >= 0x20 && !invalid.contains($0) }) else { return false }
-        return !reservedDeviceNames.contains(s.prefix { $0 != "." }.uppercased())
+        var stem = Array(s.unicodeScalars.prefix { $0 != "." })
+        while stem.last == " " { stem.removeLast() }
+        return !reservedDeviceNames.contains(String(String.UnicodeScalarView(stem)).uppercased())
     }
 
     private static let reservedDeviceNames: Set<String> =
-        Set(["CON", "PRN", "AUX", "NUL"] + (1...9).flatMap { ["COM\($0)", "LPT\($0)"] })
+        Set(["CON", "PRN", "AUX", "NUL"] + ["COM", "LPT"].flatMap { port in (0...9).map { "\(port)\($0)" } + ["\u{B9}", "\u{B2}", "\u{B3}"].map { port + $0 } })
 
     private static func lastJSONObject(_ output: String) -> JSON? {
         for line in output.split(whereSeparator: \.isNewline).reversed() where line.hasPrefix("{") {
