@@ -72,6 +72,8 @@ public actor ControlHandler {
     /// The base directory of new diagnostics bundles; nil selects `~/Library/Application Support/Alcove/Diagnostics`.
     let diagnosticsDirectory: URL?
     var recordings = RecordingTable()
+    /// The directories `vm.collect_diagnostics` calls are writing at this moment, as paths with their links resolved.
+    var diagnosticsInProgress: Set<String> = []
     var recordingSeams = RecordingSeams()
     /// A position in the event sequence of one target object, which the mark does not keep alive.
     struct EventMark {
