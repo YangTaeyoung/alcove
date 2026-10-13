@@ -38,8 +38,37 @@ private let fixtureWindow: JSON = ["id": "0x2a", "title": "Alcove Fixture", "pid
                                    "class": "AlcoveFixture", "x": 100, "y": 50, "w": 400, "h": 300, "state": "normal",
                                    "foreground": true, "responding": true, "modal": false]
 private let sendButton = node("e5", "Button", "Send", aid: "send")
-private let sendTarget: JSON = ["window": "Alcove Fixture", "role": "Button", "name": "Send", "aid": "send"]
-private let sendSelector: JSON = ["window": "Alcove Fixture", "role": "Button", "name": "Send", "automationId": "send"]
+
+/// A `ui.at` reply: a node at (`x`, 100) of 80x24 in the window titled `title`, with the counts given as (matches, index).
+private func at(_ role: String, _ name: String, id: String? = nil, x: Int = 150, title: String = "Alcove Fixture", flags: [String] = ["enabled"],
+                byID: (Int, Int)? = nil, byName: (Int, Int)? = nil) -> [String: JSON] {
+    var node: [String: JSON] = ["role": .string(role), "name": .string(name), "x": .int(Int64(x)), "y": 100, "w": 80, "h": 24,
+                                "flags": .array(flags.map(JSON.string))]
+    if let id { node["automationId"] = .string(id) }
+    var reply: [String: JSON] = ["node": .object(node), "window": ["id": "0x2a", "title": .string(title)]]
+    if let byID { reply["byAutomationId"] = ["matches": .int(Int64(byID.0)), "index": .int(Int64(byID.1))] }
+    if let byName { reply["byName"] = ["matches": .int(Int64(byName.0)), "index": .int(Int64(byName.1))] }
+    return reply
+}
+
+/// The `target` of a trace line: an element of 80x24 at (150, 100) unless `rect` says otherwise, with the counts given
+/// as (matches, index).
+private func target(_ window: String?, _ role: String, _ name: String, id: String? = nil, rect: [Int]? = [150, 100, 80, 24],
+                    byID: (Int, Int)? = nil, byName: (Int, Int)? = nil, password: Bool = false) -> JSON {
+    var facts: [String: JSON] = ["role": .string(role), "name": .string(name)]
+    if let window { facts["window"] = .string(window) }
+    if let id { facts["automationId"] = .string(id) }
+    if let rect { facts["rect"] = ["x": .int(Int64(rect[0])), "y": .int(Int64(rect[1])), "w": .int(Int64(rect[2])), "h": .int(Int64(rect[3]))] }
+    if let byID { facts["byAutomationId"] = ["matches": .int(Int64(byID.0)), "index": .int(Int64(byID.1))] }
+    if let byName { facts["byName"] = ["matches": .int(Int64(byName.0)), "index": .int(Int64(byName.1))] }
+    if password { facts["password"] = true }
+    return .object(facts)
+}
+
+private let sendAt = at("Button", "Send", id: "send", byID: (1, 0), byName: (3, 2))
+private let sendTarget = target("Alcove Fixture", "Button", "Send", id: "send", byID: (1, 0), byName: (3, 2))
+private let sendSelector: JSON = ["window": "Alcove Fixture", "role": "Button", "automationId": "send"]
+private let sendAltSelector: JSON = ["window": "Alcove Fixture", "role": "Button", "name": "Send", "index": 2]
 private let noMatch = "no element matches {\"automationId\":\"send\",\"name\":\"Send\",\"role\":\"Button\",\"window\":\"Alcove Fixture\"}; call ui.tree to see what exists"
 
 final class ScriptBuilderTests: XCTestCase {
@@ -87,10 +116,9 @@ final class ScriptBuilderTests: XCTestCase {
         return ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
     }
 
-    /// A running 800x600 VM "Win" whose agent offers `caps` and answers each op as `answers` says at that moment;
-    /// an op without an entry gets the agent's unknown-op error.
-    private func rig(caps: [String] = ["clipboard", "files", "exec", "ui"],
-                     _ answers: LockedBox<[String: Reply]>) async throws -> (ControlHandler, FakeTarget, FakeAgent) {
+    /// An agent that offers `caps` and answers each op as `answers` says at that moment; an op without an entry gets
+    /// the agent's unknown-op error.
+    private func fakeAgent(caps: [String] = ["clipboard", "files", "exec", "ui"], _ answers: LockedBox<[String: Reply]>) -> FakeAgent {
         let agent = FakeAgent()
         agent.caps = caps
         agent.handler = { m, _ in
@@ -104,6 +132,13 @@ final class ScriptBuilderTests: XCTestCase {
             case nil: return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": .string("unknown op '\(op)'; update alcove-agent")]]
             }
         }
+        return agent
+    }
+
+    /// A running 800x600 VM "Win" whose agent is `fakeAgent(caps:answers)`.
+    private func rig(caps: [String] = ["clipboard", "files", "exec", "ui"],
+                     _ answers: LockedBox<[String: Reply]>) async throws -> (ControlHandler, FakeTarget, FakeAgent) {
+        let agent = fakeAgent(caps: caps, answers)
         let (h, t) = try await handlerWithAgent(agent, in: self)
         return (h, t, agent)
     }
@@ -179,17 +214,17 @@ final class ScriptBuilderTests: XCTestCase {
     func testClickWithTargetBecomesSelectorWithFallback() {
         let script = build([
             entry(1, "vm.mouse.click", ["x": 190, "y": 112, "button": "right", "count": 2, "observe": "summary", "settleMs": 50], ["target": sendTarget]),
-            entry(2, "vm.mouse.click", ["x": 10, "y": 20], ["target": ["window": "Alcove Fixture", "role": "Button", "name": "", "aid": "send"]]),
-            entry(3, "vm.mouse.click", ["x": 30, "y": 40], ["target": ["role": "MenuItem", "name": "File"]]),
+            entry(2, "vm.mouse.click", ["x": 10, "y": 20], ["target": target("Alcove Fixture", "Button", "", id: "send", byID: (2, 1))]),
+            entry(3, "vm.mouse.click", ["x": 30, "y": 40], ["target": target("Notes", "MenuItem", "File", byName: (1, 0))]),
             entry(4, "vm.mouse.click", ["x": 190, "y": 112, "hold": 900], ["target": sendTarget]),
             entry(5, "vm.mouse.drag", ["fromX": 190, "fromY": 112, "toX": 300, "toY": 112], ["target": sendTarget]),
         ])
         XCTAssertEqual(ops(script), ["vm.ui.click", "vm.ui.click", "vm.ui.click", "vm.mouse.click", "vm.mouse.drag"])
-        XCTAssertEqual(script.steps[0].params, ["selector": sendSelector, "fallback": ["x": 190, "y": 112], "button": "right", "count": 2,
-                                                "observe": "summary", "settleMs": 50])
-        XCTAssertEqual(script.steps[1].params, ["selector": ["window": "Alcove Fixture", "role": "Button", "automationId": "send"],
+        XCTAssertEqual(script.steps[0].params, ["selector": sendSelector, "altSelector": sendAltSelector, "fallback": ["x": 190, "y": 112],
+                                                "button": "right", "count": 2, "observe": "summary", "settleMs": 50])
+        XCTAssertEqual(script.steps[1].params, ["selector": ["window": "Alcove Fixture", "role": "Button", "automationId": "send", "index": 1],
                                                 "fallback": ["x": 10, "y": 20]])
-        XCTAssertEqual(script.steps[2].params, ["selector": ["role": "MenuItem", "name": "File"], "fallback": ["x": 30, "y": 40]])
+        XCTAssertEqual(script.steps[2].params, ["selector": ["window": "Notes", "role": "MenuItem", "name": "File"], "fallback": ["x": 30, "y": 40]])
         XCTAssertEqual(script.steps[3].params, ["x": 190, "y": 112, "hold": 900])
         XCTAssertEqual(script.steps[4].params, ["fromX": 190, "fromY": 112, "toX": 300, "toY": 112])
         XCTAssertEqual(script.steps.map(\.label), ["vm.ui.click Button \"Send\"", "vm.ui.click Button #send", "vm.ui.click MenuItem \"File\"",
@@ -197,57 +232,158 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertNoThrow(try script.validate())
     }
 
+    func testAnElementAmongEquallyNamedOnesIsSelectedByItsIndex() {
+        let script = build([
+            entry(1, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("Orders", "Button", "Delete", byName: (3, 2))]),
+            entry(2, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("Orders", "Button", "Delete", byName: (3, 0))]),
+            entry(3, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("Orders", "Button", "Delete", byName: (1, 0))]),
+            entry(4, "vm.ui.action", ["ref": "e7", "action": "invoke"], result: ["node": node("e7", "Button", "Delete")],
+                  ["target": target("Orders", "Button", "Delete", byName: (3, 2))]),
+        ])
+        XCTAssertEqual(script.steps.map { $0.params["selector"] }, [
+            ["window": "Orders", "role": "Button", "name": "Delete", "index": 2],
+            ["window": "Orders", "role": "Button", "name": "Delete", "index": 0],
+            ["window": "Orders", "role": "Button", "name": "Delete"],
+            ["window": "Orders", "role": "Button", "name": "Delete", "index": 2],
+        ])
+        XCTAssertEqual(script.steps.map { $0.params["altSelector"] }, [nil, nil, nil, nil])
+        XCTAssertNoThrow(try script.validate())
+    }
+
+    func testASelectorNeedsACountedMatchInATitledWindow() {
+        let long = String(repeating: "n", count: 2000) + "…"
+        var cutName = target("Notes", "Button", long, id: "body", byID: (1, 0), byName: (1, 0)).objectValue ?? [:]
+        cutName["nameTruncated"] = true
+        var cutID = target("Notes", "Button", "Body", id: long, byID: (1, 0), byName: (2, 1)).objectValue ?? [:]
+        cutID["automationIdTruncated"] = true
+        let targets: [JSON] = [
+            target("Notes", "Button", "Send", id: "send"),
+            target(nil, "Button", "Send", id: "send", byID: (1, 0), byName: (1, 0)),
+            target("0x2a", "Button", "Send", id: "send", byID: (1, 0), byName: (1, 0)),
+            target("foreground", "Button", "Send", id: "send", byID: (1, 0), byName: (1, 0)),
+            target("Notes", "Button", "", byName: (1, 0)),
+            target("Notes", "Button", "Send", id: "send", byName: (2, 1)),
+            target("Notes", "Button", "Send", id: "send", byID: (2, 1)),
+            .object(cutName),
+            .object(cutID),
+            ["window": "Notes", "role": "Button", "name": "Send", "byName": ["matches": 2, "index": 2]],
+            ["window": "Notes", "role": "Button", "name": "Send", "byName": ["matches": 0, "index": 0]],
+            ["window": "Notes", "name": "Send", "byName": ["matches": 1, "index": 0]],
+            target("report.docx - Word", "Button", "Send", id: "send", byID: (1, 0), byName: (1, 0)),
+        ]
+        let script = build(targets.enumerated().map { entry($0.offset + 1, "vm.mouse.click", ["x": 190, "y": 112], ["target": $0.element]) })
+        XCTAssertEqual(script.steps.map { $0.params["selector"] }, [
+            nil, nil, nil, nil, nil,
+            ["window": "Notes", "role": "Button", "name": "Send", "index": 1],
+            ["window": "Notes", "role": "Button", "automationId": "send", "index": 1],
+            ["window": "Notes", "role": "Button", "automationId": "body"],
+            ["window": "Notes", "role": "Button", "name": "Body", "index": 1],
+            nil, nil, nil,
+            ["window": "Word", "role": "Button", "automationId": "send"],
+        ])
+        XCTAssertEqual(script.steps.map { $0.params["altSelector"] }, [
+            nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+            ["window": "Word", "role": "Button", "name": "Send"],
+        ])
+        XCTAssertEqual(script.steps.map(\.op), script.steps.map { $0.params["selector"] == nil ? "vm.mouse.click" : "vm.ui.click" })
+        for step in script.steps where step.op == "vm.mouse.click" { XCTAssertEqual(step.params, ["x": 190, "y": 112]) }
+    }
+
+    func testAClickWhosePointMattersKeepsItsCoordinates() {
+        func facts(_ role: String, rect: [Int]? = [100, 100, 400, 200]) -> JSON { target("Notes", role, "Body", id: "body", rect: rect, byID: (1, 0)) }
+        func kept(_ role: String, _ x: Int, _ y: Int, rect: [Int]? = [100, 100, 400, 200]) -> Bool {
+            let step = build([entry(1, "vm.mouse.click", ["x": .int(Int64(x)), "y": .int(Int64(y))], ["target": facts(role, rect: rect)])]).steps[0]
+            if step.op == "vm.mouse.click" {
+                XCTAssertEqual(step.params, ["x": .int(Int64(x)), "y": .int(Int64(y))], role)
+                XCTAssertEqual(step.label, "vm.mouse.click \(role) \"Body\"")
+                return true
+            }
+            XCTAssertEqual(step.params, ["selector": ["window": "Notes", "role": .string(role), "automationId": "body"],
+                                         "fallback": ["x": .int(Int64(x)), "y": .int(Int64(y))]], role)
+            return false
+        }
+        for role in ["Button", "CheckBox", "RadioButton", "MenuItem", "TabItem", "ListItem", "TreeItem", "Hyperlink"] {
+            XCTAssertFalse(kept(role, 101, 101), role)
+            XCTAssertFalse(kept(role, 101, 101, rect: nil), role)
+        }
+        for role in ["Edit", "ComboBox", "SplitButton", "Spinner", "HeaderItem", "DataItem", "Text"] {
+            XCTAssertFalse(kept(role, 300, 200), role)
+            XCTAssertFalse(kept(role, 400, 250), role)
+            XCTAssertFalse(kept(role, 200, 150), role)
+            XCTAssertTrue(kept(role, 401, 200), role)
+            XCTAssertTrue(kept(role, 199, 200), role)
+            XCTAssertTrue(kept(role, 300, 251), role)
+            XCTAssertTrue(kept(role, 300, 149), role)
+            XCTAssertTrue(kept(role, 300, 200, rect: nil), role)
+            XCTAssertFalse(kept(role, 111, 105, rect: [100, 100, 10, 10]), role)
+            XCTAssertTrue(kept(role, 112, 105, rect: [100, 100, 10, 10]), role)
+            XCTAssertFalse(kept(role, 105, 99, rect: [100, 100, 10, 10]), role)
+            XCTAssertTrue(kept(role, 105, 98, rect: [100, 100, 10, 10]), role)
+        }
+        for role in ["Document", "Pane", "Custom", "Image", "Group", "Window", "TitleBar", "List", "Tree", "Table", "DataGrid", "Slider", "ScrollBar",
+                     "Thumb", "ToolBar", "Menu", "MenuBar", "StatusBar", "Tab", "Calendar", "ProgressBar", "Separator", "ToolTip", "button"] {
+            XCTAssertTrue(kept(role, 300, 200), role)
+        }
+    }
+
     func testCoordinateClickWithoutTargetKeepsCoordinates() {
         let script = build([
             entry(1, "vm.mouse.click", ["x": 300, "y": 200]),
-            entry(2, "vm.mouse.click", ["x": 310, "y": 210, "button": "right"], ["target": ["window": "Program Manager", "role": "Pane", "name": ""]]),
-            entry(3, "vm.mouse.click", ["x": 320, "y": 220], ["target": ["role": "Custom", "name": "", "aid": ""]]),
+            entry(2, "vm.mouse.click", ["x": 310, "y": 210, "button": "right"], ["target": target("Program Manager", "Pane", "")]),
+            entry(3, "vm.mouse.click", ["x": 320, "y": 220], ["target": target(nil, "Custom", "", id: "")]),
         ])
         XCTAssertEqual(ops(script), ["vm.mouse.click", "vm.mouse.click", "vm.mouse.click"])
         XCTAssertEqual(script.steps.map(\.params), [["x": 300, "y": 200], ["x": 310, "y": 210, "button": "right"], ["x": 320, "y": 220]])
         XCTAssertEqual(script.steps.map(\.label), ["vm.mouse.click (300, 200)", "vm.mouse.click (310, 210)", "vm.mouse.click (320, 220)"])
     }
 
-    func testSelectorHoldsOnlyStableFieldsThatTheTraceHoldsInFull() {
-        let long = String(repeating: "n", count: 2000) + "…"
-        let script = build([
-            entry(1, "vm.mouse.click", ["x": 1, "y": 2], ["target": ["window": "0x2a", "role": "Button", "name": "Send", "ref": "e5", "x": 150, "runtimeId": "42.7"]]),
-            entry(2, "vm.mouse.click", ["x": 3, "y": 4], ["target": ["window": "foreground", "role": "Button", "name": "Send"]]),
-            entry(3, "vm.mouse.click", ["x": 5, "y": 6], ["target": ["window": "Notes", "role": "Text", "name": .string(long), "nameTruncated": true]]),
-            entry(4, "vm.mouse.click", ["x": 7, "y": 8], ["target": ["window": "Notes", "role": "Text", "name": .string(long), "nameTruncated": true, "aid": "body"]]),
-        ])
-        XCTAssertEqual(script.steps.map { $0.params["selector"] },
-                       [["role": "Button", "name": "Send"], ["role": "Button", "name": "Send"], nil, ["window": "Notes", "role": "Text", "automationId": "body"]])
-        XCTAssertEqual(ops(script), ["vm.ui.click", "vm.ui.click", "vm.mouse.click", "vm.ui.click"])
-    }
-
     func testRefBecomesSelector() throws {
         let given: JSON = ["window": "Alcove Fixture", "nameContains": "Sen", "index": 1]
+        let pane = target("Alcove Fixture", "Pane", "")
         let draft = ScriptBuilder.draft(trace: [
-            entry(1, "vm.ui.click", ["ref": "e5", "button": "right"], result: ["x": 190, "y": 112, "node": sendButton],
-                  ["selector": ["role": "Button", "name": "Send", "aid": "send"]]),
+            entry(1, "vm.ui.click", ["ref": "e5", "button": "right"], result: ["x": 190, "y": 112, "node": sendButton], ["target": sendTarget]),
             entry(2, "vm.ui.type", ["ref": "e4", "text": "hi", "clear": true], result: ["node": node("e4", "Edit", "Message")],
-                  ["selector": ["role": "Edit", "name": "Message"]]),
+                  ["target": target("Alcove Fixture", "Edit", "Message", byName: (1, 0))]),
             entry(3, "vm.ui.action", ["selector": given, "action": "invoke"], result: ["node": sendButton]),
-            entry(4, "vm.ui.click", ["ref": "e9", "count": 2], result: ["x": 40, "y": 50, "node": node("e9", "Pane", "")],
-                  ["selector": ["role": "Pane", "name": ""]]),
+            entry(4, "vm.ui.click", ["ref": "e9", "count": 2], result: ["x": 40, "y": 50, "node": node("e9", "Pane", "")], ["target": pane]),
             entry(5, "vm.ui.action", ["ref": "e9", "action": "focus"], result: ["node": node("e9", "Pane", "")]),
-            entry(6, "vm.ui.type", ["ref": "e9", "text": "x"], result: ["node": node("e9", "Pane", "")], ["selector": ["role": "Pane", "name": ""]]),
+            entry(6, "vm.ui.type", ["ref": "e9", "text": "x"], result: ["node": node("e9", "Pane", "")], ["target": pane]),
+            entry(7, "vm.ui.click", ["ref": "e5"], result: ["x": 190, "y": 112, "node": sendButton]),
+            entry(8, "vm.ui.action", ["ref": "e5", "action": "invoke"], result: ["node": sendButton], ["target": sendTarget]),
         ], vm: "Win", from: nil, to: nil)
         let script = draft.script
-        XCTAssertEqual(ops(script), ["vm.ui.click", "vm.ui.type", "vm.ui.action", "vm.mouse.click"])
-        XCTAssertEqual(script.steps[0].params, ["selector": ["role": "Button", "name": "Send", "automationId": "send"], "button": "right"])
-        XCTAssertEqual(script.steps[1].params, ["selector": ["role": "Edit", "name": "Message"], "text": "hi", "clear": true])
+        XCTAssertEqual(ops(script), ["vm.ui.click", "vm.ui.type", "vm.ui.action", "vm.mouse.click", "vm.mouse.click", "vm.ui.action"])
+        XCTAssertEqual(script.steps[0].params, ["selector": sendSelector, "altSelector": sendAltSelector, "button": "right"])
+        XCTAssertEqual(script.steps[1].params, ["selector": ["window": "Alcove Fixture", "role": "Edit", "name": "Message"], "text": "hi", "clear": true])
         XCTAssertEqual(script.steps[2].params, ["selector": given, "action": "invoke"])
         XCTAssertEqual(script.steps[3].params, ["x": 40, "y": 50, "count": 2])
+        XCTAssertEqual(script.steps[4].params, ["x": 190, "y": 112])
+        XCTAssertEqual(script.steps[5].params, ["selector": sendSelector, "altSelector": sendAltSelector, "action": "invoke"])
         XCTAssertEqual(script.steps.map(\.label), ["vm.ui.click Button \"Send\"", "vm.ui.type Edit \"Message\"", "vm.ui.action invoke \"Sen\"",
-                                                   "vm.mouse.click (40, 50)"])
+                                                   "vm.mouse.click (40, 50)", "vm.mouse.click (190, 112)", "vm.ui.action invoke Button \"Send\""])
         XCTAssertEqual(draft.warnings, [
-            "seq 5 (vm.ui.action) is left out: its element was named by ref and has neither a name nor an automation id; add the step by hand with a selector",
-            "seq 6 (vm.ui.type) is left out: its element was named by ref and has neither a name nor an automation id; add the step by hand with a selector",
+            "seq 5 (vm.ui.action) is left out: its element was named by ref and the trace holds no selector that finds it again; add the step by hand with a selector",
+            "seq 6 (vm.ui.type) is left out: its element was named by ref and the trace holds no selector that finds it again; add the step by hand with a selector",
         ])
         XCTAssertFalse(String(decoding: try script.encoded(), as: UTF8.self).contains("\"ref\""))
         XCTAssertNoThrow(try script.validate())
+    }
+
+    func testARefStepSelectsTheElementAsItWasBeforeTheAction() throws {
+        let script = build([
+            entry(1, "vm.ui.action", ["ref": "e8", "action": "invoke"], result: ["node": node("e8", "Button", "Unmute", aid: "mute")],
+                  ["target": target("Player", "Button", "Mute", id: "mute", byID: (1, 0), byName: (1, 0))]),
+            entry(2, "vm.ui.action", ["ref": "e9", "action": "toggle"], result: ["node": node("e9", "CheckBox", "Shown")],
+                  ["target": target("Player", "CheckBox", "Hidden", byName: (1, 0))]),
+        ])
+        XCTAssertEqual(script.steps.map(\.params), [
+            ["selector": ["window": "Player", "role": "Button", "automationId": "mute"],
+             "altSelector": ["window": "Player", "role": "Button", "name": "Mute"], "action": "invoke"],
+            ["selector": ["window": "Player", "role": "CheckBox", "name": "Hidden"], "action": "toggle"],
+        ])
+        let text = String(decoding: try script.encoded(), as: UTF8.self)
+        XCTAssertFalse(text.contains("Unmute"))
+        XCTAssertFalse(text.contains("Shown"))
     }
 
     func testConsecutiveTypesMerge() {
@@ -272,15 +408,17 @@ final class ScriptBuilderTests: XCTestCase {
             entry(2, "vm.type", ["text": "$"]),
             entry(3, "vm.type", ["text": "{x}"]),
             entry(4, "vm.exec", ["command": "echo ${HOME}", "argv": ["${a}", 3]]),
-            entry(5, "vm.mouse.click", ["x": 1, "y": 2], ["target": ["window": "${w}", "role": "Button", "name": "${n}"]]),
+            entry(5, "vm.mouse.click", ["x": 1, "y": 2], ["target": target("${w}", "Button", "${n}", id: "${i}", byID: (1, 0), byName: (1, 0))]),
         ])
         XCTAssertEqual(script.steps[0].params, ["text": "cost $${amount}$${x}"])
         XCTAssertEqual(script.steps[1].params, ["command": "echo $${HOME}", "argv": ["$${a}", 3]])
-        XCTAssertEqual(script.steps[2].params["selector"], ["window": "$${w}", "role": "Button", "name": "$${n}"])
+        XCTAssertEqual(script.steps[2].params["selector"], ["window": "$${w}", "role": "Button", "automationId": "$${i}"])
+        XCTAssertEqual(script.steps[2].params["altSelector"], ["window": "$${w}", "role": "Button", "name": "$${n}"])
         let replayed = try Script.parse(try script.encoded()).resolved(with: [:])
         XCTAssertEqual(replayed.steps[0].params, ["text": "cost ${amount}${x}"])
         XCTAssertEqual(replayed.steps[1].params, ["command": "echo ${HOME}", "argv": ["${a}", 3]])
-        XCTAssertEqual(replayed.steps[2].params["selector"], ["window": "${w}", "role": "Button", "name": "${n}"])
+        XCTAssertEqual(replayed.steps[2].params["selector"], ["window": "${w}", "role": "Button", "automationId": "${i}"])
+        XCTAssertEqual(replayed.steps[2].params["altSelector"], ["window": "${w}", "role": "Button", "name": "${n}"])
     }
 
     func testForegroundChangeAddsExpectation() throws {
@@ -339,27 +477,24 @@ final class ScriptBuilderTests: XCTestCase {
     }
 
     func testPasswordFieldValuesAreNotWritten() throws {
-        let secret: JSON = ["window": "Sign in", "role": "Edit", "name": "Password", "aid": "pw", "password": true, "value": "old-secret"]
+        let secret = target("Sign in", "Edit", "", id: "pw", byID: (1, 0), password: true)
         let draft = ScriptBuilder.draft(trace: [
-            entry(1, "vm.mouse.click", ["x": 10, "y": 20], ["target": secret]),
+            entry(1, "vm.mouse.click", ["x": 190, "y": 112], ["target": secret]),
             entry(2, "vm.type", ["text": "hunter2"]),
-            entry(3, "vm.ui.type", ["ref": "e7", "text": "s3cret"], result: ["node": node("e7", "Edit", "Password", flags: ["password"], value: "shown-value")],
-                  ["selector": ["role": "Edit", "name": "Password", "password": true]]),
+            entry(3, "vm.ui.type", ["ref": "e7", "text": "s3cret"], result: ["node": node("e7", "Edit", "", flags: ["password"], value: "shown-value")],
+                  ["target": secret]),
             entry(4, "vm.type", ["text": "again"]),
-            entry(5, "vm.mouse.click", ["x": 30, "y": 40], ["target": ["window": "Sign in", "role": "Edit", "name": "User"]]),
+            entry(5, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("Sign in", "Edit", "User", byName: (1, 0))]),
             entry(6, "vm.type", ["text": "ada"]),
         ], vm: "Win", from: nil, to: nil)
         let script = draft.script
-        XCTAssertEqual(script.steps[0].params, ["selector": ["window": "Sign in", "role": "Edit", "name": "Password", "automationId": "pw"],
-                                                "fallback": ["x": 10, "y": 20]])
+        XCTAssertEqual(script.steps[0].params, ["selector": ["window": "Sign in", "role": "Edit", "automationId": "pw"], "fallback": ["x": 190, "y": 112]])
         XCTAssertEqual(script.steps[1].params, ["text": "hunter2"])
-        XCTAssertEqual(script.steps[2].params, ["selector": ["role": "Edit", "name": "Password"], "text": "s3cret"])
-        XCTAssertEqual(script.steps.map(\.label), ["vm.ui.click Edit \"Password\"", "vm.type into a password field", "vm.ui.type Edit \"Password\"",
+        XCTAssertEqual(script.steps[2].params, ["selector": ["window": "Sign in", "role": "Edit", "automationId": "pw"], "text": "s3cret"])
+        XCTAssertEqual(script.steps.map(\.label), ["vm.ui.click Edit #pw", "vm.type into a password field", "vm.ui.type Edit #pw",
                                                    "vm.type into a password field", "vm.ui.click Edit \"User\"", "vm.type \"ada\""])
         let text = String(decoding: try script.encoded(), as: UTF8.self)
-        for hidden in ["old-secret", "shown-value", "\"password\""] { XCTAssertFalse(text.contains(hidden), hidden) }
-        XCTAssertEqual(text.components(separatedBy: "hunter2").count, 2)
-        XCTAssertEqual(text.components(separatedBy: "s3cret").count, 2)
+        for hidden in ["shown-value", "\"password\""] { XCTAssertFalse(text.contains(hidden), hidden) }
     }
 
     func testMaskedEnvValuesBecomeVariables() throws {
@@ -543,7 +678,7 @@ final class ScriptBuilderTests: XCTestCase {
         let script = try Script.parse(try Data(contentsOf: out))
         XCTAssertEqual(script.vm, "Win")
         XCTAssertEqual(ops(script), ["vm.ui.click", "vm.type", "vm.key.press"])
-        XCTAssertEqual(script.steps[0].params, ["selector": sendSelector, "fallback": ["x": 190, "y": 112]])
+        XCTAssertEqual(script.steps[0].params, ["selector": sendSelector, "altSelector": sendAltSelector, "fallback": ["x": 190, "y": 112]])
         XCTAssertEqual(script.steps[1].params, ["text": "hello $${name}"])
         XCTAssertEqual(script.steps[0].label, "vm.ui.click Button \"Send\"")
         XCTAssertNoThrow(try script.resolved(with: [:]).validateConditions())
@@ -560,7 +695,7 @@ final class ScriptBuilderTests: XCTestCase {
 
     func testASavedRecordingReplaysTheRecordedInput() async throws {
         let answers = LockedBox<[String: Reply]>([
-            "ui.at": .ok(["node": sendButton, "window": fixtureWindow]),
+            "ui.at": .by { $0["focused"] == true ? .ok(at("Edit", "Message", byName: (1, 0))) : .ok(sendAt) },
             "ui.rect": .ok(["node": sendButton, "cx": 190, "cy": 112, "clickable": true]),
         ])
         let (h, t, agent) = try await rig(answers)
@@ -580,9 +715,10 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertEqual(run["steps"]?.arrayValue?.map { $0["label"] }, ["vm.ui.click Button \"Send\"", "vm.type \"hi\"", "vm.key.press enter"])
         let all = await t.sent
         XCTAssertEqual(Array(all.dropFirst(recorded.count)), recorded)
-        XCTAssertEqual(fields(try XCTUnwrap(agentRequests(agent, "ui.rect").last)),
-                       ["window": "Alcove Fixture", "role": "Button", "name": "Send", "automationId": "send", "scroll": true])
-        XCTAssertEqual(agentRequests(agent, "ui.at").count, 1)
+        XCTAssertEqual(agentRequests(agent, "ui.rect").map(fields), [["window": "Alcove Fixture", "role": "Button", "automationId": "send", "scroll": true]])
+        XCTAssertEqual(run["steps"]?[0]?["usedAltSelector"], nil)
+        XCTAssertEqual(run["steps"]?[0]?["usedFallback"], nil)
+        XCTAssertEqual(agentRequests(agent, "ui.at").map(fields), [["x": 190, "y": 112, "budgetMs": 250], ["focused": true, "budgetMs": 250]])
     }
 
     func testSaveSkipsLinesThatAreNotTraceLines() async throws {
@@ -1038,10 +1174,27 @@ final class ScriptBuilderTests: XCTestCase {
 
     // MARK: - recording
 
+    /// A running 800x600 VM "Win" behind a `ParkingRegistry`, whose agent is `fakeAgent(answers)`.
+    private func parkingRig(_ answers: LockedBox<[String: Reply]>) async throws -> (ControlHandler, FakeTarget, FakeAgent, ParkingRegistry) {
+        let agent = fakeAgent(answers)
+        _ = agent.start()
+        addTeardownBlock { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        await t.setAgent(client)
+        let registry = ParkingRegistry(t)
+        return (ControlHandler(registry: registry, hostKind: "test"), t, agent, registry)
+    }
+
     func testRecordingAddsTargetToClicks() async throws {
+        let message = at("Edit", "Message", id: "101", x: 250, flags: ["enabled", "focused"], byID: (1, 0), byName: (1, 0))
+        let messageTarget = target("Alcove Fixture", "Edit", "Message", id: "101", rect: [250, 100, 80, 24], byID: (1, 0), byName: (1, 0))
         let answers = LockedBox<[String: Reply]>([
-            "ui.at": .ok(["node": sendButton, "window": fixtureWindow]),
+            "ui.at": .by { $0["focused"] == true || $0["ref"] == "e4" ? .ok(message) : .ok(sendAt) },
             "ui.rect": .ok(["node": sendButton, "cx": 190, "cy": 112, "clickable": true]),
+            "ui.act": .ok(["node": node("e5", "Button", "Sent", aid: "send")]),
+            "win.action": .ok(["window": fixtureWindow]),
         ])
         let (h, _, agent) = try await rig(answers)
         let dir = try await startRecording(h)
@@ -1051,50 +1204,72 @@ final class ScriptBuilderTests: XCTestCase {
         _ = try await h.handle(op: "vm.mouse.move", params: click(1, 1))
         _ = try await h.handle(op: "vm.ui.click", params: ["name": "Win", "ref": "e5"])
         _ = try await h.handle(op: "vm.ui.click", params: ["name": "Win", "selector": ["name": "Send"]])
-        _ = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.mouse.click", "x": 2, "y": 2]]])
-        answers.value["ui.at"] = .fail("no element at (700, 500); take a screenshot to see what is at that point")
+        _ = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.mouse.click", "x": 2, "y": 2], ["op": "vm.type", "text": "b"]]])
+        _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": "hi"])
+        _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "ref": "e4", "text": "yo"])
+        _ = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e5", "action": "invoke"])
+        _ = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "selector": ["name": "Send"], "action": "invoke"])
+        _ = try await h.handle(op: "vm.window.action", params: ["name": "Win", "window": "Fixture", "action": "focus"])
+        _ = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "enter"])
+        answers.value["ui.at"] = .fail("no element at (700, 500); take a screenshot to see what is there")
         let bare = try await h.handle(op: "vm.mouse.click", params: click(700, 500))
         XCTAssertEqual(bare, ["eventSeq": 0])
-        answers.value["ui.at"] = .ok(["node": node("e9", "Pane", ""), "window": .null])
-        _ = try await h.handle(op: "vm.mouse.click", params: click(701, 501))
         let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
-        XCTAssertEqual(status["ops"], 8)
+        XCTAssertEqual(status["ops"], 13)
+        let positions = await h.eventPositions("Win")
+        XCTAssertEqual(positions.baseline, 0)
+        XCTAssertNil(positions.observed)
         _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
         _ = try await h.handle(op: "vm.mouse.click", params: click(5, 5))
 
         let rows = try lines(dir)
         XCTAssertEqual(rows.map { $0["op"]?.stringValue },
-                       ["vm.mouse.click", "vm.mouse.drag", "vm.mouse.move", "vm.ui.click", "vm.ui.click", "vm.batch", "vm.mouse.click", "vm.mouse.click"])
-        XCTAssertEqual(rows.map { $0["target"] }, [sendTarget, sendTarget, nil, nil, nil, nil, nil, ["role": "Pane", "name": ""]])
-        XCTAssertEqual(rows.map { $0["selector"] }, [nil, nil, nil, ["role": "Button", "name": "Send", "aid": "send"], nil, nil, nil, nil])
-        XCTAssertEqual(rows.map { $0["ok"] }, Array(repeating: true, count: 8))
-        XCTAssertEqual(rows.map { $0["script"] }, Array(repeating: nil, count: 8))
-        XCTAssertEqual(agentRequests(agent, "ui.at").map(fields),
-                       [["x": 190, "y": 112], ["x": 150, "y": 100], ["x": 700, "y": 500], ["x": 701, "y": 501]])
-        XCTAssertEqual(ops(build(rows)), ["vm.ui.click", "vm.mouse.drag", "vm.mouse.move", "vm.ui.click", "vm.ui.click", "vm.batch",
-                                          "vm.mouse.click", "vm.mouse.click"])
-    }
-
-    func testRecordedTargetOfAPasswordFieldHoldsNoValue() async throws {
-        let field = node("e7", "Edit", "Password", aid: "pw", flags: ["focused", "password"], value: "shown-value")
-        let answers = LockedBox<[String: Reply]>([
-            "ui.at": .ok(["node": field, "window": fixtureWindow]),
-            "ui.rect": .ok(["node": field, "cx": 190, "cy": 112, "clickable": true]),
+                       ["vm.mouse.click", "vm.mouse.drag", "vm.mouse.move", "vm.ui.click", "vm.ui.click", "vm.batch", "vm.type", "vm.ui.type",
+                        "vm.ui.action", "vm.ui.action", "vm.window.action", "vm.key.press", "vm.mouse.click"])
+        XCTAssertEqual(rows.map { $0["target"] },
+                       [sendTarget, sendTarget, nil, sendTarget, nil, nil, messageTarget, messageTarget, sendTarget, nil, nil, nil, nil])
+        XCTAssertEqual(rows.map { $0["selector"] }, Array(repeating: nil, count: 13))
+        XCTAssertEqual(rows.map { $0["ok"] }, Array(repeating: true, count: 13))
+        XCTAssertEqual(rows.map { $0["script"] }, Array(repeating: nil, count: 13))
+        XCTAssertEqual(agentRequests(agent, "ui.at").map(fields), [
+            ["x": 190, "y": 112, "budgetMs": 250], ["x": 150, "y": 100, "budgetMs": 250], ["ref": "e5", "budgetMs": 250],
+            ["focused": true, "budgetMs": 250], ["ref": "e4", "budgetMs": 250], ["ref": "e5", "budgetMs": 250], ["x": 700, "y": 500, "budgetMs": 250],
         ])
-        let (h, _, _) = try await rig(answers)
-        let dir = try await startRecording(h)
-        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
-        _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "ref": "e7", "text": "hunter2"])
-        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
-        let rows = try lines(dir)
-        XCTAssertEqual(rows[0]["target"], ["window": "Alcove Fixture", "role": "Edit", "name": "Password", "aid": "pw", "password": true])
-        XCTAssertEqual(rows[1]["selector"], ["role": "Edit", "name": "Password", "aid": "pw", "password": true])
-        let text = String(decoding: try build(rows).encoded(), as: UTF8.self)
-        XCTAssertFalse(text.contains("shown-value"))
-        XCTAssertTrue(text.contains("hunter2"))
+        let script = build(rows)
+        XCTAssertEqual(ops(script), ["vm.ui.click", "vm.mouse.drag", "vm.mouse.move", "vm.ui.click", "vm.ui.click", "vm.batch", "vm.type", "vm.ui.type",
+                                     "vm.ui.action", "vm.ui.action", "vm.window.action", "vm.key.press", "vm.mouse.click"])
+        XCTAssertEqual(script.steps[8].params, ["selector": sendSelector, "altSelector": sendAltSelector, "action": "invoke"])
     }
 
-    func testAClickStopsWaitingForItsTargetWhenTheBudgetEndsAndTheHelperStaysTakenUntilItAnswers() async throws {
+    func testTargetFactsOfAReply() {
+        let window: JSON = ["id": "0x2a", "title": "Alcove Fixture"]
+        func facts(_ reply: [String: JSON]) -> JSON? { ControlHandler.targetFacts(.object(reply)) }
+        XCTAssertEqual(facts(sendAt), sendTarget)
+        XCTAssertEqual(facts(["node": ["role": "Button", "name": "Send", "automationId": "1004", "x": 612, "y": 480, "w": 88, "h": 28, "flags": ["enabled"]],
+                              "window": ["id": "0x50a3c", "title": "Alcove Fixture"],
+                              "byAutomationId": ["matches": 1, "index": 0], "byName": ["matches": 3, "index": 2]]),
+                       ["window": "Alcove Fixture", "role": "Button", "name": "Send", "automationId": "1004", "rect": ["x": 612, "y": 480, "w": 88, "h": 28],
+                        "byAutomationId": ["matches": 1, "index": 0], "byName": ["matches": 3, "index": 2]])
+        XCTAssertEqual(facts(["node": ["ref": "e5", "depth": 0, "role": "Button", "name": "Send", "aid": "send", "x": 1, "y": 2, "w": 3, "h": 4],
+                              "window": window, "byAutomationId": ["matches": 2, "index": 1], "byName": .null]),
+                       ["window": "Alcove Fixture", "role": "Button", "name": "Send", "automationId": "send", "rect": ["x": 1, "y": 2, "w": 3, "h": 4],
+                        "byAutomationId": ["matches": 2, "index": 1]])
+        XCTAssertEqual(facts(["node": ["role": "Edit", "name": "", "automationId": "pw", "x": 1, "y": 2, "w": 3, "h": 4, "flags": ["enabled", "password"],
+                                       "value": "shown"],
+                              "window": window, "byAutomationId": ["matches": 1, "index": 0]]),
+                       ["window": "Alcove Fixture", "role": "Edit", "name": "", "automationId": "pw", "rect": ["x": 1, "y": 2, "w": 3, "h": 4],
+                        "password": true, "byAutomationId": ["matches": 1, "index": 0]])
+        XCTAssertEqual(facts(["node": ["role": "Pane", "automationId": ""], "window": ["id": "0x1", "title": ""]]), ["role": "Pane", "name": ""])
+        XCTAssertEqual(facts(["node": ["role": "Pane", "name": "Desk", "x": 1, "y": 2, "w": 3], "window": .null,
+                              "byName": ["matches": 2, "index": 2], "byAutomationId": ["matches": "1", "index": 0]]),
+                       ["role": "Pane", "name": "Desk"])
+        XCTAssertEqual(facts(["node": ["role": "Pane", "name": "Desk"], "byName": ["matches": 0, "index": 0]]), ["role": "Pane", "name": "Desk"])
+        XCTAssertNil(facts(["node": ["name": "Send"], "window": window]))
+        XCTAssertNil(facts(["node": .null, "window": window]))
+        XCTAssertNil(facts(["window": window]))
+    }
+
+    func testATargetQuestionIsWaitedForFromItsSendAndKeepsTheHelperUntilItsAnswer() async throws {
         UITiming.targetBudget = .seconds(600)
         let budget = Latch()
         let ends = LockedBox<[ContinuousClock.Instant]>([])
@@ -1103,18 +1278,25 @@ final class ScriptBuilderTests: XCTestCase {
             await budget.pass()
         }
         let answers = LockedBox<[String: Reply]>(["ui.at": .silent])
-        let (h, t, agent) = try await rig(answers)
+        let (h, t, agent, registry) = try await parkingRig(answers)
         let dir = try await startRecording(h)
 
+        let lookup = Latch()
+        await registry.park(at: lookup)
         let press = click(190, 112)
-        let before = ContinuousClock.now
         let first = Task { try await h.handle(op: "vm.mouse.click", params: press) }
+        let parked = await eventually { await lookup.arrivals == 1 }
+        XCTAssertTrue(parked)
+        let beforeSend = ContinuousClock.now
+        await registry.park(at: nil)
+        await lookup.open()
         let asked = await eventually { agentRequests(agent, "ui.at").count == 1 && ends.value.count == 1 }
         XCTAssertTrue(asked)
-        let after = ContinuousClock.now
+        let afterSend = ContinuousClock.now
         let end = try XCTUnwrap(ends.value.first)
-        XCTAssertGreaterThanOrEqual(end, before + .seconds(600))
-        XCTAssertLessThanOrEqual(end, after + .seconds(600))
+        XCTAssertGreaterThanOrEqual(end, beforeSend + .seconds(600))
+        XCTAssertLessThanOrEqual(end, afterSend + .seconds(600))
+        XCTAssertEqual(agentRequests(agent, "ui.at").map(fields), [["x": 190, "y": 112, "budgetMs": 250]])
         let untouched = await t.sent.isEmpty
         XCTAssertTrue(untouched)
         await budget.open()
@@ -1125,60 +1307,108 @@ final class ScriptBuilderTests: XCTestCase {
 
         _ = try await h.handle(op: "vm.mouse.click", params: click(5, 5))
         XCTAssertEqual(agentRequests(agent, "ui.at").count, 1)
-        let left = await eventually { await h.helperGate.waiterCount(for: "Win") == 0 }
-        XCTAssertTrue(left)
+        XCTAssertEqual(ends.value.count, 1)
+        let waiting = await h.helperGate.waiterCount(for: "Win")
+        XCTAssertEqual(waiting, 0)
 
-        UITiming.factBudgetEnd = { try? await Task.sleep(until: $0, clock: .continuous) }
-        answers.value["ui.at"] = .ok(["node": sendButton, "window": fixtureWindow])
-        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.at").first), ["node": sendButton, "window": fixtureWindow]))
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.at").first), sendAt))
         let free = await eventually { (try? await h.helperGate.acquire("Win", until: .now)) == true }
         XCTAssertTrue(free)
         await h.helperGate.release("Win")
+        UITiming.factBudgetEnd = { try? await Task.sleep(until: $0, clock: .continuous) }
+        answers.value["ui.at"] = .ok(sendAt)
         _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
         _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
         XCTAssertEqual(try lines(dir).map { $0["target"] }, [nil, nil, sendTarget])
         XCTAssertEqual(agentRequests(agent, "ui.at").count, 2)
     }
 
-    func testACancelledClickSendsNoTargetProbe() async throws {
+    func testABusyHelperIsNotAskedForTheTarget() async throws {
         UITiming.targetBudget = .seconds(600)
-        let (h, t, agent) = try await rig(LockedBox(["ui.at": .ok(["node": sendButton, "window": fixtureWindow])]))
-        _ = try await startRecording(h)
+        let budget = Latch()
+        UITiming.factBudgetEnd = { _ in await budget.pass() }
+        addTeardownBlock { await budget.open() }
+        let (h, _, agent) = try await rig(LockedBox(["ui.at": .ok(sendAt)]))
+        let dir = try await startRecording(h)
 
         let taken = try await h.helperGate.acquire("Win", until: .now)
         XCTAssertTrue(taken)
         let press = click(190, 112)
-        let queued = Task { try await h.handle(op: "vm.mouse.click", params: press) }
-        let waiting = await eventually { await h.helperGate.waiterCount(for: "Win") == 1 }
-        XCTAssertTrue(waiting)
-        queued.cancel()
-        do { _ = try await value(of: queued); XCTFail("the cancelled click succeeded") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
-        let left = await eventually { await h.helperGate.waiterCount(for: "Win") == 0 }
-        XCTAssertTrue(left)
+        let clicked = try await value(of: Task { try await h.handle(op: "vm.mouse.click", params: press) })
+        XCTAssertEqual(clicked, ["eventSeq": 0])
+        let typed = try await value(of: Task { try await h.handle(op: "vm.type", params: ["name": "Win", "text": "a"]) })
+        XCTAssertEqual(typed, ["eventSeq": 0])
+        let waited = await budget.arrivals
+        XCTAssertEqual(waited, 0)
+        let waiting = await h.helperGate.waiterCount(for: "Win")
+        XCTAssertEqual(waiting, 0)
         await h.helperGate.release("Win")
         XCTAssertTrue(agentRequests(agent, "ui.at").isEmpty)
+        let free = try await h.helperGate.acquire("Win", until: .now)
+        XCTAssertTrue(free)
+        await h.helperGate.release("Win")
 
-        let frames = Latch()
-        await t.setFrameHook { await frames.pass() }
-        let key = Task { try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "a"]) }
-        let holding = await eventually { await frames.arrivals == 1 }
-        XCTAssertTrue(holding)
-        let behind = Task { try await h.handle(op: "vm.mouse.click", params: press) }
-        let inLine = await eventually { await h.inputGate.waiterCount(for: "Win") == 1 }
-        XCTAssertTrue(inLine)
-        behind.cancel()
-        await t.setFrameHook(nil)
-        await frames.open()
-        _ = try await value(of: key)
-        do { _ = try await value(of: behind); XCTFail("the cancelled click succeeded") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        _ = try await h.handle(op: "vm.mouse.click", params: press)
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(try lines(dir).map { $0["target"] }, [nil, nil, sendTarget])
+    }
+
+    func testACancelledActionAsksNoTarget() async throws {
+        let (h, t, agent, registry) = try await parkingRig(LockedBox(["ui.at": .ok(sendAt)]))
+        _ = try await startRecording(h)
+        let asksBefore = await t.agentCalls.count
+
+        let lookup = Latch()
+        await registry.park(at: lookup)
+        let press = click(190, 112)
+        let action = Task { try await h.handle(op: "vm.mouse.click", params: press) }
+        let parked = await eventually { await lookup.arrivals == 1 }
+        XCTAssertTrue(parked)
+        action.cancel()
+        await registry.park(at: nil)
+        await lookup.open()
+        do { _ = try await value(of: action); XCTFail("the cancelled click succeeded") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        let asksAfter = await t.agentCalls.count
+        XCTAssertEqual(asksAfter, asksBefore)
         XCTAssertTrue(agentRequests(agent, "ui.at").isEmpty)
         let free = try await h.helperGate.acquire("Win", until: .now)
         XCTAssertTrue(free)
         await h.helperGate.release("Win")
     }
 
-    func testNoTargetProbeWithoutTheUICapabilityOrAConnectedAgent() async throws {
-        let answers = LockedBox<[String: Reply]>(["ui.at": .ok(["node": sendButton, "window": fixtureWindow])])
+    func testAnAgentThatDoesNotKnowTheTargetOpIsAskedOncePerConnection() async throws {
+        let (h, t, agent) = try await rig(LockedBox([:]))
+        let dir = try await startRecording(h)
+        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
+        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
+        _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": "a"])
+        XCTAssertEqual(agentRequests(agent, "ui.at").map(fields), [["x": 190, "y": 112, "budgetMs": 250]])
+
+        let (_, other, newerAgent) = try await rig(LockedBox(["ui.at": .ok(sendAt)]))
+        await t.setAgent(await other.agentClient)
+        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(agentRequests(newerAgent, "ui.at").count, 1)
+        XCTAssertEqual(agentRequests(agent, "ui.at").count, 1)
+        XCTAssertEqual(try lines(dir).map { $0["target"] }, [nil, nil, nil, sendTarget])
+    }
+
+    func testAFailedTargetQuestionIsAskedAgain() async throws {
+        let answers = LockedBox<[String: Reply]>(["ui.at": .fail("no element at (190, 112); take a screenshot to see what is there")])
+        let (h, _, agent) = try await rig(answers)
+        let dir = try await startRecording(h)
+        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
+        answers.value["ui.at"] = .fail("no element at (190, 112): the app did not answer within 250 ms; retry")
+        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
+        answers.value["ui.at"] = .ok(sendAt)
+        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(agentRequests(agent, "ui.at").count, 3)
+        XCTAssertEqual(try lines(dir).map { $0["target"] }, [nil, nil, sendTarget])
+    }
+
+    func testNoTargetQuestionWithoutTheUICapabilityOrAConnectedAgent() async throws {
+        let answers = LockedBox<[String: Reply]>(["ui.at": .ok(sendAt)])
         let (plain, _, plainAgent) = try await rig(caps: ["clipboard", "files", "exec"], answers)
         let plainDir = try await startRecording(plain)
         _ = try await plain.handle(op: "vm.mouse.click", params: click(190, 112))
@@ -1187,6 +1417,8 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertEqual(try lines(plainDir).map { $0["target"] }, [nil])
 
         let (h, t, agent) = try await rig(answers)
+        _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
+        XCTAssertTrue(agentRequests(agent, "ui.at").isEmpty)
         await t.setLinkState(.connecting)
         let dir = try await startRecording(h)
         _ = try await h.handle(op: "vm.mouse.click", params: click(190, 112))
@@ -1201,26 +1433,38 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertEqual(try lines(dir).map { $0["target"] }, [nil, nil, sendTarget])
     }
 
-    func testARecordedClickLooksItsVMUpOnce() async throws {
+    func testARecordedActionLooksItsVMUpOnce() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
-        let registry = LookupCountingRegistry(t)
+        let registry = ParkingRegistry(t)
         let h = ControlHandler(registry: registry, hostKind: "test")
         _ = try await startRecording(h)
-        let before = await registry.lookups
-        _ = try await h.handle(op: "vm.mouse.click", params: click(5, 5))
-        let after = await registry.lookups
-        XCTAssertEqual(after - before, 1)
+        for (op, params) in [("vm.mouse.click", click(5, 5)), ("vm.type", ["name": "Win", "text": "a"]), ("vm.key.press", ["name": "Win", "keys": "a"])] {
+            let before = await registry.lookups
+            _ = try await h.handle(op: op, params: params)
+            let after = await registry.lookups
+            XCTAssertEqual(after - before, 1, op)
+        }
     }
 }
 
-/// A registry of one VM that counts its lookups.
-private actor LookupCountingRegistry: VMRegistry {
+private extension ControlHandler {
+    /// The event baseline of `vm` and the position up to which its observations have reported events.
+    func eventPositions(_ vm: String) -> (baseline: Int?, observed: Int?) {
+        (eventBaseline[vm]?.seq, observedEvents[vm]?.seq)
+    }
+}
+
+/// A registry of one VM that counts its lookups and holds each lookup at a latch while one is set.
+private actor ParkingRegistry: VMRegistry {
     private let only: FakeTarget
+    private var latch: Latch?
     private(set) var lookups = 0
     init(_ target: FakeTarget) { only = target }
+    func park(at latch: Latch?) { self.latch = latch }
     func names() async -> [String] { [only.name] }
     func target(named name: String) async -> VMTarget? {
         lookups += 1
+        if let latch { await latch.pass() }
         return name == only.name ? only : nil
     }
 }

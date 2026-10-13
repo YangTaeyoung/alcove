@@ -1,4 +1,5 @@
 import Foundation
+import AlcoveAgent
 import AlcoveQMP
 
 /// The recordings of the handler's VMs.
@@ -55,58 +56,92 @@ extension ControlHandler {
         isInput(op: op) || op == "vm.app.launch" || op == "vm.deploy"
     }
 
-    /// The guest pixel at which `op` presses the mouse button: `x` and `y` of a click, `fromX` and `fromY` of a drag;
-    /// nil for any other op and without both integers.
-    static func pressPoint(op: String, params: JSON) -> (x: Int, y: Int)? {
-        let keys: (x: String, y: String)
-        switch op {
-        case "vm.mouse.click": keys = ("x", "y")
-        case "vm.mouse.drag": keys = ("fromX", "fromY")
-        default: return nil
+    /// What `ui.at` is asked about the element `op` is aimed at, before the op runs: the press point of a
+    /// `vm.mouse.click` (`x`, `y`) or a `vm.mouse.drag` (`fromX`, `fromY`), the `ref` of a `vm.ui.click`, `vm.ui.type`
+    /// or `vm.ui.action` that names its element by ref alone, and `focused: true` for a `vm.type` with a text.
+    /// Nil for any other op and for params that do not hold these values.
+    static func targetQuestion(op: String, params: JSON) -> [String: JSON]? {
+        func point(_ x: String, _ y: String) -> [String: JSON]? {
+            guard let px = params[x]?.intValue, let py = params[y]?.intValue else { return nil }
+            return ["x": .int(Int64(px)), "y": .int(Int64(py))]
         }
-        guard let x = params[keys.x]?.intValue, let y = params[keys.y]?.intValue else { return nil }
-        return (x, y)
+        switch op {
+        case "vm.mouse.click": return point("x", "y")
+        case "vm.mouse.drag": return point("fromX", "fromY")
+        case "vm.ui.click", "vm.ui.type", "vm.ui.action":
+            guard (params["selector"] ?? .null) == .null, let ref = params["ref"]?.stringValue, UISelector.isRef(ref) else { return nil }
+            return ["ref": .string(ref)]
+        case "vm.type":
+            return params["text"]?.stringValue == nil ? nil : ["focused": true]
+        default:
+            return nil
+        }
     }
 
-    /// What a trace line says about a helper `node` and the `window` it is in: `role`, `name`, `aid` when the node has
-    /// one, the window's title as `window` when it has one, and `password: true` for a node with the `password` flag.
-    /// Nil for a node without a role.
-    static func elementFacts(node: JSON?, window: JSON?) -> JSON? {
-        guard let node, let role = node["role"]?.stringValue else { return nil }
+    /// What a trace line says about the element of a `ui.at` reply, as `target`: `role`, `name`, `automationId` when
+    /// the node has one, the window's title as `window` when it has one, the node's rectangle as `rect`,
+    /// `password: true` for a node with the `password` flag, and `byAutomationId` and `byName` as `{matches, index}`
+    /// when the reply counted them and the index lies within the matches. Nil for a reply without a node that has a role.
+    static func targetFacts(_ reply: JSON) -> JSON? {
+        guard let node = reply["node"], let role = node["role"]?.stringValue else { return nil }
         var facts: [String: JSON] = ["role": .string(role), "name": .string(node["name"]?.stringValue ?? "")]
-        if let aid = node["aid"]?.stringValue, !aid.isEmpty { facts["aid"] = .string(aid) }
-        if let title = window?["title"]?.stringValue, !title.isEmpty { facts["window"] = .string(title) }
+        if let id = node["automationId"]?.stringValue ?? node["aid"]?.stringValue, !id.isEmpty { facts["automationId"] = .string(id) }
+        if let title = reply["window"]?["title"]?.stringValue, !title.isEmpty { facts["window"] = .string(title) }
+        if let x = node["x"]?.intValue, let y = node["y"]?.intValue, let w = node["w"]?.intValue, let h = node["h"]?.intValue {
+            facts["rect"] = ["x": .int(Int64(x)), "y": .int(Int64(y)), "w": .int(Int64(w)), "h": .int(Int64(h))]
+        }
         if (node["flags"]?.arrayValue ?? []).contains("password") { facts["password"] = true }
+        for key in ["byAutomationId", "byName"] {
+            guard let matches = reply[key]?["matches"]?.intValue, let index = reply[key]?["index"]?.intValue,
+                  matches >= 1, (0..<matches).contains(index) else { continue }
+            facts[key] = ["matches": .int(Int64(matches)), "index": .int(Int64(index))]
+        }
         return .object(facts)
     }
 
-    /// The element of the guest's UI at `point` as `elementFacts`, asked of the UI helper with `ui.at`. `end` is the
-    /// latest moment the call's turn at the helper may come and the moment this stops waiting for the answer. Nil, with
-    /// nothing sent, for a cancelled task and for a guest without a connected agent that has the `ui` capability; nil
-    /// also when the turn or the answer did not come by `end` and when the call failed.
-    private nonisolated func element(at point: (x: Int, y: Int), of t: VMTarget, by end: ContinuousClock.Instant) async -> JSON? {
+    /// Whether the agent connection `agent` of `vm` has not answered that it does not know the op `ui.at`.
+    private func mayKnowTargetOp(_ agent: AgentClient, vm: String) -> Bool {
+        agentsWithoutTargetOp[vm]?.client !== agent
+    }
+
+    /// Notes that the agent connection `agent` of `vm` answered that it does not know the op `ui.at`.
+    private func noteNoTargetOp(_ agent: AgentClient, vm: String) {
+        agentsWithoutTargetOp[vm] = AgentMark(client: agent)
+    }
+
+    /// The element `question` asks `ui.at` about, as `targetFacts`. The question goes out with the helper's time limit
+    /// `UITiming.targetHelperBudgetMs`, only when the UI helper is free at this moment, and its answer is waited for
+    /// `UITiming.targetBudget`. Nil, with nothing sent, for a cancelled task, for a guest without a connected agent
+    /// that has the `ui` capability, for an agent connection that answered that it does not know `ui.at`, and while
+    /// another call has the helper; nil also when the answer did not come in time and when the call failed.
+    private nonisolated func aimedElement(_ question: [String: JSON], of t: VMTarget) async -> JSON? {
         guard !Task.isCancelled, case .connected(let agent) = await t.agentLink(), let hello = await agent.hello,
-              hello.rpcVersion >= 2, hello.capabilities.contains("ui"), !Task.isCancelled else { return nil }
-        let request: [String: JSON] = ["x": .int(Int64(point.x)), "y": .int(Int64(point.y))]
-        guard case .answer(let reply) = await fact(agent, "ui.at", request, vm: t.name, by: end) else { return nil }
-        return ControlHandler.elementFacts(node: reply["node"], window: reply["window"])
+              hello.rpcVersion >= 2, hello.capabilities.contains("ui"), await mayKnowTargetOp(agent, vm: t.name) else { return nil }
+        var request = question
+        request["budgetMs"] = .int(Int64(UITiming.targetHelperBudgetMs))
+        let name = t.name
+        let fact = await factAtOnce(agent, "ui.at", request, vm: name, patience: UITiming.targetBudget) { result in
+            guard case .failure(let error) = result, case AgentClient.AgentError.remote(let message) = error,
+                  HelperSentence(message) == .unknownOp else { return }
+            await self.noteNoTargetOp(agent, vm: name)
+        }
+        guard case .answer(let reply) = fact else { return nil }
+        return ControlHandler.targetFacts(reply)
     }
 
     /// Runs `run` and adds the op, its outcome and its frames to the VM's recording; without one it only runs `run`.
-    /// Before a `vm.mouse.click` or `vm.mouse.drag` runs, the element at its press point is read within
-    /// `UITiming.targetBudget` and written to the line as `target`; the op then runs against the target looked up for
-    /// that reading. The line of a `vm.ui.*` op that named its element by ref holds the element of its result as
-    /// `selector`, and the line of a call made by a script run holds the kind of call as `script`.
+    /// Before an op with a `targetQuestion` runs, the element it is aimed at is asked for and written to the line as
+    /// `target`; the op then runs against the VM looked up for that question. The line of a call made by a script run
+    /// holds the kind of call as `script`.
     func recorded(op: String, params: JSON, run: @Sendable () async throws -> JSON) async throws -> JSON {
         guard !op.hasPrefix("vm.record."), let vm = params["name"]?.stringValue, let recording = await liveRecording(vm) else {
             return try await run()
         }
-        var pressed: VMTarget?
+        var aimed: VMTarget?
         var target: JSON?
-        if let point = ControlHandler.pressPoint(op: op, params: params) {
-            let end = ContinuousClock.now + UITiming.targetBudget
-            pressed = await registry.target(named: vm)
-            if let pressed { target = await element(at: point, of: pressed, by: end) }
+        if let question = ControlHandler.targetQuestion(op: op, params: params) {
+            aimed = await registry.target(named: vm)
+            if let aimed { target = await aimedElement(question, of: aimed) }
         }
         let framed = ControlHandler.capturesFrames(op: op)
         let before = framed ? await recording.capture() : nil
@@ -114,8 +149,8 @@ extension ControlHandler {
         let t0 = clock()
         let outcome: Result<JSON, Error>
         do {
-            if let pressed {
-                outcome = .success(try await ControlHandler.$resolvedTarget.withValue((vm, pressed)) { try await run() })
+            if let aimed {
+                outcome = .success(try await ControlHandler.$resolvedTarget.withValue((vm, aimed)) { try await run() })
             } else {
                 outcome = .success(try await run())
             }
@@ -124,12 +159,8 @@ extension ControlHandler {
         }
         let duration = t0.duration(to: clock())
         let after = framed ? await recording.capture() : nil
-        var selector: JSON?
-        if case .success(let result) = outcome, op.hasPrefix("vm.ui."), let ref = params["ref"], ref != .null {
-            selector = ControlHandler.elementFacts(node: result["node"], window: nil)
-        }
         await recording.record(op: op, params: params, outcome: outcome, started: started, duration: duration, before: before, after: after,
-                               target: target, selector: selector, script: ControlHandler.scriptCall?.rawValue)
+                               target: target, script: ControlHandler.scriptCall?.rawValue)
         var stopped = false
         if op == "vm.stop", case .success = outcome { stopped = true }
         if recordings.vmGone.removeValue(forKey: vm) === recording || stopped { await retireRecording(vm, recording) }

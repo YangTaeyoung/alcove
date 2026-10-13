@@ -14,8 +14,11 @@ enum UITiming {
     nonisolated(unsafe) static var factBudget = Duration.seconds(3)
     /// Longest an observation at level `ui` spends on the foreground window, the focused element and the tree together.
     nonisolated(unsafe) static var treeFactBudget = Duration.seconds(20)
-    /// Longest a recorded click or drag waits for the element at its press point, the wait for the helper's turn included.
+    /// Longest a recorded action waits for the answer about the element it is aimed at, counted from the moment the
+    /// question is sent.
     nonisolated(unsafe) static var targetBudget = Duration.milliseconds(300)
+    /// The time limit a question about the element an action is aimed at gives the UI helper, in milliseconds.
+    static let targetHelperBudgetMs = 250
     /// Returns when a budget for UI facts, which ends at the given moment, has run out.
     nonisolated(unsafe) static var factBudgetEnd: @Sendable (ContinuousClock.Instant) async -> Void = {
         try? await Task.sleep(until: $0, clock: .continuous)
@@ -179,6 +182,8 @@ enum HelperSentence: Equatable {
     case cannotStart
     /// `the request was cancelled`
     case cancelled
+    /// `unknown op '<op>'; …`
+    case unknownOp
     /// Any other sentence.
     case other
 
@@ -200,6 +205,8 @@ enum HelperSentence: Equatable {
             self = .shutDown
         } else if message.hasPrefix("the request was cancelled") {
             self = .cancelled
+        } else if message.hasPrefix("unknown op '") {
+            self = .unknownOp
         } else if message.contains("the UI helper folder "), message.contains(" could not be locked ("),
                   message.hasSuffix("; fix its owner and access list, then retry") {
             self = .cannotStart
@@ -305,6 +312,14 @@ extension ControlHandler {
                                 turnBy: ContinuousClock.Instant, sent: (@Sendable () async -> Void)? = nil,
                                 answered: (@Sendable (Result<JSON, Error>) async -> Void)? = nil) async throws -> JSON {
         guard try await helperGate.acquire(vm, until: turnBy) else { throw HelperBusy() }
+        return try await takenTurn(agent, agentOp, fields, vm: vm, sent: sent, answered: answered)
+    }
+
+    /// The part of `helperTurn` that follows the taking of the turn: sends the call and keeps the turn until the agent
+    /// answered, failed, timed out after `UITiming.callTimeout` or disconnected, then gives it to the next caller.
+    private nonisolated func takenTurn(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
+                                       sent: (@Sendable () async -> Void)? = nil,
+                                       answered: (@Sendable (Result<JSON, Error>) async -> Void)? = nil) async throws -> JSON {
         let result: Result<JSON, Error>
         do {
             await sent?()
@@ -662,6 +677,32 @@ extension ControlHandler {
         switch outcome.result {
         case .success(let reply): return .answer(reply)
         case .failure(let error): return error is HelperBusy ? .late : .failed(error)
+        }
+    }
+
+    /// One helper call that is made only when the UI helper of `vm` is free at this moment: `.late`, with nothing
+    /// sent, when another call has the helper or the task is cancelled. The call runs in a task of its own and keeps
+    /// the helper until the agent answered; `answered` runs with its outcome before the helper is given to the next
+    /// caller. The caller stops waiting `patience` after the helper was taken.
+    nonisolated func factAtOnce(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, patience: Duration,
+                                answered: (@Sendable (Result<JSON, Error>) async -> Void)? = nil) async -> Fact {
+        guard (try? await helperGate.acquire(vm, until: .now)) == true else { return .late }
+        guard !Task.isCancelled else {
+            await helperGate.release(vm)
+            return .late
+        }
+        let end = ContinuousClock.now + patience
+        let answer = HelperAnswer()
+        Task {
+            _ = try? await self.takenTurn(agent, agentOp, fields, vm: vm, answered: { result in
+                await answered?(result)
+                await answer.finish(result)
+            })
+        }
+        guard let outcome = await answer.outcome(until: end, expiry: { await UITiming.factBudgetEnd(end) }) else { return .late }
+        switch outcome.result {
+        case .success(let reply): return .answer(reply)
+        case .failure(let error): return .failed(error)
         }
     }
 

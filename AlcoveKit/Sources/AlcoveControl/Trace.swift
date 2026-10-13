@@ -12,10 +12,9 @@ struct TraceEntry {
     let durationMs: Int
     let before: String?
     let after: String?
-    /// The element at the press point of a click or drag: `{window?, role, name, aid?, password?}`.
+    /// The element the op was aimed at before it ran:
+    /// `{window?, role, name, automationId?, rect?, password?, byAutomationId?, byName?}`.
     var target: JSON? = nil
-    /// The element a `vm.ui.*` op named by ref acted on, in the shape of `target`.
-    var selector: JSON? = nil
     /// The kind of call a script run made this op as; nil for an op a client sent.
     var script: String? = nil
 
@@ -36,7 +35,6 @@ struct TraceEntry {
         if let before { obj["before"] = .string(before) }
         if let after { obj["after"] = .string(after) }
         if let target { obj["target"] = TraceSanitizer.sanitize(target) }
-        if let selector { obj["selector"] = TraceSanitizer.sanitize(selector) }
         if let script { obj["script"] = .string(script) }
         return .object(obj)
     }

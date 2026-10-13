@@ -31,20 +31,22 @@ enum ScriptBuilder {
     /// An entry becomes a step when it succeeded, was sent by a client or made by a script run as a step (`script`
     /// absent or `step`), and its op is one a script may run that is not read-only, or `vm.wait_for` that matched a
     /// condition, or `vm.wait_idle`. The step's params are the entry's without `name`, also in the steps of a `vm.batch`,
-    /// with `${` escaped in every string.
-    /// - A `vm.mouse.click` whose `target` has a name or an automation id and that has no `hold` becomes `vm.ui.click`
-    ///   with the selector of that target and `fallback: {x, y}`.
-    /// - A `vm.ui.*` entry that named its element by ref uses the selector of the entry's `selector` in place of the ref;
-    ///   without a name and an automation id there, a `vm.ui.click` becomes a `vm.mouse.click` at the point it clicked
-    ///   and any other op is left out with a warning.
-    /// - A `vm.window.action` on a window id names the window by the title in its result; without one it is left out
-    ///   with a warning, as is a `vm.wait_for` with a condition that names its element by ref. A selector a client
-    ///   passed to a `vm.ui.*` op loses a window id, with a warning.
-    /// - A `vm.type` step directly after a `vm.type` step with the same other params and no expectation adds its text to that step.
-    /// - A step whose entry shows a foreground window title other than the one the entries before it showed last
-    ///   expects a window with that title.
-    /// - An env value the trace masks becomes a variable named after its key; it, a string the trace cut and a step that
-    ///   names a job id or a pid are reported in the warnings.
+    /// with `${` escaped in every string and without the `since` of an `event` wait condition.
+    /// - A `vm.mouse.click` without `hold` whose `target` passes `replaysAtCentre` and has `selectors` becomes
+    ///   `vm.ui.click` with `selector`, with `altSelector` when there is one, and with `fallback: {x, y}`.
+    /// - A `vm.ui.*` entry that named its element by ref uses the `selectors` of its `target` in place of the ref;
+    ///   without them a `vm.ui.click` becomes a `vm.mouse.click` at the point it clicked and any other op is left out.
+    /// - A `vm.window.action` on a window id names the window by the title in its result; without one it is left out.
+    ///   Left out as well are a `vm.wait_for` with a condition that names its element by ref, a `vm.batch` with a step
+    ///   that holds a ref, and an entry with a param the trace cut. A selector a client passed to a `vm.ui.*` op loses
+    ///   a window id.
+    /// - A `vm.type` step directly after a `vm.type` step with the same other params and no expectation adds its text
+    ///   to that step, unless an entry between the two was left out.
+    /// - A step whose entry shows a foreground window title with another stable part than the entries before it
+    ///   showed last expects a window with that part in its title.
+    /// - An env value the trace masks becomes a variable named after its key.
+    /// The warnings hold a sentence for every entry left out, every selector that lost its window, every variable and
+    /// every step that names a job id or a pid.
     /// Every step has the label `<op> <what it acts on>`; the label of a `vm.type` step that follows a click or UI op
     /// on a password field does not show the text.
     static func draft(trace: [JSON], vm: String, from: Int?, to: Int?) -> Draft {
@@ -133,15 +135,15 @@ enum ScriptBuilder {
             case "vm.mouse.click", "vm.mouse.drag":
                 let facts = entry["target"]
                 intoPassword = facts?["password"]?.boolValue == true
-                if let selector = selector(from: facts) {
-                    item.subject = describe(selector)
-                    if op == "vm.mouse.click", params["hold"] == nil, let x = params["x"]?.intValue, let y = params["y"]?.intValue {
-                        item.step.op = "vm.ui.click"
-                        item.step.params["x"] = nil
-                        item.step.params["y"] = nil
-                        item.step.params["selector"] = .object(selector)
-                        item.step.params["fallback"] = ["x": .int(Int64(x)), "y": .int(Int64(y))]
-                    }
+                item.element = describe(target: facts)
+                if op == "vm.mouse.click", params["hold"] == nil, let x = params["x"]?.intValue, let y = params["y"]?.intValue,
+                   replaysAtCentre(facts, x: x, y: y), let found = selectors(for: facts) {
+                    item.step.op = "vm.ui.click"
+                    item.step.params["x"] = nil
+                    item.step.params["y"] = nil
+                    item.step.params["selector"] = .object(found.selector)
+                    if let other = found.alt { item.step.params["altSelector"] = .object(other) }
+                    item.step.params["fallback"] = ["x": .int(Int64(x)), "y": .int(Int64(y))]
                 }
             case "vm.ui.click", "vm.ui.type", "vm.ui.action":
                 guard let ref = params["ref"], ref != .null else {
@@ -153,17 +155,19 @@ enum ScriptBuilder {
                     }
                     break
                 }
-                let facts = entry["selector"]
+                let facts = entry["target"]
                 intoPassword = facts?["password"]?.boolValue == true
+                item.element = describe(target: facts)
                 item.step.params["ref"] = nil
-                if let selector = selector(from: facts) {
-                    item.step.params["selector"] = .object(selector)
+                if let found = selectors(for: facts) {
+                    item.step.params["selector"] = .object(found.selector)
+                    if let other = found.alt { item.step.params["altSelector"] = .object(other) }
                 } else if op == "vm.ui.click", let x = entry["result"]?["x"]?.intValue, let y = entry["result"]?["y"]?.intValue {
                     item.step.op = "vm.mouse.click"
                     item.step.params["x"] = .int(Int64(x))
                     item.step.params["y"] = .int(Int64(y))
                 } else {
-                    leaveOut(line, "its element was named by ref and has neither a name nor an automation id; add the step by hand with a selector")
+                    leaveOut(line, "its element was named by ref and the trace holds no selector that finds it again; add the step by hand with a selector")
                     return
                 }
             case "vm.window.action":
@@ -188,7 +192,7 @@ enum ScriptBuilder {
             if let id = sessionID(op: op, params: params) {
                 warnings.append("\(line): its \(id) belongs to the recorded session and a replay gets another one; change the step by hand")
             }
-            if item.subject == nil { item.subject = subject(of: item.step) }
+            item.subject = subject(of: item.step, element: item.element)
             item.step.params = prepared(item.step.params, inEnv: false, line: line, warnings: &warnings, required: &required)
             if let shown, let previous = foreground, shown != previous {
                 item.step.expect = [["type": "window_title", "contains": .string(Script.escape(shown))]]
@@ -204,22 +208,55 @@ enum ScriptBuilder {
         }
     }
 
-    /// The selector fields for an element a trace line describes as `{window?, role, name, aid?}`: `name` and
-    /// `automationId` when the line holds them in full and not empty, with `role`, and with `window` when the title
-    /// reads as a title part. Nil when the line holds neither a name nor an automation id.
-    static func selector(from facts: JSON?) -> [String: JSON]? {
-        guard let facts else { return nil }
-        func whole(_ key: String) -> String? {
-            guard let text = facts[key]?.stringValue, !text.isEmpty, facts["\(key)Truncated"]?.boolValue != true else { return nil }
-            return text
+    /// The roles of elements that a click at any of their points acts on as a click at their centre does.
+    static let wholeElementRoles: Set<String> = ["Button", "CheckBox", "RadioButton", "MenuItem", "TabItem", "ListItem", "TreeItem", "Hyperlink"]
+    /// The roles of elements that only a click near their centre acts on as a click at their centre does.
+    static let centreRoles: Set<String> = ["Edit", "ComboBox", "SplitButton", "Spinner", "HeaderItem", "DataItem", "Text"]
+    /// The least distance from the centre, in pixels, that counts as near it.
+    static let centreMargin = 6.0
+
+    /// Whether a click at (`x`, `y`) on the element a trace line describes as `target` may be replayed as a click at
+    /// the element's centre: always for a role of `wholeElementRoles`; for a role of `centreRoles` when the point lies
+    /// within `max(centreMargin, w / 4)` horizontally and `max(centreMargin, h / 4)` vertically of the centre of
+    /// `rect`; never for another role or without the facts this needs.
+    static func replaysAtCentre(_ facts: JSON?, x: Int, y: Int) -> Bool {
+        guard let role = facts?["role"]?.stringValue else { return false }
+        if wholeElementRoles.contains(role) { return true }
+        guard centreRoles.contains(role), let rect = facts?["rect"], let left = rect["x"]?.intValue, let top = rect["y"]?.intValue,
+              let w = rect["w"]?.intValue, let h = rect["h"]?.intValue else { return false }
+        let dx = abs(Double(x) - (Double(left) + Double(w) / 2))
+        let dy = abs(Double(y) - (Double(top) + Double(h) / 2))
+        return dx <= max(centreMargin, Double(w) / 4) && dy <= max(centreMargin, Double(h) / 4)
+    }
+
+    /// The string `key` of `facts` when the trace holds it in full and not empty.
+    private static func whole(_ facts: JSON, _ key: String) -> String? {
+        guard let text = facts[key]?.stringValue, !text.isEmpty, facts[key + TraceSanitizer.cutMarkerSuffix]?.boolValue != true else { return nil }
+        return text
+    }
+
+    /// The selectors that find the element a trace line describes as `target` again.
+    ///
+    /// Each holds `window` (the stable part of the title) and `role`, and `index` when more than one element matched.
+    /// `selector` holds `automationId` when the line has one and `byAutomationId` counted its matches; otherwise
+    /// `name` when the line has one and `byName` counted its matches. `alt` is the selector by `name` when `selector`
+    /// is the one by `automationId` and both exist. Nil without a role, without a window title that reads as a
+    /// title part, and when neither selector exists.
+    static func selectors(for facts: JSON?) -> (selector: [String: JSON], alt: [String: JSON]?)? {
+        guard let facts, let role = whole(facts, "role"), let title = whole(facts, "window") else { return nil }
+        let window = [stablePart(ofTitle: title), title].first(where: isTitlePart)
+        guard let window else { return nil }
+        func selector(_ field: String, countedBy count: String) -> [String: JSON]? {
+            guard let value = whole(facts, field), let matches = facts[count]?["matches"]?.intValue, let index = facts[count]?["index"]?.intValue,
+                  matches >= 1, (0..<matches).contains(index) else { return nil }
+            var fields: [String: JSON] = ["window": .string(window), "role": .string(role), field: .string(value)]
+            if matches > 1 { fields["index"] = .int(Int64(index)) }
+            return fields
         }
-        var selector: [String: JSON] = [:]
-        if let name = whole("name") { selector["name"] = .string(name) }
-        if let aid = whole("aid") { selector["automationId"] = .string(aid) }
-        guard !selector.isEmpty else { return nil }
-        if let role = whole("role") { selector["role"] = .string(role) }
-        if let title = whole("window"), isTitlePart(title) { selector["window"] = .string(stablePart(ofTitle: title)) }
-        return selector
+        let byID = selector("automationId", countedBy: "byAutomationId")
+        let byName = selector("name", countedBy: "byName")
+        guard let first = byID ?? byName else { return nil }
+        return (first, byID == nil ? nil : byName)
     }
 
     // MARK: - parts of a step
@@ -233,6 +270,8 @@ enum ScriptBuilder {
         var text: String?
         /// Whether the label leaves the typed text out.
         var hidesText = false
+        /// How the label names the element of the entry's `target`.
+        var element: String?
         /// What the label names after the op.
         var subject: String?
     }
@@ -390,8 +429,19 @@ enum ScriptBuilder {
         return parts.joined(separator: " ")
     }
 
+    /// The element of a `target` as a label names it; nil without a target and for one that has neither a name nor an
+    /// automation id in full.
+    private static func describe(target facts: JSON?) -> String? {
+        guard let facts else { return nil }
+        var fields: [String: JSON] = [:]
+        for key in ["role", "name", "automationId"] { fields[key] = whole(facts, key).map(JSON.string) }
+        guard fields["name"] != nil || fields["automationId"] != nil else { return nil }
+        return describe(fields)
+    }
+
     /// What the label of `step` names after the op, read from its unescaped params; nil when the op has nothing to name.
-    private static func subject(of step: Script.Step) -> String? {
+    /// `element` names the element the step acts on; without it the step's selector does.
+    private static func subject(of step: Script.Step, element: String?) -> String? {
         let params = step.params
         func text(_ key: String) -> String? { params[key]?.stringValue.map { short($0.split(whereSeparator: \.isNewline).first.map(String.init) ?? "") } }
         func point(_ x: String, _ y: String) -> String? {
@@ -402,7 +452,8 @@ enum ScriptBuilder {
             let present = parts.compactMap { $0 }.filter { !$0.isEmpty }
             return present.isEmpty ? nil : present.joined(separator: " ")
         }
-        let element = params["selector"]?.objectValue.map(describe)
+        if let element, step.op == "vm.mouse.click" || step.op == "vm.mouse.drag" { return element }
+        let element = element ?? params["selector"]?.objectValue.map(describe)
         switch step.op {
         case "vm.ui.click", "vm.ui.type": return element
         case "vm.ui.action": return words([text("action"), element])

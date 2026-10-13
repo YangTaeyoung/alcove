@@ -88,6 +88,13 @@ public actor ControlHandler {
     /// Per VM: the event sequence number up to which its observations have reported events; an op of `sessionOps`
     /// moves it past the events received by then.
     var observedEvents: [String: EventMark] = [:]
+    /// An agent connection, which the mark does not keep alive.
+    struct AgentMark {
+        weak var client: AgentClient?
+    }
+
+    /// Per VM: the agent connection that answered that it does not know the op `ui.at`.
+    var agentsWithoutTargetOp: [String: AgentMark] = [:]
     /// The target `handle` looked up for the op running in the current task.
     @TaskLocal static var resolvedTarget: (name: String, target: any VMTarget)?
     /// The kind of call a script run is making in the current task; nil outside a script run.
@@ -336,7 +343,7 @@ public actor ControlHandler {
         return t
     }
 
-    /// Drops the lease, the runtime forwards, the cached frame size and the event positions of `vm`.
+    /// Drops the lease, the runtime forwards, the cached frame size, the event positions and the agent mark of `vm`.
     func forget(vm: String) {
         leases.forget(vm: vm)
         runtimeForwards[vm] = nil
@@ -344,6 +351,7 @@ public actor ControlHandler {
         lastSize[vm] = nil
         eventBaseline[vm] = nil
         observedEvents[vm] = nil
+        agentsWithoutTargetOp[vm] = nil
     }
 
     /// Runs `op`. For an op outside the read-only set the VM is looked up once: here, or before the op by the code that
