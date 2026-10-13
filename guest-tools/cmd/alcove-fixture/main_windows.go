@@ -18,7 +18,9 @@
 //     Windows Error Reporting records;
 //   - "Hang": the window thread sleeps for 60 s;
 //   - "Fetch": an HTTPS GET of --url on another goroutine, which appends
-//     "Fetch: <status code or error>" to the transcript.
+//     "Fetch: <status code or error>" to the transcript;
+//   - "Titles": changes the window title every 50 ms for 5 s, ending with
+//     "Alcove Fixture".
 //
 // With --log every action appends one line "<RFC 3339 time> <action> [detail]"
 // to the file; a change of Secret is logged as "secret <length>", without the
@@ -64,6 +66,7 @@ const (
 	idCrash
 	idHang
 	idFetch
+	idTitles
 )
 
 const (
@@ -108,6 +111,9 @@ const (
 	defaultCharset = 1
 	clearType      = 5
 	streamTimer    = 1
+	titlesTimer    = 2
+	titlesInterval = 50 // ms
+	titlesTicks    = 100
 )
 
 var (
@@ -130,6 +136,7 @@ var (
 	procMessageBox         = user32.NewProc("MessageBoxW")
 	procGetWindowText      = user32.NewProc("GetWindowTextW")
 	procGetWindowTextLen   = user32.NewProc("GetWindowTextLengthW")
+	procSetWindowText      = user32.NewProc("SetWindowTextW")
 	procGetClientRect      = user32.NewProc("GetClientRect")
 	procMoveWindow         = user32.NewProc("MoveWindow")
 	procSetWindowPos       = user32.NewProc("SetWindowPos")
@@ -189,12 +196,13 @@ type app struct {
 
 	main, message, secret, transcript, send uintptr
 	labels                                  [4]uintptr
-	buttons                                 [4]uintptr
+	buttons                                 [5]uintptr
 	dpi                                     int
 	font                                    uintptr
 
-	words     []string
-	wordsSent int
+	words      []string
+	wordsSent  int
+	titlesTick int
 
 	mu      sync.Mutex
 	fetched []string
@@ -266,7 +274,7 @@ func (a *app) createControls() {
 	for i, b := range []struct {
 		text string
 		id   int
-	}{{"Dialog", idDialog}, {"Crash", idCrash}, {"Hang", idHang}, {"Fetch", idFetch}} {
+	}{{"Dialog", idDialog}, {"Crash", idCrash}, {"Hang", idHang}, {"Fetch", idFetch}, {"Titles", idTitles}} {
 		a.buttons[i] = a.child("BUTTON", b.text, wsTabStop, 0, b.id)
 	}
 	sendMessage(a.transcript, emSetLimitText, 0, 0)
@@ -408,7 +416,37 @@ func (a *app) onCommand(id int) {
 		a.log("hang-over")
 	case idFetch:
 		a.onFetch()
+	case idTitles:
+		a.onTitles()
 	}
+}
+
+// onTitles starts changing the window title every 50 ms.
+func (a *app) onTitles() {
+	if a.titlesTick > 0 {
+		return
+	}
+	a.log("titles")
+	a.titlesTick = 1
+	setWindowText(a.main, fmt.Sprintf("Alcove Fixture %d", a.titlesTick))
+	procSetTimer.Call(a.main, titlesTimer, titlesInterval, 0)
+}
+
+// onTitlesTimer changes the title once more, ending at the base title.
+func (a *app) onTitlesTimer() {
+	a.titlesTick++
+	if a.titlesTick < titlesTicks {
+		setWindowText(a.main, fmt.Sprintf("Alcove Fixture %d", a.titlesTick))
+		return
+	}
+	procKillTimer.Call(a.main, titlesTimer)
+	setWindowText(a.main, windowTitle)
+	a.titlesTick = 0
+	a.log("titles-done")
+}
+
+func setWindowText(hwnd uintptr, text string) {
+	procSetWindowText.Call(hwnd, uintptr(unsafe.Pointer(utf16(text))))
 }
 
 // failFast clears SEM_NOGPFAULTERRORBOX from the error mode of the process,
@@ -441,6 +479,8 @@ func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 	case wmTimer:
 		if wParam == streamTimer {
 			a.onStreamTimer()
+		} else if wParam == titlesTimer {
+			a.onTitlesTimer()
 		}
 		return 0
 	case wmFetchDone:
