@@ -49,7 +49,8 @@ func finishedValue<T: Sendable, Failure: Error>(of task: Task<T, Failure>, withi
 }
 
 final class WaitTests: XCTestCase {
-    override func setUp() {
+    override func setUp() async throws {
+        await recognitionsEnded()
         WaitTiming.tick = .milliseconds(20)
         WaitTiming.screenPeriod = .milliseconds(20)
         WaitTiming.ocrPeriod = .milliseconds(60)
@@ -58,7 +59,8 @@ final class WaitTests: XCTestCase {
         WaitTiming.recognitionGrace = .milliseconds(300)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
+        await recognitionsEnded()
         WaitTiming.tick = .milliseconds(250)
         WaitTiming.screenPeriod = .milliseconds(250)
         WaitTiming.ocrPeriod = .milliseconds(700)
@@ -1041,6 +1043,28 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(unchanged.map(\.width).sorted(), [32, 64])
         XCTAssertEqual(calls.value.filter { $0 == Call(width: 32, shade: 20) }.count, 1)
         XCTAssertLessThanOrEqual(calls.value.filter { $0 == Call(width: 64, shade: 20) }.count, 1)
+    }
+
+    func testAFailureOfTheSecondRecognitionOfAReadingWithoutLanguagesFailsTheReadingAndTheNextPeriodReadsAgain() async throws {
+        let seen = LockedBox<[[String]]>([])
+        WaitTiming.recognizer = { _, languages in
+            seen.value.append(languages)
+            if seen.value.count == 2 { throw ControlHandler.ControlError.recognitionFailed("transient") }
+            return [WaitTests.ready]
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let r = try await waitFor(h, [["type": "text_visible", "text": "ready"]], timeout: 60)
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+        XCTAssertEqual(seen.value, [["ko-KR", "en-US"], ["en-US"], ["ko-KR", "en-US"], ["en-US"]])
+
+        WaitTiming.recognizer = { _, languages in
+            if languages == ["en-US"] { throw ControlHandler.ControlError.recognitionFailed("the second pass failed") }
+            return [WaitTests.ready]
+        }
+        let failing = try await waitFor(h, [["type": "text_visible", "text": "ready"]], timeout: 1)
+        XCTAssertEqual(failing["matched"]?.intValue, -1)
+        XCTAssertEqual(failing["problems"]?[0]?["error"]?.stringValue, "text recognition failed: the second pass failed")
+        XCTAssertGreaterThan(failing["problems"]?[0]?["failures"]?.intValue ?? 0, 1)
     }
 
     func testFrameReadFailuresAreRetried() async throws {

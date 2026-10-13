@@ -6,6 +6,10 @@ import AlcoveQMP
 import AlcoveTestSupport
 
 final class ControlServerTests: XCTestCase {
+    override func setUp() async throws {
+        await recognitionsEnded()
+    }
+
     func testRequestsOverTheSocket() async throws {
         let path = "/tmp/alcove-ctl-\(UUID().uuidString.prefix(8)).sock"
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))

@@ -52,6 +52,10 @@ private func line(_ text: String, _ x: Int, _ y: Int, _ w: Int, _ h: Int, confid
 }
 
 final class ScreenTextTests: XCTestCase {
+    override func tearDown() async throws {
+        await recognitionsEnded()
+    }
+
     func testRecognizesEnglishAndKorean() throws {
         let supported = try VNRecognizeTextRequest(completionHandler: nil).supportedRecognitionLanguages()
         let korean = supported.contains("ko-KR")
@@ -231,6 +235,20 @@ final class ScreenTextTests: XCTestCase {
         XCTAssertEqual(r["matches"]?.arrayValue?.count, 1)
     }
 
+    func testFindTextReadsBothRecognitionsAgainWhenTheSecondOneOfAReadingWithoutLanguagesFails() async throws {
+        let seen = LockedBox<[[String]]>([])
+        WaitTiming.recognizer = { _, languages in
+            seen.value.append(languages)
+            if seen.value.count == 2 { throw ControlHandler.ControlError.recognitionFailed("transient") }
+            return [TextMatch(text: "Send", rect: Frame.Rect(x: 1, y: 2, w: 30, h: 10), confidence: 1)]
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
+        let r = try await h.handle(op: "vm.find_text", params: ["name": "Win", "query": "send"])
+        XCTAssertEqual(seen.value, [["ko-KR", "en-US"], ["en-US"], ["ko-KR", "en-US"], ["en-US"]])
+        XCTAssertEqual(r["matches"]?.arrayValue?.count, 1)
+    }
+
     // MARK: - the reading without `languages`
 
     func testMergeTakesTheLatinReadingOfALineWithoutHangul() {
@@ -326,7 +344,7 @@ final class ScreenTextTests: XCTestCase {
         }
     }
 
-    func testAReadingWithoutLanguagesFindsSmallLatinTextAndHangul() throws {
+    func testAReadingWithoutLanguagesFinds28PixelLatinTextAndHangul() throws {
         guard try ScreenText.supportedLanguages.get().contains("ko-KR") else { throw XCTSkip("ko-KR is not a supported recognition language on this host") }
         let drawn = drawText([("Send message", 100, 120), ("메시지 보내기", 100, 300), ("저장 report.xlsx", 100, 480)])
         let lines = try ScreenText.read(drawn.frame, languages: nil) { try ScreenText.recognize($0, languages: $1) }
