@@ -32,6 +32,12 @@ const (
 	gmemMoveable  = 0x0002
 )
 
+// pointerAt returns the address a GlobalLock call returns as a pointer; the
+// memory belongs to the Windows global heap, not to the Go collector.
+func pointerAt(address uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&address))
+}
+
 type windowsClipboard struct{}
 
 // New returns the Windows clipboard of the calling session.
@@ -75,7 +81,7 @@ func (windowsClipboard) Text() (string, error) {
 	defer procGlobalUnlock.Call(h)
 	size, _, _ := procGlobalSize.Call(h)
 	n := int(size / 2)
-	u := unsafe.Slice((*uint16)(unsafe.Pointer(p)), n)
+	u := unsafe.Slice((*uint16)(pointerAt(p)), n)
 	end := 0
 	for end < n && u[end] != 0 {
 		end++
@@ -96,7 +102,7 @@ func (windowsClipboard) SetText(s string) error {
 		procGlobalFree.Call(h)
 		return errors.New("GlobalLock failed")
 	}
-	copy(unsafe.Slice((*uint16)(unsafe.Pointer(p)), len(u)), u)
+	copy(unsafe.Slice((*uint16)(pointerAt(p)), len(u)), u)
 	procGlobalUnlock.Call(h)
 	if err := open(); err != nil {
 		procGlobalFree.Call(h)
