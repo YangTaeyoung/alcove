@@ -75,26 +75,37 @@ extension AgentClient {
         let part = path + ".alcove-part"
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        var hasher = SHA256()
+        let renamed: JSON
         var offset = 0
-        while true {
-            let piece = try handle.read(upToCount: transferPiece) ?? Data()
-            if piece.isEmpty && offset > 0 { break }
-            hasher.update(data: piece)
-            _ = try await call("fs.write", [
-                "path": .string(part), "data": .string(piece.base64EncodedString()),
-                "offset": .int(Int64(offset)), "truncate": .bool(offset == 0), "mkdirs": .bool(true),
-            ], timeout: timeout)
-            offset += piece.count
-            if piece.isEmpty { break }
-        }
-        let digest = hex(hasher.finalize())
-        let uploaded = try await call("fs.stat", ["path": .string(part), "sha256": .bool(true)], timeout: timeout)
-        guard uploaded["sha256"]?.stringValue?.lowercased() == digest else {
+        var digest = ""
+        do {
+            var hasher = SHA256()
+            while true {
+                let piece = try handle.read(upToCount: transferPiece) ?? Data()
+                if piece.isEmpty && offset > 0 { break }
+                hasher.update(data: piece)
+                _ = try await call("fs.write", [
+                    "path": .string(part), "data": .string(piece.base64EncodedString()),
+                    "offset": .int(Int64(offset)), "truncate": .bool(offset == 0), "mkdirs": .bool(true),
+                ], timeout: timeout)
+                offset += piece.count
+                if piece.isEmpty { break }
+            }
+            digest = hex(hasher.finalize())
+            let uploaded = try await call("fs.stat", ["path": .string(part), "sha256": .bool(true)], timeout: timeout)
+            guard uploaded["sha256"]?.stringValue?.lowercased() == digest else {
+                throw AgentError.remote("digest mismatch after upload")
+            }
+            do {
+                renamed = try await call("fs.rename", ["from": .string(part), "to": .string(path), "overwrite": .bool(overwrite)], timeout: timeout)
+            } catch AgentError.remote(let text) where !overwrite && text.contains("exists") {
+                throw AgentError.remote("'\(path)' exists in the guest; pass overwrite")
+            }
+        } catch {
+            if let agentError = error as? AgentError, agentError == .disconnected || agentError == .notConnected { throw error }
             _ = try? await call("fs.delete", ["path": .string(part)], timeout: timeout)
-            throw AgentError.remote("digest mismatch after upload")
+            throw error
         }
-        let renamed = try await call("fs.rename", ["from": .string(part), "to": .string(path), "overwrite": .bool(true)], timeout: timeout)
         return TransferResult(guestPath: renamed["path"]?.stringValue ?? path, bytes: offset, sha256: digest)
     }
 

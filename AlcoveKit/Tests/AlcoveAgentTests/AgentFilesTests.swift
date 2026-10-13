@@ -202,4 +202,40 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertEqual(pair?.0, "A.txt")
         XCTAssertEqual(pair?.1, "a.txt")
     }
+
+    func testPushRefusesDestinationCreatedBeforeRename() async throws {
+        let fs = FakeFS()
+        let (agent, client) = try await connected(fs)
+        let inner = agent.handler
+        agent.handler = { m, a in
+            if m["op"]?.stringValue == "fs.rename" { fs["/data/blob.bin"] = Data("original".utf8) }
+            return inner?(m, a) ?? []
+        }
+        let local = try tempDir().appendingPathComponent("blob.bin")
+        try randomData(3000).write(to: local)
+        do { _ = try await client.pushFile(local, toGuestPath: "/data/blob.bin", overwrite: false); XCTFail("expected refusal") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, "'/data/blob.bin' exists in the guest; pass overwrite") }
+        XCTAssertEqual(fs["/data/blob.bin"], Data("original".utf8))
+        XCTAssertNil(fs["/data/blob.bin.alcove-part"])
+        XCTAssertEqual(fs.paths(), ["/data/blob.bin"])
+    }
+
+    func testPushRemovesPartFileWhenAWriteFails() async throws {
+        let fs = FakeFS()
+        let (agent, client) = try await connected(fs)
+        let inner = agent.handler
+        let writes = LockedBox(0)
+        agent.handler = { m, a in
+            if m["op"]?.stringValue == "fs.write" {
+                writes.value += 1
+                if writes.value == 2 { return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "disk full"]] }
+            }
+            return inner?(m, a) ?? []
+        }
+        let local = try tempDir().appendingPathComponent("blob.bin")
+        try randomData(600_000).write(to: local)
+        do { _ = try await client.pushFile(local, toGuestPath: "/data/blob.bin", overwrite: false); XCTFail("expected failure") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, "disk full") }
+        XCTAssertEqual(fs.paths(), [])
+    }
 }
