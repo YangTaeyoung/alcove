@@ -137,6 +137,11 @@ public actor VMController {
     /// `discardChanges` runs the session on qcow2 overlays of the disks and a copy of the
     /// UEFI variables in `run/`; `teardown()` removes them. A template with clones and a
     /// suspended bundle asked to discard changes are refused before anything is launched.
+    /// A VM with a `templateEpoch` is refused, on a cold start and on a resume from a suspended
+    /// session, unless `VMBundle.templateMismatch` is nil for the configuration it launches with.
+    /// A cold start that keeps its changes raises the stored `diskEpoch` of a VM that has one
+    /// (`VMBundle.advanceDiskEpoch`) and carries the new value in `config` and `runningConfig`;
+    /// when that cannot be saved the start is refused.
     public func start(bootFromCDROM: Bool = false, discardChanges: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
         let clones = bundle.liveClones().map { VMBundle(url: $0).configName }
@@ -148,6 +153,18 @@ public actor VMController {
         guard !(resuming && discardChanges) else {
             throw ControllerError.engineDidNotStart(
                 "'\(config.name)' has a suspended session; resume it or discard the suspended state before starting a session that discards changes")
+        }
+        if let mismatch = VMBundle.templateMismatch(for: resuming ? (bundle.loadSuspendedConfig() ?? config) : config) {
+            throw ControllerError.engineDidNotStart(mismatch)
+        }
+        if !discardChanges, !resuming {
+            do {
+                if let epoch = try bundle.advanceDiskEpoch() { config.diskEpoch = epoch }
+            } catch {
+                throw ControllerError.engineDidNotStart(
+                    "'\(config.name)' has been cloned, so each start is recorded in \(bundle.configURL.path), and that file could not be saved; "
+                    + "make the bundle folder writable and start it again\n\(error.localizedDescription)")
+            }
         }
         generation += 1
         let gen = generation

@@ -251,7 +251,126 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
     }
 
+    // MARK: - disk epoch (stand-in qemu-img)
+
+    private func setDiskEpoch(_ epoch: Int?, of bundle: VMBundle) throws {
+        var config = try bundle.loadConfig()
+        config.diskEpoch = epoch
+        try bundle.save(config)
+    }
+
+    private func setPermissions(_ mode: Int, of bundle: VMBundle) throws {
+        try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: bundle.url.path)
+    }
+
+    func testTemplateMismatchIsNilForAVMThatIsNotAClone() throws {
+        let (template, engine) = try stubTemplate()
+        XCTAssertNil(VMBundle.templateMismatch(for: try template.loadConfig()))
+        _ = try template.cloneLinked(named: "Copy", engine: engine)
+        XCTAssertNil(VMBundle.templateMismatch(for: try template.loadConfig()))
+    }
+
+    func testTemplateMismatchComparesTheCloneEpochWithTheStoredTemplateEpoch() throws {
+        let (template, engine) = try stubTemplate()
+        let config = try template.cloneLinked(named: "Copy", engine: engine).loadConfig()
+        let stale = "the template 'Base' was started after 'Copy' was cloned from it, so the clone's disk no longer matches; "
+            + "delete the clone and clone again"
+        XCTAssertNil(VMBundle.templateMismatch(for: config))
+        try setDiskEpoch(1, of: template)
+        XCTAssertEqual(VMBundle.templateMismatch(for: config), stale)
+        try setDiskEpoch(nil, of: template)
+        XCTAssertEqual(VMBundle.templateMismatch(for: config), stale)
+        try setDiskEpoch(0, of: template)
+        XCTAssertNil(VMBundle.templateMismatch(for: config))
+    }
+
+    func testTemplateMismatchReportsATemplateThatCannotBeRead() throws {
+        let (template, engine) = try stubTemplate()
+        var config = try template.cloneLinked(named: "Copy", engine: engine).loadConfig()
+        let path = standardPath(template.url)
+        XCTAssertEqual(config.templatePath, path)
+        let notFound = "the template of 'Copy' was not found at \(path); the clone cannot run without it"
+
+        try Data("not json".utf8).write(to: template.configURL)
+        XCTAssertEqual(VMBundle.templateMismatch(for: config), notFound)
+        try FileManager.default.removeItem(at: template.url)
+        XCTAssertEqual(VMBundle.templateMismatch(for: config), notFound)
+
+        config.templatePath = nil
+        XCTAssertEqual(VMBundle.templateMismatch(for: config),
+                       "the template of 'Copy' was not found at an unrecorded path; the clone cannot run without it")
+    }
+
+    func testAdvanceDiskEpochLeavesAVMWithoutEpochUntouched() throws {
+        let (bundle, _) = try stubTemplate()
+        let before = try Data(contentsOf: bundle.configURL)
+        XCTAssertNil(try bundle.advanceDiskEpoch())
+        XCTAssertEqual(try Data(contentsOf: bundle.configURL), before)
+    }
+
+    func testAdvanceDiskEpochStoresTheNextEpochAndNothingElse() throws {
+        let (template, engine) = try stubTemplate()
+        _ = try template.cloneLinked(named: "Copy", engine: engine)
+        var expected = try template.loadConfig()
+        XCTAssertEqual(expected.diskEpoch, 0)
+        XCTAssertEqual(try template.advanceDiskEpoch(), 1)
+        expected.diskEpoch = 1
+        XCTAssertEqual(try template.loadConfig(), expected)
+        XCTAssertEqual(try template.advanceDiskEpoch(), 2)
+        expected.diskEpoch = 2
+        XCTAssertEqual(try template.loadConfig(), expected)
+    }
+
+    func testAdvanceDiskEpochThrowsWhenTheConfigCannotBeSaved() throws {
+        let (template, engine) = try stubTemplate()
+        _ = try template.cloneLinked(named: "Copy", engine: engine)
+        try setPermissions(0o555, of: template)
+        defer { try? setPermissions(0o755, of: template) }
+        XCTAssertThrowsError(try template.advanceDiskEpoch())
+        XCTAssertEqual(try template.loadConfig().diskEpoch, 0)
+    }
+
     // MARK: - linked clones (real qemu-img)
+
+    func testFirstCloneSetsTheTemplateEpochAndLaterClonesKeepIt() throws {
+        let engine = try realEngine()
+        let (template, _) = try makeTemplate(engine)
+        XCTAssertNil(try template.loadConfig().diskEpoch)
+
+        let first = try template.cloneLinked(named: "First", engine: engine).loadConfig()
+        XCTAssertEqual(try template.loadConfig().diskEpoch, 0)
+        XCTAssertEqual(first.templateEpoch, 0)
+        XCTAssertEqual(first.templatePath, standardPath(template.url))
+        XCTAssertNil(first.diskEpoch)
+        XCTAssertNil(try template.loadConfig().templateEpoch)
+        XCTAssertNil(try template.loadConfig().templatePath)
+
+        let stored = try Data(contentsOf: template.configURL)
+        let second = try template.cloneLinked(named: "Second", engine: engine).loadConfig()
+        XCTAssertEqual(try Data(contentsOf: template.configURL), stored)
+        XCTAssertEqual(second.templateEpoch, 0)
+        XCTAssertEqual(second.templatePath, standardPath(template.url))
+
+        try setDiskEpoch(4, of: template)
+        let third = try template.cloneLinked(named: "Third", engine: engine).loadConfig()
+        XCTAssertEqual(try template.loadConfig().diskEpoch, 4)
+        XCTAssertEqual(third.templateEpoch, 4)
+    }
+
+    func testNoCloneIsCreatedWhenTheTemplateConfigCannotBeSaved() throws {
+        let engine = try realEngine()
+        let (template, _) = try makeTemplate(engine)
+        try setPermissions(0o555, of: template)
+        defer { try? setPermissions(0o755, of: template) }
+        XCTAssertThrowsError(try template.cloneLinked(named: "Clone", engine: engine)) {
+            let path = ($0 as NSError).userInfo[NSFilePathErrorKey] as? String ?? ""
+            XCTAssertTrue(path.hasSuffix("/Template.alcovevm/config.json"), "\($0)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("Clone.alcovevm").path))
+        try setPermissions(0o755, of: template)
+        XCTAssertNil(try template.loadConfig().diskEpoch)
+        XCTAssertEqual(template.liveClones(), [])
+    }
 
     private func realEngine() throws -> EngineLocator.Engine {
         let engine = try? EngineLocator.standard().locate()

@@ -188,7 +188,7 @@ extension VMBundle {
     /// The name in `config.json`; the directory name when the config cannot be read.
     public var configName: String { storedConfig()?.name ?? url.deletingPathExtension().lastPathComponent }
     /// `config.json` as stored, without writing migrated fields back.
-    private func storedConfig() -> VMConfig? { try? VMConfig.decode(Data(contentsOf: configURL)) }
+    func storedConfig() -> VMConfig? { try? VMConfig.decode(Data(contentsOf: configURL)) }
     /// Whether an engine process holds this bundle's pidfile lock.
     public var isRunning: Bool { VMController.pidfileLockHolder(pidFileURL.path) != nil }
     /// The disk image a session that discards changes writes to in place of `diskURL(disk)`.
@@ -234,14 +234,18 @@ extension VMBundle {
     /// and MAC, an agent port no bundle in the directory uses, no CD-ROMs, USB passthrough or static
     /// forwards, and `cloneOf` set. The clone is added to `clones.json`.
     /// The overlays reference the template's disk files by absolute path.
+    /// A template without a `diskEpoch` is saved with `diskEpoch` 0 before anything of the clone is created.
+    /// The clone records the template's `diskEpoch` as `templateEpoch` and this bundle's standardized
+    /// path as `templatePath`.
     public func cloneLinked(named newName: String, engine: EngineLocator.Engine, fileManager fm: FileManager = .default) throws -> VMBundle {
         let newName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         let directory = url.deletingLastPathComponent()
-        let source = try loadConfig()
+        var source = try loadConfig()
         if let template = source.cloneOf { throw CloneError.sourceIsClone(source.name, template: template) }
         guard !source.tpm else { throw CloneError.sourceHasTPM }
         guard !isRunning else { throw CloneError.sourceRunning(source.name) }
         guard !isSuspended else { throw CloneError.sourceSuspended(source.name) }
+        let epoch = source.diskEpoch ?? 0
 
         let takenPorts = Set(VMBundle.list(in: directory, fileManager: fm).compactMap { $0.storedConfig()?.agentHostPort } + [source.agentHostPort])
         var token = UUID().uuidString.lowercased(), attempts = 0
@@ -253,7 +257,8 @@ extension VMBundle {
         if case .none = source.network { network = .none }
         let config = VMConfig(name: newName, guestOS: source.guestOS, cpuCount: source.cpuCount, memoryMiB: source.memoryMiB,
                               disks: source.disks, network: network, display: source.display,
-                              sharedFolders: source.sharedFolders, agentToken: token, cloneOf: source.name)
+                              sharedFolders: source.sharedFolders, agentToken: token, cloneOf: source.name,
+                              templateEpoch: epoch, templatePath: url.standardizedFileURL.path)
         do {
             try config.validate()
         } catch VMConfig.ValidationError.emptyName, VMConfig.ValidationError.invalidName {
@@ -262,6 +267,10 @@ extension VMBundle {
         let clone = VMBundle(url: directory.appendingPathComponent(newName).appendingPathExtension(VMBundle.pathExtension))
         guard !fm.fileExists(atPath: clone.url.path), VMBundle.named(newName, in: directory, fileManager: fm) == nil else {
             throw CloneError.nameExists(newName)
+        }
+        if source.diskEpoch == nil {
+            source.diskEpoch = epoch
+            try save(source)
         }
 
         do {
@@ -292,6 +301,31 @@ extension VMBundle {
         try fm.removeItem(at: url)
         try? fm.removeItem(atPath: socketDirectory)
         _ = VMBundle.named(template, in: url.deletingLastPathComponent(), fileManager: fm)?.liveClones(fileManager: fm)
+    }
+
+    /// The sentence that refuses to start a VM configured as `config`; nil when `config` has no
+    /// `templateEpoch`, or when the `config.json` of the bundle at its `templatePath` stores a
+    /// `diskEpoch` equal to it.
+    public static func templateMismatch(for config: VMConfig) -> String? {
+        guard let epoch = config.templateEpoch else { return nil }
+        guard let path = config.templatePath, let template = VMBundle(url: URL(fileURLWithPath: path)).storedConfig() else {
+            return "the template of '\(config.name)' was not found at \(config.templatePath ?? "an unrecorded path"); "
+                + "the clone cannot run without it"
+        }
+        guard template.diskEpoch == epoch else {
+            return "the template '\(template.name)' was started after '\(config.name)' was cloned from it, "
+                + "so the clone's disk no longer matches; delete the clone and clone again"
+        }
+        return nil
+    }
+
+    /// Saves `config.json` as stored with `diskEpoch` raised by one and returns the new value.
+    /// Returns nil and writes nothing when the stored config has no `diskEpoch` or cannot be read.
+    public func advanceDiskEpoch() throws -> Int? {
+        guard var stored = storedConfig(), let epoch = stored.diskEpoch else { return nil }
+        stored.diskEpoch = epoch + 1
+        try save(stored)
+        return epoch + 1
     }
 
     /// Removes the overlays and the UEFI variable copy of a session that discards changes.

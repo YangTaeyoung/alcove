@@ -109,12 +109,21 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public var agentHostPort: Int
     /// Name of the template this VM was cloned from; nil for a VM that is not a clone.
     public var cloneOf: String?
+    /// Counts writable starts of a VM that has been cloned. A clone runs only while its
+    /// `templateEpoch` equals this value. Nil until the VM is cloned for the first time.
+    public var diskEpoch: Int?
+    /// On a clone: the template's `diskEpoch` when the clone was made. A VM with this field starts
+    /// only while it equals the `diskEpoch` stored in the bundle at `templatePath`.
+    public var templateEpoch: Int?
+    /// On a clone: the absolute path of the template's bundle directory when the clone was made.
+    public var templatePath: String?
 
     public init(schemaVersion: Int = VMConfig.currentSchemaVersion, name: String, guestOS: GuestOS, cpuCount: Int,
                 memoryMiB: Int, disks: [Disk], cdroms: [CDROM] = [], network: Network = .user(portForwards: []),
                 display: DisplayDevice, tpm: Bool = false, usbPassthrough: [USBSelector] = [],
                 sharedFolders: [SharedFolder] = [], macAddress: String = VMConfig.randomMAC(), createdAt: Date = Date(),
-                agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil, cloneOf: String? = nil) {
+                agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil, cloneOf: String? = nil,
+                diskEpoch: Int? = nil, templateEpoch: Int? = nil, templatePath: String? = nil) {
         self.schemaVersion = schemaVersion; self.name = name; self.guestOS = guestOS; self.cpuCount = cpuCount
         self.memoryMiB = memoryMiB; self.disks = disks; self.cdroms = cdroms; self.network = network
         self.display = display; self.tpm = tpm; self.usbPassthrough = usbPassthrough
@@ -122,6 +131,7 @@ public struct VMConfig: Codable, Sendable, Equatable {
         self.agentToken = agentToken
         self.agentHostPort = agentHostPort ?? VMConfig.agentPort(for: agentToken)
         self.cloneOf = cloneOf
+        self.diskEpoch = diskEpoch; self.templateEpoch = templateEpoch; self.templatePath = templatePath
     }
 
     /// Guest port the agent listens on.
@@ -220,7 +230,8 @@ extension VMConfig {
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, name, guestOS, cpuCount, memoryMiB, disks, cdroms, network, display, tpm,
-             usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort, cloneOf
+             usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort, cloneOf,
+             diskEpoch, templateEpoch, templatePath
     }
 
     public init(from decoder: Decoder) throws {
@@ -243,5 +254,8 @@ extension VMConfig {
         agentToken = token
         agentHostPort = try c.decodeIfPresent(Int.self, forKey: .agentHostPort) ?? VMConfig.agentPort(for: token)
         cloneOf = try c.decodeIfPresent(String.self, forKey: .cloneOf)
+        diskEpoch = try c.decodeIfPresent(Int.self, forKey: .diskEpoch)
+        templateEpoch = try c.decodeIfPresent(Int.self, forKey: .templateEpoch)
+        templatePath = try c.decodeIfPresent(String.self, forKey: .templatePath)
     }
 }

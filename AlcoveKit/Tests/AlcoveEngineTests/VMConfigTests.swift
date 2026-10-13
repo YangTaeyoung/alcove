@@ -82,6 +82,45 @@ final class VMConfigTests: XCTestCase {
         XCTAssertEqual(try VMConfig.decode(try c.encoded()).cloneOf, "Template")
     }
 
+    func testEpochFieldsRoundTripAndAreOmittedWhenNil() throws {
+        var c = VMConfig.defaults(name: "E", guestOS: .linux)
+        XCTAssertNil(c.diskEpoch); XCTAssertNil(c.templateEpoch); XCTAssertNil(c.templatePath)
+        let plain = try c.encoded()
+        let json = String(decoding: plain, as: UTF8.self)
+        for key in ["diskEpoch", "templateEpoch", "templatePath"] { XCTAssertFalse(json.contains(key), key) }
+        XCTAssertFalse(VMConfig.needsMigration(plain))
+
+        c.diskEpoch = 3; c.templateEpoch = 7; c.templatePath = "/vms/Template.alcovevm"
+        let data = try c.encoded()
+        let back = try VMConfig.decode(data)
+        XCTAssertEqual(back.diskEpoch, 3)
+        XCTAssertEqual(back.templateEpoch, 7)
+        XCTAssertEqual(back.templatePath, "/vms/Template.alcovevm")
+        XCTAssertFalse(VMConfig.needsMigration(data))
+
+        let made = VMConfig(name: "I", guestOS: .other, cpuCount: 1, memoryMiB: 512, disks: c.disks, display: .ramfb,
+                            diskEpoch: 0, templateEpoch: 2, templatePath: "/t")
+        XCTAssertEqual(made.diskEpoch, 0); XCTAssertEqual(made.templateEpoch, 2); XCTAssertEqual(made.templatePath, "/t")
+    }
+
+    func testConfigWithoutEpochFieldsDecodesWithNil() throws {
+        let json = #"""
+        {"schemaVersion": 1, "name": "Old", "guestOS": "linux", "cpuCount": 2, "memoryMiB": 1024, "display": "ramfb",
+         "disks": [{"id": "disk0", "fileName": "disk0.qcow2", "sizeGiB": 8, "bus": "virtio-blk"}],
+         "agentToken": "0f0e0d0c-0000-4000-8000-000000000001", "agentHostPort": 17001, "cloneOf": "Template"}
+        """#
+        let old = Data(json.utf8)
+        let c = try VMConfig.decode(old)
+        XCTAssertNil(c.diskEpoch); XCTAssertNil(c.templateEpoch); XCTAssertNil(c.templatePath)
+        XCTAssertEqual(c.cloneOf, "Template")
+        XCTAssertFalse(VMConfig.needsMigration(old))
+
+        var withoutAgent = try JSONSerialization.jsonObject(with: old) as! [String: Any]
+        withoutAgent.removeValue(forKey: "agentToken")
+        withoutAgent["diskEpoch"] = 1
+        XCTAssertTrue(VMConfig.needsMigration(try JSONSerialization.data(withJSONObject: withoutAgent)))
+    }
+
     func testRandomMACIsLocallyAdministeredUnicast() {
         for _ in 0..<20 {
             let m = VMConfig.randomMAC()

@@ -383,6 +383,194 @@ final class VMControllerFakeEngineTests: XCTestCase {
         let s = await vm.state; XCTAssertEqual(s, .stopped)
     }
 
+    // MARK: - disk epoch
+
+    private static let staleClone = "the template 'Fake' was started after 'Clone' was cloned from it, "
+        + "so the clone's disk no longer matches; delete the clone and clone again"
+
+    private func storedEpoch(_ vm: VMController) throws -> Int? { try vm.bundle.loadConfig().diskEpoch }
+
+    private func fileNumber(_ url: URL) throws -> Int? {
+        try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? Int
+    }
+
+    /// A controller for `bundle`, configured from its `config.json`.
+    private func controller(for bundle: VMBundle, engine: EngineLocator.Engine) throws -> VMController {
+        let vm = VMController(bundle: bundle, config: try bundle.loadConfig(), engine: engine)
+        controllers.append(vm)
+        return vm
+    }
+
+    /// Moves `bundle` into a new directory of its own.
+    private func moveAway(_ bundle: VMBundle) throws -> VMBundle {
+        let directory = tmp.appendingPathComponent("elsewhere-\(UUID().uuidString.prefix(6))")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let moved = VMBundle(url: directory.appendingPathComponent(bundle.url.lastPathComponent))
+        try FileManager.default.moveItem(at: bundle.url, to: moved.url)
+        return moved
+    }
+
+    /// Clones `vm` and deletes the clone, which leaves `vm` with a stored `diskEpoch` of 0.
+    private func cloneAndDeleteClone(_ vm: VMController) async throws {
+        try await vm.cloneLinked(named: "Clone").deleteClone()
+        XCTAssertEqual(try storedEpoch(vm), 0)
+    }
+
+    private func assertStartRefused(_ vm: VMController, _ sentence: String, discardChanges: Bool = false,
+                                    file: StaticString = #filePath, line: UInt = #line) async {
+        do {
+            try await vm.start(discardChanges: discardChanges)
+            XCTFail("the start was not refused", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? VMController.ControllerError, .engineDidNotStart(sentence), file: file, line: line)
+        }
+        let s = await vm.state
+        XCTAssertEqual(s, .stopped, file: file, line: line)
+        XCTAssertFalse(launched(vm), file: file, line: line)
+    }
+
+    func testNeverClonedVMStartDoesNotRewriteConfig() async throws {
+        let vm = try makeVM()
+        let bytes = try Data(contentsOf: vm.bundle.configURL)
+        let file = try fileNumber(vm.bundle.configURL)
+        try await vm.start()
+        let running = await vm.runningConfig; XCTAssertNil(running?.diskEpoch)
+        try await vm.shutdown(force: true)
+        XCTAssertEqual(try Data(contentsOf: vm.bundle.configURL), bytes)
+        XCTAssertEqual(try fileNumber(vm.bundle.configURL), file)
+        let config = await vm.config; XCTAssertNil(config.diskEpoch)
+    }
+
+    func testTemplateStartBumpsEpochAfterClonesAreGone() async throws {
+        let vm = try makeVM()
+        try await cloneAndDeleteClone(vm)
+
+        try await vm.start()
+        XCTAssertEqual(try storedEpoch(vm), 1)
+        var config = await vm.config; XCTAssertEqual(config.diskEpoch, 1)
+        var running = await vm.runningConfig; XCTAssertEqual(running?.diskEpoch, 1)
+        try await vm.shutdown(force: true)
+
+        try await vm.start()
+        XCTAssertEqual(try storedEpoch(vm), 2)
+        config = await vm.config; XCTAssertEqual(config.diskEpoch, 2)
+        running = await vm.runningConfig; XCTAssertEqual(running?.diskEpoch, 2)
+        try await vm.shutdown(force: true)
+
+        let later = try await vm.cloneLinked(named: "Later")
+        XCTAssertEqual(try later.loadConfig().templateEpoch, 2)
+        XCTAssertEqual(try storedEpoch(vm), 2)
+    }
+
+    func testThrowawaySessionDoesNotBumpEpoch() async throws {
+        let vm = try makeVM()
+        try await cloneAndDeleteClone(vm)
+        let bytes = try Data(contentsOf: vm.bundle.configURL)
+        try await vm.start(discardChanges: true)
+        let ephemeral = await vm.isEphemeral; XCTAssertTrue(ephemeral)
+        try await vm.shutdown(force: true)
+        XCTAssertEqual(try Data(contentsOf: vm.bundle.configURL), bytes)
+        XCTAssertEqual(try storedEpoch(vm), 0)
+    }
+
+    func testResumeFromSuspendDoesNotBumpEpoch() async throws {
+        let vm = try makeVM()
+        try await cloneAndDeleteClone(vm)
+        try await vm.start()
+        try await vm.suspendToDisk()
+        XCTAssertEqual(try storedEpoch(vm), 1)
+        try await vm.start()
+        XCTAssertTrue(try argv(vm).contains("-incoming"))
+        let running = await vm.runningConfig; XCTAssertEqual(running?.diskEpoch, 1)
+        try await vm.shutdown(force: true)
+        XCTAssertEqual(try storedEpoch(vm), 1)
+    }
+
+    func testStartThatFailsAfterTheBumpKeepsTheBumpedEpoch() async throws {
+        let vm = try makeVM(mode: "bad-status")
+        try await cloneAndDeleteClone(vm)
+        await XCTAssertThrowsErrorAsync(try await vm.start())
+        XCTAssertTrue(launched(vm))
+        XCTAssertEqual(try storedEpoch(vm), 1)
+        let config = await vm.config; XCTAssertEqual(config.diskEpoch, 1)
+    }
+
+    func testStartIsRefusedWhenTheEpochCannotBeSaved() async throws {
+        let vm = try makeVM()
+        try await cloneAndDeleteClone(vm)
+        let fm = FileManager.default
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: vm.bundle.url.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: vm.bundle.url.path) }
+        do {
+            try await vm.start()
+            XCTFail("the start was not refused")
+        } catch {
+            guard case .engineDidNotStart(let message)? = error as? VMController.ControllerError else { return XCTFail("\(error)") }
+            XCTAssertTrue(message.hasPrefix("'Fake' has been cloned, so each start is recorded in \(vm.bundle.configURL.path), "
+                + "and that file could not be saved; make the bundle folder writable and start it again\n"), message)
+        }
+        let s = await vm.state; XCTAssertEqual(s, .stopped)
+        XCTAssertFalse(launched(vm))
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: vm.bundle.url.path)
+        XCTAssertEqual(try storedEpoch(vm), 0)
+        let config = await vm.config; XCTAssertNil(config.diskEpoch)
+    }
+
+    func testStaleCloneRefusesToStart() async throws {
+        let vm = try makeVM()
+        let moved = try moveAway(try await vm.cloneLinked(named: "Clone"))
+        try await vm.start()
+        try await vm.shutdown(force: true)
+        XCTAssertEqual(try storedEpoch(vm), 1)
+
+        let clone = try controller(for: moved, engine: vm.engine)
+        await assertStartRefused(clone, Self.staleClone)
+        await assertStartRefused(clone, Self.staleClone, discardChanges: true)
+        let s = await clone.state; XCTAssertFalse(s.isActive)
+    }
+
+    func testCloneWithMissingTemplateRefusesToStart() async throws {
+        let vm = try makeVM()
+        let clone = try controller(for: try await vm.cloneLinked(named: "Clone"), engine: vm.engine)
+        let path = vm.bundle.url.standardizedFileURL.path
+        try FileManager.default.moveItem(at: vm.bundle.url, to: vm.bundle.url.deletingLastPathComponent().appendingPathComponent("Renamed.alcovevm"))
+        await assertStartRefused(clone, "the template of 'Clone' was not found at \(path); the clone cannot run without it")
+    }
+
+    /// A clone whose `templateEpoch` equals its template's `diskEpoch` starts, and resumes from a suspended session.
+    func testFreshCloneStarts() async throws {
+        let vm = try makeVM()
+        let clone = try controller(for: try await vm.cloneLinked(named: "Clone"), engine: vm.engine)
+        let bytes = try Data(contentsOf: clone.bundle.configURL)
+        try await clone.start()
+        var s = await clone.state; XCTAssertEqual(s, .running)
+        try await clone.suspendToDisk()
+        try await clone.start()
+        s = await clone.state; XCTAssertEqual(s, .running)
+        XCTAssertTrue(try argv(clone).contains("-incoming"))
+        try await clone.shutdown(force: true)
+        XCTAssertEqual(try Data(contentsOf: clone.bundle.configURL), bytes)
+        XCTAssertEqual(try storedEpoch(vm), 0)
+    }
+
+    /// The template check runs on a resume from a suspended session as it does on a cold start.
+    func testStaleSuspendedCloneDoesNotResume() async throws {
+        let vm = try makeVM()
+        let suspended = try controller(for: try await vm.cloneLinked(named: "Clone"), engine: vm.engine)
+        try await suspended.start()
+        try await suspended.suspendToDisk()
+        let moved = try moveAway(suspended.bundle)
+        XCTAssertTrue(moved.isSuspended)
+        XCTAssertEqual(moved.loadSuspendedConfig()?.templateEpoch, 0)
+        try FileManager.default.removeItem(at: moved.runURL.appendingPathComponent("fake-argv.json"))
+        try await vm.start()
+        try await vm.shutdown(force: true)
+
+        let clone = try controller(for: moved, engine: vm.engine)
+        await assertStartRefused(clone, Self.staleClone)
+        XCTAssertTrue(moved.isSuspended)
+    }
+
     func testEphemeralOverlayRemovedOnStop() async throws {
         let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
         let run = vm.bundle.runURL
