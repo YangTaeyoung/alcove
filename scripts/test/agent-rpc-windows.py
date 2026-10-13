@@ -5,8 +5,9 @@ Talks docs/agent-protocol.md directly on the forwarded agent port: reads hello,
 sends welcome, then req/res with ids. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py). Each check prints
 `PASS <n> <title>`; the first failing check prints `FAIL <n>: <reason>` and the
-script exits 1. Files go under C:\\alcove-e2e\\rpc, which is deleted at the end
-together with every job the script started.
+script exits 1. Files go under C:\\alcove-e2e\\rpc. However the run ends, a
+second connection kills the jobs and GUI programs the script started and
+deletes that directory.
 
 Usage: agent-rpc-windows.py [--agent-port N] [--only N[,N...]]
 """
@@ -115,11 +116,18 @@ class Run:
     def __init__(self, agent):
         self.a = agent
         self.jobs = []
+        self.images = []
+        self.markers = []
 
     def start(self, **params):
         r = self.a.call("exec.start", **params)
         self.jobs.append(r["job"])
         return r["job"], r["pid"]
+
+    def start_gui(self, image, argv):
+        """Starts a GUI program as a job; cleanup kills every process with that image name."""
+        self.images.append(image)
+        return self.start(shell="none", argv=argv)
 
     def read_until(self, job, done, timeout=30):
         """Polls exec.read with advancing offsets until done(out, err, last reply)."""
@@ -142,17 +150,31 @@ class Run:
     def procs(self, name=None):
         return self.a.call("proc.list", **({"name": name} if name else {}))["procs"]
 
-    def cleanup(self):
-        for job in self.jobs:
-            try:
-                self.a.call("exec.kill", job=job)
-            except Failure:
-                pass
+    def cleanup(self, port):
+        """On a new connection: kills the started jobs, the registered images and
+        the PowerShell processes whose command line holds a registered marker,
+        then deletes BASE and its parent when that is empty."""
         try:
-            self.a.call("fs.delete", path=BASE, recursive=True)
-            self.a.wait(self.a.request("fs.delete", path=ntpath.dirname(BASE)))
-        except Failure:
-            pass
+            a = Agent(port)
+        except (Failure, OSError, ValueError) as e:
+            print(f"cleanup did not run: {e}; jobs {self.jobs}, programs {self.images} and {BASE} may remain in the guest",
+                  file=sys.stderr)
+            return
+        steps = [("exec.kill", {"job": job}) for job in self.jobs]
+        steps += [("proc.kill", {"name": image, "tree": True}) for image in self.images]
+        if self.markers:
+            try:
+                for p in a.call("proc.list", name="powershell")["procs"]:
+                    if any(marker in p["cmd"] for marker in self.markers):
+                        steps.append(("proc.kill", {"pid": p["pid"], "tree": True}))
+            except (Failure, OSError, ValueError, KeyError, TypeError):
+                pass
+        steps += [("fs.delete", {"path": BASE, "recursive": True}), ("fs.delete", {"path": ntpath.dirname(BASE)})]
+        for op, params in steps:
+            try:
+                a.wait(a.request(op, **params), 30)
+            except (Failure, OSError, ValueError):
+                pass
 
 
 def exited(out, err, r):
@@ -270,7 +292,7 @@ def _(a, run):
 
 @check("a job reads exec.write input and exits on eof")
 def _(a, run):
-    # findstr writes its matches when its input ends.
+    # Writes two lines to findstr, closes its stdin, then reads the output.
     job, _pid = run.start(shell="cmd", cmd="findstr x")
     a.call("exec.write", job=job, data="axb\r\nnope\r\n")
     expect(a.call("exec.read", job=job)["state"] == "running", "findstr exited before eof")
@@ -325,7 +347,7 @@ def _(a, run):
     for image, argv in (("notepad.exe", ["notepad.exe"]), ("charmap.exe", ["C:\\Windows\\System32\\charmap.exe"])):
         stem = image[:-4]
         expect(run.procs(stem) == [], f"{image} runs already; close it in the guest before this check")
-        run.start(shell="none", argv=argv)
+        run.start_gui(image, argv)
         end = time.time() + 10
         while time.time() < end and not run.procs(stem):
             time.sleep(0.5)
@@ -447,7 +469,7 @@ def _(a, run):
 @check("exec.start with shell none shows the window of a GUI program")
 def _(a, run):
     expect(run.procs("charmap") == [], "charmap.exe runs already; close it in the guest before this check")
-    _job, pid = run.start(shell="none", argv=["C:\\Windows\\System32\\charmap.exe"])
+    _job, pid = run.start_gui("charmap.exe", ["C:\\Windows\\System32\\charmap.exe"])
     query = f"$p = Get-Process -Id {pid}; \"hwnd=$($p.MainWindowHandle) title=$($p.MainWindowTitle)\""
     end = time.time() + 10
     while True:
@@ -459,6 +481,22 @@ def _(a, run):
     expect("title=Character Map" in r["stdout"], f"charmap.exe has no visible main window: {r['stdout'].strip()!r} {r['stderr'].strip()!r}")
     expect(killed == 1, f"proc.kill by pid reported killed={killed!r}")
     expect(run.procs("charmap") == [], "charmap.exe survived proc.kill by pid")
+
+
+@check("exec.run and v1 exec without stdin give the command an input at end-of-file")
+def _(a, run):
+    read_line = "$l = [Console]::In.ReadLine(); \"null=$($null -eq $l)\""
+    r = a.call("exec.run", timeout=20, cmd=read_line, timeout_ms=10000)
+    expect(r["timed_out"] is False and lines(r["stdout"]) == ["null=True"] and r["code"] == 0,
+           f"PowerShell ReadLine: timed_out {r['timed_out']!r}, code {r['code']!r}, stdout {r['stdout']!r}, stderr {r['stderr']!r}")
+    r = a.call("exec.run", timeout=20, shell="cmd", cmd="set /p x= & echo done", timeout_ms=10000)
+    expect(r["timed_out"] is False and lines(r["stdout"]) == ["done"],
+           f"cmd set /p: timed_out {r['timed_out']!r}, code {r['code']!r}, stdout {r['stdout']!r}, stderr {r['stderr']!r}")
+    marker = "alcove-e2e-v1-stdin"
+    run.markers.append(marker)
+    a.send({"t": "exec", "cmd": f"'{marker}' | Out-Null; {read_line}"})
+    r = a.v1("exec.result", 10)
+    expect(lines(r.get("out", "")) == ["null=True"] and r.get("code") == 0, f"v1 exec ReadLine returned code {r.get('code')!r}, out {r.get('out')!r}")
 
 
 def main():
@@ -480,19 +518,24 @@ def main():
 
     run = Run(a)
     failed = None
-    for n, title, fn in CHECKS:
-        if only and n not in only:
-            continue
-        try:
-            note = fn(a, run)
-        except Failure as e:
-            failed = f"FAIL {n}: {e}"
-            break
-        except (KeyError, TypeError) as e:
-            failed = f"FAIL {n}: a reply lacks an expected field ({type(e).__name__}: {e})"
-            break
-        print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
-    run.cleanup()
+    try:
+        for n, title, fn in CHECKS:
+            if only and n not in only:
+                continue
+            try:
+                note = fn(a, run)
+            except Failure as e:
+                failed = f"FAIL {n}: {e}"
+                break
+            except (KeyError, TypeError) as e:
+                failed = f"FAIL {n}: a reply lacks an expected field ({type(e).__name__}: {e})"
+                break
+            except (OSError, ValueError) as e:
+                failed = f"FAIL {n}: the connection to the agent broke ({type(e).__name__}: {e})"
+                break
+            print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
+    finally:
+        run.cleanup(args.agent_port)
     if failed:
         print(failed)
         sys.exit(1)

@@ -2,15 +2,20 @@
 """Installs build/alcove-agent-windows-arm64.exe into a running Windows VM and
 checks the agent's hello.
 
-The VM is started through the control socket when it is stopped. The binary is
-copied over SSH and installed with `alcove-agent.exe --install --allow-exec`,
-which replaces the running copy and restarts the scheduled task. The script
-then connects to the forwarded agent port and compares hello with
-guest-tools/internal/server/server.go.
+A stopped VM is started through the control socket; a starting VM is awaited.
+The binary is copied over SSH and installed with
+`alcove-agent.exe --install --allow-exec`, which replaces the running copy and
+restarts the scheduled task. The script then requires, in this order:
+
+1. the installed file has the SHA-256 of the build,
+2. the agent process at the installed path started after the installer was
+   launched and owns the listening agent port in the guest,
+3. hello on the forwarded agent port matches
+   guest-tools/internal/server/server.go.
 
 Usage: install-agent.py [--vm NAME] [--ssh-port N] [--agent-port N]
 """
-import argparse, json, os, re, socket, subprocess, sys, time
+import argparse, hashlib, json, os, re, socket, subprocess, sys, time
 
 sys.dont_write_bytecode = True
 import ctl
@@ -23,7 +28,23 @@ SSH_OPTS = ["-i", KEY, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFi
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR"]
 GUEST_COPY = "C:/Users/alcove/alcove-agent.exe"
 INSTALLED = r"C:\Program Files\Alcove\alcove-agent.exe"
+GUEST_AGENT_PORT = 7645
 REQUIRED_CAPS = ("rpc", "jobs", "proc", "fs")
+
+INSTALL_PS = (
+    '$before = (Get-Date).ToUniversalTime().Ticks; "before=$before"; '
+    r'$p = Start-Process -FilePath "C:\Users\alcove\alcove-agent.exe" -ArgumentList "--install","--allow-exec" -Wait -PassThru; '
+    '"exit=$($p.ExitCode)"; '
+    f'"sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath "{INSTALLED}").Hash.ToLower())"; '
+    r'"log=$(Get-Content C:\ProgramData\Alcove\install.log -Tail 1)"'
+)
+PROCESS_PS = (
+    f'$p = Get-Process alcove-agent -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -eq "{INSTALLED}" }} '
+    '| Sort-Object StartTime | Select-Object -Last 1; '
+    'if ($p) { "pid=$($p.Id)"; "start=$($p.StartTime.ToUniversalTime().Ticks)" }; '
+    f'"listener=$((Get-NetTCPConnection -LocalPort {GUEST_AGENT_PORT} -State Listen -ErrorAction SilentlyContinue '
+    '| Select-Object -First 1).OwningProcess)"'
+)
 
 
 def log(*a):
@@ -35,16 +56,35 @@ def fail(msg):
     sys.exit(1)
 
 
-def ssh(port, cmd, timeout=120):
-    return subprocess.run(["ssh", *SSH_OPTS, "-p", str(port), "alcove@127.0.0.1", cmd],
-                          capture_output=True, text=True, timeout=timeout)
+def run(what, argv, timeout):
+    """Runs a host command; a timeout ends the script with FAIL."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        fail(f"{what} did not finish within {timeout} s")
+
+
+def ssh(port, what, cmd, timeout=120):
+    return run(what, ["ssh", *SSH_OPTS, "-p", str(port), "alcove@127.0.0.1", cmd], timeout)
 
 
 def ssh_up(port):
     try:
-        return ssh(port, "hostname", timeout=20).returncode == 0
+        r = subprocess.run(["ssh", *SSH_OPTS, "-p", str(port), "alcove@127.0.0.1", "hostname"],
+                           capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
         return False
+    return r.returncode == 0
+
+
+def fields(stdout):
+    """Parses `key=value` output lines into a dict."""
+    out = {}
+    for line in stdout.splitlines():
+        m = re.fullmatch(r"(\w+)=(.*)", line.strip())
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
 
 
 def source_version():
@@ -54,20 +94,70 @@ def source_version():
     return m.group(1)
 
 
-def ensure_running(vm, ssh_port):
+def vm_state(vm):
     status = ctl.call(ctl.connect(), "vm.status", name=vm)
     if not status.get("ok"):
         fail(f"vm.status: {status.get('error')}")
-    if status.get("state") != "running":
-        log(f"{vm} is {status.get('state')}; starting it")
+    return status.get("state")
+
+
+def ensure_running(vm, ssh_port):
+    state = vm_state(vm)
+    if state == "stopped":
+        log(f"{vm} is stopped; starting it")
         started = ctl.call(ctl.connect(), "vm.start", name=vm)
         if not started.get("ok"):
             fail(f"vm.start: {started.get('error')}")
+        state = vm_state(vm)
+    end = time.time() + 300
+    while state != "running":
+        if state == "paused":
+            fail(f"VM '{vm}' is paused; resume it with vm.resume and run this script again")
+        if state != "starting":
+            fail(f"VM '{vm}' is {state}; wait until it is stopped or running and run this script again")
+        if time.time() > end:
+            fail(f"VM '{vm}' is still starting after 300 s")
+        time.sleep(2)
+        state = vm_state(vm)
     for _ in range(60):
         if ssh_up(ssh_port):
             return
         time.sleep(5)
     fail(f"ssh on port {ssh_port} did not answer")
+
+
+def install(ssh_port, digest):
+    """Runs the installer in the guest and returns the guest time taken just before it."""
+    r = ssh(ssh_port, "the installer over ssh", INSTALL_PS)
+    got = fields(r.stdout)
+    log("install:", ", ".join(f"{k}={got[k]}" for k in ("exit", "sha256", "log") if k in got) or (r.stdout + r.stderr).strip()[:300])
+    if r.returncode != 0 or got.get("exit") != "0":
+        fail("the installer did not exit with 0; read C:\\ProgramData\\Alcove\\install.log in the guest")
+    if got.get("sha256") != digest:
+        fail(f"{INSTALLED} has SHA-256 {got.get('sha256')!r}, the build has {digest}")
+    if not got.get("before", "").isdigit():
+        fail("the guest did not report the time before the install")
+    return int(got["before"])
+
+
+def wait_for_new_process(ssh_port, before):
+    """Waits until the agent at the installed path started after `before` and listens on the agent port."""
+    got = {}
+    end = time.time() + 60
+    while True:
+        got = fields(ssh(ssh_port, "the agent process query over ssh", PROCESS_PS, timeout=60).stdout)
+        started = got.get("start", "").isdigit() and int(got["start"]) > before
+        if started and got.get("pid") and got.get("listener") == got["pid"]:
+            log(f"agent process {got['pid']} started after the install and listens on guest port {GUEST_AGENT_PORT}")
+            return
+        if time.time() > end:
+            break
+        time.sleep(2)
+    if not got.get("pid"):
+        fail(f"no alcove-agent process runs from {INSTALLED}; run `schtasks /Run /TN AlcoveAgent` in the guest and read C:\\ProgramData\\Alcove\\agent.log")
+    if not (got.get("start", "").isdigit() and int(got["start"]) > before):
+        fail(f"agent process {got['pid']} started before the install; the scheduled task did not restart it")
+    fail(f"guest port {GUEST_AGENT_PORT} is owned by process {got.get('listener') or 'none'}, not by the new agent process {got['pid']}")
 
 
 def read_hello(port):
@@ -97,31 +187,24 @@ def main():
         if not os.path.exists(p):
             fail(f"missing {p}")
     want = source_version()
+    digest = hashlib.sha256(open(AGENT, "rb").read()).hexdigest()
     ensure_running(args.vm, args.ssh_port)
 
-    log("copying", os.path.relpath(AGENT, ROOT))
-    scp = subprocess.run(["scp", *SSH_OPTS, "-P", str(args.ssh_port), AGENT, f"alcove@127.0.0.1:{GUEST_COPY}"],
-                         capture_output=True, text=True, timeout=300)
+    log("copying", os.path.relpath(AGENT, ROOT), "sha256", digest)
+    scp = run("scp of the agent binary", ["scp", *SSH_OPTS, "-P", str(args.ssh_port), AGENT, f"alcove@127.0.0.1:{GUEST_COPY}"], 300)
     if scp.returncode != 0:
         fail("scp: " + scp.stderr.strip())
 
-    # The agent is a GUI-subsystem binary; Start-Process -Wait blocks until it exits.
-    r = ssh(args.ssh_port,
-            r'$p = Start-Process -FilePath "C:\Users\alcove\alcove-agent.exe" -ArgumentList "--install","--allow-exec" -Wait -PassThru; '
-            rf'"exit=$($p.ExitCode)"; "size=$((Get-Item "{INSTALLED}").Length)"; Get-Content C:\ProgramData\Alcove\install.log -Tail 1')
-    log("install:", (r.stdout + r.stderr).strip().replace("\r\n", " | ").replace("\n", " | ")[:300])
-    if r.returncode != 0 or "exit=0" not in r.stdout:
-        fail("the installer did not exit with 0; read C:\\ProgramData\\Alcove\\install.log in the guest")
-    if f"size={os.path.getsize(AGENT)}" not in r.stdout:
-        fail(f"{INSTALLED} does not have the size of the build")
+    before = install(args.ssh_port, digest)
+    wait_for_new_process(args.ssh_port, before)
 
     hello = None
     for _ in range(30):
         hello = read_hello(args.agent_port)
-        if hello and hello.get("t") == "hello" and hello.get("agent") == want:
+        if hello:
             break
         time.sleep(2)
-    if not hello:
+    if not hello or hello.get("t") != "hello":
         fail(f"no hello on port {args.agent_port}")
     log("hello:", {k: hello.get(k) for k in ("os", "agent", "v", "proto", "caps")})
     if hello.get("agent") != want:
