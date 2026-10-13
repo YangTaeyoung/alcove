@@ -126,9 +126,9 @@ test("image line shows the scale with four decimals and the guest area", () => {
 });
 
 test("screenshot caption gives the scale with four decimals and the guest area", () => {
-  const caption = screenshotCaption("Win", { width: 1920, height: 1080, sentWidth: 1280, sentHeight: 720, x: 0, y: 0, scale: 1280 / 1920 });
+  const caption = screenshotCaption("Win", { width: 1920, height: 1080, sentWidth: 1280, sentHeight: 720, x: 0, y: 0, scale: 1280 / 1920, areaWidth: 1920, areaHeight: 1080 });
   assert.equal(caption, "Win: guest frame 1920x1080; image 1280x720 shows guest (0,0) 1920x1080 at scale 0.6667; guest = origin + image_pixel / scale");
-  const region = screenshotCaption("Win", { width: 1920, height: 1080, sentWidth: 200, sentHeight: 100, x: 40, y: 50, scale: 0.5 });
+  const region = screenshotCaption("Win", { width: 1920, height: 1080, sentWidth: 200, sentHeight: 100, x: 40, y: 50, scale: 0.5, areaWidth: 400, areaHeight: 200 });
   assert.match(region, /image 200x100 shows guest \(40,50\) 400x200 at scale 0\.5;/);
 });
 

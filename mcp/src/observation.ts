@@ -26,10 +26,9 @@ function field(v: unknown): string | undefined {
 /** The text part of an `alcove_screenshot` result. */
 export function screenshotCaption(name: string, r: Record<string, unknown>): string {
   const x = Number(r.x ?? 0), y = Number(r.y ?? 0);
-  const scale = Number(r.scale ?? 1) || 1;
+  const scale = Number(r.scale ?? 1);
   const sentWidth = Number(r.sentWidth), sentHeight = Number(r.sentHeight);
-  let w = Math.round(sentWidth / scale), h = Math.round(sentHeight / scale);
-  if (x === 0 && y === 0 && w === Number(r.width)) h = Number(r.height);
+  const w = r.areaWidth, h = r.areaHeight;
   return `${name}: guest frame ${r.width}x${r.height}; image ${sentWidth}x${sentHeight} shows guest (${x},${y}) ${w}x${h} at scale ${formatScale(scale)}; guest = origin + image_pixel / scale`;
 }
 

@@ -56,7 +56,7 @@ affected. The control socket carries no events: a job's exit is seen through
 | `vm.start` | `name` | `{state}` after the guest is running |
 | `vm.stop` | `name`, `force?` | `{state}` after the engine exited (graceful ACPI first) |
 | `vm.pause` / `vm.resume` | `name` | `{state}` |
-| `vm.screenshot` | `name`, `region?`, `scale?`, `format?`, `quality?`, `maxWidth?` | `{png | jpeg, mime, width, height, sentWidth, sentHeight, x, y, scale}` — see [Screenshots](#screenshots) |
+| `vm.screenshot` | `name`, `region?`, `scale?`, `format?`, `quality?`, `maxWidth?` | `{png | jpeg, mime, width, height, sentWidth, sentHeight, x, y, areaWidth, areaHeight, scale}` — see [Screenshots](#screenshots) |
 | `vm.mouse.move` | `name`, `x`, `y`, observe params | `{}` or `{observation}` |
 | `vm.mouse.click` | `name`, `x`, `y`, `button?` ("left"/"right"/"middle"), `count?` (1 to 3), `hold?` ms (default 60), observe params | `{}` or `{observation}` — moves, presses, releases |
 | `vm.mouse.drag` | `name`, `fromX`, `fromY`, `toX`, `toY`, `button?`, observe params | `{}` or `{observation}` |
@@ -109,7 +109,9 @@ cropped and shrunk.
 - The result holds the image base64-encoded under `png` or `jpeg`, `mime`
   (`image/png` or `image/jpeg`), `width` and `height` of the whole guest frame,
   `sentWidth` and `sentHeight` of the image, `x` and `y` of the top-left corner
-  of the area the image shows (0 without `region`), and `scale`, the image
+  of the area the image shows (0 without `region`), `areaWidth` and `areaHeight`,
+  the size of that area in guest pixels (the region after clamping, or the whole
+  frame), and `scale`, the image
   pixels per guest pixel (`sentWidth` divided by the width of the area).
   A guest pixel is `x + image_x / scale`, `y + image_y / scale`.
 

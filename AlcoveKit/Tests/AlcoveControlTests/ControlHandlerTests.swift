@@ -217,6 +217,7 @@ final class ControlHandlerTests: XCTestCase {
         XCTAssertEqual(r["x"]?.intValue, 100); XCTAssertEqual(r["y"]?.intValue, 200)
         XCTAssertEqual(r["sentWidth"]?.intValue, 200); XCTAssertEqual(r["sentHeight"]?.intValue, 150)
         XCTAssertEqual(r["scale"]?.doubleValue, 0.5)
+        XCTAssertEqual(r["areaWidth"]?.intValue, 400); XCTAssertEqual(r["areaHeight"]?.intValue, 300)
         XCTAssertEqual(r["mime"]?.stringValue, "image/png")
         let png = Data(base64Encoded: r["png"]!.stringValue!)!
         XCTAssertEqual(Frame(png: png)?.width, 200)
@@ -228,10 +229,12 @@ final class ControlHandlerTests: XCTestCase {
         let clamped = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": ["x": 1500, "y": 900, "w": 400, "h": 400]])
         XCTAssertEqual(clamped["x"]?.intValue, 1500); XCTAssertEqual(clamped["sentWidth"]?.intValue, 100)
         XCTAssertEqual(clamped["sentHeight"]?.intValue, 100); XCTAssertEqual(clamped["scale"]?.doubleValue, 1)
+        XCTAssertEqual(clamped["areaWidth"]?.intValue, 100); XCTAssertEqual(clamped["areaHeight"]?.intValue, 100)
 
         let full = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
         XCTAssertEqual(full["x"]?.intValue, 0); XCTAssertEqual(full["y"]?.intValue, 0)
         XCTAssertEqual(full["scale"]?.doubleValue, 1)
+        XCTAssertEqual(full["areaWidth"]?.intValue, 1600); XCTAssertEqual(full["areaHeight"]?.intValue, 1000)
     }
 
     func testScreenshotRegionOutside() async throws {

@@ -388,6 +388,7 @@ public actor ControlHandler {
                 "width": .int(Int64(frame.width)), "height": .int(Int64(frame.height)),
                 "sentWidth": .int(Int64(image.width)), "sentHeight": .int(Int64(image.height)),
                 "x": .int(Int64(area.x)), "y": .int(Int64(area.y)),
+                "areaWidth": .int(Int64(area.w)), "areaHeight": .int(Int64(area.h)),
                 "scale": .double(Double(image.width) / Double(area.w))]
     }
 }
