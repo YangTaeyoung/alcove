@@ -15,6 +15,13 @@ actor FakeTarget: VMTarget {
     var startCount = 0, stopCount = 0
     var agentWait: Duration = .zero
     var agentWaits = 0, cancelledAgentWaits = 0
+    var snapshotList: [VMController.SnapshotInfo] = []
+    var snapshotCalls: [String] = []
+    var monitorReplies: [String] = []
+    var monitorLines: [String] = []
+    var linkCalls: [Bool] = []
+    var forwards: [VMConfig.PortForward] = []
+    var restoreHook: (@Sendable (FakeTarget) async -> Void)?
 
     init(name: String, state: VMController.State, png: Data) { self.name = name; self.stateValue = state; self.png = png }
     func guestOS() async -> VMConfig.GuestOS { .windows }
@@ -34,6 +41,23 @@ actor FakeTarget: VMTarget {
         }
         return agentClient
     }
+    func snapshots() async throws -> [VMController.SnapshotInfo] { snapshotList }
+    func createSnapshot(named name: String) async throws { snapshotCalls.append("create:\(name)") }
+    func restoreSnapshot(named name: String) async throws {
+        snapshotCalls.append("restore:\(name)")
+        await restoreHook?(self)
+    }
+    func deleteSnapshot(named name: String) async throws { snapshotCalls.append("delete:\(name)") }
+    func monitorCommand(_ line: String) async throws -> String {
+        monitorLines.append(line)
+        return monitorReplies.isEmpty ? "" : monitorReplies.removeFirst()
+    }
+    func setNetworkLink(up: Bool) async throws { linkCalls.append(up) }
+    func staticForwards() async -> [VMConfig.PortForward] { forwards }
+    func setSnapshotList(_ l: [VMController.SnapshotInfo]) { snapshotList = l }
+    func setMonitorReplies(_ r: [String]) { monitorReplies = r }
+    func setForwards(_ f: [VMConfig.PortForward]) { forwards = f }
+    func setRestoreHook(_ h: (@Sendable (FakeTarget) async -> Void)?) { restoreHook = h }
     func setAgent(_ a: AgentClient?) { agentClient = a }
     func setAgentWait(_ d: Duration) { agentWait = d }
     func setPNG(_ d: Data) { png = d }

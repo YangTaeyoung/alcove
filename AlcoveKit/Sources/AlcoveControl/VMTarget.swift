@@ -21,6 +21,15 @@ public protocol VMTarget: Sendable {
     /// The guest agent, connecting on demand; nil when the VM is not running
     /// or the agent is not reachable within `timeout`.
     func agent(timeout: Duration) async -> AgentClient?
+    func snapshots() async throws -> [VMController.SnapshotInfo]
+    func createSnapshot(named name: String) async throws
+    func restoreSnapshot(named name: String) async throws
+    func deleteSnapshot(named name: String) async throws
+    /// Runs one human-monitor line and returns its text output.
+    func monitorCommand(_ line: String) async throws -> String
+    func setNetworkLink(up: Bool) async throws
+    /// The TCP port forwards of the VM's user-network configuration.
+    func staticForwards() async -> [VMConfig.PortForward]
 }
 
 /// Provides the VMs by name.
@@ -63,6 +72,20 @@ public actor ControllerTarget: VMTarget {
         guard let display = await controller.display else { return false }
         display.send(message)
         return true
+    }
+
+    public func snapshots() async throws -> [VMController.SnapshotInfo] { try await controller.snapshots() }
+    public func createSnapshot(named name: String) async throws { try await controller.createSnapshot(named: name) }
+    public func restoreSnapshot(named name: String) async throws {
+        await agentClient?.disconnect(); agentClient = nil
+        try await controller.restoreSnapshot(named: name)
+    }
+    public func deleteSnapshot(named name: String) async throws { try await controller.deleteSnapshot(named: name) }
+    public func monitorCommand(_ line: String) async throws -> String { try await controller.monitorCommand(line) }
+    public func setNetworkLink(up: Bool) async throws { try await controller.setNetworkLink(up: up) }
+    public func staticForwards() async -> [VMConfig.PortForward] {
+        guard case .user(let forwards) = await controller.config.network else { return [] }
+        return forwards.filter { $0.proto == .tcp }
     }
 
     public func agent(timeout: Duration) async -> AgentClient? {

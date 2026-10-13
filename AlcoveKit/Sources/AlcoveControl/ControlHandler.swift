@@ -39,6 +39,10 @@ public actor ControlHandler {
     /// Guest frame size per VM from the latest screenshot (for coordinate scaling).
     private var lastSize: [String: (Int, Int)] = [:]
     private let inputGate = InputGate()
+    /// Port forwards added with `vm.forward.add`, per VM name.
+    var runtimeForwards: [String: [Forward]] = [:]
+
+    struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
     public init(registry: VMRegistry, hostKind: String) {
         self.registry = registry
@@ -90,6 +94,7 @@ public actor ControlHandler {
                 do { try await t.stop(force: params["force"]?.boolValue ?? false) } catch { throw ControlError.failed("stop failed: \(error)") }
             }
             lastSize[t.name] = nil
+            runtimeForwards[t.name] = nil
             return ["state": .string(describe(await t.state()))]
         case "vm.pause":
             let t = try await running(params)
@@ -190,6 +195,9 @@ public actor ControlHandler {
             return [:]
         case "vm.push_file", "vm.pull_file", "vm.sync_dir", "vm.fs.list", "vm.fs.read", "vm.fs.write", "vm.fs.delete":
             return try await files(op: op, params: params)
+        case "vm.snapshot.list", "vm.snapshot.create", "vm.snapshot.restore", "vm.snapshot.delete",
+             "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network":
+            return try await state(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of thumbnail pixels changing between samples
@@ -225,7 +233,10 @@ public actor ControlHandler {
     func running(_ params: JSON) async throws -> VMTarget {
         let t = try await target(params)
         let st = await t.state()
-        guard st == .running || st == .paused else { throw ControlError.notRunning(t.name, st) }
+        guard st == .running || st == .paused else {
+            runtimeForwards[t.name] = nil
+            throw ControlError.notRunning(t.name, st)
+        }
         return t
     }
 

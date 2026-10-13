@@ -96,13 +96,13 @@ public struct QEMUCommandBuilder: Sendable {
         // network
         switch config.network {
         case .user(let forwards):
-            var netdev = "user,id=net0"
+            var netdev = "user,id=\(VMController.netdevID)"
             for f in forwards {
                 netdev += ",hostfwd=\(f.proto.rawValue):127.0.0.1:\(f.hostPort)-:\(f.guestPort)"
             }
             // guest agent: the app connects to 127.0.0.1:agentHostPort -> guest 7645
             netdev += ",hostfwd=tcp:127.0.0.1:\(config.agentHostPort)-:\(VMConfig.agentGuestPort)"
-            a += ["-netdev", netdev, "-device", "virtio-net-pci,netdev=net0,mac=\(config.macAddress)"]
+            a += ["-netdev", netdev, "-device", "virtio-net-pci,netdev=\(VMController.netdevID),mac=\(config.macAddress)"]
         case .none:
             break
         }

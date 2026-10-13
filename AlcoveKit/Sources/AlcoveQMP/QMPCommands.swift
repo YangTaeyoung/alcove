@@ -31,6 +31,22 @@ extension QMPClient {
     /// `quit`: terminate QEMU (qapi/control.json).
     public func quit() async throws { _ = try await execute("quit") }
 
+    // MARK: monitor and network (qapi/misc.json, net.json)
+
+    /// `human-monitor-command`; returns the monitor's text output.
+    public func humanMonitorCommand(_ line: String) async throws -> String {
+        let r = try await execute("human-monitor-command", arguments: ["command-line": .string(line)])
+        guard let text = r.stringValue else {
+            throw QMPError.unexpectedReturn(command: "human-monitor-command", value: r)
+        }
+        return text
+    }
+
+    /// `set_link` for a net client name.
+    public func setLink(name: String, up: Bool) async throws {
+        _ = try await execute("set_link", arguments: ["name": .string(name), "up": .bool(up)])
+    }
+
     // MARK: block devices (qapi/block.json, block-core.json)
 
     /// One `BlockInfo` from `query-block` (qapi/block-core.json).

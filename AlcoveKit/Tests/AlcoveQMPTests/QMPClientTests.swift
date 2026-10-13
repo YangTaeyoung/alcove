@@ -134,6 +134,30 @@ final class QMPClientTests: XCTestCase {
         } catch QMPClient.QMPError.timeout {}
     }
 
+    func testHumanMonitorCommandReturnsText() async throws {
+        let server = try FakeQMPServer { req, _ in
+            req["execute"]?.stringValue == "human-monitor-command" ? [FakeQMPServer.ok(req, "forwarded\r\n")] : [FakeQMPServer.ok(req)]
+        }
+        defer { server.stop() }
+        let client = QMPClient()
+        try await client.connect(path: server.path)
+        let text = try await client.humanMonitorCommand("info usernet")
+        XCTAssertEqual(text, "forwarded\r\n")
+        XCTAssertEqual(server.requests.last?["execute"]?.stringValue, "human-monitor-command")
+        XCTAssertEqual(server.requests.last?["arguments"]?["command-line"]?.stringValue, "info usernet")
+    }
+
+    func testSetLinkSendsNameAndUp() async throws {
+        let server = try FakeQMPServer { req, _ in [FakeQMPServer.ok(req)] }
+        defer { server.stop() }
+        let client = QMPClient()
+        try await client.connect(path: server.path)
+        try await client.setLink(name: "net0", up: false)
+        XCTAssertEqual(server.requests.last?["execute"]?.stringValue, "set_link")
+        XCTAssertEqual(server.requests.last?["arguments"]?["name"]?.stringValue, "net0")
+        XCTAssertEqual(server.requests.last?["arguments"]?["up"]?.boolValue, false)
+    }
+
     func testSnapshotSaveJobFlow() async throws {
         let server = try FakeQMPServer { req, server in
             let id = req["id"] ?? .null

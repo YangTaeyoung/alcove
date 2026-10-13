@@ -38,7 +38,14 @@ public actor VMController {
         public let name: String
         public let vmStateSize: Int
         public let date: Date
+
+        public init(name: String, vmStateSize: Int, date: Date) {
+            self.name = name; self.vmStateSize = vmStateSize; self.date = date
+        }
     }
+
+    /// The id of the guest's user-mode network backend.
+    public static let netdevID = "net0"
 
     public nonisolated let bundle: VMBundle
     public nonisolated let engine: EngineLocator.Engine
@@ -367,6 +374,20 @@ public actor VMController {
         try checkSnapshotName(name)
         guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks else { throw ControllerError.notRunning }
         try await qmp.snapshotDelete(tag: name, devices: disks.map(\.id))
+    }
+
+    // MARK: - monitor and network
+
+    /// Runs one human-monitor line and returns its text output.
+    public func monitorCommand(_ line: String) async throws -> String {
+        guard state.isActive, let qmp else { throw ControllerError.notRunning }
+        return try await qmp.humanMonitorCommand(line)
+    }
+
+    /// Brings the guest's network link up or down.
+    public func setNetworkLink(up: Bool) async throws {
+        guard state.isActive, let qmp else { throw ControllerError.notRunning }
+        try await qmp.setLink(name: Self.netdevID, up: up)
     }
 
     // MARK: - devices
