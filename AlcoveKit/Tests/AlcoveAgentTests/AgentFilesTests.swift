@@ -151,8 +151,15 @@ final class AgentFilesTests: XCTestCase {
         fs["/data/out.bin"] = randomData(700_000)
         let (agent, client, _) = try await connectedHoldingRead(fs, held: 2)
         let dir = try tempDir()
+        let origin = ContinuousClock.now
+        let readings = LockedBox(0)
+        let clock: @Sendable () -> ContinuousClock.Instant = {
+            readings.value += 1
+            return readings.value <= 2 ? origin : origin + .seconds(3600) - .milliseconds(20)
+        }
         do {
-            _ = try await client.pullFile(guestPath: "/data/out.bin", to: dir.appendingPathComponent("out.bin"), deadline: .now + .milliseconds(300))
+            _ = try await client.pullFile(guestPath: "/data/out.bin", to: dir.appendingPathComponent("out.bin"),
+                                          deadline: origin + .seconds(3600), now: clock)
             XCTFail("expected a timeout")
         } catch AgentClient.AgentError.timeout(let op) { XCTAssertEqual(op, "fs.read") }
         XCTAssertEqual(try hostFiles(dir), [])
@@ -166,8 +173,10 @@ final class AgentFilesTests: XCTestCase {
         let client = AgentClient()
         try await client.connect(port: agent.port, expectedToken: nil)
         let dir = try tempDir()
+        let origin = ContinuousClock.now
         do {
-            _ = try await client.pullFile(guestPath: "/data/out.bin", to: dir.appendingPathComponent("out.bin"), deadline: .now + .milliseconds(300))
+            _ = try await client.pullFile(guestPath: "/data/out.bin", to: dir.appendingPathComponent("out.bin"),
+                                          deadline: origin + .milliseconds(20), now: { origin })
             XCTFail("expected a timeout")
         } catch AgentClient.AgentError.timeout(let op) { XCTAssertEqual(op, "fs.stat") }
         XCTAssertEqual(try hostFiles(dir), [])

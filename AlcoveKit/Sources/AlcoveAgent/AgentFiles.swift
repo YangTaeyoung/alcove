@@ -155,12 +155,13 @@ extension AgentClient {
     /// due after `deadline` throws `AgentError.timeout` without being sent. With `maxBytes`, a file that holds more bytes
     /// throws `TransferTooLarge`: before any piece is read when `fs.stat` reports the size, otherwise once more bytes
     /// arrived. A task cancelled before the file is moved to `url` throws `CancellationError` and leaves no
-    /// `<url>.alcove-part`; a file already at `url` stays as it is.
+    /// `<url>.alcove-part`; a file already at `url` stays as it is. `now` is the clock `deadline` is read on.
     public func pullFile(guestPath: String, to url: URL, timeout: Duration = .seconds(1800),
-                         deadline: ContinuousClock.Instant? = nil, maxBytes: Int? = nil) async throws -> TransferResult {
+                         deadline: ContinuousClock.Instant? = nil, maxBytes: Int? = nil,
+                         now: @Sendable () -> ContinuousClock.Instant = { .now }) async throws -> TransferResult {
         func wait(for op: String) throws -> Duration {
             guard let deadline else { return timeout }
-            let left = ContinuousClock.now.duration(to: deadline)
+            let left = now().duration(to: deadline)
             guard left > .zero else { throw AgentError.timeout(op) }
             return min(timeout, left)
         }
