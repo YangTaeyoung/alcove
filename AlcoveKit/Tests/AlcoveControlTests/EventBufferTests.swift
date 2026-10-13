@@ -268,6 +268,50 @@ final class EventBufferTests: XCTestCase {
         XCTAssertEqual(titles, [adopted.caps[0], adopted.caps[0]])
     }
 
+    func testLinkSaysWhetherAConnectionIsBeingMade() async throws {
+        let unreachable = FakeAgent()
+        unreachable.stop()
+        let reachable = fakeAgent(caps: ["clipboard"])
+        let latch = Latch()
+        let port = LockedBox(unreachable.port)
+        let link = AgentLink(events: EventBuffer(), retryDelay: .milliseconds(10), isRunning: { true }, endpoint: {
+            await latch.pass()
+            return (port.value, nil)
+        })
+        var connecting = await link.isConnecting
+        XCTAssertFalse(connecting)
+
+        let first = await link.agent(timeout: .zero)
+        XCTAssertNil(first)
+        connecting = await link.isConnecting
+        XCTAssertTrue(connecting)
+        let held = await eventually { await latch.arrivals == 1 }
+        XCTAssertTrue(held)
+        connecting = await link.isConnecting
+        XCTAssertTrue(connecting)
+
+        await latch.open()
+        let failed = await eventually { await !link.isConnecting }
+        XCTAssertTrue(failed)
+        let second = await link.agent(timeout: .zero)
+        XCTAssertNil(second)
+        connecting = await link.isConnecting
+        XCTAssertFalse(connecting)
+
+        port.value = reachable.port
+        let connected = await eventually { await link.agent(timeout: .zero) != nil }
+        XCTAssertTrue(connected)
+        let settled = await eventually { await !link.isConnecting }
+        XCTAssertTrue(settled)
+
+        await link.drop()
+        port.value = unreachable.port
+        let afterTheDrop = await link.agent(timeout: .zero)
+        XCTAssertNil(afterTheDrop)
+        let failedAgain = await eventually { await !link.isConnecting }
+        XCTAssertTrue(failedAgain)
+    }
+
     func testLinkPingsTheUIHelperOfAnAgentThatHasOne() async throws {
         let withUI = fakeAgent(caps: ["clipboard", "ui"])
         let link = AgentLink(events: EventBuffer(), isRunning: { true }, endpoint: { (withUI.port, nil) })

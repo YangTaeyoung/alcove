@@ -606,15 +606,19 @@ extension ControlHandler {
     }
 
     static let agentNotConnectedYet = "the guest tools are not connected yet; the next observation will carry the UI facts"
+    static let agentNotConnected = "the guest tools are not connected; UI facts need alcove-agent running in the guest"
 
     /// Adds the foreground window title, the focused element, the events since the VM's previous observation and,
     /// at level `ui`, the tree of the foreground window. Needs a connected agent with the `ui` capability; without one
-    /// only level `ui` says so in `uiError`: the agent is not connected yet, or it has no UI Automation. The helper calls share one budget counted from the start: `UITiming.factBudget`,
-    /// or `UITiming.treeFactBudget` at level `ui`; what did not arrive within it is left out and `uiError` says the helper is busy.
+    /// only level `ui` says so in `uiError`: the agent is being connected, is not connected, or has no UI Automation.
+    /// The helper calls share one budget counted from the start: `UITiming.factBudget`, or `UITiming.treeFactBudget`
+    /// at level `ui`; what did not arrive within it is left out and `uiError` says the helper is busy.
     func addUIFacts(to observation: inout ScreenObservation, _ t: VMTarget, level: ObserveLevel) async {
         let end = ContinuousClock.now + (level == .ui ? UITiming.treeFactBudget : UITiming.factBudget)
         guard let agent = await t.agent(timeout: .zero) else {
-            if level == .ui { observation.uiError = ControlHandler.agentNotConnectedYet }
+            if level == .ui {
+                observation.uiError = await t.isConnectingAgent() ? ControlHandler.agentNotConnectedYet : ControlHandler.agentNotConnected
+            }
             return
         }
         guard let hello = await agent.hello, hello.rpcVersion >= 2, hello.capabilities.contains("ui") else {

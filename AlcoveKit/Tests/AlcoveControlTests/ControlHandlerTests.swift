@@ -128,6 +128,10 @@ actor FakeTarget: VMTarget {
     func setMonitorReplies(_ r: [String]) { monitorReplies = r }
     func setForwards(_ f: [VMConfig.PortForward]) { forwards = f }
     func setRestoreHook(_ h: (@Sendable (FakeTarget) async -> Void)?) { restoreHook = h }
+    /// What `isConnectingAgent()` answers.
+    var connectingAgent = false
+    func isConnectingAgent() async -> Bool { connectingAgent }
+    func setConnectingAgent(_ value: Bool) { connectingAgent = value }
     func setAgent(_ a: AgentClient?) {
         agentClient = a
         eventFeed?.cancel()

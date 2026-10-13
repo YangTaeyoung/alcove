@@ -1392,8 +1392,15 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(calls.first?.sent, sentByTheFirstClick)
         XCTAssertTrue(calls.allSatisfy { $0.timeout == .zero })
 
-        let asked = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "ui", "settleMs": 20])
-        XCTAssertEqual(asked["observation"]?["uiError"]?.stringValue, "the guest tools are not connected yet; the next observation will carry the UI facts")
+        let ui: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "ui", "settleMs": 20]
+        let unreachable = try await h.handle(op: "vm.mouse.click", params: ui)
+        XCTAssertEqual(unreachable["observation"]?["uiError"]?.stringValue, "the guest tools are not connected; UI facts need alcove-agent running in the guest")
+        await t.setConnectingAgent(true)
+        let connecting = try await h.handle(op: "vm.mouse.click", params: ui)
+        XCTAssertEqual(connecting["observation"]?["uiError"]?.stringValue, "the guest tools are not connected yet; the next observation will carry the UI facts")
+        await t.setConnectingAgent(false)
+        let summaryAgain = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20])
+        XCTAssertNil(summaryAgain["observation"]?["uiError"])
 
         let before = await (t.agentCalls.count, t.sent.count)
         _ = try await h.handle(op: "vm.batch", params: ["name": "Win", "observe": "summary", "settleMs": 20, "steps": [["op": "vm.key.press", "keys": "a"]]])

@@ -31,6 +31,9 @@ public protocol VMTarget: Sendable {
     /// or the agent is not reachable within `timeout`. A zero `timeout` returns
     /// the agent only when it is already connected.
     func agent(timeout: Duration) async -> AgentClient?
+    /// Whether a connection to the guest agent is being made and no attempt has failed since an agent was last
+    /// connected or the VM last stopped.
+    func isConnectingAgent() async -> Bool
     /// The guest events with a sequence number above `seq`, oldest first, the sequence
     /// number of the newest event and that of the oldest one still kept. The events
     /// outlive the agent connection.
@@ -88,6 +91,13 @@ actor AgentLink {
     private(set) var warmUpCount = 0
     /// The `ui.ping` sent after the latest adoption of a client with the `ui` capability.
     private(set) var helperStart: Task<Void, Never>?
+    /// Connection attempts in flight.
+    private var attempts = 0
+    /// Whether the latest attempt that ended failed; false once a client was adopted or dropped.
+    private var lastAttemptFailed = false
+
+    /// Whether a connection is being made and no attempt has failed since a client was last adopted or dropped.
+    var isConnecting: Bool { (attempts > 0 || warmUp != nil) && !lastAttemptFailed }
 
     /// `isRunning` says whether the VM runs; `endpoint` gives the forwarded agent port and the token the agent must present.
     init(events: EventBuffer, retryDelay: Duration = .seconds(1), isRunning: @escaping @Sendable () async -> Bool,
@@ -113,11 +123,15 @@ actor AgentLink {
         let deadline = ContinuousClock.now + timeout
         repeat {
             let begun = generation
+            attempts += 1
             let target = await endpoint()
             let candidate = AgentClient()
             do {
                 try await candidate.connect(port: target.port, expectedToken: target.token, timeout: .seconds(5))
+                attempts -= 1
             } catch {
+                attempts -= 1
+                if begun == generation { lastAttemptFailed = true }
                 try? await Task.sleep(for: retryDelay)
                 continue
             }
@@ -141,6 +155,7 @@ actor AgentLink {
         let dropped = client
         client = nil
         generation += 1
+        lastAttemptFailed = false
         feed?.cancel()
         feed = nil
         await dropped?.disconnect()
@@ -165,6 +180,7 @@ actor AgentLink {
         feed?.cancel()
         feed = events.follow(candidate)
         client = candidate
+        lastAttemptFailed = false
         helperStart = startsHelper ? Task { _ = try? await candidate.call("ui.ping", [:], timeout: UITiming.callTimeout) } : nil
     }
 
@@ -254,4 +270,5 @@ public actor ControllerTarget: VMTarget {
     }
 
     public func agent(timeout: Duration) async -> AgentClient? { await link.agent(timeout: timeout) }
+    public func isConnectingAgent() async -> Bool { await link.isConnecting }
 }
