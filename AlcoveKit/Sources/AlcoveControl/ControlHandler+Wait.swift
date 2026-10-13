@@ -11,7 +11,10 @@ extension ControlHandler {
 
     /// What one evaluation of a condition found.
     private enum Verdict {
+        /// The guest was read and the condition does not hold yet.
         case pending
+        /// The guest has not answered; nothing is known.
+        case unanswered
         case holds(JSON?)
         /// The condition can no longer become true.
         case over(JSON?)
@@ -33,8 +36,13 @@ extension ControlHandler {
         /// Evaluations in a row that failed, and the sentence of the latest failure.
         var failures = 0
         var lastError: String?
-        /// The element text of the previous evaluation.
+        /// The element text of the previous evaluation and its full length.
         var lastText: String?
+        var lastTotal: JSON?
+        /// The helper call of a UI condition whose outcome has not been collected.
+        var probe: HelperProbe?
+        /// Whether the latest helper call ended without getting its turn at the helper.
+        var helperWasBusy = false
         /// The sequence number of the newest guest event this condition has looked at.
         var eventCursor = 0
     }
@@ -95,17 +103,19 @@ extension ControlHandler {
         var matched = -1
         var type: String?
         var detail: JSON?
+        defer { for state in states { state.probe?.abandon() } }
         wait: while true {
             try Task.checkCancellation()
             let tickStart = clock.now
             var tick = Tick()
-            for (index, condition) in conditions.enumerated() where states[index].nextDue <= tickStart {
-                states[index].nextDue = tickStart + condition.period
+            for (index, condition) in conditions.enumerated() where states[index].probe != nil || states[index].nextDue <= tickStart {
+                if condition.kind != .ui { states[index].nextDue = tickStart + condition.period }
                 let verdict: Verdict
                 do {
                     verdict = try await evaluate(condition, index: index, state: &states[index], tick: &tick, vm: t,
                                                  now: tickStart,
                                                  agent: agent, clock: clock, deadline: deadline)
+                    if case .unanswered = verdict { continue }
                     states[index].failures = 0
                     states[index].lastError = nil
                 } catch is CancellationError {
@@ -123,7 +133,7 @@ extension ControlHandler {
                     }
                 }
                 switch verdict {
-                case .pending:
+                case .pending, .unanswered:
                     continue
                 case .holds(let found):
                     (matched, type, detail) = (index, condition.typeName, found)
@@ -143,17 +153,39 @@ extension ControlHandler {
         if let type { out["type"] = .string(type) }
         if let detail { out["detail"] = detail }
         if matched == -1 {
-            let problems: [JSON] = conditions.indices.compactMap { index in
-                guard states[index].failures > 0, let error = states[index].lastError else { return nil }
-                return ["condition": .int(Int64(index)), "type": .string(conditions[index].typeName),
-                        "error": .string(error), "failures": .int(Int64(states[index].failures))]
+            var problems: [JSON] = []
+            for index in conditions.indices {
+                var problem: [String: JSON] = ["condition": .int(Int64(index)), "type": .string(conditions[index].typeName)]
+                if states[index].failures > 0, let error = states[index].lastError {
+                    problem["error"] = .string(error)
+                    problem["failures"] = .int(Int64(states[index].failures))
+                } else if let silence = await helperSilence(states[index], now: clock.now) {
+                    problem["error"] = .string(silence)
+                } else {
+                    continue
+                }
+                problems.append(.object(problem))
             }
             if !problems.isEmpty { out["problems"] = .array(problems) }
         }
+        for state in states { state.probe?.abandon() }
         if options.level != .none, let first {
             try await addObservation(to: &out, t, after: "vm.wait_for", before: first, options)
         }
         return .object(out)
+    }
+
+    /// Why a UI condition without a recorded failure got no answer from the helper: its call was sent and not answered,
+    /// or never got its turn. Nil when its latest call was answered.
+    private func helperSilence(_ state: WaitState, now: ContinuousClock.Instant) async -> String? {
+        let busy = "the UI helper was busy with other requests"
+        guard let probe = state.probe else { return state.helperWasBusy ? busy : nil }
+        switch await probe.answer.phase {
+        case .queued: return busy
+        case .sent(let at): return "the UI helper has not answered \(probe.op) for \(max(0, (now - at).components.seconds)) s"
+        case .done(.failure(let error), _): return error is HelperBusy ? busy : nil
+        case .done: return nil
+        }
     }
 
     private func outside(_ index: Int, _ frame: Frame) -> ControlError {
@@ -197,9 +229,12 @@ extension ControlHandler {
             }
             eventBaseline[t.name] = max(eventBaseline[t.name] ?? 0, found.seq)
             return .holds(found.json)
+        case .uiExists, .uiGone, .uiEnabled, .windowTitle, .uiTextStable:
+            guard let agent else { throw ControlError.noTools(t.name) }
+            return try await evaluateUI(condition, state: &state, vm: t.name, agent: agent, clock: clock, deadline: deadline)
         default:
             guard let agent else { throw ControlError.noTools(t.name) }
-            return try await evaluateAgent(condition, index: index, state: &state, vm: t.name, agent: agent, clock: clock, deadline: deadline)
+            return try await evaluateAgent(condition, index: index, state: &state, agent: agent, clock: clock, deadline: deadline)
         }
     }
 
@@ -277,48 +312,141 @@ extension ControlHandler {
     // MARK: - agent conditions
 
     /// One agent call bounded by the per-call limit and the deadline; nil when the call timed out.
-    /// A `ui.*` or `win.*` call first waits for its turn among the helper calls of `vm`; its limit counts from the moment it is sent.
-    private func callAgent(_ agent: AgentClient, _ op: String, _ params: [String: JSON], vm: String, clock: ContinuousClock,
+    private func callAgent(_ agent: AgentClient, _ op: String, _ params: [String: JSON], clock: ContinuousClock,
                            deadline: ContinuousClock.Instant) async throws -> JSON? {
-        let send: @Sendable () async throws -> JSON = {
-            let limit = min(WaitTiming.agentCallTimeout, max(deadline - clock.now, .milliseconds(200)))
-            return try await agent.call(op, params, timeout: limit)
-        }
-        do {
-            if ControlHandler.isHelperOp(op) { return try await helperGate.withLock(vm, send) }
-            return try await send()
-        } catch AgentClient.AgentError.timeout { return nil }
+        let limit = min(WaitTiming.agentCallTimeout, max(deadline - clock.now, .milliseconds(200)))
+        do { return try await agent.call(op, params, timeout: limit) } catch AgentClient.AgentError.timeout { return nil }
     }
 
-    private func evaluateAgent(_ condition: WaitCondition, index: Int, state: inout WaitState, vm: String, agent: AgentClient,
+    /// The helper call that reads what a UI condition asks about.
+    private static func probeRequest(_ condition: WaitCondition) -> (op: String, fields: [String: JSON]) {
+        switch condition {
+        case .uiExists(let element), .uiGone(let element), .uiEnabled(let element):
+            if element["ref"] != nil { return ("ui.rect", element) }
+            var request = element
+            request["limit"] = 1
+            return ("ui.find", request)
+        case .uiTextStable(let element, _): return ("ui.text", element)
+        default: return ("win.list", [:])
+        }
+    }
+
+    /// Evaluates a UI condition with at most one helper call in flight.
+    ///
+    /// Without a call in flight it starts one, unless the deadline has passed, and waits for the answer for
+    /// `WaitTiming.agentCallTimeout` at most. A call in flight is only looked at: answered, it is judged and the next
+    /// call is due one period after the answer arrived; unanswered, the verdict is `unanswered` and no call is sent.
+    private func evaluateUI(_ condition: WaitCondition, state: inout WaitState, vm: String, agent: AgentClient,
+                            clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
+        let outcome: (result: Result<JSON, Error>, at: ContinuousClock.Instant)?
+        if let probe = state.probe {
+            outcome = await probe.answer.outcome(until: clock.now)
+        } else {
+            let now = clock.now
+            guard now < deadline else { return .unanswered }
+            let request = ControlHandler.probeRequest(condition)
+            let probe = startHelperCall(agent, request.op, request.fields, vm: vm, turnBy: deadline)
+            state.probe = probe
+            state.helperWasBusy = false
+            outcome = await probe.answer.outcome(until: min(now + WaitTiming.agentCallTimeout, deadline))
+        }
+        guard let outcome else { return .unanswered }
+        state.probe = nil
+        state.nextDue = outcome.at + condition.period
+        if case .failure(let error) = outcome.result, error is HelperBusy {
+            state.helperWasBusy = true
+            return .unanswered
+        }
+        return try judge(condition, outcome.result, state: &state, at: outcome.at)
+    }
+
+    /// What the helper's answer to the call of a UI condition means; `at` is when the answer arrived.
+    private func judge(_ condition: WaitCondition, _ result: Result<JSON, Error>, state: inout WaitState,
+                       at now: ContinuousClock.Instant) throws -> Verdict {
+        switch condition {
+        case .uiExists(let element), .uiGone(let element), .uiEnabled(let element):
+            var found: JSON?
+            do {
+                let r = try result.get()
+                found = element["ref"] != nil ? r["node"] ?? .null : r["nodes"]?.arrayValue?.first
+            } catch AgentClient.AgentError.remote(let message) {
+                let absent = element["ref"]?.stringValue.map { UISelector.isStaleRef(message, ref: $0) } ?? UISelector.isWindowGone(message)
+                guard absent else { throw AgentClient.AgentError.remote(message) }
+            }
+            switch condition {
+            case .uiGone: return found == nil ? .holds(nil) : .pending
+            case .uiEnabled:
+                guard let node = found, !(node["flags"]?.arrayValue ?? []).contains("disabled") else { return .pending }
+                return .holds(node)
+            default:
+                guard let node = found else { return .pending }
+                return .holds(node)
+            }
+        case .windowTitle(let contains, let pattern):
+            for window in try result.get()["windows"]?.arrayValue ?? [] {
+                guard let title = window["title"]?.stringValue else { continue }
+                let matches: Bool
+                if let contains {
+                    matches = title.range(of: contains, options: .caseInsensitive) != nil
+                } else {
+                    matches = pattern?.firstMatch(in: title, range: NSRange(title.startIndex..., in: title)) != nil
+                }
+                if matches { return .holds(["id": window["id"] ?? .null, "title": .string(title), "foreground": window["foreground"] ?? false]) }
+            }
+            return .pending
+        case .uiTextStable(let element, let quietMs):
+            let r: JSON
+            do { r = try result.get() }
+            catch AgentClient.AgentError.remote(let message) where UISelector.isPasswordRefusal(message) {
+                throw HardFailure(error: .failed(message))
+            } catch AgentClient.AgentError.remote(let message)
+                where UISelector.isGone(message, ref: element["ref"]?.stringValue, wasRead: state.lastText != nil) {
+                return .over(.string(message))
+            }
+            let text = r["text"]?.stringValue ?? ""
+            let total = r["total"] ?? .int(Int64(text.utf16.count))
+            guard text == state.lastText, total == state.lastTotal else {
+                state.lastText = text
+                state.lastTotal = total
+                state.quietSince = now
+                return .pending
+            }
+            guard now - state.quietSince >= .milliseconds(quietMs) else { return .pending }
+            return .holds(total)
+        default:
+            return .pending
+        }
+    }
+
+    private func evaluateAgent(_ condition: WaitCondition, index: Int, state: inout WaitState, agent: AgentClient,
                                clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
         func call(_ op: String, _ params: [String: JSON]) async throws -> JSON? {
-            try await callAgent(agent, op, params, vm: vm, clock: clock, deadline: deadline)
+            try await callAgent(agent, op, params, clock: clock, deadline: deadline)
         }
         switch condition {
         case .processStarted(let name):
-            guard let r = try await call("proc.list", ["name": .string(ControlHandler.processKey(name))]) else { return .pending }
+            guard let r = try await call("proc.list", ["name": .string(ControlHandler.processKey(name))]) else { return .unanswered }
             let wanted = ControlHandler.processKey(name)
             guard let found = (r["procs"]?.arrayValue ?? []).first(where: { ControlHandler.processKey($0["name"]?.stringValue ?? "") == wanted }) else { return .pending }
             return .holds(["pid": found["pid"] ?? .null, "name": found["name"] ?? .null])
         case .processExited(let pid, let name):
             var request: [String: JSON] = [:]
             if pid == nil, let name { request["name"] = .string(ControlHandler.processKey(name)) }
-            guard let r = try await call("proc.list", request) else { return .pending }
+            guard let r = try await call("proc.list", request) else { return .unanswered }
             let procs = r["procs"]?.arrayValue ?? []
             if let pid { return procs.contains { $0["pid"]?.intValue == pid } ? .pending : .holds(nil) }
             let wanted = ControlHandler.processKey(name ?? "")
             return procs.contains { ControlHandler.processKey($0["name"]?.stringValue ?? "") == wanted } ? .pending : .holds(nil)
         case .fileExists(let path):
-            guard let r = try await call("fs.stat", ["path": .string(path)]) else { return .pending }
+            guard let r = try await call("fs.stat", ["path": .string(path)]) else { return .unanswered }
             guard r["exists"]?.boolValue == true else { return .pending }
             return .holds(["path": r["path"] ?? .string(path), "size": r["size"] ?? 0])
         case .portListening:
             guard let script = state.script else { return .pending }
             let milliseconds = Int64(WaitTiming.agentCallTimeout.components.seconds * 1000)
                 + Int64(WaitTiming.agentCallTimeout.components.attoseconds / 1_000_000_000_000_000)
-            guard let r = try await call("exec.run", ["cmd": .string(script), "timeout_ms": .int(milliseconds)]) else { return .pending }
-            if r["timed_out"]?.boolValue == true { return .pending }
+            guard let r = try await call("exec.run", ["cmd": .string(script), "timeout_ms": .int(milliseconds)]) else { return .unanswered }
+            if r["timed_out"]?.boolValue == true { return .unanswered }
             let code = r["code"]?.intValue ?? -1
             let out = (r["stdout"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard code == 0, !out.isEmpty else {
@@ -331,10 +459,11 @@ extension ControlHandler {
             let r: JSON?
             do { r = try await call("fs.tail", ["path": .string(path), "lines": .int(Int64(ControlHandler.tailLines))]) }
             catch AgentClient.AgentError.remote(let message) {
-                guard let stat = try await call("fs.stat", ["path": .string(path)]), stat["exists"]?.boolValue == true else { return .pending }
+                guard let stat = try await call("fs.stat", ["path": .string(path)]) else { return .unanswered }
+                guard stat["exists"]?.boolValue == true else { return .pending }
                 throw AgentClient.AgentError.remote(message)
             }
-            guard let r else { return .pending }
+            guard let r else { return .unanswered }
             let data = Data(base64Encoded: r["data"]?.stringValue ?? "") ?? Data()
             let text = GuestText.decode(data, utf16: r["encoding"]?.stringValue == "utf-16le")
             for line in text.split(whereSeparator: \.isNewline) {
@@ -354,7 +483,7 @@ extension ControlHandler {
                 } catch AgentClient.AgentError.remote(let message) {
                     throw HardFailure(error: .failed(message))
                 }
-                guard let r = reply else { return .pending }
+                guard let r = reply else { return .unanswered }
                 let out = r["out"]?.stringValue ?? "", err = r["err"]?.stringValue ?? ""
                 let outNext = r["out_next"]?.intValue ?? state.outOffset + out.utf8.count
                 let errNext = r["err_next"]?.intValue ?? state.errOffset + err.utf8.count
@@ -371,60 +500,6 @@ extension ControlHandler {
                 return .holds(nil)
             }
             return exited && drained ? .over(.string("job exited")) : .pending
-        case .uiExists(let element), .uiGone(let element), .uiEnabled(let element):
-            var found: JSON?
-            if let ref = element["ref"]?.stringValue {
-                do {
-                    guard let r = try await call("ui.rect", element) else { return .pending }
-                    found = r["node"] ?? .null
-                } catch AgentClient.AgentError.remote(let message) where UISelector.isStaleRef(message, ref: ref) {
-                    found = nil
-                }
-            } else {
-                var request = element
-                request["limit"] = 1
-                guard let r = try await call("ui.find", request) else { return .pending }
-                found = r["nodes"]?.arrayValue?.first
-            }
-            switch condition {
-            case .uiGone: return found == nil ? .holds(nil) : .pending
-            case .uiEnabled:
-                guard let node = found, !(node["flags"]?.arrayValue ?? []).contains("disabled") else { return .pending }
-                return .holds(node)
-            default:
-                guard let node = found else { return .pending }
-                return .holds(node)
-            }
-        case .windowTitle(let contains, let pattern):
-            guard let r = try await call("win.list", [:]) else { return .pending }
-            for window in r["windows"]?.arrayValue ?? [] {
-                guard let title = window["title"]?.stringValue else { continue }
-                let matches: Bool
-                if let contains {
-                    matches = title.range(of: contains, options: .caseInsensitive) != nil
-                } else {
-                    matches = pattern?.firstMatch(in: title, range: NSRange(title.startIndex..., in: title)) != nil
-                }
-                if matches { return .holds(["id": window["id"] ?? .null, "title": .string(title), "foreground": window["foreground"] ?? false]) }
-            }
-            return .pending
-        case .uiTextStable(let element, let quietMs):
-            let reply: JSON?
-            do { reply = try await call("ui.text", element) }
-            catch AgentClient.AgentError.remote(let message)
-                where UISelector.isGone(message, ref: element["ref"]?.stringValue, wasRead: state.lastText != nil) {
-                return .over(.string(message))
-            }
-            guard let r = reply else { return .pending }
-            let text = r["text"]?.stringValue ?? ""
-            let now = clock.now
-            guard text == state.lastText else {
-                state.lastText = text
-                state.quietSince = now
-                return .pending
-            }
-            guard now - state.quietSince >= .milliseconds(quietMs) else { return .pending }
-            return .holds(r["total"] ?? .int(Int64(text.utf16.count)))
         default:
             return .pending
         }

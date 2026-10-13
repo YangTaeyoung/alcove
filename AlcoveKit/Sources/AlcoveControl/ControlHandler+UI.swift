@@ -4,18 +4,89 @@ import AlcoveQMP
 
 /// The clocks of the UI ops.
 enum UITiming {
-    /// Longest the host waits for one window or element op of the agent.
+    /// Longest the host waits for the agent's answer to one window or element op, counted from the moment it is sent.
+    /// It exceeds the agent's own limits: 30 s for a call after a helper start of up to 120 s, or after 60 s in the agent's queue.
     nonisolated(unsafe) static var callTimeout = Duration.seconds(160)
-    /// Longest an observation waits for the focused element.
-    nonisolated(unsafe) static var factTimeout = Duration.seconds(5)
-    /// Longest an observation waits for the tree of the foreground window.
-    nonisolated(unsafe) static var treeFactTimeout = Duration.seconds(20)
+    /// Longest a window or element op waits for its turn at the UI helper.
+    nonisolated(unsafe) static var queueTimeout = Duration.seconds(60)
+    /// Longest an observation spends on the foreground window and the focused element, the wait for the helper's turn included.
+    nonisolated(unsafe) static var factBudget = Duration.seconds(3)
+    /// Longest an observation at level `ui` spends on the foreground window, the focused element and the tree together.
+    nonisolated(unsafe) static var treeFactBudget = Duration.seconds(20)
     /// Pause between the click of `vm.ui.type` and its first key.
     nonisolated(unsafe) static var focusDelay = Duration.milliseconds(120)
     /// Pause between two reads of the process list while `vm.deploy` waits for stopped processes to exit.
     nonisolated(unsafe) static var processPoll = Duration.milliseconds(200)
     /// Longest `vm.deploy` waits for stopped processes to exit.
     nonisolated(unsafe) static var processExitTimeout = Duration.seconds(5)
+}
+
+/// A helper call that was not sent: other calls kept the VM's UI helper until the call's turn deadline.
+struct HelperBusy: Error {}
+
+/// Where one helper call stands, for a caller that does not wait for it.
+actor HelperAnswer {
+    enum Phase: Sendable {
+        /// Waiting for its turn at the helper.
+        case queued
+        /// Sent to the agent at the given time.
+        case sent(ContinuousClock.Instant)
+        /// Ended at the given time with the agent's reply or an error.
+        case done(Result<JSON, Error>, ContinuousClock.Instant)
+    }
+
+    private(set) var phase = Phase.queued
+    private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var nextID = 0
+
+    func markSent() {
+        if case .queued = phase { phase = .sent(.now) }
+    }
+
+    func finish(_ result: Result<JSON, Error>) {
+        phase = .done(result, .now)
+        let waiting = waiters
+        waiters = [:]
+        for continuation in waiting.values { continuation.resume() }
+    }
+
+    /// The outcome of the call and the time it ended, once it ended; waits for that until `deadline` at most and
+    /// returns nil when the call has not ended by then or the waiting task was cancelled.
+    func outcome(until deadline: ContinuousClock.Instant) async -> (result: Result<JSON, Error>, at: ContinuousClock.Instant)? {
+        if case .done(let result, let at) = phase { return (result, at) }
+        guard ContinuousClock.now < deadline, !Task.isCancelled else { return nil }
+        nextID += 1
+        let id = nextID
+        let timer = Task {
+            do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+            self.wake(id)
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if Task.isCancelled { continuation.resume() } else { waiters[id] = continuation }
+            }
+        } onCancel: {
+            Task { await self.wake(id) }
+        }
+        timer.cancel()
+        if case .done(let result, let at) = phase { return (result, at) }
+        return nil
+    }
+
+    private func wake(_ id: Int) {
+        waiters.removeValue(forKey: id)?.resume()
+    }
+}
+
+/// One helper call running in its own task.
+struct HelperProbe: Sendable {
+    /// The agent op of the call.
+    let op: String
+    let answer: HelperAnswer
+    let task: Task<Void, Never>
+
+    /// Gives the call up: a call still waiting for its turn is not sent; a sent call keeps the helper until the agent answered.
+    func abandon() { task.cancel() }
 }
 
 /// How a control op or a wait condition names one element: a ref, or selector fields.
@@ -71,11 +142,24 @@ enum UISelector {
         message.hasPrefix("element \(ref) no longer exists")
     }
 
+    /// Whether an agent error says that the window a selector names does not exist: `no window has "…" in its title; …`
+    /// or `window 0x… no longer exists; …`.
+    static func isWindowGone(_ message: String) -> Bool {
+        if message.hasPrefix("no window has \"") { return true }
+        let words = message.split(separator: " ", maxSplits: 2)
+        return words.count == 3 && words[0] == "window" && words[1].hasPrefix("0x") && words[2].hasPrefix("no longer exists")
+    }
+
+    /// Whether an agent error to a text read says that the element is a password field, whose text is never read.
+    static func isPasswordRefusal(_ message: String) -> Bool {
+        message.hasPrefix("the element is a password field")
+    }
+
     /// Whether an agent error to a read of an element says that the element is gone: the stale-ref sentence for `ref`,
-    /// or the no-match sentence for a selector whose element was read before.
+    /// or, for a selector whose element was read before, the no-match sentence or a sentence about its window being gone.
     static func isGone(_ message: String, ref: String?, wasRead: Bool) -> Bool {
         if let ref { return isStaleRef(message, ref: ref) }
-        return wasRead && message.hasPrefix("no element matches ")
+        return wasRead && (message.hasPrefix("no element matches ") || isWindowGone(message))
     }
 }
 
@@ -154,18 +238,52 @@ extension ControlHandler {
         return agent
     }
 
-    /// Whether the agent hands `op` to its UI helper, which serves one request at a time.
-    static func isHelperOp(_ op: String) -> Bool { op.hasPrefix("ui.") || op.hasPrefix("win.") }
-
-    /// One `ui.*` or `win.*` agent call. It waits for its turn among the helper calls of `vm`; `timeout` counts from the moment it is sent.
-    func helperCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, timeout: Duration) async throws -> JSON {
-        try await helperGate.withLock(vm) { try await agent.call(agentOp, fields, timeout: timeout) }
+    /// One `ui.*` or `win.*` agent call as the only helper call of `vm` in flight: waits for its turn until `turnBy`, sends,
+    /// and keeps the turn until the agent answered, failed, timed out after `UITiming.callTimeout` or disconnected.
+    /// `sent` runs once the turn is taken. Throws `HelperBusy` when the turn did not come by `turnBy`, and
+    /// `CancellationError` without sending when the task was cancelled before the call went out.
+    nonisolated func helperTurn(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
+                                turnBy: ContinuousClock.Instant, sent: (@Sendable () async -> Void)? = nil) async throws -> JSON {
+        guard try await helperGate.acquire(vm, until: turnBy) else { throw HelperBusy() }
+        let result: Result<JSON, Error>
+        do {
+            await sent?()
+            try Task.checkCancellation()
+            result = .success(try await agent.call(agentOp, fields, timeout: UITiming.callTimeout))
+        } catch {
+            result = .failure(error)
+        }
+        await helperGate.release(vm)
+        return try result.get()
     }
 
-    /// One helper call on behalf of the control op `op`; failures become control errors.
-    func uiCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, op: String,
-                timeout: Duration = UITiming.callTimeout) async throws -> JSON {
-        do { return try await helperCall(agent, agentOp, fields, vm: vm, timeout: timeout) } catch { throw agentFailure(error, vm: vm, op: op) }
+    /// Starts `helperTurn` in a task of its own and returns at once.
+    nonisolated func startHelperCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
+                                     turnBy: ContinuousClock.Instant) -> HelperProbe {
+        let answer = HelperAnswer()
+        let task = Task {
+            let result: Result<JSON, Error>
+            do {
+                result = .success(try await self.helperTurn(agent, agentOp, fields, vm: vm, turnBy: turnBy) { await answer.markSent() })
+            } catch {
+                result = .failure(error)
+            }
+            await answer.finish(result)
+        }
+        return HelperProbe(op: agentOp, answer: answer, task: task)
+    }
+
+    /// One helper call on behalf of the control op `op`, which waits `UITiming.queueTimeout` for its turn; failures become control errors.
+    func uiCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, op: String) async throws -> JSON {
+        do {
+            return try await helperTurn(agent, agentOp, fields, vm: vm, turnBy: .now + UITiming.queueTimeout)
+        } catch is HelperBusy {
+            throw ControlError.failed("the UI helper is busy with other requests; retry")
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw agentFailure(error, vm: vm, op: op)
+        }
     }
 
     /// The agent fields that select the element of a control op: its `ref`, or the fields of its `selector` object.
@@ -451,32 +569,62 @@ extension ControlHandler {
 
     // MARK: - observation
 
+    static let busyHelperFacts = "the UI helper is busy with another request; call vm.ui.tree when you need the tree"
+
+    /// What one helper call of an observation brought.
+    private enum Fact {
+        case answer(JSON)
+        /// The call did not end within the observation's budget.
+        case late
+        case failed(Error)
+    }
+
+    /// One helper call of an observation in a task of its own; the observation stops waiting for it at `end`.
+    private nonisolated func fact(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
+                                  by end: ContinuousClock.Instant) async -> Fact {
+        let probe = startHelperCall(agent, agentOp, fields, vm: vm, turnBy: end)
+        guard let outcome = await probe.answer.outcome(until: end) else {
+            probe.abandon()
+            return .late
+        }
+        switch outcome.result {
+        case .success(let reply): return .answer(reply)
+        case .failure(let error): return error is HelperBusy ? .late : .failed(error)
+        }
+    }
+
     /// Adds the foreground window title, the focused element, the events since the VM's previous observation and,
     /// at level `ui`, the tree of the foreground window. Needs a connected agent with the `ui` capability; without one
-    /// only level `ui` says so in `uiError`.
+    /// only level `ui` says so in `uiError`. The helper calls share one budget counted from the start: `UITiming.factBudget`,
+    /// or `UITiming.treeFactBudget` at level `ui`; what did not arrive within it is left out and `uiError` says the helper is busy.
     func addUIFacts(to observation: inout ScreenObservation, _ t: VMTarget, level: ObserveLevel) async {
+        let end = ContinuousClock.now + (level == .ui ? UITiming.treeFactBudget : UITiming.factBudget)
         guard let agent = await t.agent(timeout: .zero), let hello = await agent.hello, hello.rpcVersion >= 2,
               hello.capabilities.contains("ui") else {
             if level == .ui { observation.uiError = ControlError.noUI(t.name).description }
             return
         }
-        do {
-            let r = try await helperCall(agent, "ui.focused", [:], vm: t.name, timeout: UITiming.factTimeout)
+        switch await fact(agent, "ui.focused", [:], vm: t.name, by: end) {
+        case .answer(let r):
             observation.foreground = r["window"]?["title"]?.stringValue
             observation.focused = r["node"].map(UITreeText.label)
-        } catch {
+        case .late:
+            observation.uiError = ControlHandler.busyHelperFacts
+        case .failed(let error):
             let reason = agentFailure(error, vm: t.name, op: "the observation").description
             observation.uiError = "the foreground window and focused element could not be read: \(reason)"
         }
         if level == .ui, observation.uiError == nil {
-            do {
-                let request: [String: JSON] = ["window": "foreground", "max": .int(Int64(ControlHandler.observedTreeNodes))]
-                let r = try await helperCall(agent, "ui.tree", request, vm: t.name, timeout: UITiming.treeFactTimeout)
+            let request: [String: JSON] = ["window": "foreground", "max": .int(Int64(ControlHandler.observedTreeNodes))]
+            switch await fact(agent, "ui.tree", request, vm: t.name, by: end) {
+            case .answer(let r):
                 var text = UITreeText.render(r["nodes"]?.arrayValue ?? [])
                 if r["truncated"]?.boolValue == true { text += "\n… more elements; call vm.ui.tree to read the whole window" }
                 observation.tree = text
                 if observation.foreground == nil { observation.foreground = r["window"]?["title"]?.stringValue }
-            } catch {
+            case .late:
+                observation.uiError = ControlHandler.busyHelperFacts
+            case .failed(let error):
                 let reason = agentFailure(error, vm: t.name, op: "the observation").description
                 observation.uiError = "the UI tree could not be read: \(reason)"
             }

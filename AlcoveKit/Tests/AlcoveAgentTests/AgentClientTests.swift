@@ -244,6 +244,7 @@ final class AgentClientTests: XCTestCase {
         try await client.connect(port: agent.port, expectedToken: nil)
         let count = 400
         for i in 0..<count { agent.sendLine(["t": "ev", "name": "tick", "i": .int(Int64(i))]) }
+        agent.drop()
         var it = client.events.makeAsyncIterator()
         var order: [Int] = []
         while order.count < count, case .agent(_, let payload)? = await it.next() { order.append(payload["i"]?.intValue ?? -1) }

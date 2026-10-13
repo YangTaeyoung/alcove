@@ -80,6 +80,9 @@ final class ControlUITests: XCTestCase {
         UITiming.focusDelay = .milliseconds(120)
         UITiming.processPoll = .milliseconds(200)
         UITiming.processExitTimeout = .seconds(5)
+        UITiming.queueTimeout = .seconds(60)
+        UITiming.factBudget = .seconds(3)
+        UITiming.treeFactBudget = .seconds(20)
     }
 
     /// A running 800x600 VM "Win" whose agent offers `caps` and answers from `script`.
@@ -97,6 +100,30 @@ final class ControlUITests: XCTestCase {
         catch let e as ControlHandler.ControlError { return e.description }
         catch { XCTFail("\(op) threw \(error)", file: file, line: line); return "" }
     }
+
+    /// The value of `task` once it finished; nil when it has not finished within `limit`.
+    private func finished<T: Sendable>(_ task: Task<T, Error>, within limit: Duration = .seconds(20)) async throws -> T? {
+        let box = LockedBox<Result<T, Error>?>(nil)
+        Task { box.value = await task.result }
+        guard await eventually(timeout: limit, { box.value != nil }), let result = box.value else { return nil }
+        return try result.get()
+    }
+
+    private struct StillRunning: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// The value of `task`; throws `StillRunning` with `message` when it has not finished within 20 s.
+    private func completed<T: Sendable>(_ task: Task<T, Error>, _ message: String = "the call did not return") async throws -> T {
+        guard let value = try await finished(task) else { throw StillRunning(description: message) }
+        return value
+    }
+
+    private func requestOps(_ agent: FakeAgent) -> [String] {
+        agent.received.filter { $0["t"]?.stringValue == "req" }.compactMap { $0["op"]?.stringValue }
+    }
+
+    private static let busyFacts = "the UI helper is busy with another request; call vm.ui.tree when you need the tree"
 
     /// The request fields of `m` without the transport fields.
     private func fields(_ m: JSON?) -> [String: JSON] {
@@ -1094,31 +1121,57 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "ui.find").count, 9)
     }
 
-    func testUIGoneHoldsOnlyOnAnEmptySearchResult() async throws {
+    func testUIGoneHoldsOnAnEmptySearchResultOrAGoneWindow() async throws {
         let searchErrors = [
             "the search for {\"name\":\"Busy\"} did not finish within 12 s; read the window in parts with ui.tree and root, then use a ref",
             "UI helper did not answer 'ui.find' within 20 s; it was restarted",
             "UI helper exited; retry",
+            "the UI helper is busy with 'ui.tree'; retry",
+            "window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait for it or end its process with proc.kill",
         ]
+        let hung = "window 0x9 \"File no longer exists\" is not responding; wait for it or end its process with proc.kill"
+        let noTitle = "no window has \"Fixture Dialog\" in its title; call win.list to see the open windows"
+        let noHandle = "window 0x50 no longer exists; call win.list again"
         let (h, _, agent) = try await rig(["ui.find": { m, n in
             switch m["name"]?.stringValue {
             case "Busy": return n < searchErrors.count ? .fail(searchErrors[n]) : .ok(["nodes": []])
-            case "Closed": return .fail("no window has \"Fixture Dialog\" in its title; call win.list to see the open windows")
+            case "Closed": return .fail(m["window"]?.stringValue == "0x50" ? noHandle : noTitle)
+            case "Front": return .fail("no window is in the foreground; pass a window id from win.list")
+            case "Hung": return .fail(hung)
             default: return .fail("UI helper exited; retry")
             }
         }])
         let gone = try await waitFor(h, [["type": "ui_gone", "name": "Busy"]])
         XCTAssertEqual(gone["matched"]?.intValue, 0)
-        XCTAssertEqual(agentRequests(agent, "ui.find").count, 4)
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, searchErrors.count + 1)
+
+        let notResponding = try await waitFor(h, [["type": "ui_gone", "window": "File", "name": "Hung"]], timeout: 1)
+        XCTAssertEqual(notResponding["matched"]?.intValue, -1)
+        XCTAssertEqual(notResponding["problems"]?[0]?["error"]?.stringValue, hung)
 
         let unknown = try await waitFor(h, [["type": "ui_gone", "name": "Other"]], timeout: 1)
         XCTAssertEqual(unknown["matched"]?.intValue, -1)
         XCTAssertEqual(unknown["problems"]?[0]?["type"]?.stringValue, "ui_gone")
         XCTAssertEqual(unknown["problems"]?[0]?["error"]?.stringValue, "UI helper exited; retry")
 
-        let closed = try await waitFor(h, [["type": "ui_gone", "window": "Fixture Dialog", "name": "Closed"]], timeout: 1)
-        XCTAssertEqual(closed["matched"]?.intValue, -1)
-        XCTAssertEqual(closed["problems"]?[0]?["error"]?.stringValue, "no window has \"Fixture Dialog\" in its title; call win.list to see the open windows")
+        for window in ["Fixture Dialog", "0x50"] {
+            let before = agentRequests(agent, "ui.find").count
+            let closed = try await waitFor(h, [["type": "ui_gone", "window": .string(window), "name": "Closed"]])
+            XCTAssertEqual(closed["matched"]?.intValue, 0, window)
+            XCTAssertEqual(closed["type"]?.stringValue, "ui_gone")
+            XCTAssertNil(closed["problems"])
+            XCTAssertEqual(agentRequests(agent, "ui.find").count, before + 1)
+
+            for type in ["ui_exists", "ui_enabled"] {
+                let notYet = try await waitFor(h, [["type": .string(type), "window": .string(window), "name": "Closed"]], timeout: 1)
+                XCTAssertEqual(notYet["matched"]?.intValue, -1, type)
+                XCTAssertNil(notYet["problems"], type)
+            }
+        }
+
+        let noForeground = try await waitFor(h, [["type": "ui_gone", "name": "Front"]], timeout: 1)
+        XCTAssertEqual(noForeground["matched"]?.intValue, -1)
+        XCTAssertEqual(noForeground["problems"]?[0]?["error"]?.stringValue, "no window is in the foreground; pass a window id from win.list")
 
         let exists = try await waitFor(h, [["type": "ui_exists", "name": "Other"]], timeout: 1)
         XCTAssertEqual(exists["matched"]?.intValue, -1)
@@ -1213,6 +1266,43 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(otherRef["matched"]?.intValue, -1)
         XCTAssertNil(otherRef["detail"])
         XCTAssertEqual(otherRef["problems"]?[0]?["error"]?.stringValue, noMatch)
+
+        let closed = "no window has \"Chat\" in its title; call win.list to see the open windows"
+        let (third, _, thirdAgent) = try await rig(["ui.text": { m, n in
+            m["name"]?.stringValue == "Transcript" && n == 0 ? .ok(["text": "partial", "total": 7, "source": "value"]) : .fail(closed)
+        }])
+        let windowGone = try await waitFor(third, [["type": "ui_text_stable", "window": "Chat", "name": "Transcript", "quietMs": 60_000]])
+        XCTAssertEqual(windowGone["matched"]?.intValue, -1)
+        XCTAssertEqual(windowGone["type"]?.stringValue, "ui_text_stable")
+        XCTAssertEqual(windowGone["detail"]?.stringValue, closed)
+        XCTAssertEqual(agentRequests(thirdAgent, "ui.text").count, 2)
+        let notOpened = try await waitFor(third, [["type": "ui_text_stable", "window": "Chat", "name": "Later"]], timeout: 1)
+        XCTAssertNil(notOpened["type"])
+        XCTAssertEqual(notOpened["problems"]?[0]?["error"]?.stringValue, closed)
+    }
+
+    func testTextStableOnAPasswordFieldFailsTheWait() async throws {
+        let refusal = "the element is a password field; its text is not read"
+        let (h, _, agent) = try await rig(["ui.text": { _, _ in .fail(refusal) }])
+        do {
+            _ = try await waitFor(h, [["type": "window_title", "contains": "never"], ["type": "ui_text_stable", "role": "Edit", "name": "Secret"]])
+            XCTFail("the wait went on")
+        } catch {
+            XCTAssertEqual("\(error)", refusal)
+        }
+        XCTAssertEqual(agentRequests(agent, "ui.text").count, 1)
+    }
+
+    func testTextStableWatchesTheTotalOfATextLongerThanItReads() async throws {
+        let shown = String(repeating: "a", count: 64)
+        let totals = [300_000, 300_050, 300_100, 300_150]
+        let (h, _, agent) = try await rig(["ui.text": { _, n in
+            .ok(["text": .string(shown), "total": .int(Int64(totals[min(n, totals.count - 1)])), "source": "text"])
+        }])
+        let r = try await waitFor(h, [["type": "ui_text_stable", "ref": "e4", "quietMs": 0]])
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+        XCTAssertEqual(r["detail"]?.intValue, 300_150)
+        XCTAssertEqual(agentRequests(agent, "ui.text").count, 5)
     }
 
     func testWaitEvent() async throws {
@@ -1364,6 +1454,7 @@ final class ControlUITests: XCTestCase {
     // MARK: - one helper call at a time
 
     func testHelperCallsOfOneVMRunOneAtATime() async throws {
+        UITiming.factBudget = .milliseconds(50)
         let (h, _, agent) = try await rig([
             "ui.tree": { _, _ in .silent },
             "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
@@ -1375,13 +1466,25 @@ final class ControlUITests: XCTestCase {
         XCTAssertTrue(sent)
 
         let list = Task { try await h.handle(op: "vm.window.list", params: ["name": "Win"]) }
+        let listQueued = await eventually { await h.helperGate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(listQueued)
         let wait = Task {
-            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 30, "conditions": [["type": "ui_exists", "name": "Send"]]])
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 60, "conditions": [["type": "ui_exists", "name": "Send"]]])
         }
+        let waitQueued = await eventually { await h.helperGate.waiterCount(for: "Win") == 2 }
+        XCTAssertTrue(waitQueued)
+        XCTAssertEqual(requestOps(agent), ["ui.tree"])
+
         let click = Task { try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20]) }
-        try await Task.sleep(for: .milliseconds(500))
-        let early = agent.received.filter { $0["t"]?.stringValue == "req" }.compactMap { $0["op"]?.stringValue }
-        XCTAssertEqual(early, ["ui.tree"])
+        let clicked = try await completed(click, "the click waited for the helper")
+        XCTAssertEqual(clicked["observation"]?["settled"]?.boolValue, true)
+        XCTAssertEqual(clicked["observation"]?["uiError"]?.stringValue, ControlUITests.busyFacts)
+        XCTAssertNil(clicked["observation"]?["foreground"])
+        XCTAssertNil(clicked["observation"]?["focused"])
+        XCTAssertEqual(clicked["observation"]?["events"], [])
+        let left = await eventually { await h.helperGate.waiterCount(for: "Win") == 2 }
+        XCTAssertTrue(left)
+        XCTAssertEqual(requestOps(agent), ["ui.tree"])
 
         let request = try XCTUnwrap(agentRequests(agent, "ui.tree").first)
         agent.sendLine(agentReply(request, ["window": fixtureWindow, "nodes": [sendButton], "truncated": false]))
@@ -1391,10 +1494,251 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(listResult["windows"], [fixtureWindow])
         let waitResult = try await wait.value
         XCTAssertEqual(waitResult["matched"]?.intValue, 0)
-        let clickResult = try await click.value
-        XCTAssertEqual(clickResult["observation"]?["focused"], "Edit \"Message\"")
-        let all = agent.received.filter { $0["t"]?.stringValue == "req" }.compactMap { $0["op"]?.stringValue }
-        XCTAssertEqual(Set(all.dropFirst()), ["win.list", "ui.find", "ui.focused"])
+        XCTAssertEqual(requestOps(agent), ["ui.tree", "win.list", "ui.find"])
+    }
+
+    func testAWaitSendsNoSecondProbeBeforeTheFirstIsAnsweredAndCollectsTheLateReply() async throws {
+        WaitTiming.agentCallTimeout = .milliseconds(50)
+        let (h, _, agent) = try await rig([
+            "ui.find": { _, _ in .silent },
+            "fs.stat": { _, _ in .ok(["exists": false]) },
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+        ])
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 120, "conditions": [
+                ["type": "ui_exists", "name": "Send"], ["type": "file_exists", "path": "C:\\never"],
+            ]])
+        }
+        let ticked = await eventually { agentRequests(agent, "fs.stat").count >= 4 }
+        XCTAssertTrue(ticked)
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 1)
+
+        let list = Task { try await h.handle(op: "vm.window.list", params: ["name": "Win"]) }
+        let queued = await eventually { await h.helperGate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(queued, "the helper was free while it still served the probe")
+        XCTAssertTrue(agentRequests(agent, "win.list").isEmpty)
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 1)
+
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.find").first), ["nodes": [sendButton]]))
+        let result = try await completed(wait, "the wait did not collect the late reply")
+        XCTAssertEqual(result["matched"]?.intValue, 0)
+        XCTAssertEqual(result["type"]?.stringValue, "ui_exists")
+        XCTAssertEqual(result["detail"], sendButton)
+        let listed = try await completed(list)
+        XCTAssertEqual(listed["windows"], [fixtureWindow])
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 1)
+    }
+
+    func testAWaitWhoseProbeIsNotAnsweredSaysSo() async throws {
+        WaitTiming.agentCallTimeout = .milliseconds(50)
+        let (h, _, agent) = try await rig(["ui.find": { _, _ in .silent }])
+        let r = try await waitFor(h, [["type": "ui_exists", "name": "Slow"]], timeout: 1)
+        XCTAssertEqual(r["matched"]?.intValue, -1)
+        let problem = try XCTUnwrap(r["problems"]?[0])
+        XCTAssertEqual(problem["condition"]?.intValue, 0)
+        XCTAssertEqual(problem["type"]?.stringValue, "ui_exists")
+        let sentence = try XCTUnwrap(problem["error"]?.stringValue)
+        XCTAssertNotNil(sentence.range(of: #"^the UI helper has not answered ui\.find for \d+ s$"#, options: .regularExpression), sentence)
+        XCTAssertNil(problem["failures"])
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 1)
+    }
+
+    func testAnUnansweredProbeKeepsTheFailuresRecordedBefore() async throws {
+        WaitTiming.agentCallTimeout = .milliseconds(50)
+        let (h, _, agent) = try await rig([
+            "ui.find": { _, n in n == 0 ? .fail("UI helper exited; retry") : .silent },
+            "fs.stat": { m, n in m["path"]?.stringValue == "C:\\denied" && n == 0 ? .fail("access denied") : .silent },
+        ])
+        let r = try await waitFor(h, [["type": "ui_exists", "name": "Send"], ["type": "file_exists", "path": "C:\\denied"]], timeout: 1)
+        XCTAssertEqual(r["matched"]?.intValue, -1)
+        XCTAssertEqual(r["problems"], [
+            ["condition": 0, "type": "ui_exists", "error": "UI helper exited; retry", "failures": 1],
+            ["condition": 1, "type": "file_exists", "error": "access denied", "failures": 1],
+        ])
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 2)
+    }
+
+    func testAWaitWhoseProbeGetsNoTurnReportsABusyHelperWithinItsTimeout() async throws {
+        let (h, _, agent) = try await rig([
+            "ui.tree": { _, _ in .silent },
+            "ui.find": { _, _ in .ok(["nodes": [sendButton]]) },
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+        ])
+        let tree = Task { try await h.handle(op: "vm.ui.tree", params: ["name": "Win"]) }
+        let sent = await eventually { agentRequests(agent, "ui.tree").count == 1 }
+        XCTAssertTrue(sent)
+
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 1, "conditions": [["type": "ui_exists", "name": "Send"]]])
+        }
+        let r = try await completed(wait, "the wait outlasted its timeout in the queue")
+        XCTAssertEqual(r["matched"]?.intValue, -1)
+        XCTAssertEqual(r["problems"], [["condition": 0, "type": "ui_exists", "error": "the UI helper was busy with other requests"]])
+        let left = await eventually { await h.helperGate.waiterCount(for: "Win") == 0 }
+        XCTAssertTrue(left)
+
+        let list = Task { try await h.handle(op: "vm.window.list", params: ["name": "Win"]) }
+        let queued = await eventually { await h.helperGate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(queued)
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.tree").first), ["window": fixtureWindow, "nodes": [], "truncated": false]))
+        _ = try await tree.value
+        _ = try await list.value
+        XCTAssertEqual(requestOps(agent), ["ui.tree", "win.list"])
+    }
+
+    func testACancelledQueuedUIActionIsNeverSent() async throws {
+        let (h, _, agent) = try await rig([
+            "ui.tree": { _, _ in .silent },
+            "ui.act": { _, _ in .ok(["node": sendButton]) },
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+        ])
+        let tree = Task { try await h.handle(op: "vm.ui.tree", params: ["name": "Win"]) }
+        let sent = await eventually { agentRequests(agent, "ui.tree").count == 1 }
+        XCTAssertTrue(sent)
+
+        let action = Task { try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e5", "action": "invoke"]) }
+        let queued = await eventually { await h.helperGate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(queued)
+        action.cancel()
+        do {
+            let value = try await finished(action)
+            XCTFail(value == nil ? "the cancelled action stayed in the queue" : "the cancelled action ran")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        let left = await eventually { await h.helperGate.waiterCount(for: "Win") == 0 }
+        XCTAssertTrue(left)
+
+        let list = Task { try await h.handle(op: "vm.window.list", params: ["name": "Win"]) }
+        let listQueued = await eventually { await h.helperGate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(listQueued)
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.tree").first), ["window": fixtureWindow, "nodes": [], "truncated": false]))
+        _ = try await tree.value
+        _ = try await list.value
+        XCTAssertEqual(requestOps(agent), ["ui.tree", "win.list"])
+    }
+
+    func testAUIOpThatGetsNoTurnAnswersThatTheHelperIsBusy() async throws {
+        UITiming.queueTimeout = .milliseconds(50)
+        let (h, _, agent) = try await rig([
+            "ui.tree": { _, _ in .silent },
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+            "win.action": { _, _ in .ok(["window": fixtureWindow]) },
+        ])
+        let tree = Task { try await h.handle(op: "vm.ui.tree", params: ["name": "Win"]) }
+        let sent = await eventually { agentRequests(agent, "ui.tree").count == 1 }
+        XCTAssertTrue(sent)
+        let calls: [(String, JSON)] = [
+            ("vm.window.list", ["name": "Win"]),
+            ("vm.window.action", ["name": "Win", "window": "0x2a", "action": "focus"]),
+            ("vm.screenshot", ["name": "Win", "window": "Alcove"]),
+        ]
+        for (op, params) in calls {
+            let call = Task { try await h.handle(op: op, params: params) }
+            do {
+                let value = try await finished(call)
+                XCTFail(value == nil ? "\(op) stayed in the queue" : "\(op) ran")
+            } catch {
+                XCTAssertEqual("\(error)", "the UI helper is busy with other requests; retry", op)
+            }
+        }
+        XCTAssertEqual(requestOps(agent), ["ui.tree"])
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.tree").first), ["window": fixtureWindow, "nodes": [], "truncated": false]))
+        _ = try await tree.value
+    }
+
+    func testObservationFactsShareOneBudgetAndTheHelperStaysTakenUntilItAnswers() async throws {
+        UITiming.factBudget = .milliseconds(50)
+        UITiming.treeFactBudget = .milliseconds(50)
+        let (h, _, agent) = try await rig([
+            "ui.focused": { _, _ in .ok(["node": messageEdit, "window": fixtureWindow]) },
+            "ui.tree": { _, _ in .silent },
+        ])
+        let click: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "ui", "settleMs": 20]
+        let withTree = try await completed(Task { try await h.handle(op: "vm.mouse.click", params: click) })
+        XCTAssertEqual(withTree["observation"]?["foreground"], "Alcove Fixture")
+        XCTAssertEqual(withTree["observation"]?["focused"], "Edit \"Message\"")
+        XCTAssertNil(withTree["observation"]?["tree"])
+        XCTAssertEqual(withTree["observation"]?["uiError"]?.stringValue, ControlUITests.busyFacts)
+        XCTAssertEqual(requestOps(agent), ["ui.focused", "ui.tree"])
+
+        let summary: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20]
+        let behind = try await completed(Task { try await h.handle(op: "vm.mouse.click", params: summary) })
+        XCTAssertEqual(behind["observation"]?["uiError"]?.stringValue, ControlUITests.busyFacts)
+        XCTAssertNil(behind["observation"]?["foreground"])
+        XCTAssertEqual(requestOps(agent), ["ui.focused", "ui.tree"])
+
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.tree").first), ["window": fixtureWindow, "nodes": [], "truncated": false]))
+        let free = await eventually {
+            let r = try? await h.handle(op: "vm.mouse.click", params: summary)
+            return r?["observation"]?["foreground"]?.stringValue == "Alcove Fixture"
+        }
+        XCTAssertTrue(free)
+    }
+
+    // MARK: - the gate
+
+    func testGateHandsTheLockOverInArrivalOrderAndDropsCancelledWaiters() async throws {
+        let gate = InputGate()
+        let far = ContinuousClock.now + .seconds(120)
+        let first = try await gate.acquire("Win", until: far)
+        XCTAssertTrue(first)
+        let other = try await gate.acquire("Linux", until: far)
+        XCTAssertTrue(other)
+
+        let order = LockedBox<[String]>([])
+        let b = Task { let got = try await gate.acquire("Win", until: far); order.value = order.value + ["b"]; return got }
+        let bQueued = await eventually { await gate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(bQueued)
+        let c = Task { let got = try await gate.acquire("Win", until: far); order.value = order.value + ["c"]; return got }
+        let cQueued = await eventually { await gate.waiterCount(for: "Win") == 2 }
+        XCTAssertTrue(cQueued)
+        let d = Task { let got = try await gate.acquire("Win", until: far); order.value = order.value + ["d"]; return got }
+        let dQueued = await eventually { await gate.waiterCount(for: "Win") == 3 }
+        XCTAssertTrue(dQueued)
+
+        b.cancel()
+        do { _ = try await b.value; XCTFail("a cancelled waiter got the lock") } catch { XCTAssertTrue(error is CancellationError) }
+        let waiting = await gate.waiterCount(for: "Win")
+        XCTAssertEqual(waiting, 2)
+        XCTAssertEqual(order.value, [])
+
+        await gate.release("Win")
+        let cGot = try await c.value
+        XCTAssertTrue(cGot)
+        XCTAssertEqual(order.value, ["c"])
+        await gate.release("Win")
+        let dGot = try await d.value
+        XCTAssertTrue(dGot)
+        await gate.release("Win")
+        let free = try await gate.acquire("Win", until: .now)
+        XCTAssertTrue(free)
+    }
+
+    func testGateWaiterLeavesAtItsDeadline() async throws {
+        let gate = InputGate()
+        let held = try await gate.acquire("Win", until: .now + .seconds(120))
+        XCTAssertTrue(held)
+        let past = try await gate.acquire("Win", until: .now)
+        XCTAssertFalse(past)
+        let soon = try await gate.acquire("Win", until: .now + .milliseconds(30))
+        XCTAssertFalse(soon)
+        let waiting = await gate.waiterCount(for: "Win")
+        XCTAssertEqual(waiting, 0)
+
+        let cancelled = Task { () -> Bool in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await gate.acquire("Linux", until: .now + .seconds(120))
+        }
+        do { _ = try await cancelled.value; XCTFail("a cancelled task took the lock") } catch { XCTAssertTrue(error is CancellationError) }
+        let untouched = try await gate.acquire("Linux", until: .now)
+        XCTAssertTrue(untouched)
+
+        await gate.release("Win")
+        let again = try await gate.acquire("Win", until: .now)
+        XCTAssertTrue(again)
+        let ran = await gate.withLock("Other") { 7 }
+        XCTAssertEqual(ran, 7)
     }
 
     // MARK: - screenshot
