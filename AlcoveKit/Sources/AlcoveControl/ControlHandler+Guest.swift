@@ -44,7 +44,11 @@ extension ControlHandler {
                 rows.append(["setting": .string(setting), "ok": false, "detail": .string(unsupportedDetail(os)), "takesEffect": "now"])
                 continue
             }
-            let result = await runRecipe(agent, script, vm: t.name, op: "vm.set_environment")
+            var result = await runRecipe(agent, script, vm: t.name, op: "vm.set_environment")
+            if setting == "dpiScale", result.ok, let scale {
+                let read = GuestRecipes.dpiScaleResult(requested: scale, output: result.stdout)
+                result = (read.ok, read.detail, result.stdout)
+            }
             rows.append(["setting": .string(setting), "ok": .bool(result.ok), "detail": .string(result.detail), "takesEffect": .string(takesEffect)])
         }
         return ["applied": .array(rows)]

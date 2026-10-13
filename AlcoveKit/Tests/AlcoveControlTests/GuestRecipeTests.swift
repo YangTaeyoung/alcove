@@ -105,12 +105,83 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(GuestRecipes.setTimeZone("A'B", os: .linux), "timedatectl set-timezone 'A'\\''B'")
     }
 
-    func testDPIRecipeMapsPercentToScalingSteps() throws {
+    func testDPIStepIndexIsTheNearestOfferedPercentage() {
+        XCTAssertEqual(GuestRecipes.dpiStepIndex(percent: 100), 0)
+        XCTAssertEqual(GuestRecipes.dpiStepIndex(percent: 112), 0)
+        XCTAssertEqual(GuestRecipes.dpiStepIndex(percent: 113), 1)
+        XCTAssertEqual(GuestRecipes.dpiStepIndex(percent: 150), 2)
+        XCTAssertEqual(GuestRecipes.dpiStepIndex(percent: 275), 6)
+        XCTAssertEqual(GuestRecipes.dpiStepIndex(percent: 500), 11)
+    }
+
+    func testDPIRecipeCountsTheStepFromTheRecommendedScale() throws {
         let at100 = try XCTUnwrap(GuestRecipes.setDPIScale(percent: 100, os: .windows))
         let at150 = try XCTUnwrap(GuestRecipes.setDPIScale(percent: 150, os: .windows))
-        XCTAssertTrue(at100.contains("0x009F, 0,"), at100)
-        XCTAssertTrue(at150.contains("0x009F, 2,"), at150)
-        XCTAssertTrue(at150.hasSuffix("'scale: 150 %'"), at150)
+        XCTAssertTrue(at150.contains("DisplayConfigGetDeviceInfo"), at150)
+        XCTAssertTrue(at150.contains("$recommended = -$range[0]"), at150)
+        XCTAssertTrue(at100.contains("0x009F, 0 - $recommended,"), at100)
+        XCTAssertTrue(at150.contains("0x009F, 2 - $recommended,"), at150)
+        XCTAssertTrue(at150.contains("$steps = 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500\n"), at150)
+    }
+
+    func testDPIRecipePrintsTheScaleANewProcessReads() throws {
+        let script = try XCTUnwrap(GuestRecipes.setDPIScale(percent: 150, os: .windows))
+        XCTAssertTrue(script.contains("powershell.exe -NoProfile -NonInteractive -EncodedCommand"), script)
+        XCTAssertTrue(script.contains("SetProcessDPIAware"), script)
+        XCTAssertTrue(script.contains("GetDpiForSystem"), script)
+        XCTAssertTrue(script.contains("$applied = [int]([int]$dpi * 100 / 96)"), script)
+        XCTAssertTrue(script.hasSuffix("| ConvertTo-Json -Compress"), script)
+        XCTAssertFalse(script.contains("'scale: 150 %'"), script)
+    }
+
+    func testDPIRecipeStoresTheAppliedStepWhenItIsNotTheRequestedOne() throws {
+        let script = try XCTUnwrap(GuestRecipes.setDPIScale(percent: 150, os: .windows))
+        XCTAssertTrue(script.contains("$index = [Array]::IndexOf($steps, $applied)"), script)
+        XCTAssertTrue(script.contains("if ($index -ge 0 -and $index -ne 2) { [void][Alcove.Dpi]::SystemParametersInfo(0x009F, $index - $recommended, [IntPtr]::Zero, 3) }"), script)
+    }
+
+    func testDPIScaleResultIsOkWhenTheRequestedScaleWasApplied() {
+        let r = GuestRecipes.dpiScaleResult(requested: 125, output: "{\"applied\":125,\"recommended\":100,\"offered\":[100,125]}")
+        XCTAssertTrue(r.ok)
+        XCTAssertEqual(r.detail, "scale: 125 %")
+    }
+
+    func testDPIScaleResultNamesTheLargestOfferedScaleForARequestAboveIt() {
+        let r = GuestRecipes.dpiScaleResult(requested: 150, output: "{\"applied\":125,\"recommended\":100,\"offered\":[100,125]}")
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(r.detail, "scale: 125 % was applied, not 150 %; the largest scale the guest offers at its resolution is 125 %; "
+                       + "request it, or set a larger resolution with vm.set_resolution first")
+    }
+
+    func testDPIScaleResultNamesTheOfferedScalesAroundARequestBetweenThem() {
+        let r = GuestRecipes.dpiScaleResult(requested: 130, output: "noise\r\n{\"applied\":125,\"recommended\":150,\"offered\":[100,125,150,175]}\r\n")
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(r.detail, "scale: 125 % was applied, not 130 %; the nearest scales the guest offers are 125 % and 150 %; request one of them")
+    }
+
+    func testDPIScaleResultNamesTheNearestOfferedScaleForARequestThatIsNoStepAndAboveTheOfferedOnes() {
+        let r = GuestRecipes.dpiScaleResult(requested: 130, output: "{\"applied\":125,\"recommended\":100,\"offered\":[100,125]}")
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(r.detail, "scale: 125 % was applied, not 130 %; the nearest scale the guest offers is 125 %; request it")
+    }
+
+    func testDPIScaleResultReportsAnOfferedScaleThatWasNotApplied() {
+        let r = GuestRecipes.dpiScaleResult(requested: 150, output: "{\"applied\":100,\"recommended\":100,\"offered\":[100,125,150]}")
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(r.detail, "scale: 100 % was applied, not 150 %; the guest offers 150 % and did not apply it; "
+                       + "read the scale row of vm.doctor and set dpiScale again")
+    }
+
+    func testDPIScaleResultWithoutAnOfferedListNamesOnlyTheAppliedScale() {
+        let r = GuestRecipes.dpiScaleResult(requested: 150, output: "{\"applied\":125}")
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(r.detail, "scale: 125 % was applied, not 150 %; request 125, or read the scale row of vm.doctor")
+    }
+
+    func testDPIScaleResultReportsOutputWithoutAScale() {
+        let r = GuestRecipes.dpiScaleResult(requested: 150, output: "done")
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(r.detail, "the guest did not report the scale it applied; read the scale row of vm.doctor")
     }
 
     func testDoctorScaleProbeReadsTheSystemDPI() throws {
@@ -126,6 +197,7 @@ final class GuestRecipeTests: XCTestCase {
             guard m["op"]?.stringValue == "exec.run" else { return [] }
             let cmd = m["cmd"]?.stringValue ?? ""
             if cmd.contains("AppsUseLightTheme") { return [exitReply(m, code: 1, stderr: "access denied\n")] }
+            if cmd.contains("0x009F") { return [exitReply(m, stdout: "{\"applied\":150,\"recommended\":100,\"offered\":[100,125,150,175]}\r\n")] }
             return [exitReply(m, stdout: "done\n")]
         }
         let r = try await h.handle(op: "vm.set_environment", params: [
@@ -137,6 +209,7 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(rows.compactMap { $0["ok"]?.boolValue }, [true, true, true, true, false, true])
         XCTAssertEqual(rows[0]["detail"]?.stringValue, "done")
         XCTAssertEqual(rows[4]["detail"]?.stringValue, "access denied")
+        XCTAssertEqual(rows[5]["detail"]?.stringValue, "scale: 150 %")
         XCTAssertEqual(rows.compactMap { $0["takesEffect"]?.stringValue }, ["now", "now", "app restart", "now", "now", "now"])
         let sent = commands(agent)
         XCTAssertEqual(sent.count, 6)
@@ -147,6 +220,28 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertTrue(sent[4].contains("AppsUseLightTheme"))
         XCTAssertTrue(sent[5].contains("0x009F"))
         XCTAssertEqual(agentRequests(agent, "exec.run").first?["timeout_ms"]?.intValue, 60_000)
+    }
+
+    func testSetEnvironmentFailsTheScaleRowWhenAnotherScaleWasApplied() async throws {
+        let (h, _, _) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run"
+                ? [exitReply(m, stdout: "{\"applied\":125,\"recommended\":100,\"offered\":[100,125]}\r\n")] : []
+        }
+        let r = try await h.handle(op: "vm.set_environment", params: ["name": "Win", "dpiScale": 200])
+        let row = try XCTUnwrap(r["applied"]?[0])
+        XCTAssertEqual(row["ok"]?.boolValue, false)
+        XCTAssertEqual(row["detail"]?.stringValue, "scale: 125 % was applied, not 200 %; the largest scale the guest offers at its resolution is 125 %; "
+                       + "request it, or set a larger resolution with vm.set_resolution first")
+        XCTAssertEqual(row["takesEffect"]?.stringValue, "now")
+    }
+
+    func testSetEnvironmentKeepsTheScriptErrorOfAFailedScaleRecipe() async throws {
+        let (h, _, _) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m, code: 1, stdout: "{\"applied\":125}", stderr: "no display\n")] : []
+        }
+        let r = try await h.handle(op: "vm.set_environment", params: ["name": "Win", "dpiScale": 125])
+        XCTAssertEqual(r["applied"]?[0]?["ok"]?.boolValue, false)
+        XCTAssertEqual(r["applied"]?[0]?["detail"]?.stringValue, "no display")
     }
 
     func testSetEnvironmentReportsTimedOutScriptAsFailed() async throws {

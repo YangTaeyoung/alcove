@@ -528,7 +528,7 @@ in the order of this table.
 | `locale` | a language tag such as `ko-KR`: letters, digits and `-`, 2 to 35 characters, not starting with `-`. Sets the regional format and adds the language to the user's language list | Windows | `app restart` |
 | `keyboardLayouts` | a non-empty array of language tags; the user's input languages become exactly these, in this order | Windows | `now` |
 | `theme` | `dark` or `light`, for apps and for the system | Windows | `now` |
-| `dpiScale` | a whole percentage from 100 to 500; the nearest of 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500 is set. Windows redraws the desktop and open windows at the new scale without a sign-out | Windows | `now` |
+| `dpiScale` | a whole percentage from 100 to 500; Windows is asked for the nearest of 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500, as a number of steps from the display's recommended scale, and redraws the desktop and open windows without a sign-out. See [Display scale](#display-scale) | Windows | `now` |
 
 The result lists one row per requested setting: `setting`, `ok`, `detail` (what
 the script printed, e.g. the new time or zone id; the script's error text when
@@ -537,6 +537,24 @@ afterwards see it). A setting
 the guest OS has no script for is a row with `ok: false` and `detail` `not
 supported on <os> guests`. The op itself succeeds when a row fails, so read
 the rows.
+
+### Display scale
+
+The `dpiScale` row reports the scale Windows applied, read as the system DPI
+by a process started after the change: `ok: true` with `detail` `scale: 125 %`
+when that is the requested percentage. Windows offers only the scales that fit
+the display's resolution (100 and 125 on a 1280x800 display, more on a larger
+one) and applies the nearest offered one, and a percentage between two steps
+becomes the nearest step. In both cases the row
+has `ok: false` and a `detail` that names the applied scale and the nearest
+offered ones, e.g. `scale: 125 % was applied, not 150 %; the largest scale the
+guest offers at its resolution is 125 %; request it, or set a larger
+resolution with vm.set_resolution first` or `scale: 125 % was applied, not
+130 %; the nearest scales the guest offers are 125 % and 150 %; request one of
+them`. The applied scale is then the guest's stored setting, so a later change
+of resolution keeps it. A guest whose display reports no scale range gives
+`ok: false` with `the guest did not report the scale range of its display;
+sign in to the guest desktop and set dpiScale again`.
 
 Refusals for values: `theme must be 'dark' or 'light'`, `dpiScale must be
 between 100 and 500`, `clock must be 'host' or an ISO 8601 time such as
