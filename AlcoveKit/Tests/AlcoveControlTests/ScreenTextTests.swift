@@ -47,6 +47,9 @@ private func assertNear(_ rect: Frame.Rect, _ expected: Frame.Rect, tolerance: I
     XCTAssertLessThanOrEqual(abs(rect.h - expected.h), tolerance, "h \(rect) vs \(expected) \(message)", file: file, line: line)
 }
 
+/// PNG of a 400x48 strip of a Windows 11 guest frame at 100 % scale: a Notepad line that reads "batch works!" in 11-point Consolas.
+private let notepadLine = "iVBORw0KGgoAAAANSUhEUgAAAZAAAAAwCAIAAACwtrvBAAAAAXNSR0IArs4c6QAAADhlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAAqACAAQAAAABAAABkKADAAQAAAABAAAAMAAAAACDggHFAAAEqElEQVR4Ae2dPWvrMBSG1cuFTP0XhhICWbL1FwQ6OFu3C96ydSkZO3QMXbpl89wtGQr5Bd28BEII5Bd07ZTtHsmOP+J8FKcpVvR4smVZevUc++UcpdCrz89PxQEBCEDABgJX6/XaBp1ohAAEIKD+wAACEICALQQwLFsihU4IQIAMi3cAAhCwhwAZlj2xQikEnCeAYTn/CgAAAvYQwLDsiRVKIeA8AQzL+VcAABCwhwCGZU+sUAoB5wlgWM6/AgCAgD0EMCx7YoVSCDhPAMNy/hUAAATsIYBh2RMrlELAeQIYlvOvAAAgYA8BDMueWKEUAs4TwLCcfwUAAAF7CGBY9sQKpRBwngCG5fwrAAAI2EMAw7InViiFgPMEMCznXwEAQMAeAhUMa/V62+hPz7fEc4+/T7me9/Z1te/2nnb91Flx7JmXZgi4SKCCYVXBVM0MqszEMxCAwOUS+CXDulyA3k37chfHyiBQMwKVDcuUQg195MvDad805Zrjfq1BpKJBK7mZK7yyYRrFeiy9keu8g53uttUj15QOUpCpW0X0RuvW42aS+MHszqZvbmE5MZ2ml7viFAIQOBeBioYV+q3Fk/xLw/V82An9xLLkKx/3dKMckyD0zffuPXzIpXRTneHc3FqvPx7iD1xsoDVoT5LWtFnWmo4/CaLBvwMbSzrBiRaljaf2jadETjb6fDjz89Ya+o3nptYzH6rtCcyDStQmOuXan6Xi16PuuYLBuBCAwGECFQ0rmCTfrffwFKjZ0jiGeFP6MXd7weGJ5e50HKpgkj6S75+Of3Qcr9mJH9RJkHHO1SLSKc/q/S3KRjc6w3H2W0Ewie1o2/E2Nrcx1URV9PZecsW8YM4hAIFfIFDRsIrKNimOfOxJ0ddo+GGxT/lqtZypoHdquqINRxvmdDwLgpk4kh7WJFiLqDBn6mymNZu4O1pnSVM08KV4zW6avmLEOg+LC9qsTCyMzgUEIPALBE42LO0P8R7OtN8a6EIqPibHMyxZXpKbnbJQMSIxzNVS3T/22nEOtXNPSRKv49PosjWtZnPd48I2LiBb+U07pcTwtrKx3HOcQgACP0ngVMOavgyi4CnZk8qETfvFDMsUXltVlXd33zm8QZWNd+BMD62W74vmnSf1Yzh+WUQ6wVK6mEy312SH3Q87w8fv5HPdkcmndqZSZrKCGJNV7uxb6MYFBCDwAwQqGpbsWceHrza7War7OBQDigun5+awmGF1R3r7PPmZMPm+C6WWDFfxs5cUKxy8iV8ZkwrDMEmwJPXRyVKiU3bNv50IibBYbZxL5X8i1LvvO3fdfiAWDAEBCBwhcCUF3JEu3IYABCBQDwIVM6x6iEcFBCDgFgEMy614s1oIWE0Aw7I6fIiHgFsEMCy34s1qIWA1AQzL6vAhHgJuEcCw3Io3q4WA1QT+Wq0+FX99fR2ff3195c/TDpxAAAIXQODS/g5L3Eo86wICwxIgAIEyAUrCMhNaIACBmhLAsGoaGGRBAAJlAhhWmQktEIBATQlgWDUNDLIgAIEyAQyrzIQWCECgpgQwrJoGBlkQgECZAIZVZkILBCBQUwIYVk0DgywIQKBM4D//c4a1lbJ5NQAAAABJRU5ErkJggg=="
+
 final class ScreenTextTests: XCTestCase {
     func testRecognizesEnglishAndKorean() throws {
         let supported = try VNRecognizeTextRequest(completionHandler: nil).supportedRecognitionLanguages()
@@ -62,6 +65,33 @@ final class ScreenTextTests: XCTestCase {
         guard korean else { throw XCTSkip("ko-KR is not a supported recognition language on this host") }
         let hangul = try XCTUnwrap(lines.first { $0.text.replacingOccurrences(of: " ", with: "").contains("메시지보내기") }, "\(lines)")
         assertNear(hangul.rect, drawn.rects[1], "korean")
+    }
+
+    func testReadsTheSmallTextOfAGuestWindow() throws {
+        let supported = try VNRecognizeTextRequest(completionHandler: nil).supportedRecognitionLanguages()
+        guard supported.contains("ko-KR") else { throw XCTSkip("ko-KR is not a supported recognition language on this host") }
+        let frame = try XCTUnwrap(Frame(png: try XCTUnwrap(Data(base64Encoded: notepadLine))))
+        XCTAssertEqual(frame.width, 400)
+        let lines = try ScreenText.recognize(frame, languages: ScreenText.defaultLanguages)
+        XCTAssertTrue(lines.contains { $0.text.lowercased().contains("batch works") }, "\(lines.map(\.text))")
+    }
+
+    func testEnlargesAreasUpTo1600PixelsPerSide() {
+        XCTAssertEqual(ScreenText.enlargement(width: 1280, height: 800), 2)
+        XCTAssertEqual(ScreenText.enlargement(width: 1600, height: 1600), 2)
+        XCTAssertEqual(ScreenText.enlargement(width: 200, height: 100), 2)
+        XCTAssertEqual(ScreenText.enlargement(width: 1601, height: 800), 1)
+        XCTAssertEqual(ScreenText.enlargement(width: 800, height: 1601), 1)
+        XCTAssertEqual(ScreenText.enlargement(width: 1920, height: 1080), 1)
+    }
+
+    func testLineRectanglesStayInsideTheImage() {
+        let left = ScreenText.pixelRect(of: CGRect(x: -0.0004, y: 0.5, width: 0.125, height: 0.125), width: 1280, height: 800, scale: 1)
+        XCTAssertEqual(left, Frame.Rect(x: 0, y: 300, w: 160, h: 100))
+        let corner = ScreenText.pixelRect(of: CGRect(x: 0.9375, y: -0.0078125, width: 0.078125, height: 0.0625), width: 2560, height: 1600, scale: 2)
+        XCTAssertEqual(corner, Frame.Rect(x: 1200, y: 756, w: 80, h: 44))
+        let top = ScreenText.pixelRect(of: CGRect(x: 0.25, y: 0.9375, width: 0.5, height: 0.125), width: 400, height: 200, scale: 1)
+        XCTAssertEqual(top, Frame.Rect(x: 100, y: 0, w: 200, h: 13))
     }
 
     func testLinesComeTopToBottomThenLeftToRight() throws {

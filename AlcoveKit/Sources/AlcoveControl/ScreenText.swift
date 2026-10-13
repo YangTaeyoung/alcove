@@ -13,9 +13,25 @@ struct TextMatch: Sendable, Equatable {
 enum ScreenText {
     static let defaultLanguages = ["ko-KR", "en-US"]
 
-    /// Frames narrower than this are enlarged before recognition.
-    static let upscaleBelowWidth = 400
+    /// Areas with no side longer than this are enlarged before recognition.
+    static let upscaleUpToSide = 1600
     static let upscaleFactor = 2
+
+    /// The factor by which an area of `width` x `height` pixels is enlarged before recognition.
+    static func enlargement(width: Int, height: Int) -> Int {
+        max(width, height) <= upscaleUpToSide ? upscaleFactor : 1
+    }
+
+    /// The pixel rectangle (top-left origin) of a Vision bounding box in an image of `width` x `height` pixels
+    /// that shows the area enlarged by `scale`, cut to the area.
+    static func pixelRect(of box: CGRect, width: Double, height: Double, scale: Double) -> Frame.Rect {
+        let areaWidth = width / scale, areaHeight = height / scale
+        let left = max(0, (box.minX * areaWidth).rounded(.down))
+        let right = min(areaWidth, (box.maxX * areaWidth).rounded(.up))
+        let top = max(0, ((1 - box.maxY) * areaHeight).rounded(.down))
+        let bottom = min(areaHeight, ((1 - box.minY) * areaHeight).rounded(.up))
+        return Frame.Rect(x: Int(left), y: Int(top), w: max(1, Int(right - left)), h: max(1, Int(bottom - top)))
+    }
 
     /// Throws when Vision does not support one of `languages`.
     static func validate(languages: [String]) throws {
@@ -34,9 +50,8 @@ enum ScreenText {
         request.recognitionLanguages = languages
 
         guard var image = frame.cgImage() else { throw ControlHandler.ControlError.failed("the frame cannot be read for text recognition") }
-        var factor = 1
-        if frame.width < upscaleBelowWidth {
-            factor = upscaleFactor
+        let factor = enlargement(width: frame.width, height: frame.height)
+        if factor > 1 {
             guard let enlarged = enlarge(image, by: factor) else { throw ControlHandler.ControlError.failed("the frame cannot be enlarged for text recognition") }
             image = enlarged
         }
@@ -47,12 +62,7 @@ enum ScreenText {
         var lines: [TextMatch] = []
         for observation in request.results ?? [] {
             guard let candidate = observation.topCandidates(1).first else { continue }
-            let box = observation.boundingBox
-            let left = (box.minX * width / scale).rounded(.down)
-            let right = (box.maxX * width / scale).rounded(.up)
-            let top = ((1 - box.maxY) * height / scale).rounded(.down)
-            let bottom = ((1 - box.minY) * height / scale).rounded(.up)
-            let rect = Frame.Rect(x: Int(left), y: Int(top), w: max(1, Int(right - left)), h: max(1, Int(bottom - top)))
+            let rect = pixelRect(of: observation.boundingBox, width: width, height: height, scale: scale)
             lines.append(TextMatch(text: candidate.string, rect: rect, confidence: Double(candidate.confidence)))
         }
         return readingOrder(lines)
