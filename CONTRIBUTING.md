@@ -158,10 +158,20 @@ files: `meson.build`, `meson_options.txt`, `qapi/ui.json`, `qemu-options.hx`,
 `qemu-patches/0002-hw-nvme-reset-the-controller-before-loading-its-state.patch`
 touches `hw/nvme/ctrl.c`: the NVMe controller frees its queues and clears its
 AER request pointers before its state is loaded, so `snapshot-load` works on a
-machine whose guest has used the controller. With more than one patch in the
-series, export each with a pathspec, e.g.
-`git -C build/qemu-src diff --cached HEAD -- hw/nvme/ctrl.c` for this one and
-`-- . ':(exclude)hw/nvme/ctrl.c'` for the display backend.
+machine whose guest has used the controller.
+
+`qemu-patches/0003-accel-hvf-log-dirty-pages-of-writable-ram-only.patch`
+touches `accel/hvf/hvf-all.c`: starting, clearing and stopping dirty logging
+(`snapshot-save`, `migrate`) changes the HVF protection of writable RAM only.
+The flash that holds the UEFI variables is a ROM device: it has no HVF mapping
+while the guest programs it and a read-only one otherwise, and it keeps both
+through a snapshot.
+
+With more than one patch in the series, export each with a pathspec, e.g.
+`git -C build/qemu-src diff --cached HEAD -- hw/nvme/ctrl.c` for the NVMe
+patch, `-- accel/hvf/hvf-all.c` for the HVF one and
+`-- . ':(exclude)hw/nvme/ctrl.c' ':(exclude)accel/hvf/hvf-all.c'` for the
+display backend.
 
 `build-qemu.sh` applies the series with `git apply --index`, so after a build
 the patched files are **staged** in `build/qemu-src`. The loop is:

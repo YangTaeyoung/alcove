@@ -187,7 +187,7 @@ can do.
 Alcove/          the macOS app
 AlcoveKit/       Swift package: display protocol, QMP, engine, agent client,
                  control API, and the alcovectl command line tool
-qemu-patches/    the display backend and an NVMe snapshot fix, applied to a pinned QEMU tag
+qemu-patches/    the display backend and two snapshot fixes (NVMe, HVF), applied to a pinned QEMU tag
 guest-tools/     the Go agent that runs inside Windows and Linux guests
 mcp/             the MCP server
 scripts/         engine build, unattended Windows install, test harnesses

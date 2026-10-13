@@ -14,6 +14,12 @@ meson_options.txt, qapi/ui.json, qemu-options.hx and ui/meson.build.
 existing QEMU file, hw/nvme/ctrl.c, whose header reads "This code is licensed
 under the GNU GPL v2 or later."
 
+0003-accel-hvf-log-dirty-pages-of-writable-ram-only.patch modifies one
+existing QEMU file, accel/hvf/hvf-all.c, whose header reads "This work is
+licensed under the terms of the GNU GPL, version 2. [...] Contributions after
+2012-01-13 are licensed under the terms of the GNU GPL, version 2 or (at your
+option) any later version."
+
 The new file carries "SPDX-License-Identifier: GPL-2.0-or-later" in its own
 header (0001-ui-add-alcove-display-backend.patch line 136), with the copyright
 line "Copyright (c) 2026 Alcove contributors" (line 134).

@@ -1,0 +1,51 @@
+diff --git a/accel/hvf/hvf-all.c b/accel/hvf/hvf-all.c
+index 8bd9154..3db79a6 100644
+--- a/accel/hvf/hvf-all.c
++++ b/accel/hvf/hvf-all.c
+@@ -135,10 +135,25 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
+     assert_hvf_ok(ret);
+ }
+ 
++/*
++ * True for the sections hvf_set_phys_mem() maps with write access: RAM that
++ * is neither read-only nor a ROM device. Dirty logging changes the protection
++ * of these sections only.
++ */
++static bool hvf_section_is_writable_ram(MemoryRegionSection *section)
++{
++    MemoryRegion *area = section->mr;
++
++    return memory_region_is_ram(area) && !area->readonly && !area->rom_device;
++}
++
+ static void hvf_log_start(MemoryListener *listener,
+                           MemoryRegionSection *section, int old, int new)
+ {
+     assert(new != 0);
++    if (!hvf_section_is_writable_ram(section)) {
++        return;
++    }
+     if (old == 0) {
+         hvf_protect_clean_range(section->offset_within_address_space,
+                                 int128_get64(section->size));
+@@ -149,6 +164,9 @@ static void hvf_log_stop(MemoryListener *listener,
+                          MemoryRegionSection *section, int old, int new)
+ {
+     assert(old != 0);
++    if (!hvf_section_is_writable_ram(section)) {
++        return;
++    }
+     if (new == 0) {
+         hvf_unprotect_dirty_range(section->offset_within_address_space,
+                                   int128_get64(section->size));
+@@ -158,6 +176,10 @@ static void hvf_log_stop(MemoryListener *listener,
+ static void hvf_log_clear(MemoryListener *listener,
+                           MemoryRegionSection *section)
+ {
++    if (!hvf_section_is_writable_ram(section)) {
++        return;
++    }
++
+     /*
+      * The dirty page bits within section are being cleared.
+      * Some number of those pages may have been dirtied and

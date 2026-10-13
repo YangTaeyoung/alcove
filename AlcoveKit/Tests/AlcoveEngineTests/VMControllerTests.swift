@@ -156,6 +156,22 @@ final class VMControllerTests: XCTestCase {
         XCTAssertTrue(base.isEmpty)
     }
 
+    func testFirmwareVariableWritesReachTheFlashFileAfterASnapshot() async throws {
+        let vm = try makeVM()
+        try await vm.start()
+        try await vm.createSnapshot(named: "first")
+        let before = try Data(contentsOf: vm.bundle.efiVarsURL)
+        try await vm.reset()
+        var changed = false
+        let deadline = ContinuousClock.now + .seconds(30)
+        while !changed, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(250))
+            changed = try Data(contentsOf: vm.bundle.efiVarsURL) != before
+        }
+        XCTAssertTrue(changed, "the firmware's variable writes after the reset are in efi-vars.fd")
+        try await vm.shutdown(force: true)
+    }
+
     func testFailureIsReportedWithLogExactlyOnce() async throws {
         let vm = try makeVM()
         let log = StateLog()
