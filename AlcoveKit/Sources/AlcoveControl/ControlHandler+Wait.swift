@@ -10,7 +10,7 @@ extension ControlHandler {
     private static let jobBufferLimit = 64 * 1024
 
     /// What one evaluation of a condition found.
-    private enum Verdict {
+    private enum Verdict: Sendable {
         /// The guest was read and the condition does not hold yet.
         case pending
         /// The guest has not answered; nothing is known.
@@ -23,6 +23,25 @@ extension ControlHandler {
     /// A failure that ends the wait at once.
     private struct HardFailure: Error { let error: ControlError }
 
+    /// The output of its job that a `job_output_matches` condition has read.
+    private struct JobOutput: Sendable {
+        var outOffset = 0, errOffset = 0
+        var out = "", err = ""
+    }
+
+    /// What the agent calls of one evaluation of an agent condition brought: the verdict or the error, and the job
+    /// output read by then.
+    private struct AgentReading: Sendable {
+        let verdict: Result<Verdict, Error>
+        let job: JobOutput
+    }
+
+    /// The agent calls of one evaluation of an agent condition, running in a task of their own.
+    private struct AgentProbe: Sendable {
+        let answer: CallAnswer<AgentReading>
+        let task: Task<Void, Never>
+    }
+
     /// Per-condition progress between evaluations.
     private struct WaitState {
         var nextDue: ContinuousClock.Instant
@@ -31,8 +50,7 @@ extension ControlHandler {
         var reference: Frame?
         var referenceRect: Frame.Rect?
         var script: String?
-        var outOffset = 0, errOffset = 0
-        var out = "", err = ""
+        var job = JobOutput()
         /// Evaluations in a row that failed, and the sentence of the latest failure.
         var failures = 0
         var lastError: String?
@@ -41,10 +59,22 @@ extension ControlHandler {
         var lastTotal: JSON?
         /// The helper call of a UI condition whose outcome has not been collected.
         var probe: HelperProbe?
+        /// The agent calls of an agent condition whose outcome has not been collected.
+        var reading: AgentProbe?
         /// Whether the latest helper call waited `WaitTiming.reportedSilence` or longer for its turn at the helper and did not get it.
         var helperWasBusy = false
         /// The sequence number of the newest guest event this condition has looked at.
         var eventCursor = 0
+
+        /// Whether an evaluation of the condition runs in a task of its own and has not been collected.
+        var isInFlight: Bool { probe != nil || reading != nil }
+
+        /// Gives up the evaluation in flight: a helper call still waiting for its turn is not sent and a sent one keeps
+        /// the helper until the agent answered; agent calls not yet made are not made.
+        func abandon() {
+            probe?.abandon()
+            reading?.task.cancel()
+        }
     }
 
     /// Frames and recognitions shared by the conditions of one tick.
@@ -107,51 +137,74 @@ extension ControlHandler {
         var matched = -1
         var type: String?
         var detail: JSON?
-        defer { for state in states { state.probe?.abandon() } }
+        defer { for state in states { state.abandon() } }
+
+        /// Takes in what an evaluation of condition `index` brought: a failure is counted, an answer clears the count.
+        /// True when the answer ends the wait. Cancellation, a hard failure and a lost agent are thrown.
+        func settle(_ outcome: Result<Verdict, Error>, _ index: Int) throws -> Bool {
+            let verdict: Verdict
+            do {
+                verdict = try outcome.get()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let hard as HardFailure {
+                throw hard.error
+            } catch {
+                switch error {
+                case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected, AgentClient.AgentError.unsupported:
+                    throw agentFailure(error, vm: t.name, op: "vm.wait_for")
+                default:
+                    states[index].failures += 1
+                    states[index].lastError = agentFailure(error, vm: t.name, op: "vm.wait_for").description
+                    return false
+                }
+            }
+            if case .unanswered = verdict { return false }
+            states[index].failures = 0
+            states[index].lastError = nil
+            switch verdict {
+            case .pending, .unanswered:
+                return false
+            case .holds(let found):
+                (matched, type, detail) = (index, conditions[index].typeName, found)
+                return true
+            case .over(let found):
+                (type, detail) = (conditions[index].typeName, found)
+                return true
+            }
+        }
+
+        var settled = false
         wait: while true {
             try Task.checkCancellation()
             let tickStart = clock.now
+            let tickEnd = min(tickStart + WaitTiming.tick, deadline)
             var tick = Tick()
-            for (index, condition) in conditions.enumerated() where states[index].probe != nil || states[index].nextDue <= tickStart {
-                if condition.kind != .ui { states[index].nextDue = tickStart + condition.period }
-                let verdict: Verdict
+            for (index, condition) in conditions.enumerated() where states[index].isInFlight || states[index].nextDue <= tickStart {
+                let outcome: Result<Verdict, Error>
                 do {
-                    verdict = try await evaluate(condition, index: index, state: &states[index], tick: &tick, vm: t,
-                                                 now: tickStart,
-                                                 agent: agent, clock: clock, deadline: deadline)
-                    if case .unanswered = verdict { continue }
-                    states[index].failures = 0
-                    states[index].lastError = nil
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch let hard as HardFailure {
-                    throw hard.error
+                    outcome = .success(try await evaluate(condition, index: index, state: &states[index], tick: &tick, vm: t,
+                                                          now: tickStart, agent: agent, clock: clock, tickEnd: tickEnd, deadline: deadline))
                 } catch {
-                    switch error {
-                    case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected, AgentClient.AgentError.unsupported:
-                        throw agentFailure(error, vm: t.name, op: "vm.wait_for")
-                    default:
-                        states[index].failures += 1
-                        states[index].lastError = agentFailure(error, vm: t.name, op: "vm.wait_for").description
-                        continue
-                    }
+                    outcome = .failure(error)
                 }
-                switch verdict {
-                case .pending, .unanswered:
-                    continue
-                case .holds(let found):
-                    (matched, type, detail) = (index, condition.typeName, found)
-                    break wait
-                case .over(let found):
-                    (type, detail) = (condition.typeName, found)
+                if try settle(outcome, index) {
+                    settled = true
                     break wait
                 }
             }
             if clock.now >= deadline { break }
-            try await Task.sleep(until: min(tickStart + WaitTiming.tick, deadline), clock: clock)
+            try await Task.sleep(until: tickEnd, clock: clock)
+        }
+        if !settled {
+            for index in conditions.indices {
+                guard let outcome = await collect(conditions[index], state: &states[index], until: clock.now) else { continue }
+                if try settle(outcome, index) { break }
+            }
         }
 
-        let elapsed = clock.now - started
+        let ending = clock.now
+        let elapsed = ending - started
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
         var out: [String: JSON] = ["matched": .int(Int64(matched)), "waited": .double((seconds * 10).rounded() / 10)]
         if let type { out["type"] = .string(type) }
@@ -163,7 +216,7 @@ extension ControlHandler {
                 if states[index].failures > 0, let error = states[index].lastError {
                     problem["error"] = .string(error)
                     problem["failures"] = .int(Int64(states[index].failures))
-                } else if let silence = await helperSilence(states[index], now: clock.now) {
+                } else if let silence = await helperSilence(states[index], now: ending) {
                     problem["error"] = .string(silence)
                 } else {
                     continue
@@ -172,27 +225,33 @@ extension ControlHandler {
             }
             if !problems.isEmpty { out["problems"] = .array(problems) }
         }
-        for state in states { state.probe?.abandon() }
+        var helperTaken = false
+        for state in states {
+            if let probe = state.probe, case .sent(let at) = await probe.answer.phase, ending - at >= WaitTiming.reportedSilence {
+                helperTaken = true
+            }
+            state.abandon()
+        }
         if options.level != .none, let first {
-            try await addObservation(to: &out, t, after: "vm.wait_for", before: first, options)
+            try await addObservation(to: &out, t, after: "vm.wait_for", before: first, options, helperTaken: helperTaken)
         }
         return .object(out)
     }
 
     static let busyHelper = "the UI helper was busy with other requests"
 
-    /// Why a UI condition without a recorded failure got no answer from the helper: its call was sent and has not been
-    /// answered, or did not get its turn, for `WaitTiming.reportedSilence` or longer. Nil for an answered call and for a
-    /// shorter silence.
+    /// Why a UI condition without a recorded failure got no answer from the helper: its call has waited for
+    /// `WaitTiming.reportedSilence` or longer, counted from the moment it began to wait for its turn, and was sent and
+    /// not answered, or did not get its turn. Nil for an answered call and for a shorter wait.
     private func helperSilence(_ state: WaitState, now: ContinuousClock.Instant) async -> String? {
         guard let probe = state.probe else { return state.helperWasBusy ? ControlHandler.busyHelper : nil }
+        let waited = now - probe.started
         switch await probe.answer.phase {
         case .queued:
-            return now - probe.started >= WaitTiming.reportedSilence ? ControlHandler.busyHelper : nil
-        case .sent(let at):
-            let silent = now - at
-            guard silent >= WaitTiming.reportedSilence else { return nil }
-            let seconds = (Double(silent.components.seconds) + Double(silent.components.attoseconds) / 1e18).rounded()
+            return waited >= WaitTiming.reportedSilence ? ControlHandler.busyHelper : nil
+        case .sent:
+            guard waited >= WaitTiming.reportedSilence else { return nil }
+            let seconds = (Double(waited.components.seconds) + Double(waited.components.attoseconds) / 1e18).rounded()
             return "the UI helper has not answered \(probe.op) for \(Int(seconds)) s"
         case .done(.failure(let error), let at):
             return error is HelperBusy && at - probe.started >= WaitTiming.reportedSilence ? ControlHandler.busyHelper : nil
@@ -205,8 +264,12 @@ extension ControlHandler {
         .failed("condition \(index): region is outside the \(frame.width)x\(frame.height) frame")
     }
 
+    /// One evaluation of a condition in the tick that began at `now`. A screen, text or event condition is read here
+    /// and is due again one period after `now`; an agent or UI condition takes one `step`.
     private func evaluate(_ condition: WaitCondition, index: Int, state: inout WaitState, tick: inout Tick, vm t: VMTarget,
-                          now: ContinuousClock.Instant, agent: AgentClient?, clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
+                          now: ContinuousClock.Instant, agent: AgentClient?, clock: ContinuousClock,
+                          tickEnd: ContinuousClock.Instant, deadline: ContinuousClock.Instant) async throws -> Verdict {
+        if condition.kind != .ui, condition.kind != .agent { state.nextDue = now + condition.period }
         switch condition {
         case .screenIdle(let seconds):
             let frame = try await tickFrame(&tick, t)
@@ -241,13 +304,78 @@ extension ControlHandler {
                 return .pending
             }
             return .holds(found.json)
-        case .uiExists, .uiGone, .uiEnabled, .windowTitle, .uiTextStable:
-            guard let agent else { throw ControlError.noTools(t.name) }
-            return try await evaluateUI(condition, state: &state, vm: t.name, agent: agent, clock: clock, deadline: deadline)
         default:
             guard let agent else { throw ControlError.noTools(t.name) }
-            return try await evaluateAgent(condition, index: index, state: &state, agent: agent, clock: clock, deadline: deadline)
+            return try await step(condition, state: &state, vm: t.name, agent: agent, now: now, clock: clock,
+                                  tickEnd: tickEnd, deadline: deadline)
         }
+    }
+
+    /// One step of an agent or UI condition, whose calls run in a task of their own, one evaluation at a time.
+    ///
+    /// An evaluation in flight is only looked at. Without one, and before the deadline, one is started and waited for
+    /// until `tickEnd` at most; an agent condition is due again one period after the tick that started it. The verdict
+    /// is `unanswered` while the evaluation has not ended.
+    private func step(_ condition: WaitCondition, state: inout WaitState, vm: String, agent: AgentClient,
+                      now tickStart: ContinuousClock.Instant, clock: ContinuousClock,
+                      tickEnd: ContinuousClock.Instant, deadline: ContinuousClock.Instant) async throws -> Verdict {
+        var limit = clock.now
+        if !state.isInFlight {
+            guard limit < deadline else { return .unanswered }
+            if condition.kind == .ui {
+                let request = ControlHandler.probeRequest(condition)
+                state.probe = startHelperCall(agent, request.op, request.fields, vm: vm, turnBy: deadline)
+                state.helperWasBusy = false
+            } else {
+                state.nextDue = tickStart + condition.period
+                state.reading = startReading(condition, job: state.job, script: state.script, agent: agent, clock: clock, deadline: deadline)
+            }
+            limit = tickEnd
+        }
+        guard let outcome = await collect(condition, state: &state, until: limit) else { return .unanswered }
+        return try outcome.get()
+    }
+
+    /// What the evaluation of `condition` in flight brought, once it ended; waits for that until `limit` at most, and
+    /// only looks when `limit` has passed. Nil when none is in flight or it has not ended by then. The answer of a
+    /// helper call is judged here, and the condition's next call is due one period after the answer arrived.
+    private func collect(_ condition: WaitCondition, state: inout WaitState,
+                         until limit: ContinuousClock.Instant) async -> Result<Verdict, Error>? {
+        if let probe = state.probe {
+            guard let outcome = await probe.answer.outcome(until: limit) else { return nil }
+            state.probe = nil
+            state.nextDue = outcome.at + condition.period
+            if case .failure(let error) = outcome.result, error is HelperBusy {
+                state.helperWasBusy = outcome.at - probe.started >= WaitTiming.reportedSilence
+                return .success(.unanswered)
+            }
+            return Result { try judge(condition, outcome.result, state: &state, at: outcome.at) }
+        }
+        if let reading = state.reading {
+            guard let outcome = await reading.answer.outcome(until: limit) else { return nil }
+            state.reading = nil
+            state.job = outcome.result.job
+            return outcome.result.verdict
+        }
+        return nil
+    }
+
+    /// Starts the agent calls of one evaluation of an agent condition in a task of their own and returns at once.
+    private nonisolated func startReading(_ condition: WaitCondition, job: JobOutput, script: String?, agent: AgentClient,
+                                          clock: ContinuousClock, deadline: ContinuousClock.Instant) -> AgentProbe {
+        let answer = CallAnswer<AgentReading>()
+        let task = Task {
+            var progress = job
+            let verdict: Result<Verdict, Error>
+            do {
+                verdict = .success(try await self.evaluateAgent(condition, job: &progress, script: script, agent: agent,
+                                                                clock: clock, deadline: deadline))
+            } catch {
+                verdict = .failure(error)
+            }
+            await answer.finish(AgentReading(verdict: verdict, job: progress))
+        }
+        return AgentProbe(answer: answer, task: task)
     }
 
     private func tickFrame(_ tick: inout Tick, _ t: VMTarget) async throws -> Frame {
@@ -323,9 +451,11 @@ extension ControlHandler {
 
     // MARK: - agent conditions
 
-    /// One agent call bounded by the per-call limit and the deadline; nil when the call timed out.
-    private func callAgent(_ agent: AgentClient, _ op: String, _ params: [String: JSON], clock: ContinuousClock,
-                           deadline: ContinuousClock.Instant) async throws -> JSON? {
+    /// One agent call bounded by the per-call limit and the deadline; nil when the call timed out. A cancelled task
+    /// makes no call.
+    private nonisolated func callAgent(_ agent: AgentClient, _ op: String, _ params: [String: JSON], clock: ContinuousClock,
+                                       deadline: ContinuousClock.Instant) async throws -> JSON? {
+        try Task.checkCancellation()
         let limit = min(WaitTiming.agentCallTimeout, max(deadline - clock.now, .milliseconds(200)))
         do { return try await agent.call(op, params, timeout: limit) } catch AgentClient.AgentError.timeout { return nil }
     }
@@ -341,36 +471,6 @@ extension ControlHandler {
         case .uiTextStable(let element, _): return ("ui.text", element)
         default: return ("win.list", [:])
         }
-    }
-
-    /// Evaluates a UI condition with at most one helper call in flight.
-    ///
-    /// Without a call in flight it starts one, unless the deadline has passed, and waits for the answer for
-    /// `WaitTiming.agentCallTimeout` at most. A call in flight is only looked at: answered, it is judged and the next
-    /// call is due one period after the answer arrived; unanswered, the verdict is `unanswered` and no call is sent.
-    private func evaluateUI(_ condition: WaitCondition, state: inout WaitState, vm: String, agent: AgentClient,
-                            clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
-        let outcome: (result: Result<JSON, Error>, at: ContinuousClock.Instant)?
-        if let probe = state.probe {
-            outcome = await probe.answer.outcome(until: clock.now)
-        } else {
-            let now = clock.now
-            guard now < deadline else { return .unanswered }
-            let request = ControlHandler.probeRequest(condition)
-            let probe = startHelperCall(agent, request.op, request.fields, vm: vm, turnBy: deadline)
-            state.probe = probe
-            state.helperWasBusy = false
-            outcome = await probe.answer.outcome(until: min(now + WaitTiming.agentCallTimeout, deadline))
-        }
-        guard let outcome else { return .unanswered }
-        let started = state.probe?.started ?? outcome.at
-        state.probe = nil
-        state.nextDue = outcome.at + condition.period
-        if case .failure(let error) = outcome.result, error is HelperBusy {
-            state.helperWasBusy = outcome.at - started >= WaitTiming.reportedSilence
-            return .unanswered
-        }
-        return try judge(condition, outcome.result, state: &state, at: outcome.at)
     }
 
     /// What the helper's answer to the call of a UI condition means; `at` is when the answer arrived. A sentence that
@@ -436,8 +536,9 @@ extension ControlHandler {
         }
     }
 
-    private func evaluateAgent(_ condition: WaitCondition, index: Int, state: inout WaitState, agent: AgentClient,
-                               clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
+    /// The agent calls of one evaluation of an agent condition and what they mean. `job` holds the job output read so far.
+    private nonisolated func evaluateAgent(_ condition: WaitCondition, job state: inout JobOutput, script: String?, agent: AgentClient,
+                                           clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
         func call(_ op: String, _ params: [String: JSON]) async throws -> JSON? {
             try await callAgent(agent, op, params, clock: clock, deadline: deadline)
         }
@@ -460,7 +561,7 @@ extension ControlHandler {
             guard r["exists"]?.boolValue == true else { return .pending }
             return .holds(["path": r["path"] ?? .string(path), "size": r["size"] ?? 0])
         case .portListening:
-            guard let script = state.script else { return .pending }
+            guard let script else { return .pending }
             let milliseconds = Int64(WaitTiming.agentCallTimeout.components.seconds * 1000)
                 + Int64(WaitTiming.agentCallTimeout.components.attoseconds / 1_000_000_000_000_000)
             guard let r = try await call("exec.run", ["cmd": .string(script), "timeout_ms": .int(milliseconds)]) else { return .unanswered }

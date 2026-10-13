@@ -157,14 +157,15 @@ extension ControlHandler {
 
     /// Waits for the screen to settle after `op` and sets `observation` in `out`, or `observationError`
     /// when a frame cannot be read. The observation carries the UI facts of a guest whose connected agent
-    /// has the `ui` capability; the ops that observe ask for that connection before they send input. Cancellation is thrown.
+    /// has the `ui` capability; the ops that observe ask for that connection before they send input. With `helperTaken`
+    /// the facts that need the UI helper are left out. Cancellation is thrown.
     func addObservation(to out: inout [String: JSON], _ t: VMTarget, after op: String, before: Frame,
-                                _ options: ObserveOptions) async throws {
+                                _ options: ObserveOptions, helperTaken: Bool = false) async throws {
         do {
             var result = try await observe(t, before: before, level: options.level, settleMs: options.settleMs,
                                            settleTimeoutMs: options.settleTimeoutMs)
             lastSize[t.name] = (result.width, result.height)
-            await addUIFacts(to: &result, t, level: options.level)
+            await addUIFacts(to: &result, t, level: options.level, helperTaken: helperTaken)
             try Task.checkCancellation()
             out["observation"] = result.json()
         } catch is CancellationError {

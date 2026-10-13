@@ -11,8 +11,10 @@ enum WaitTiming {
     nonisolated(unsafe) static var agentCallTimeout = Duration.seconds(5)
     /// Shortest time a text recognition gets to finish, also when the wait's timeout passes sooner.
     nonisolated(unsafe) static var recognitionGrace = Duration.seconds(1)
-    /// How long the UI helper must have left a wait's call unanswered, or without its turn, before the wait reports it.
-    static let reportedSilence = Duration.milliseconds(500)
+    /// How long a wait's helper call must have gone without an answer, counted from the moment it began to wait for
+    /// its turn, before the wait reports it; also how long a sent call must have been unanswered before the wait's
+    /// observation leaves the UI facts out instead of waiting for the helper.
+    nonisolated(unsafe) static var reportedSilence = Duration.milliseconds(500)
     /// Output bytes one job condition reads per tick.
     nonisolated(unsafe) static var jobByteBudget = 4 * 1024 * 1024
     /// Text recognition on a frame.
