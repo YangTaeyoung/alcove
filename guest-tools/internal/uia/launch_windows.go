@@ -5,7 +5,6 @@ package uia
 import (
 	_ "embed"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,32 +38,30 @@ func Available() bool { return true }
 // cleanHelperEnv of the agent's, with the tmp folder inside dir as its
 // temporary directory.
 func DefaultLauncher(dir string) Launcher {
-	starts := 0
-	var gate exitGate
-	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
-		system, err := systemDirectory()
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		if !gate.waitPrevious(previousExitWait) {
-			return nil, nil, nil, fmt.Errorf("the previous UI helper process has not ended after %d s; retry", int(previousExitWait.Seconds()))
-		}
+	tmp := filepath.Join(dir, "tmp")
+	prepare := func() error {
 		if err := LockHelperFolders(filepath.Dir(dir), dir); err != nil {
-			return nil, nil, nil, fmt.Errorf("the UI helper folder %s could not be locked (%v); fix its owner and access list, then retry", dir, err)
+			return fmt.Errorf("the UI helper folder %s could not be locked (%v); fix its owner and access list, then retry", dir, err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "bootstrap.ps1"), bootstrapScript, 0o644); err != nil {
-			return nil, nil, nil, notPrepared(dir, err)
+			return notPrepared(dir, err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "helper.cs"), helperSource, 0o644); err != nil {
-			return nil, nil, nil, notPrepared(dir, err)
+			return notPrepared(dir, err)
 		}
-		tmp := filepath.Join(dir, "tmp")
 		if err := os.Mkdir(tmp, 0o755); err != nil {
-			return nil, nil, nil, notPrepared(dir, err)
+			return notPrepared(dir, err)
+		}
+		return nil
+	}
+	start := func(starts int) (*helperProcess, error) {
+		system, err := systemDirectory()
+		if err != nil {
+			return nil, notStarted(err)
 		}
 		logFile, err := openCappedLog(filepath.Join(dir, "helper.log"), maxLogBytes)
 		if err != nil {
-			return nil, nil, nil, notPrepared(dir, err)
+			return nil, notPrepared(dir, err)
 		}
 		cmd := exec.Command(filepath.Join(system, "WindowsPowerShell", "v1.0", "powershell.exe"),
 			"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(dir, "bootstrap.ps1"))
@@ -76,14 +73,14 @@ func DefaultLauncher(dir string) Launcher {
 		childIn, stdin, err := os.Pipe()
 		if err != nil {
 			logFile.Close()
-			return nil, nil, nil, err
+			return nil, notStarted(err)
 		}
 		stdout, childOut, err := os.Pipe()
 		if err != nil {
 			childIn.Close()
 			stdin.Close()
 			logFile.Close()
-			return nil, nil, nil, err
+			return nil, notStarted(err)
 		}
 		cmd.Stdin, cmd.Stdout = childIn, childOut
 		err = cmd.Start()
@@ -93,16 +90,17 @@ func DefaultLauncher(dir string) Launcher {
 			stdin.Close()
 			stdout.Close()
 			logFile.Close()
-			return nil, nil, nil, err
+			return nil, notStarted(err)
 		}
-		starts++
-		ended := gate.started()
-		go func() {
-			_ = cmd.Wait()
-			logFile.Close()
-			ended()
-		}()
-		kill := func() { _ = cmd.Process.Kill() }
-		return stdin, stdout, kill, nil
+		return &helperProcess{
+			stdin:  stdin,
+			stdout: stdout,
+			kill:   func() { _ = cmd.Process.Kill() },
+			wait: func() {
+				_ = cmd.Wait()
+				logFile.Close()
+			},
+		}, nil
 	}
+	return newLauncher(launchSteps{prepare: prepare, start: start}, &exitGate{})
 }

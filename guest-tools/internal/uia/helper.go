@@ -195,8 +195,10 @@ func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (
 
 // CallContext sends one request and waits for its reply; it starts or restarts
 // the child as needed. The returned fields exclude "id" and "ok". The call
-// waits for its turn first; timeout counts from the moment the request is
-// handed to the child, and a child that does not answer within it is killed. A
+// waits for its turn first and runs the launcher, when a child is needed,
+// without holding the Helper's lock; timeout counts from the moment the
+// request is handed to the child, and a child that does not answer within it
+// is killed. A child whose launch ends after Close is killed at once. A
 // call whose context is cancelled before its request reaches the child, while
 // it waits for its turn or for a starting child to become ready, gives up its
 // turn without sending the request; a request already handed to the child runs
@@ -213,11 +215,21 @@ func (h *Helper) CallContext(ctx context.Context, op string, params map[string]a
 		return nil, errors.New(errClosed)
 	}
 	c := h.cur
+	h.mu.Unlock()
 	if c == nil {
 		stdin, stdout, kill, err := h.launch()
 		if err != nil {
-			h.mu.Unlock()
 			return nil, fmt.Errorf("could not start the UI helper through PowerShell: %v", err)
+		}
+		h.mu.Lock()
+		if h.closed {
+			h.mu.Unlock()
+			if kill != nil {
+				kill()
+			}
+			stdin.Close()
+			stdout.Close()
+			return nil, errors.New(errClosed)
 		}
 		c = &child{stdin: stdin, stdout: stdout, kill: kill, pending: map[int64]chan result{},
 			ready: make(chan struct{}), done: make(chan struct{}), readerDone: make(chan struct{})}
@@ -230,8 +242,8 @@ func (h *Helper) CallContext(ctx context.Context, op string, params map[string]a
 			strconv.FormatFloat(h.startTimeout.Seconds(), 'f', -1, 64), logPath)
 		c.startTimer = time.AfterFunc(h.startTimeout, func() { h.terminate(c, startErr) })
 		go h.readLoop(c)
+		h.mu.Unlock()
 	}
-	h.mu.Unlock()
 
 	select {
 	case <-c.ready:

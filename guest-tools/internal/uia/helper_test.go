@@ -935,3 +935,68 @@ func TestFatalEventOfAReadyHelperIsReportedAsItIs(t *testing.T) {
 		t.Fatalf("retry: %v", err)
 	}
 }
+
+// blockedLauncher returns a launcher whose first run announces itself on
+// entered and returns a fake child once release is closed.
+func blockedLauncher(f *fakeHelper, entered, release chan struct{}) Launcher {
+	launch := f.launcher()
+	first := true
+	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
+		if first {
+			first = false
+			close(entered)
+			<-release
+		}
+		return launch()
+	}
+}
+
+func TestCloseReturnsWhileALaunchRunsAndTheLaunchedChildIsKilled(t *testing.T) {
+	f := newFake(echoPlay)
+	entered, release := make(chan struct{}), make(chan struct{})
+	h := New(blockedLauncher(f, entered, release), nil)
+	starting := make(chan error, 1)
+	go func() {
+		_, err := h.Call("ping", nil, longWait)
+		starting <- err
+	}()
+	<-entered
+	h.Close()
+	close(release)
+	if err := <-starting; err == nil || err.Error() != errClosed {
+		t.Fatalf("the call whose launch ran during Close: %v", err)
+	}
+	select {
+	case <-f.killed[0]:
+	default:
+		t.Fatal("the child launched after Close was not killed")
+	}
+}
+
+func TestACallLeavesTheQueueWhileALaunchRuns(t *testing.T) {
+	f := newFake(echoPlay)
+	entered, release := make(chan struct{}), make(chan struct{})
+	h := New(blockedLauncher(f, entered, release), nil)
+	defer h.Close()
+	starting := make(chan error, 1)
+	go func() {
+		_, err := h.Call("ping", nil, longWait)
+		starting <- err
+	}()
+	<-entered
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := make(chan error, 1)
+	go func() {
+		_, err := h.CallContext(ctx, "win.list", nil, longWait)
+		queued <- err
+	}()
+	waitQueued(t, h, 1)
+	cancel()
+	if err := <-queued; err == nil || err.Error() != errCancelled {
+		t.Fatalf("the cancelled call: %v", err)
+	}
+	close(release)
+	if err := <-starting; err != nil {
+		t.Fatalf("the call that launched: %v", err)
+	}
+}
