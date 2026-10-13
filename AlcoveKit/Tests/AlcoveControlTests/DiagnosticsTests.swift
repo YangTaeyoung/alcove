@@ -989,6 +989,54 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(whole)
     }
 
+    func testRunningRecordingWhoseWriterFailedNamesTheFailureInTheVideoLine() async throws {
+        let r = try await rig()
+        let recorder = LockedBox<VideoRecorder?>(nil)
+        await r.handler.setRecordingSeams(RecordingSeams(makeSink: { dir, fps in
+            let made = VideoRecorder(url: dir.appendingPathComponent("video.mp4"), fps: fps)
+            recorder.value = made
+            return made
+        }))
+        await r.target.setFrames((0..<300).map { blockFrame(step: $0) })
+        let recording = try await startRecording(r.handler, ["video": true, "fps": 10])
+        let playable = await eventually { await VideoRecorder.isPlayable(recording.appendingPathComponent("video.mp4")) }
+        XCTAssertTrue(playable)
+        try XCTUnwrap(recorder.value).failWriterForTesting("the video could not be written: test")
+
+        let result = try await collect(r.handler)
+        XCTAssertTrue(files(result).contains("video.mp4"))
+        let lines = try summaryLines(result)
+        XCTAssertTrue(lines.contains("video.mp4: copied up to the point where the video writer failed (the video could not be written: test)"), "\(lines)")
+        XCTAssertFalse(lines.contains { $0.contains("up to the last second may be missing") }, "\(lines)")
+        _ = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
+    }
+
+    func testRecordingEndedWithAFailedWriterCopiesTheFileItKept() async throws {
+        let r = try await rig()
+        let recorder = LockedBox<VideoRecorder?>(nil)
+        await r.handler.setRecordingSeams(RecordingSeams(makeSink: { dir, fps in
+            let made = VideoRecorder(url: dir.appendingPathComponent("video.mp4"), fps: fps)
+            recorder.value = made
+            return made
+        }))
+        await r.target.setFrames((0..<300).map { blockFrame(step: $0) })
+        let recording = try await startRecording(r.handler, ["video": true, "fps": 10])
+        let playable = await eventually { await VideoRecorder.isPlayable(recording.appendingPathComponent("video.mp4")) }
+        XCTAssertTrue(playable)
+        try XCTUnwrap(recorder.value).failWriterForTesting("the video could not be written: test")
+        let stopped = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertNil(stopped["video"])
+        XCTAssertEqual(stopped["lastWriteError"]?.stringValue, "the video could not be written: test")
+
+        let result = try await collect(r.handler)
+        XCTAssertTrue(files(result).contains("video.mp4"))
+        XCTAssertFalse(files(result).contains("video.error.txt"))
+        let copied = await VideoRecorder.isPlayable(bundleDirectory().appendingPathComponent("video.mp4"))
+        XCTAssertTrue(copied)
+        let lines = try summaryLines(result)
+        XCTAssertTrue(lines.contains("video.mp4: copied up to the point where the video writer failed (the video could not be written: test)"), "\(lines)")
+    }
+
     func testRunningRecordingWithoutAPlayableVideoYetWritesVideoErrorFile() async throws {
         let r = try await rig()
         await r.handler.setRecordingSeams(RecordingSeams(makeSink: { _, _ in NoVideoSink() }))
@@ -1156,6 +1204,41 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(try onDisk().filter { $0.hasPrefix("frames") }, ["frames", "frames/000001-after.jpg", "frames/000001-before.jpg"])
         XCTAssertTrue(try summaryLines(result).contains("frames: 2 of 10 copied"))
         XCTAssertFalse(try onDisk().contains { $0.hasSuffix("outside.jpg") || $0.hasSuffix("nested.jpg") || $0.hasSuffix("link.jpg") })
+    }
+
+    func testFramesFolderThatIsALinkToElsewhereYieldsNoFrames() async throws {
+        let r = try await rig()
+        let recording = try await startRecording(r.handler)
+        _ = try await r.handler.handle(op: "vm.mouse.move", params: ["name": "Win", "x": 10, "y": 10])
+        let elsewhere = scratch.appendingPathComponent("elsewhere")
+        try FileManager.default.moveItem(at: recording.appendingPathComponent("frames"), to: elsewhere)
+        try FileManager.default.createSymbolicLink(at: recording.appendingPathComponent("frames"), withDestinationURL: elsewhere)
+        let result = try await collect(r.handler)
+        XCTAssertFalse(try onDisk().contains { $0.hasPrefix("frames") })
+        XCTAssertTrue(try summaryLines(result).contains("frames: 0 of 2 copied"))
+    }
+
+    func testFrameFileThatIsALinkOrBelowALinkedFramesFolderIsNotUsed() throws {
+        let recording = scratch.appendingPathComponent("rec")
+        let frames = recording.appendingPathComponent("frames")
+        try FileManager.default.createDirectory(at: frames, withIntermediateDirectories: true)
+        let outside = scratch.appendingPathComponent("outside.jpg")
+        try Data("outside".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: frames.appendingPathComponent("link.jpg"), withDestinationURL: outside)
+        XCTAssertNil(ControlHandler.frameFile("frames/link.jpg", in: recording))
+
+        let linked = scratch.appendingPathComponent("linked")
+        let target = scratch.appendingPathComponent("target")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: target.appendingPathComponent("a.jpg"))
+        try FileManager.default.createDirectory(at: linked, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: linked.appendingPathComponent("frames"), withDestinationURL: target)
+        XCTAssertNil(ControlHandler.frameFile("frames/a.jpg", in: linked))
+
+        let viaLinkedRecording = scratch.appendingPathComponent("recording-link")
+        try FileManager.default.createSymbolicLink(at: viaLinkedRecording, withDestinationURL: recording)
+        try Data("y".utf8).write(to: frames.appendingPathComponent("b.jpg"))
+        XCTAssertEqual(ControlHandler.frameFile("frames/b.jpg", in: viaLinkedRecording)?.lastPathComponent, "b.jpg")
     }
 
     func testFramePathIsUsedOnlyInsideTheFramesFolderOfTheRecording() throws {

@@ -162,8 +162,8 @@ final class DiagnosticsLog: @unchecked Sendable {
     var snapshot: State { lock.lock(); defer { lock.unlock() }; return state }
 }
 
-/// The directory a diagnostics bundle is written to. Work that may still run after its step gave up on it writes only
-/// below `.partial/`; a file gets its place in the bundle when the step that waited for it moves it there.
+/// The directory a diagnostics bundle is written to. Files written below `.partial/` get their place in the bundle when
+/// the step that waited for them moves them there.
 struct DiagnosticsBundle: Sendable {
     static let partialName = ".partial"
 
@@ -210,8 +210,7 @@ struct DiagnosticsBundle: Sendable {
         try FileManager.default.moveItem(at: scratch, to: url)
     }
 
-    /// Renames `.partial/`, then removes it with everything in it: from the rename on, a path below `.partial/` names
-    /// no folder a file could be created in.
+    /// Renames `.partial/`, then removes it with everything in it.
     func removePartial() {
         let gone = root.appendingPathComponent("\(DiagnosticsBundle.partialName)-\(UUID().uuidString)")
         guard (try? FileManager.default.moveItem(at: partial, to: gone)) != nil else { return }
@@ -233,7 +232,7 @@ enum HelperReply: Sendable {
 /// The recording a diagnostics bundle uses.
 private enum BundleRecording {
     case running(Recording)
-    case ended(Recording, Recording.Summary)
+    case ended(LastRecording)
     /// A recording that is ending and had not ended when the wait for it ran out.
     case ending(Recording)
 }
@@ -730,9 +729,8 @@ extension ControlHandler {
     }
 
     /// The dumps written in the last `since` minutes of the guest's clock and those without a readable time, newest
-    /// first, within the dump budget. The
-    /// guest's clock is the one its listing reports, or the host's when the listing reports none. A dump is pulled only
-    /// while the size the guest reports for it at that moment fits what is left of the budget.
+    /// first, within the dump budget. The guest's clock is the one its listing reports, or the host's when the listing
+    /// reports none. A dump is pulled only while the size the guest reports for it at that moment fits what is left of the budget.
     private func collectDumps(_ t: VMTarget, since: Int, _ bundle: DiagnosticsBundle, _ log: DiagnosticsLog) async {
         let deadline = ContinuousClock.now + DiagnosticsTiming.dumps
         let base: JSON = ["name": .string(t.name)]
@@ -816,12 +814,12 @@ extension ControlHandler {
         if let active = recordings.active[vm], await active.isActive { return .running(active) }
         if let recording = recordings.active[vm] ?? recordings.retiring[vm] {
             if case .success(let summary?) = await timed(DiagnosticsTiming.recordingEnd, { await recording.ending() }) {
-                return .ended(recording, summary)
+                return .ended(LastRecording(recording, summary: summary))
             }
             return .ending(recording)
         }
-        guard let latest = recordings.latest[vm], collected.timeIntervalSince(latest.summary.ended) <= Double(since) * 60 else { return nil }
-        return .ended(latest.recording, latest.summary)
+        guard let latest = recordings.latest[vm], collected.timeIntervalSince(latest.ended) <= Double(since) * 60 else { return nil }
+        return .ended(latest)
     }
 
     private func collectRecording(_ vm: String, since: Int, collected: Date, _ bundle: DiagnosticsBundle, _ log: DiagnosticsLog) async {
@@ -829,21 +827,25 @@ extension ControlHandler {
             log.update { $0.recording = "none in the last \(since) minutes" }
             return
         }
-        let recording: Recording
+        let directory: URL
+        let video: Bool
         switch chosen {
         case .running(let r):
-            recording = r
+            directory = r.directory
+            video = r.video
             log.update { $0.recording = "\(r.directory.path) (running)" }
-        case .ended(let r, let summary):
-            recording = r
-            log.update { $0.recording = "\(r.directory.path) (ended \(ISO8601DateFormatter().string(from: summary.ended)))" }
+        case .ended(let last):
+            directory = last.directory
+            video = last.video
+            log.update { $0.recording = "\(last.directory.path) (ended \(ISO8601DateFormatter().string(from: last.ended)))" }
         case .ending(let r):
-            recording = r
+            directory = r.directory
+            video = r.video
             log.update { $0.recording = "\(r.directory.path) (ending)" }
         }
         await withTaskGroup(of: Void.self) { group in
-            group.addTask { await self.collectTrace(recording.directory, bundle, log) }
-            if recording.video { group.addTask { await self.collectVideo(chosen, bundle, log) } }
+            group.addTask { await self.collectTrace(directory, bundle, log) }
+            if video { group.addTask { await self.collectVideo(chosen, bundle, log) } }
         }
     }
 
@@ -907,13 +909,16 @@ extension ControlHandler {
     }
 
     /// The file a frame path of a trace names: `frames/<name>` below `directory`, when that file lies in the frames
-    /// folder of the recording with every link resolved; nil for any other path.
+    /// folder of the recording with every link resolved, and that folder lies directly in the resolved recording directory;
+    /// nil for any other path.
     nonisolated static func frameFile(_ reference: String, in directory: URL) -> URL? {
         let parts = reference.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 2, parts[0] == TraceWriter.framesName, !parts[1].isEmpty, parts[1] != ".", parts[1] != ".." else { return nil }
+        let root = directory.resolvingSymlinksInPath()
         let folder = directory.appendingPathComponent(TraceWriter.framesName).resolvingSymlinksInPath()
         let file = folder.appendingPathComponent(parts[1]).resolvingSymlinksInPath()
-        guard file.deletingLastPathComponent().path == folder.path, file.lastPathComponent == parts[1] else { return nil }
+        guard folder.deletingLastPathComponent().path == root.path, folder.lastPathComponent == TraceWriter.framesName,
+              file.deletingLastPathComponent().path == folder.path, file.lastPathComponent == parts[1] else { return nil }
         return file
     }
 
@@ -956,13 +961,13 @@ extension ControlHandler {
         func fail(_ sentence: String) { bundle.fail("video", stem: "video", sentence, log: log) }
         let limit = DiagnosticsTiming.video
         var left = limit
-        var ended: (recording: Recording, summary: Recording.Summary)?
+        var ended: LastRecording?
         switch chosen {
         case .ending(let recording):
             fail("the recording in \(recording.directory.path) has not ended within \(Int(DiagnosticsTiming.recordingEnd.components.seconds)) s; its video is complete there when vm.record.stop has returned")
             return
-        case .ended(let recording, let summary):
-            ended = (recording, summary)
+        case .ended(let last):
+            ended = last
         case .running(let recording):
             let directory = recording.directory
             let source = directory.appendingPathComponent("video.mp4")
@@ -982,7 +987,11 @@ extension ControlHandler {
                     do { try bundle.adopt(scratch, as: "video.mp4") } catch {
                         return fail("could not write video.mp4: \(ControlHandler.failureReason(error, fallback: "the disk write failed")); free disk space or choose another dir")
                     }
-                    log.note("video.mp4: copied while recording, up to the last second may be missing")
+                    if let error = recording.videoError {
+                        log.note("video.mp4: copied up to the point where the video writer failed (\(error))")
+                    } else {
+                        log.note("video.mp4: copied while recording, up to the last second may be missing")
+                    }
                 case .failure(let error):
                     try? FileManager.default.removeItem(at: scratch)
                     fail(diagnosticsSentence(error, step: "video", limit: limit))
@@ -995,20 +1004,27 @@ extension ControlHandler {
                 return await collectVideo(.ending(recording), bundle, log)
             }
             log.update { $0.recording = "\(directory.path) (ended \(ISO8601DateFormatter().string(from: summary.ended)))" }
-            ended = (recording, summary)
+            ended = LastRecording(recording, summary: summary)
         }
         guard let ended else { return }
-        guard let path = ended.summary.video else {
+        let source = ended.directory.appendingPathComponent("video.mp4")
+        let bytes = videoSize(source)
+        var usable = bytes > 0
+        if usable, ended.videoError != nil { usable = await VideoRecorder.isPlayable(source) }
+        guard usable else {
             return fail("the recording ended without a playable video; check lastWriteError of vm.record.stop and record again")
         }
-        let source = URL(fileURLWithPath: path)
-        let bytes = videoSize(source)
-        if let sentence = oversizedVideo(bytes, in: ended.recording.directory) { return fail(sentence) }
+        if let sentence = oversizedVideo(bytes, in: ended.directory) { return fail(sentence) }
         guard left > .zero else { return fail(diagnosticsSentence(DiagnosticsTimeout(), step: "video", limit: limit)) }
         let copied = await collectFile("video.mp4", limit: left, bundle) { scratch in
             try ControlHandler.copyStart(of: source, bytes: bytes, to: scratch)
         }
-        if case .failure(let error) = copied { fail(diagnosticsSentence(error, step: "video", limit: limit)) }
+        switch copied {
+        case .success:
+            if let error = ended.videoError { log.note("video.mp4: copied up to the point where the video writer failed (\(error))") }
+        case .failure(let error):
+            fail(diagnosticsSentence(error, step: "video", limit: limit))
+        }
     }
 
     /// Writes the first `bytes` bytes of the file at `source` to a new file at `destination`. A cancelled task stops
