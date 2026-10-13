@@ -33,6 +33,15 @@ actor Latch {
     }
 }
 
+/// Which case `state` is.
+private func kind(_ state: AgentLinkState) -> String {
+    switch state {
+    case .connected: return "connected"
+    case .connecting: return "connecting"
+    case .notConnected: return "not connected"
+    }
+}
+
 final class EventBufferTests: XCTestCase {
     private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 
@@ -310,6 +319,109 @@ final class EventBufferTests: XCTestCase {
         XCTAssertNil(afterTheDrop)
         let failedAgain = await eventually { await !link.isConnecting }
         XCTAssertTrue(failedAgain)
+    }
+
+    func testLinkStateNamesTheClientOrWhetherOneIsBeingConnected() async throws {
+        let unreachable = FakeAgent()
+        unreachable.stop()
+        let reachable = fakeAgent(caps: ["clipboard"])
+        let latch = Latch()
+        let port = LockedBox(unreachable.port)
+        let running = LockedBox(true)
+        let link = AgentLink(events: EventBuffer(), retryDelay: .milliseconds(10), isRunning: { running.value }, endpoint: {
+            await latch.pass()
+            return (port.value, nil)
+        })
+        let first = await link.state()
+        XCTAssertEqual(kind(first), "connecting")
+        var attempts = await link.warmUpCount
+        XCTAssertEqual(attempts, 1)
+        let held = await eventually { await latch.arrivals == 1 }
+        XCTAssertTrue(held)
+        let whileItRuns = await link.state()
+        XCTAssertEqual(kind(whileItRuns), "connecting")
+        attempts = await link.warmUpCount
+        XCTAssertEqual(attempts, 1)
+
+        await latch.open()
+        let failed = await eventually { kind(await link.state()) == "not connected" }
+        XCTAssertTrue(failed)
+
+        port.value = reachable.port
+        let connected = await eventually { kind(await link.state()) == "connected" }
+        XCTAssertTrue(connected)
+        guard case .connected(let client) = await link.state() else { return XCTFail("the link lost its client") }
+        let cached = await link.agent(timeout: .zero)
+        XCTAssertTrue(cached === client)
+        let connecting = await link.isConnecting
+        XCTAssertFalse(connecting)
+
+        running.value = false
+        let stopped = await link.state()
+        XCTAssertEqual(kind(stopped), "not connected")
+        let dropped = await eventually { await !client.isConnected }
+        XCTAssertTrue(dropped)
+    }
+
+    func testLinkIsNotConnectingInThePauseAfterAnAttemptThatFailedAcrossADrop() async throws {
+        let unreachable = FakeAgent()
+        unreachable.stop()
+        let latch = Latch()
+        let link = AgentLink(events: EventBuffer(), retryDelay: .seconds(600), isRunning: { true }, endpoint: {
+            await latch.pass()
+            return (unreachable.port, nil)
+        })
+        let first = await link.state()
+        XCTAssertEqual(kind(first), "connecting")
+        let held = await eventually { await latch.arrivals == 1 }
+        XCTAssertTrue(held)
+        await link.drop()
+        let inFlight = await link.isConnecting
+        XCTAssertTrue(inFlight)
+
+        await latch.open()
+        let paused = await eventually { await !link.isConnecting }
+        XCTAssertTrue(paused, "the pause after the failed attempt counts as connecting")
+        let state = await link.state()
+        XCTAssertEqual(kind(state), "not connected")
+        let attempts = await link.warmUpCount
+        XCTAssertEqual(attempts, 1)
+        let arrivals = await latch.arrivals
+        XCTAssertEqual(arrivals, 1)
+    }
+
+    func testLinkStaysConnectingWhileACallerPausesBeforeItsNextAttempt() async throws {
+        let unreachable = FakeAgent()
+        unreachable.stop()
+        let reachable = fakeAgent(caps: ["clipboard"])
+        let first = Latch(), second = Latch()
+        let calls = LockedBox(0)
+        let link = AgentLink(events: EventBuffer(), retryDelay: .milliseconds(300), isRunning: { true }, endpoint: {
+            let n = calls.value
+            calls.value = n + 1
+            await (n == 0 ? first : second).pass()
+            return (n == 0 ? unreachable.port : reachable.port, nil)
+        })
+        let pending = Task { await link.agent(timeout: .seconds(3600)) }
+        let held = await eventually { await first.arrivals == 1 }
+        XCTAssertTrue(held)
+        await link.drop()
+        await first.open()
+        var readings: [Bool] = []
+        while await second.arrivals == 0 {
+            readings.append(await link.isConnecting)
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        readings.append(await link.isConnecting)
+        XCTAssertFalse(readings.contains(false), "\(readings)")
+
+        await second.open()
+        let adopted = await pending.value
+        XCTAssertNotNil(adopted)
+        let state = await link.state()
+        XCTAssertEqual(kind(state), "connected")
+        let settled = await link.isConnecting
+        XCTAssertFalse(settled)
     }
 
     func testLinkPingsTheUIHelperOfAnAgentThatHasOne() async throws {

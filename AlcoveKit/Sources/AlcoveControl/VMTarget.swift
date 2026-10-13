@@ -31,9 +31,10 @@ public protocol VMTarget: Sendable {
     /// or the agent is not reachable within `timeout`. A zero `timeout` returns
     /// the agent only when it is already connected.
     func agent(timeout: Duration) async -> AgentClient?
-    /// Whether a connection to the guest agent is being made and no attempt has failed since an agent was last
-    /// connected or the VM last stopped.
-    func isConnectingAgent() async -> Bool
+    /// The agent connection as it is at one moment, without waiting: the connected agent, or whether one is being
+    /// connected. Without a connected agent one connection attempt is started in the background, as by
+    /// `agent(timeout: .zero)`.
+    func agentLink() async -> AgentLinkState
     /// The guest events with a sequence number above `seq`, oldest first, the sequence
     /// number of the newest event and that of the oldest one still kept. The events
     /// outlive the agent connection.
@@ -51,6 +52,18 @@ public protocol VMTarget: Sendable {
     func engineInstance() async -> Int
     /// The host port forwarded to the guest agent.
     func agentHostPort() async -> Int
+}
+
+/// What a VM's agent connection is at one moment.
+public enum AgentLinkState: Sendable {
+    /// The agent is connected.
+    case connected(AgentClient)
+    /// No agent is connected. A connection attempt is running or about to start, and none has failed since an agent
+    /// was last connected or the VM last stopped.
+    case connecting
+    /// No agent is connected, and no attempt is running or about to start, or one has failed since an agent was
+    /// last connected or the VM last stopped.
+    case notConnected
 }
 
 /// Why a frame could not be produced.
@@ -91,13 +104,16 @@ actor AgentLink {
     private(set) var warmUpCount = 0
     /// The `ui.ping` sent after the latest adoption of a client with the `ui` capability.
     private(set) var helperStart: Task<Void, Never>?
-    /// Connection attempts in flight.
+    /// Connection attempts that are running or about to start. An attempt is counted from the moment it is certain
+    /// to be made until its client is adopted or given up, or it failed; the pause after a failed attempt counts
+    /// only when the caller's deadline leaves room for another attempt.
     private var attempts = 0
-    /// Whether the latest attempt that ended failed; false once a client was adopted or dropped.
+    /// Whether the latest attempt that ended failed; false once an attempt connected or the client was dropped.
     private var lastAttemptFailed = false
 
-    /// Whether a connection is being made and no attempt has failed since a client was last adopted or dropped.
-    var isConnecting: Bool { (attempts > 0 || warmUp != nil) && !lastAttemptFailed }
+    /// Whether an attempt is counted in `attempts` and none has failed since an attempt last connected or the client
+    /// was last dropped.
+    var isConnecting: Bool { attempts > 0 && !lastAttemptFailed }
 
     /// `isRunning` says whether the VM runs; `endpoint` gives the forwarded agent port and the token the agent must present.
     init(events: EventBuffer, retryDelay: Duration = .seconds(1), isRunning: @escaping @Sendable () async -> Bool,
@@ -120,34 +136,60 @@ actor AgentLink {
             startWarmUp()
             return nil
         }
-        let deadline = ContinuousClock.now + timeout
-        repeat {
+        attempts += 1
+        return await connect(until: .now + timeout)
+    }
+
+    /// The connected client, or whether one is being connected, read at one moment: the client and the counters are
+    /// looked at without a suspension in between. Without a client it starts one connection attempt in the
+    /// background, which already counts.
+    func state() async -> AgentLinkState {
+        guard await isRunning() else {
+            await drop()
+            return .notConnected
+        }
+        if let current = await connected() { return .connected(current) }
+        startWarmUp()
+        return isConnecting ? .connecting : .notConnected
+    }
+
+    /// Makes connection attempts until one is adopted, another caller's client is connected, or an attempt ended
+    /// with no room for a further one before `deadline`. A failed attempt is followed by a pause of `retryDelay`.
+    /// The caller has counted the first attempt in `attempts`; the count is kept while a further attempt follows
+    /// and is given back when none does, in the same step that adopts a client.
+    private func connect(until deadline: ContinuousClock.Instant) async -> AgentClient? {
+        while true {
             let begun = generation
-            attempts += 1
             let target = await endpoint()
             let candidate = AgentClient()
             do {
                 try await candidate.connect(port: target.port, expectedToken: target.token, timeout: .seconds(5))
-                attempts -= 1
             } catch {
-                attempts -= 1
                 if begun == generation { lastAttemptFailed = true }
+                let again = ContinuousClock.now + retryDelay < deadline
+                if !again { attempts -= 1 }
                 try? await Task.sleep(for: retryDelay)
-                continue
+                if again { continue }
+                return nil
             }
+            if begun == generation { lastAttemptFailed = false }
             let hasUI = await candidate.hello?.capabilities.contains("ui") ?? false
             if let current = await connected() {
+                attempts -= 1
                 await candidate.disconnect()
                 return current
             }
             guard begun == generation else {
+                let again = ContinuousClock.now < deadline
+                if !again { attempts -= 1 }
                 await candidate.disconnect()
-                continue
+                if again { continue }
+                return nil
             }
+            attempts -= 1
             adopt(candidate, startsHelper: hasUI)
             return candidate
-        } while ContinuousClock.now < deadline
-        return nil
+        }
     }
 
     /// Forgets the client and ends its event feed, then disconnects it.
@@ -184,13 +226,29 @@ actor AgentLink {
         helperStart = startsHelper ? Task { _ = try? await candidate.call("ui.ping", [:], timeout: UITiming.callTimeout) } : nil
     }
 
+    /// Starts the warm-up unless one is running, and counts its attempt in `attempts`.
     private func startWarmUp() {
         guard warmUp == nil else { return }
         warmUpCount += 1
+        attempts += 1
         warmUp = Task {
-            _ = await self.agent(timeout: .milliseconds(1))
+            await self.warm()
             self.warmUp = nil
         }
+    }
+
+    /// One connection attempt, already counted in `attempts`, when the VM runs and no client is connected.
+    private func warm() async {
+        guard await isRunning() else {
+            attempts -= 1
+            await drop()
+            return
+        }
+        guard await connected() == nil else {
+            attempts -= 1
+            return
+        }
+        _ = await connect(until: .now)
     }
 }
 
@@ -270,5 +328,5 @@ public actor ControllerTarget: VMTarget {
     }
 
     public func agent(timeout: Duration) async -> AgentClient? { await link.agent(timeout: timeout) }
-    public func isConnectingAgent() async -> Bool { await link.isConnecting }
+    public func agentLink() async -> AgentLinkState { await link.state() }
 }

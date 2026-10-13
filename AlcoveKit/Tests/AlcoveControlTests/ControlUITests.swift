@@ -1526,6 +1526,32 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(calls[before.0].timeout, .zero)
     }
 
+    func testObservationTakesItsAgentAndItsSentenceFromOneReadingOfTheLink() async throws {
+        let (h, t, agent) = try await rig(["ui.focused": { _, _ in .ok(["node": messageEdit, "window": fixtureWindow]) },
+                                            "ui.tree": { _, _ in .ok(["window": fixtureWindow, "nodes": [sendButton]]) }])
+        let ui: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "ui", "settleMs": 20]
+        let set = await t.agentClient
+        let client = try XCTUnwrap(set)
+
+        await t.setAgent(nil)
+        await t.setLinkState(.connected(client))
+        let connected = try await h.handle(op: "vm.mouse.click", params: ui)
+        XCTAssertNil(connected["observation"]?["uiError"])
+        XCTAssertEqual(connected["observation"]?["foreground"], "Alcove Fixture")
+        XCTAssertEqual(connected["observation"]?["tree"]?.stringValue, UITreeText.render([sendButton]))
+
+        await t.setAgent(client)
+        let sentBefore = requestOps(agent).count
+        await t.setLinkState(.connecting)
+        let connecting = try await h.handle(op: "vm.mouse.click", params: ui)
+        XCTAssertEqual(connecting["observation"]?["uiError"]?.stringValue, "the guest tools are not connected yet; the next observation will carry the UI facts")
+        await t.setLinkState(.notConnected)
+        let notConnected = try await h.handle(op: "vm.mouse.click", params: ui)
+        XCTAssertEqual(notConnected["observation"]?["uiError"]?.stringValue, "the guest tools are not connected; UI facts need alcove-agent running in the guest")
+        XCTAssertNil(notConnected["observation"]?["foreground"])
+        XCTAssertEqual(requestOps(agent).count, sentBefore)
+    }
+
     func testAnOpLooksItsVMUpOnce() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
         let registry = CountingRegistry(t)

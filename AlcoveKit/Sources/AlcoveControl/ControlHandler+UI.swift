@@ -668,15 +668,21 @@ extension ControlHandler {
     /// Adds the foreground window title, the focused element, the events since the VM's previous observation and,
     /// at level `ui`, the tree of the foreground window. Needs a connected agent with the `ui` capability; without one
     /// only level `ui` says so in `uiError`: the agent is being connected, is not connected, or has no UI Automation.
+    /// The agent and that sentence come from one reading of the VM's agent connection.
     /// The helper calls share one budget counted from the start: `UITiming.factBudget`, or `UITiming.treeFactBudget`
     /// at level `ui`; what did not arrive within it is left out and `uiError` says the helper is busy. With
     /// `helperTaken` no helper call is made and `uiError` says the same at once.
     func addUIFacts(to observation: inout ScreenObservation, _ t: VMTarget, level: ObserveLevel, helperTaken: Bool = false) async {
         let end = ContinuousClock.now + (level == .ui ? UITiming.treeFactBudget : UITiming.factBudget)
-        guard let agent = await t.agent(timeout: .zero) else {
-            if level == .ui {
-                observation.uiError = await t.isConnectingAgent() ? ControlHandler.agentNotConnectedYet : ControlHandler.agentNotConnected
-            }
+        let agent: AgentClient
+        switch await t.agentLink() {
+        case .connected(let client):
+            agent = client
+        case .connecting:
+            if level == .ui { observation.uiError = ControlHandler.agentNotConnectedYet }
+            return
+        case .notConnected:
+            if level == .ui { observation.uiError = ControlHandler.agentNotConnected }
             return
         }
         guard let hello = await agent.hello, hello.rpcVersion >= 2, hello.capabilities.contains("ui") else {

@@ -128,10 +128,19 @@ actor FakeTarget: VMTarget {
     func setMonitorReplies(_ r: [String]) { monitorReplies = r }
     func setForwards(_ f: [VMConfig.PortForward]) { forwards = f }
     func setRestoreHook(_ h: (@Sendable (FakeTarget) async -> Void)?) { restoreHook = h }
-    /// What `isConnectingAgent()` answers.
+    /// Whether `agentLink()` answers `connecting` when no agent is set.
     var connectingAgent = false
-    func isConnectingAgent() async -> Bool { connectingAgent }
     func setConnectingAgent(_ value: Bool) { connectingAgent = value }
+    /// What `agentLink()` answers when set, whatever agent is set.
+    var linkState: AgentLinkState?
+    func setLinkState(_ value: AgentLinkState?) { linkState = value }
+    /// Counted in `agentCalls` as a call without a timeout.
+    func agentLink() async -> AgentLinkState {
+        agentCalls.append((.zero, sent.count))
+        if let linkState { return linkState }
+        if let agentClient { return .connected(agentClient) }
+        return connectingAgent ? .connecting : .notConnected
+    }
     func setAgent(_ a: AgentClient?) {
         agentClient = a
         eventFeed?.cancel()
