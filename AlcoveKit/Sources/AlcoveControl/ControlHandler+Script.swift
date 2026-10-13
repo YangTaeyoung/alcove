@@ -71,20 +71,31 @@ extension ControlHandler {
 
         var assembly = ScriptBuilder.Assembly(from: from, to: to)
         var skipped = 0
+        var skippedWarnings: [String] = []
+        var latestSeq = 0
+        func skip(line number: Int, reason: String) {
+            skipped += 1
+            let next = latestSeq + 1
+            if (from.map { next >= $0 } ?? true) && (to.map { next <= $0 } ?? true) {
+                skippedWarnings.append("trace line \(number) was skipped (\(reason)); a step may be missing")
+            }
+        }
         do {
-            skipped += try TraceReader.lines(at: tracePath, limit: ScriptLimits.traceLineBytes) { line in
+            try TraceReader.numberedLines(at: tracePath, limit: ScriptLimits.traceLineBytes, { line, number in
                 guard line.contains(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0D }) else { return }
-                guard let entry = try? JSON.parse(line), entry.objectValue != nil, entry["seq"]?.intValue != nil,
+                guard let entry = try? JSON.parse(line), entry.objectValue != nil, let seq = entry["seq"]?.intValue,
                       entry["op"]?.stringValue != nil else {
-                    skipped += 1
+                    skip(line: number, reason: "it is not a trace line")
                     return
                 }
+                latestSeq = seq
                 assembly.add(entry)
-            }
+            }, tooLong: { skip(line: $0, reason: "it is longer than \(ScriptLimits.traceLineBytes) bytes") })
         } catch {
             throw ControlError.failed("cannot read the trace '\(tracePath)'; check that the file is readable")
         }
         var draft = assembly.draft(vm: vm ?? assembly.recordedVM ?? "")
+        draft.warnings += skippedWarnings
         if draft.script.vm?.isEmpty == true { draft.script.vm = nil }
         guard !draft.script.steps.isEmpty else {
             guard from != nil || to != nil else {

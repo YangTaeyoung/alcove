@@ -18,7 +18,7 @@ enum UITiming {
     /// question is sent.
     nonisolated(unsafe) static var targetBudget = Duration.milliseconds(300)
     /// The time limit a question about the element an action is aimed at gives the UI helper, in milliseconds.
-    static let targetHelperBudgetMs = 250
+    static let targetHelperBudgetMs = 200
     /// Returns when a budget for UI facts, which ends at the given moment, has run out.
     nonisolated(unsafe) static var factBudgetEnd: @Sendable (ContinuousClock.Instant) async -> Void = {
         try? await Task.sleep(until: $0, clock: .continuous)

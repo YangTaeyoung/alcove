@@ -48,8 +48,13 @@ enum ScriptBuilder {
     /// - The `text` of a `vm.ui.type` and the `value` of a `vm.ui.action` whose `target` or result node is a password
     ///   element, and the `text` of a `vm.type` when the latest entry that says what it was aimed at was aimed at a
     ///   password element, become a variable each: `password`, `password2`, and so on. Such a `vm.type` step is not merged.
+    /// A `vm.key.press`, `vm.key.down` or `vm.key.up` whose keys the trace masks is left out.
     /// No variable has a default. The warnings hold a sentence for every entry left out, every selector that lost its
-    /// window, every variable and every step that names a job id or a pid.
+    /// window, every variable, every step that names a job id or a pid, every step whose selector carries an `index`, and
+    /// every window part that stands for a longer title.
+    /// A window title is replaced by its stable part only when no other title in the entries `from...to` show contains that
+    /// part; this holds for `selector.window`, `altSelector.window`, the foreground expectation and the title that replaces
+    /// a window id in `vm.window.action`.
     /// Every step has the label `<op> <what it acts on>`; the label of a `vm.type` step whose text is a variable does
     /// not show it.
     static func draft(trace: [JSON], vm: String, from: Int?, to: Int?) -> Draft {
@@ -67,6 +72,8 @@ enum ScriptBuilder {
         private var warnings: [String] = []
         private var required: [String] = []
         private var foreground: String?
+        /// Every window title the entries in range show.
+        private var titles: Set<String> = []
         /// Whether the latest entry that says what it was aimed at was aimed at a password element.
         private var passwordAimed = false
         /// The variable each masked env key is read from.
@@ -84,14 +91,59 @@ enum ScriptBuilder {
 
         /// The draft of the entries added so far, as a script for the VM `vm`.
         func draft(vm: String) -> Draft {
-            let steps = pending.map { item -> Script.Step in
+            var warnings = self.warnings
+            var namedParts: Set<String> = []
+            var steps: [Script.Step] = []
+            for (offset, item) in pending.enumerated() {
                 var step = item.step
                 if let text = item.text { step.params["text"] = .string(Script.escape(text)) }
                 if let secret = item.secret { step.params[secret.param] = .string("${\(secret.variable)}") }
+                for use in item.windows {
+                    let name = windowName(use.title, onlyTitleParts: use.place != .expectation)
+                    let escaped = JSON.string(Script.escape(name))
+                    switch use.place {
+                    case .selector, .altSelector:
+                        let key = use.place == .selector ? "selector" : "altSelector"
+                        if var fields = step.params[key]?.objectValue {
+                            fields["window"] = escaped
+                            step.params[key] = .object(fields)
+                        }
+                    case .expectation:
+                        step.expect = [["type": "window_title", "contains": escaped]]
+                    case .windowParam:
+                        step.params["window"] = escaped
+                    }
+                    if name != use.title, namedParts.insert(name).inserted {
+                        warnings.append("steps name the window \"\(name)\" by a part of its title \"\(use.title)\"; another window whose title contains \"\(name)\" would be used instead")
+                    }
+                }
                 step.label = label(item)
-                return step
+                if let position = item.positions.first {
+                    warnings.append("step \(offset + 1) (\(step.label ?? step.op)) selects number \(position.index + 1) of \(position.matches) elements that look the same; it replays whatever is at that position")
+                }
+                steps.append(step)
             }
             return Draft(script: Script(vm: vm, variables: [:], steps: steps), warnings: warnings, sources: pending.map(\.seq), required: required)
+        }
+
+        /// What a script names the window titled `title` by: the stable part of the title when no other title the
+        /// entries show contains that part (compared as the agent compares, ignoring case), the whole title otherwise.
+        /// `onlyTitleParts` makes a part that does not read as a title part give way to the whole title.
+        private func windowName(_ title: String, onlyTitleParts: Bool) -> String {
+            let part = ScriptBuilder.stablePart(ofTitle: title)
+            guard part != title, !onlyTitleParts || ScriptBuilder.isTitlePart(part),
+                  !titles.contains(where: { $0 != title && $0.range(of: part, options: .caseInsensitive) != nil }) else { return title }
+            return part
+        }
+
+        /// Notes the window titles `entry` shows.
+        private mutating func collectTitles(_ entry: JSON) {
+            func add(_ title: JSON?) { if let text = title?.stringValue, !text.isEmpty { titles.insert(text) } }
+            add(entry["target"]?["window"])
+            add(entry["result"]?["observation"]?["foreground"])
+            guard let op = entry["op"]?.stringValue, ["vm.window.list", "vm.app.launch", "vm.deploy", "vm.window.action"].contains(op) else { return }
+            add(entry["result"]?["window"]?["title"])
+            for window in entry["result"]?["windows"]?.arrayValue ?? [] { add(window["title"]) }
         }
 
         /// A variable no step reads yet, which becomes one of `required`: `preferred`, or `preferred` followed by the
@@ -148,10 +200,11 @@ enum ScriptBuilder {
         mutating func add(_ entry: JSON) {
             guard let seq = entry["seq"]?.intValue, let op = entry["op"]?.stringValue else { return }
             if recordedVM == nil, let name = entry["params"]?["name"]?.stringValue, !name.isEmpty { recordedVM = name }
+            if (from.map { seq >= $0 } ?? true) && (to.map { seq <= $0 } ?? true) { collectTitles(entry) }
             guard entry["ok"]?.boolValue == true else { return }
             if let to, seq > to { return }
             let shown = shownForeground(entry)
-            defer { if let shown { foreground = shown } }
+            defer { if let shown { foreground = ScriptBuilder.stablePart(ofTitle: shown) } }
             if let from, seq < from { return }
             if let role = entry["script"], role != .null, role.stringValue != ScriptCall.step.rawValue { return }
             guard Script.allows(op: op), ControlHandler.knownOps.contains(op),
@@ -194,6 +247,7 @@ enum ScriptBuilder {
                     item.step.params["y"] = nil
                     item.step.params["selector"] = .object(found.selector)
                     if let other = found.alt { item.step.params["altSelector"] = .object(other) }
+                    item.useSelectors(found)
                     item.step.params["fallback"] = ["x": .int(Int64(x)), "y": .int(Int64(y))]
                 }
             case "vm.ui.click", "vm.ui.type", "vm.ui.action":
@@ -213,6 +267,7 @@ enum ScriptBuilder {
                 if let found = selectors(for: facts) {
                     item.step.params["selector"] = .object(found.selector)
                     if let other = found.alt { item.step.params["altSelector"] = .object(other) }
+                    item.useSelectors(found)
                 } else if op == "vm.ui.click", let x = entry["result"]?["x"]?.intValue, let y = entry["result"]?["y"]?.intValue {
                     item.step.op = "vm.mouse.click"
                     item.step.params["x"] = .int(Int64(x))
@@ -228,6 +283,14 @@ enum ScriptBuilder {
                         return
                     }
                     item.step.params["window"] = .string(title)
+                    item.windows.append(WindowUse(place: .windowParam, title: title))
+                }
+            case "vm.key.press", "vm.key.down", "vm.key.up":
+                if let param = ControlHandler.keyParam(op: op), params[param] == .string(TraceSanitizer.mask) {
+                    let warning = "step \(pending.count + 1) pressed keys in a password field; type the password with vm.type and a variable instead"
+                    if warnings.last != warning { warnings.append(warning) }
+                    leftOut = true
+                    return
                 }
             case "vm.type":
                 if let facts = entry["target"] { passwordAimed = facts["password"]?.boolValue == true }
@@ -252,13 +315,15 @@ enum ScriptBuilder {
             }
             item.subject = subject(of: item.step, element: item.element)
             item.step.params = prepared(item.step.params, inEnv: false, line: line)
-            if let shown, let previous = foreground, shown != previous {
-                item.step.expect = [["type": "window_title", "contains": .string(Script.escape(shown))]]
+            if let shown, let previous = foreground, ScriptBuilder.stablePart(ofTitle: shown) != previous {
+                item.step.expect = [["type": "window_title", "contains": .string(Script.escape(ScriptBuilder.stablePart(ofTitle: shown)))]]
+                item.windows.append(WindowUse(place: .expectation, title: shown))
             }
             if !leftOut, let text = item.text, let last = pending.last, let before = last.text, last.step.op == "vm.type", last.step.expect.isEmpty,
                last.step.params.filter({ $0.key != "text" }) == item.step.params.filter({ $0.key != "text" }) {
                 pending[pending.count - 1].text = before + text
                 pending[pending.count - 1].step.expect = item.step.expect
+                pending[pending.count - 1].windows += item.windows
                 return
             }
             leftOut = false
@@ -300,21 +365,37 @@ enum ScriptBuilder {
     /// `name` when the line has one and `byName` counted its matches. `alt` is the selector by `name` when `selector`
     /// is the one by `automationId` and both exist. Nil without a role, without a window title that reads as a
     /// title part, and when neither selector exists.
-    static func selectors(for facts: JSON?) -> (selector: [String: JSON], alt: [String: JSON]?)? {
+    static func selectors(for facts: JSON?) -> Selectors? {
         guard let facts, let role = whole(facts, "role"), let title = whole(facts, "window") else { return nil }
         let window = [stablePart(ofTitle: title), title].first(where: isTitlePart)
         guard let window else { return nil }
-        func selector(_ field: String, countedBy count: String) -> [String: JSON]? {
+        func selector(_ field: String, countedBy count: String) -> (fields: [String: JSON], position: Position?)? {
             guard let value = whole(facts, field), let matches = facts[count]?["matches"]?.intValue, let index = facts[count]?["index"]?.intValue,
                   matches >= 1, (0..<matches).contains(index) else { return nil }
             var fields: [String: JSON] = ["window": .string(window), "role": .string(role), field: .string(value)]
             if matches > 1 { fields["index"] = .int(Int64(index)) }
-            return fields
+            return (fields, matches > 1 ? Position(index: index, matches: matches) : nil)
         }
         let byID = selector("automationId", countedBy: "byAutomationId")
         let byName = selector("name", countedBy: "byName")
         guard let first = byID ?? byName else { return nil }
-        return (first, byID == nil ? nil : byName)
+        let alt = byID == nil ? nil : byName
+        return Selectors(selector: first.fields, alt: alt?.fields, title: title, positions: [first.position, alt?.position].compactMap { $0 })
+    }
+
+    /// The place of an element among the `matches` elements that look the same.
+    struct Position: Equatable {
+        var index: Int
+        var matches: Int
+    }
+
+    /// What `selectors(for:)` finds: the selector, the alternative selector, the full title of the window the selectors
+    /// name by a part of it, and the position of the element for each selector that carries an `index`.
+    struct Selectors {
+        var selector: [String: JSON]
+        var alt: [String: JSON]?
+        var title: String
+        var positions: [Position]
     }
 
     // MARK: - parts of a step
@@ -332,13 +413,30 @@ enum ScriptBuilder {
         var element: String?
         /// What the label names after the op.
         var subject: String?
+        /// The window titles the step names, which `draft(vm:)` replaces by the name each gets.
+        var windows: [WindowUse] = []
+        /// The positions of the element among equal ones, for the selectors that carry an `index`.
+        var positions: [Position] = []
+
+        mutating func useSelectors(_ found: Selectors) {
+            windows.append(WindowUse(place: .selector, title: found.title))
+            if found.alt != nil { windows.append(WindowUse(place: .altSelector, title: found.title)) }
+            positions += found.positions
+        }
+    }
+
+    /// A place in a step that names a window by its title.
+    private struct WindowUse {
+        enum Place { case selector, altSelector, expectation, windowParam }
+        var place: Place
+        var title: String
     }
 
     /// Whether the agent reads `window` as a window id.
     private static func isWindowID(_ window: String) -> Bool { window.lowercased().hasPrefix("0x") }
 
     /// Whether the agent reads `window` as a part of a title: it is neither a window id nor the word `foreground`.
-    private static func isTitlePart(_ window: String) -> Bool { !isWindowID(window) && window != "foreground" }
+    static func isTitlePart(_ window: String) -> Bool { !isWindowID(window) && window != "foreground" }
 
     /// What `params` of `op` name that only the recorded session has: the `job id` of `vm.exec.write`, `vm.exec.kill`
     /// or a wait condition, the `pid` of `vm.process.kill` or a wait condition; nil without one.
@@ -355,12 +453,12 @@ enum ScriptBuilder {
         }
     }
 
-    /// The stable part of the foreground window title in the observation of `entry`; nil without a title, for an
-    /// empty one and for one the trace cut.
+    /// The foreground window title in the observation of `entry`; nil without a title, for an empty one and for one
+    /// the trace cut.
     private static func shownForeground(_ entry: JSON) -> String? {
         guard let observation = entry["result"]?["observation"], let title = observation["foreground"]?.stringValue, !title.isEmpty,
               observation["foregroundTruncated"]?.boolValue != true else { return nil }
-        return stablePart(ofTitle: title)
+        return title
     }
 
     /// What separates the parts of a window title.

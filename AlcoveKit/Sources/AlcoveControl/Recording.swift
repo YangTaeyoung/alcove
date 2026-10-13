@@ -192,6 +192,11 @@ actor Recording {
         if isActive, clock() >= deadline { _ = await stop() }
     }
 
+    /// Whether the latest action that said what it was aimed at was aimed at a password element.
+    private(set) var aimedAtPassword = false
+
+    func noteAim(password: Bool) { aimedAtPassword = password }
+
     var opCount: Int { lineCount }
     var writeErrorCount: Int { writeErrors }
     var latestWriteError: String? { lastWriteError }

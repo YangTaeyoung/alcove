@@ -206,6 +206,7 @@ struct ScriptRunner: Sendable {
             if let label = step.label { entry["label"] = .string(label) }
             if run.usedAltSelector { entry["usedAltSelector"] = true }
             if run.usedFallback { entry["usedFallback"] = true }
+            if run.positional { entry["positional"] = true }
             switch outcome {
             case .success: entry["ok"] = true
             case .failure(let error):
@@ -275,6 +276,8 @@ struct ScriptRunner: Sendable {
         var usedAltSelector = false
         /// Whether the step went on to the click at its `fallback` coordinates.
         var usedFallback = false
+        /// Whether a selector the step ran with carries an `index`.
+        var positional = false
     }
 
     /// Runs one step: its op, then each expectation with the time left of the step's timeout, counted from the op's end.
@@ -289,11 +292,14 @@ struct ScriptRunner: Sendable {
         if step.op == "vm.ui.click", let point = params.removeValue(forKey: "fallback"), point != .null { fallback = point }
         var alt: JSON?
         if let other = params.removeValue(forKey: "altSelector"), other != .null, (params["selector"] ?? .null) != .null { alt = other }
+        func hasIndex(_ selector: JSON?) -> Bool { (selector?["index"] ?? .null) != .null }
+        run.positional = hasIndex(params["selector"])
         var acted: Result<JSON, Error>
         do { acted = .success(try await call(.step, step.op, base(vm, token, params))) } catch { acted = .failure(error) }
         if case .failure(let first) = acted, let alt, ScriptRunner.matchedNothing(first) {
             run.usedAltSelector = true
             params["selector"] = alt
+            run.positional = run.positional || hasIndex(alt)
             do {
                 acted = .success(try await call(.step, step.op, base(vm, token, params)))
             } catch is CancellationError {
