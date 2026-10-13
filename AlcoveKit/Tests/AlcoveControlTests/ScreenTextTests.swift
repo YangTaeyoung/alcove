@@ -179,7 +179,7 @@ final class ScreenTextTests: XCTestCase {
         let calls = LockedBox(0)
         WaitTiming.recognizer = { _, _ in
             calls.value += 1
-            if calls.value == 1 { throw ControlHandler.ControlError.failed("text recognition failed: transient") }
+            if calls.value == 1 { throw ControlHandler.ControlError.recognitionFailed("transient") }
             return [TextMatch(text: "Send", rect: Frame.Rect(x: 1, y: 2, w: 30, h: 10), confidence: 1)]
         }
         addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
@@ -193,7 +193,7 @@ final class ScreenTextTests: XCTestCase {
         let calls = LockedBox(0)
         WaitTiming.recognizer = { _, _ in
             calls.value += 1
-            throw ControlHandler.ControlError.failed("text recognition failed: transient")
+            throw ControlHandler.ControlError.recognitionFailed("transient")
         }
         addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
         let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
@@ -204,6 +204,40 @@ final class ScreenTextTests: XCTestCase {
             XCTAssertEqual(e.description, "text recognition failed twice; call vm.find_text again or use vm.screenshot")
         }
         XCTAssertEqual(calls.value, 2)
+    }
+
+    func testFindTextReportsAnUnsupportedLanguageAtOnce() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            return []
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
+        do {
+            _ = try await h.handle(op: "vm.find_text", params: ["name": "Win", "languages": ["xx-XX"]])
+            XCTFail("expected an error")
+        } catch let e as ControlHandler.ControlError {
+            XCTAssertTrue(e.description.hasPrefix("language 'xx-XX' is not supported; supported: "), e.description)
+        }
+        XCTAssertLessThanOrEqual(calls.value, 1)
+    }
+
+    func testFindTextDoesNotRetryAFailureThatIsNotARecognitionFailure() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            throw ControlHandler.ControlError.failed("the frame cannot be read for text recognition")
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
+        do {
+            _ = try await h.handle(op: "vm.find_text", params: ["name": "Win"])
+            XCTFail("expected an error")
+        } catch let e as ControlHandler.ControlError {
+            XCTAssertEqual(e.description, "the frame cannot be read for text recognition")
+        }
+        XCTAssertEqual(calls.value, 1)
     }
 
     func testFindTextIsReadOnlyAndConcurrent() {

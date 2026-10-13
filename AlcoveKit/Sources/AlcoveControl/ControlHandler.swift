@@ -24,6 +24,7 @@ public actor ControlHandler {
         case untypable(String)
         case oneOf(String, String)
         case toolsTooOld(vm: String, op: String)
+        case recognitionFailed(String)
         case failed(String)
 
         public var description: String {
@@ -38,6 +39,7 @@ public actor ControlHandler {
             case .untypable(let s): return "cannot type \(s) with the US keyboard layout; use vm.clipboard.set + ctrl+v or connect guest tools"
             case .oneOf(let a, let b): return "missing parameter; pass '\(a)' or '\(b)'"
             case .toolsTooOld(let vm, let op): return "guest tools in '\(vm)' are too old for \(op); update alcove-agent in the guest"
+            case .recognitionFailed(let m): return "text recognition failed: \(m)"
             case .failed(let m): return m
             }
         }
@@ -350,15 +352,16 @@ public actor ControlHandler {
         }
         let cropped = area == frame.bounds ? frame : frame.crop(area)
         let chosen = languages
+        try ScreenText.validate(languages: chosen)
         let recognizer = WaitTiming.recognizer
         let lines: [TextMatch]
         do {
             lines = try await Task.detached { try recognizer(cropped, chosen) }.value
-        } catch {
+        } catch ControlError.recognitionFailed {
             try await Task.sleep(for: .milliseconds(150))
             do {
                 lines = try await Task.detached { try recognizer(cropped, chosen) }.value
-            } catch {
+            } catch ControlError.recognitionFailed {
                 throw ControlError.failed("text recognition failed twice; call vm.find_text again or use vm.screenshot")
             }
         }

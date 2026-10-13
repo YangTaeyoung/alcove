@@ -17,15 +17,20 @@ enum ScreenText {
     static let upscaleBelowWidth = 400
     static let upscaleFactor = 2
 
+    /// Throws when Vision does not support one of `languages`.
+    static func validate(languages: [String]) throws {
+        let supported = try VNRecognizeTextRequest().supportedRecognitionLanguages()
+        for language in languages where !supported.contains(language) {
+            throw ControlHandler.ControlError.failed("language '\(language)' is not supported; supported: \(supported.joined(separator: ", "))")
+        }
+    }
+
     /// Recognized lines in reading order with rectangles in the coordinates of `frame` (top-left origin).
     static func recognize(_ frame: Frame, languages: [String]) throws -> [TextMatch] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
-        let supported = try request.supportedRecognitionLanguages()
-        for language in languages where !supported.contains(language) {
-            throw ControlHandler.ControlError.failed("language '\(language)' is not supported; supported: \(supported.joined(separator: ", "))")
-        }
+        try validate(languages: languages)
         request.recognitionLanguages = languages
 
         guard var image = frame.cgImage() else { throw ControlHandler.ControlError.failed("the frame cannot be read for text recognition") }
@@ -36,7 +41,7 @@ enum ScreenText {
             image = enlarged
         }
         do { try VNImageRequestHandler(cgImage: image, options: [:]).perform([request]) }
-        catch { throw ControlHandler.ControlError.failed("text recognition failed: \(error.localizedDescription)") }
+        catch { throw ControlHandler.ControlError.recognitionFailed(error.localizedDescription) }
 
         let width = Double(image.width), height = Double(image.height), scale = Double(factor)
         var lines: [TextMatch] = []

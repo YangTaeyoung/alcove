@@ -185,7 +185,8 @@ run; steps before it keep their effect.
   recognized line.
 - `region` is as for `vm.screenshot`.
 - `languages` is a non-empty array of recognition languages, default
-  `["ko-KR", "en-US"]`; an unsupported one answers
+  `["ko-KR", "en-US"]`; an unsupported one is refused before any
+  recognition and answers
   `language '<l>' is not supported; supported: ...`.
 - The result is `{matches, lines}`. `matches` lists the matching lines in
   reading order (top to bottom, then left to right) as `{text, x, y, w, h, cx,
@@ -193,9 +194,11 @@ run; steps before it keep their effect.
   (`cx`, `cy`, the point to click) and a confidence from 0 to 1 with two
   decimals. `lines` is the number of lines recognized in the area before the
   filter. Frames narrower than 400 pixels are enlarged twofold for recognition.
-- When recognition throws, the op waits 150 ms and tries once more on the same
-  frame; a second failure answers `text recognition failed twice; call
-  vm.find_text again or use vm.screenshot`.
+- When the Vision request itself fails (`text recognition failed: <reason>`),
+  the op waits 150 ms and tries once more on the same frame; a second failure
+  answers `text recognition failed twice; call vm.find_text again or use
+  vm.screenshot`. Other errors, such as an unsupported language or a frame that
+  cannot be read, answer at once without a retry.
 
 ## Waiting for conditions
 

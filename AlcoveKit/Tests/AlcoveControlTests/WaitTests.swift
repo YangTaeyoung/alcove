@@ -450,7 +450,7 @@ final class WaitTests: XCTestCase {
         let calls = LockedBox(0)
         WaitTiming.recognizer = { frame, languages in
             calls.value += 1
-            if calls.value <= 3 { throw ControlHandler.ControlError.failed("text recognition failed: transient") }
+            if calls.value <= 3 { throw ControlHandler.ControlError.recognitionFailed("transient") }
             return try ScreenText.recognize(frame, languages: languages)
         }
         let drawn = drawText([("Install complete", 100, 120)])
