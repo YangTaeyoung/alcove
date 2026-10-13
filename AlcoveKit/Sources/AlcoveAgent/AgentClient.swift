@@ -30,9 +30,17 @@ public actor AgentClient {
         case disconnected
     }
 
+    /// What the transport delivers: a line, or the end of the connection.
+    private enum Inbound: Sendable {
+        case line(Data)
+        case end(String)
+    }
+
     public nonisolated let events: AsyncStream<Event>
     private let eventContinuation: AsyncStream<Event>.Continuation
     private var transport: TCPLineTransport?
+    /// Handles the transport's lines and its end one at a time in the order they arrived.
+    private var readerTask: Task<Void, Never>?
     private var helloWaiter: CheckedContinuation<JSON, Error>?
     private var pendingCalls: [Int: CheckedContinuation<JSON, Error>] = [:]
     private var nextCallID = 1
@@ -46,23 +54,33 @@ public actor AgentClient {
         eventContinuation = c
     }
 
+    deinit {
+        readerTask?.cancel()
+    }
+
     /// Connect to `127.0.0.1:port`, wait for `hello`, check the token (when
     /// `expectedToken` is non-nil) and answer `welcome`.
     public func connect(port: Int, expectedToken: String?, timeout: Duration = .seconds(10)) async throws {
         guard transport == nil else { return }
+        let (inbound, feed) = AsyncStream<Inbound>.makeStream(bufferingPolicy: .unbounded)
         let t: TCPLineTransport
         do {
-            t = try TCPLineTransport(host: "127.0.0.1", port: port, onLine: { [weak self] line in
-                guard let self else { return }
-                Task { await self.handle(line: line) }
-            }, onEnd: { [weak self] reason in
-                guard let self else { return }
-                Task { await self.handleEnd(reason) }
-            })
+            t = try TCPLineTransport(host: "127.0.0.1", port: port,
+                                     onLine: { feed.yield(.line($0)) },
+                                     onEnd: { feed.yield(.end($0)); feed.finish() })
         } catch {
             throw AgentError.connect("\(error)")
         }
         transport = t
+        readerTask = Task { [weak self] in
+            for await message in inbound {
+                guard let self else { return }
+                switch message {
+                case .line(let line): await self.handle(line: line)
+                case .end(let reason): await self.handleEnd(reason)
+                }
+            }
+        }
         let timeoutTask = Task { [weak self] in
             try? await Task.sleep(for: timeout)
             await self?.failHello(AgentError.timeout("hello"))

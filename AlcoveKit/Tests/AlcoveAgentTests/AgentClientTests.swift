@@ -237,4 +237,16 @@ final class AgentClientTests: XCTestCase {
         XCTAssertEqual(payload["job"]?.stringValue, "j1")
         XCTAssertEqual(payload["code"]?.intValue, 0)
     }
+
+    func testEventsArriveInWireOrder() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let count = 400
+        for i in 0..<count { agent.sendLine(["t": "ev", "name": "tick", "i": .int(Int64(i))]) }
+        var it = client.events.makeAsyncIterator()
+        var order: [Int] = []
+        while order.count < count, case .agent(_, let payload)? = await it.next() { order.append(payload["i"]?.intValue ?? -1) }
+        XCTAssertEqual(order, Array(0..<count))
+    }
 }
