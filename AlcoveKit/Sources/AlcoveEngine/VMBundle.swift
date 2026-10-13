@@ -55,11 +55,18 @@ public struct VMBundle: Sendable, Equatable {
         return config
     }
 
+    /// Held by `save` from reading the stored config to writing the merged one, and by
+    /// `advanceDiskEpoch` from reading the stored config to saving it; one lock for every bundle in the process.
+    private static let configLock = NSRecursiveLock()
+
     /// Validates `config` and writes it to `config.json` with the stored config's disk identity
     /// preserved (`preservingStoredDiskIdentity`). Returns the configuration that was written.
+    /// Reading the stored config and writing run under `configLock`.
     @discardableResult
     public func save(_ config: VMConfig) throws -> VMConfig {
         try config.validate()
+        VMBundle.configLock.lock()
+        defer { VMBundle.configLock.unlock() }
         let written = preservingStoredDiskIdentity(config)
         try written.encoded().write(to: configURL, options: .atomic)
         return written
@@ -338,7 +345,10 @@ extension VMBundle {
 
     /// Saves `config.json` as stored with `diskEpoch` raised by one and returns the new value.
     /// Returns nil and writes nothing when the stored config has no `diskEpoch` or cannot be read.
+    /// Reading, raising and saving run under `configLock`.
     public func advanceDiskEpoch() throws -> Int? {
+        VMBundle.configLock.lock()
+        defer { VMBundle.configLock.unlock() }
         guard var stored = storedConfig(), let epoch = stored.diskEpoch else { return nil }
         stored.diskEpoch = epoch + 1
         try save(stored)

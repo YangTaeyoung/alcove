@@ -144,8 +144,13 @@ public actor VMController {
     /// A cold start that keeps its changes raises the stored `diskEpoch` of a VM that has one
     /// (`VMBundle.advanceDiskEpoch`) and carries the new value in `config` and `runningConfig`;
     /// when that cannot be saved the start is refused.
+    /// A VM whose `config.json` is missing or does not decode is refused, whatever kind of start is asked for.
     public func start(bootFromCDROM: Bool = false, discardChanges: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
+        guard bundle.storedConfig() != nil else {
+            throw ControllerError.engineDidNotStart(
+                "the configuration of '\(config.name)' at \(bundle.configURL.path) cannot be read; restore or repair config.json before starting")
+        }
         let clones = bundle.liveClones().map { VMBundle(url: $0).configName }
         guard clones.isEmpty else {
             throw ControllerError.engineDidNotStart(

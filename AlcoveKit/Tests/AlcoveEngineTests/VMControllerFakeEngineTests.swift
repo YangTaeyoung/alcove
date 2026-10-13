@@ -662,6 +662,45 @@ final class VMControllerFakeEngineTests: XCTestCase {
         await assertStartRefused(clone, "the VM at \(path) is not the template 'Clone' was cloned from; the clone cannot run")
     }
 
+    /// The controller's `config` holds epoch 1 while `config.json` is written back with epoch 0.
+    func testUpdateConfigKeepsAnEpochHeldOnlyInMemory() async throws {
+        let vm = try makeVM()
+        try await cloneAndDeleteClone(vm)
+        var older = try vm.bundle.loadConfig()
+        try await vm.start()
+        try await vm.shutdown(force: true)
+        var config = await vm.config; XCTAssertEqual(config.diskEpoch, 1)
+        try older.encoded().write(to: vm.bundle.configURL, options: .atomic)
+        XCTAssertEqual(try storedEpoch(vm), 0)
+
+        older.memoryMiB = 1024
+        try await vm.update(config: older)
+        config = await vm.config
+        XCTAssertEqual(config.diskEpoch, 1)
+        XCTAssertEqual(config.memoryMiB, 1024)
+    }
+
+    func testStartIsRefusedWhenTheStoredConfigCannotBeRead() async throws {
+        let vm = try makeVM()
+        let url = vm.bundle.configURL
+        let bytes = try Data(contentsOf: url)
+        let refusal = "the configuration of 'Fake' at \(url.path) cannot be read; restore or repair config.json before starting"
+
+        try Data("not json".utf8).write(to: url)
+        await assertStartRefused(vm, refusal)
+        await assertStartRefused(vm, refusal, discardChanges: true)
+        try FileManager.default.removeItem(at: url)
+        await assertStartRefused(vm, refusal)
+
+        try bytes.write(to: url)
+        let file = try fileNumber(url)
+        try await vm.start()
+        let s = await vm.state; XCTAssertEqual(s, .running)
+        try await vm.shutdown(force: true)
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        XCTAssertEqual(try fileNumber(url), file)
+    }
+
     func testEphemeralOverlayRemovedOnStop() async throws {
         let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
         let run = vm.bundle.runURL

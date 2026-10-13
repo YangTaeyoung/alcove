@@ -1,6 +1,14 @@
 import XCTest
 @testable import AlcoveEngine
 
+/// Values appended from closures that run concurrently.
+private final class Collected<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [Value] = []
+    func append(_ value: Value) { lock.lock(); stored.append(value); lock.unlock() }
+    var values: [Value] { lock.lock(); defer { lock.unlock() }; return stored }
+}
+
 final class VMBundleAndLocatorTests: XCTestCase {
     private var tmp: URL!
 
@@ -331,6 +339,53 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(try template.loadConfig().diskEpoch, 0)
     }
 
+    /// `advanceDiskEpoch` and `save` of a copy that holds epoch 0 run concurrently on one bundle, 200 calls each.
+    func testConcurrentSavesOfAnOlderCopyNeverLoseAnEpochBump() throws {
+        let (template, engine) = try stubTemplate()
+        _ = try template.cloneLinked(named: "Copy", engine: engine)
+        var older = try template.loadConfig()
+        let id = try XCTUnwrap(older.diskID)
+        XCTAssertEqual(older.diskEpoch, 0)
+        older.memoryMiB = 2048
+
+        let rounds = 200
+        let bumps = Collected<Int?>(), errors = Collected<String>()
+        let saved = older
+        DispatchQueue.concurrentPerform(iterations: rounds * 2) { i in
+            do {
+                if i.isMultiple(of: 2) {
+                    bumps.append(try template.advanceDiskEpoch())
+                } else {
+                    try template.save(saved)
+                }
+            } catch {
+                errors.append("\(error)")
+            }
+        }
+
+        XCTAssertEqual(errors.values, [])
+        XCTAssertEqual(bumps.values.compactMap { $0 }.sorted(), Array(1...rounds))
+        let stored = try template.loadConfig()
+        XCTAssertEqual(stored.diskEpoch, rounds)
+        XCTAssertEqual(stored.diskID, id)
+        XCTAssertEqual(stored.memoryMiB, 2048)
+    }
+
+    func testNoCloneIsCreatedWhenTheTemplateConfigCannotBeSaved() throws {
+        let (template, engine) = try stubTemplate()
+        try setPermissions(0o555, of: template)
+        defer { try? setPermissions(0o755, of: template) }
+        XCTAssertThrowsError(try template.cloneLinked(named: "Clone", engine: engine)) {
+            let path = ($0 as NSError).userInfo[NSFilePathErrorKey] as? String ?? ""
+            XCTAssertTrue(path.hasSuffix("/Base.alcovevm/config.json"), "\($0)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("Clone.alcovevm").path))
+        try setPermissions(0o755, of: template)
+        XCTAssertNil(try template.loadConfig().diskEpoch)
+        XCTAssertNil(try template.loadConfig().diskID)
+        XCTAssertEqual(template.liveClones(), [])
+    }
+
     func testSaveKeepsTheStoredDiskEpochAndDiskIDWhenTheSavedConfigHasLess() throws {
         let (template, engine) = try stubTemplate()
         var beforeClone = try template.loadConfig()
@@ -444,21 +499,6 @@ final class VMBundleAndLocatorTests: XCTestCase {
         let third = try template.cloneLinked(named: "Third", engine: engine).loadConfig()
         XCTAssertEqual(try template.loadConfig().diskEpoch, 4)
         XCTAssertEqual(third.templateEpoch, 4)
-    }
-
-    func testNoCloneIsCreatedWhenTheTemplateConfigCannotBeSaved() throws {
-        let engine = try realEngine()
-        let (template, _) = try makeTemplate(engine)
-        try setPermissions(0o555, of: template)
-        defer { try? setPermissions(0o755, of: template) }
-        XCTAssertThrowsError(try template.cloneLinked(named: "Clone", engine: engine)) {
-            let path = ($0 as NSError).userInfo[NSFilePathErrorKey] as? String ?? ""
-            XCTAssertTrue(path.hasSuffix("/Template.alcovevm/config.json"), "\($0)")
-        }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("Clone.alcovevm").path))
-        try setPermissions(0o755, of: template)
-        XCTAssertNil(try template.loadConfig().diskEpoch)
-        XCTAssertEqual(template.liveClones(), [])
     }
 
     private func realEngine() throws -> EngineLocator.Engine {
