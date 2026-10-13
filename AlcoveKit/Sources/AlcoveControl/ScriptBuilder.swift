@@ -63,6 +63,8 @@ enum ScriptBuilder {
         private var required: [String] = []
         private var foreground: String?
         private var intoPassword = false
+        /// Whether an entry was left out with a warning since the latest step was added.
+        private var leftOut = false
         /// The VM the first entry with a VM name names.
         private(set) var recordedVM: String?
 
@@ -81,6 +83,12 @@ enum ScriptBuilder {
                 return step
             }
             return Draft(script: Script(vm: vm, variables: [:], steps: steps), warnings: warnings, sources: pending.map(\.seq), required: required)
+        }
+
+        /// Adds the warning that the entry `line` names is left out, for `reason`.
+        private mutating func leaveOut(_ line: String, _ reason: String) {
+            warnings.append("\(line) is left out: \(reason)")
+            leftOut = true
         }
 
         /// Takes one trace entry into account; `draft(trace:vm:from:to:)` says what becomes of it.
@@ -104,18 +112,24 @@ enum ScriptBuilder {
             switch op {
             case "vm.batch":
                 if let steps = params["steps"]?.arrayValue {
+                    guard !steps.contains(where: holdsRef) else {
+                        leaveOut(line, "one of its steps names an element by ref; add the steps by hand with selector fields")
+                        return
+                    }
                     item.step.params["steps"] = .array(steps.map { step in
                         guard var fields = step.objectValue else { return step }
                         fields["name"] = nil
+                        if fields["op"] == "vm.wait_for", let conditions = fields["conditions"] { fields["conditions"] = withoutCursors(conditions) }
                         return .object(fields)
                     })
                 }
             case "vm.wait_for":
                 guard entry["result"]?["matched"]?.intValue != -1 else { return }
                 if (params["conditions"]?.arrayValue ?? []).contains(where: { ($0["ref"] ?? .null) != .null }) {
-                    warnings.append("\(line) is left out: a condition names its element by ref; add the step by hand with selector fields")
+                    leaveOut(line, "a condition names its element by ref; add the step by hand with selector fields")
                     return
                 }
+                if let conditions = params["conditions"] { item.step.params["conditions"] = withoutCursors(conditions) }
             case "vm.mouse.click", "vm.mouse.drag":
                 let facts = entry["target"]
                 intoPassword = facts?["password"]?.boolValue == true
@@ -149,13 +163,13 @@ enum ScriptBuilder {
                     item.step.params["x"] = .int(Int64(x))
                     item.step.params["y"] = .int(Int64(y))
                 } else {
-                    warnings.append("\(line) is left out: its element was named by ref and has neither a name nor an automation id; add the step by hand with a selector")
+                    leaveOut(line, "its element was named by ref and has neither a name nor an automation id; add the step by hand with a selector")
                     return
                 }
             case "vm.window.action":
                 if let window = params["window"]?.stringValue, isWindowID(window) {
                     guard let title = entry["result"]?["window"]?["title"]?.stringValue, !title.isEmpty, isTitlePart(title) else {
-                        warnings.append("\(line) is left out: its window was named by id and the trace holds no title for it; add the step by hand with a title part")
+                        leaveOut(line, "its window was named by id and the trace holds no title for it; add the step by hand with a title part")
                         return
                     }
                     item.step.params["window"] = .string(title)
@@ -167,6 +181,10 @@ enum ScriptBuilder {
                 break
             }
 
+            if let cut = cutParam(params) {
+                leaveOut(line, "the trace holds only the first \(TraceSanitizer.maxStringLength) characters of '\(cut)'; add the step by hand with the full value")
+                return
+            }
             if let id = sessionID(op: op, params: params) {
                 warnings.append("\(line): its \(id) belongs to the recorded session and a replay gets another one; change the step by hand")
             }
@@ -175,12 +193,13 @@ enum ScriptBuilder {
             if let shown, let previous = foreground, shown != previous {
                 item.step.expect = [["type": "window_title", "contains": .string(Script.escape(shown))]]
             }
-            if let text = item.text, let last = pending.last, let before = last.text, last.step.op == "vm.type", last.step.expect.isEmpty,
+            if !leftOut, let text = item.text, let last = pending.last, let before = last.text, last.step.op == "vm.type", last.step.expect.isEmpty,
                last.hidesText == item.hidesText, last.step.params.filter({ $0.key != "text" }) == item.step.params.filter({ $0.key != "text" }) {
                 pending[pending.count - 1].text = before + text
                 pending[pending.count - 1].step.expect = item.step.expect
                 return
             }
+            leftOut = false
             pending.append(item)
         }
     }
@@ -199,7 +218,7 @@ enum ScriptBuilder {
         if let aid = whole("aid") { selector["automationId"] = .string(aid) }
         guard !selector.isEmpty else { return nil }
         if let role = whole("role") { selector["role"] = .string(role) }
-        if let title = whole("window"), isTitlePart(title) { selector["window"] = .string(title) }
+        if let title = whole("window"), isTitlePart(title) { selector["window"] = .string(stablePart(ofTitle: title)) }
         return selector
     }
 
@@ -239,27 +258,83 @@ enum ScriptBuilder {
         }
     }
 
-    /// The foreground window title in the observation of `entry`; nil without one, for an empty one and for one the trace cut.
+    /// The stable part of the foreground window title in the observation of `entry`; nil without a title, for an
+    /// empty one and for one the trace cut.
     private static func shownForeground(_ entry: JSON) -> String? {
         guard let observation = entry["result"]?["observation"], let title = observation["foreground"]?.stringValue, !title.isEmpty,
               observation["foregroundTruncated"]?.boolValue != true else { return nil }
-        return title
+        return stablePart(ofTitle: title)
     }
 
-    /// `fields` as a step holds them: every string with `${` escaped, without the marker of a string the trace cut,
-    /// and with `${<key>}` in place of an env value the trace masks. `warnings` gains a sentence per cut string and
-    /// per masked value, in key order; `required` gains the key of each masked value it does not hold yet.
+    /// What separates the parts of a window title.
+    static let titleSeparators = [" - ", " – ", " — "]
+    /// The fewest characters of a title part that names a window.
+    static let titlePartLength = 3
+
+    /// The part of `title` a script names the window by: what follows the last of `titleSeparators` when that has at
+    /// least `titlePartLength` characters, the whole title otherwise.
+    static func stablePart(ofTitle title: String) -> String {
+        let ends = titleSeparators.compactMap { title.range(of: $0, options: .backwards)?.upperBound }
+        guard let last = ends.max() else { return title }
+        let part = title[last...]
+        return part.count >= titlePartLength ? String(part) : title
+    }
+
+    /// Whether `value` holds a `ref` at any depth.
+    private static func holdsRef(_ value: JSON) -> Bool {
+        switch value {
+        case .object(let fields): return (fields["ref"] ?? .null) != .null || fields.values.contains(where: holdsRef)
+        case .array(let items): return items.contains(where: holdsRef)
+        default: return false
+        }
+    }
+
+    /// The wait conditions `conditions` without the `since` of each `event` condition.
+    private static func withoutCursors(_ conditions: JSON) -> JSON {
+        guard let list = conditions.arrayValue else { return conditions }
+        return .array(list.map { condition in
+            guard var fields = condition.objectValue, fields["type"] == "event" else { return condition }
+            fields["since"] = nil
+            return .object(fields)
+        })
+    }
+
+    /// Whether `text` has the length and the ending of a string the trace cut.
+    private static func isCut(_ text: String) -> Bool {
+        text.count == TraceSanitizer.maxStringLength + 1 && text.hasSuffix("…")
+    }
+
+    /// The first param of `fields`, in key order and at any depth, that the trace holds cut: a string with its cut
+    /// marker beside it, or a string of an array that `isCut`. Nil when every param is whole.
+    private static func cutParam(_ fields: [String: JSON]) -> String? {
+        func cut(in items: [JSON]) -> Bool {
+            items.contains { item in
+                switch item {
+                case .string(let text): return isCut(text)
+                case .object(let inner): return cutParam(inner) != nil
+                case .array(let nested): return cut(in: nested)
+                default: return false
+                }
+            }
+        }
+        for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
+            switch value {
+            case .string(let text): if fields[key + TraceSanitizer.cutMarkerSuffix] == true, isCut(text) { return key }
+            case .object(let inner): if let found = cutParam(inner) { return "\(key).\(found)" }
+            case .array(let items): if cut(in: items) { return key }
+            default: break
+            }
+        }
+        return nil
+    }
+
+    /// `fields` as a step holds them: every string with `${` escaped, and `${<key>}` in place of an env value the trace
+    /// masks. `warnings` gains a sentence per masked value, in key order; `required` gains the key of each masked value
+    /// it does not hold yet.
     private static func prepared(_ fields: [String: JSON], inEnv: Bool, line: String, warnings: inout [String],
                                  required: inout [String]) -> [String: JSON] {
         var out: [String: JSON] = [:]
         for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
-            if key.hasSuffix(TraceSanitizer.cutMarkerSuffix), value == true,
-               let cut = fields[String(key.dropLast(TraceSanitizer.cutMarkerSuffix.count))]?.stringValue,
-               cut.count == TraceSanitizer.maxStringLength + 1, cut.hasSuffix("…") {
-                let name = key.dropLast(TraceSanitizer.cutMarkerSuffix.count)
-                warnings.append("\(line): the trace holds only the first \(TraceSanitizer.maxStringLength) characters of '\(name)'; write the full value into the step by hand")
-                continue
-            }
             if inEnv, value == .string(TraceSanitizer.mask), TraceSanitizer.isSecret(key), !key.contains("}") {
                 out[key] = .string("${\(key)}")
                 if !required.contains(key) { required.append(key) }

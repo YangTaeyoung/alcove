@@ -362,23 +362,119 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertEqual(text.components(separatedBy: "s3cret").count, 2)
     }
 
-    func testMaskedAndCutValuesAreReported() throws {
-        let cut = String(repeating: "a", count: 2000) + "…"
+    func testMaskedEnvValuesBecomeVariables() throws {
         let draft = ScriptBuilder.draft(trace: [
             entry(1, "vm.exec", ["command": "deploy", "env": ["API_TOKEN": "<masked>", "REGION": "eu", "MY_KEY": "<masked>"]], result: ["code": 0]),
-            entry(2, "vm.type", ["text": .string(cut), "textTruncated": true]),
+            entry(2, "vm.exec", ["command": "again", "env": ["MY_KEY": "<masked>"]], result: ["code": 0]),
         ], vm: "Win", from: nil, to: nil)
         XCTAssertEqual(draft.script.steps[0].params, ["command": "deploy", "env": ["API_TOKEN": "${API_TOKEN}", "REGION": "eu", "MY_KEY": "${MY_KEY}"]])
-        XCTAssertEqual(draft.script.steps[1].params, ["text": .string(cut)])
+        XCTAssertEqual(draft.script.steps[1].params, ["command": "again", "env": ["MY_KEY": "${MY_KEY}"]])
+        XCTAssertEqual(draft.required, ["API_TOKEN", "MY_KEY"])
         XCTAssertEqual(draft.warnings, [
             "seq 1 (vm.exec): the trace masks the env value 'API_TOKEN'; the step reads it from the variable 'API_TOKEN', pass it in variables when running the script",
             "seq 1 (vm.exec): the trace masks the env value 'MY_KEY'; the step reads it from the variable 'MY_KEY', pass it in variables when running the script",
-            "seq 2 (vm.type): the trace holds only the first 2000 characters of 'text'; write the full value into the step by hand",
+            "seq 2 (vm.exec): the trace masks the env value 'MY_KEY'; the step reads it from the variable 'MY_KEY', pass it in variables when running the script",
         ])
         XCTAssertThrowsError(try draft.script.resolved(with: ["MY_KEY": "k"])) {
             XCTAssertEqual("\($0)", "variable 'API_TOKEN' is not defined; pass it or add a default")
         }
         XCTAssertNoThrow(try draft.script.resolved(with: ["API_TOKEN": "t", "MY_KEY": "k"]))
+    }
+
+    func testAStepWithCutParamsIsLeftOut() throws {
+        let cut = String(repeating: "a", count: 2000) + "…"
+        let draft = ScriptBuilder.draft(trace: [
+            entry(1, "vm.type", ["text": "a"]),
+            entry(2, "vm.type", ["text": .string(cut), "textTruncated": true]),
+            entry(3, "vm.type", ["text": "b"]),
+            entry(4, "vm.exec", ["argv": ["cmd", .string(cut)]], result: ["code": 0]),
+            entry(5, "vm.ui.type", ["selector": ["name": .string(cut), "nameTruncated": true], "text": "c"], result: ["node": sendButton]),
+            entry(6, "vm.exec", ["command": "x", "env": ["NOTE": .string(cut), "NOTETruncated": true]], result: ["code": 0]),
+            entry(7, "vm.exec", ["command": .string(cut), "commandTruncated": false, "outputTruncated": true], result: ["code": 0]),
+            entry(8, "vm.key.press", ["keys": "enter"]),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(ops(draft.script), ["vm.type", "vm.type", "vm.exec", "vm.key.press"])
+        XCTAssertEqual(draft.script.steps.map(\.params), [["text": "a"], ["text": "b"], ["command": .string(cut), "commandTruncated": false, "outputTruncated": true],
+                                                          ["keys": "enter"]])
+        XCTAssertEqual(draft.sources, [1, 3, 7, 8])
+        func left(_ line: String, _ param: String) -> String {
+            "\(line) is left out: the trace holds only the first 2000 characters of '\(param)'; add the step by hand with the full value"
+        }
+        XCTAssertEqual(draft.warnings, [left("seq 2 (vm.type)", "text"), left("seq 4 (vm.exec)", "argv"), left("seq 5 (vm.ui.type)", "selector.name"),
+                                        left("seq 6 (vm.exec)", "env.NOTE")])
+    }
+
+    func testABatchWithARefIsLeftOut() throws {
+        let draft = ScriptBuilder.draft(trace: [
+            entry(1, "vm.batch", ["steps": [["op": "vm.key.press", "keys": "a"],
+                                            ["op": "vm.wait_for", "conditions": [["type": "ui_exists", "ref": "e5"]]]]],
+                  result: ["completed": 2, "results": [[:], [:]]]),
+            entry(2, "vm.batch", ["steps": [["op": "vm.key.press", "keys": "b"]]], result: ["completed": 1, "results": [[:]]]),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(draft.script.steps.map(\.params), [["steps": [["op": "vm.key.press", "keys": "b"]]]])
+        XCTAssertEqual(draft.warnings, ["seq 1 (vm.batch) is left out: one of its steps names an element by ref; add the steps by hand with selector fields"])
+        XCTAssertFalse(String(decoding: try draft.script.encoded(), as: UTF8.self).contains("\"ref\""))
+    }
+
+    func testTypesAreNotMergedAcrossALeftOutStep() {
+        let draft = ScriptBuilder.draft(trace: [
+            entry(1, "vm.type", ["text": "a"]),
+            entry(2, "vm.wait_for", ["conditions": [["type": "ui_exists", "ref": "e5"]]], result: ["matched": 0]),
+            entry(3, "vm.type", ["text": "b"]),
+            entry(4, "vm.type", ["text": "c"]),
+            entry(5, "vm.ui.type", ["ref": "e9", "text": "x"], result: ["node": node("e9", "Pane", "")]),
+            entry(6, "vm.screenshot"),
+            entry(7, "vm.type", ["text": "d"]),
+            entry(8, "vm.window.action", ["window": "0x3b", "action": "close"], result: ["window": .null, "closed": true]),
+            entry(9, "vm.type", ["text": "e"]),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(draft.script.steps.map { $0.params["text"] }, ["a", "bc", "d", "e"])
+        XCTAssertEqual(draft.warnings.count, 3)
+    }
+
+    func testEventConditionsLoseTheirSinceCursor() throws {
+        let script = build([
+            entry(1, "vm.wait_for", ["conditions": [["type": "event", "event": "window.opened", "since": 40], ["type": "screen_idle"]], "timeout": 5],
+                  result: ["matched": 0]),
+            entry(2, "vm.batch", ["steps": [["op": "vm.wait_for", "conditions": [["type": "event", "event": "window.closed", "since": 41, "titleContains": "Save"]]],
+                                            ["op": "vm.key.press", "keys": "a"]]],
+                  result: ["completed": 2, "results": [[:], [:]]]),
+        ])
+        XCTAssertEqual(script.steps.map(\.params), [
+            ["conditions": [["type": "event", "event": "window.opened"], ["type": "screen_idle"]], "timeout": 5],
+            ["steps": [["op": "vm.wait_for", "conditions": [["type": "event", "event": "window.closed", "titleContains": "Save"]]],
+                       ["op": "vm.key.press", "keys": "a"]]],
+        ])
+        XCTAssertFalse(String(decoding: try script.encoded(), as: UTF8.self).contains("since"))
+        XCTAssertNoThrow(try script.validateConditions())
+    }
+
+    func testWindowTitlesAreNamedByTheirStablePart() {
+        let parts: [(String, String)] = [
+            ("report-final.docx - Word", "Word"),
+            ("Inbox (3) - Outlook", "Outlook"),
+            ("*Untitled - Notepad", "Notepad"),
+            ("a - b – c — Visual Studio", "Visual Studio"),
+            ("x — y - Paint", "Paint"),
+            ("x - y – Paint", "Paint"),
+            ("Notes - abc", "abc"),
+            ("Notes – ab", "Notes – ab"),
+            ("Ends with - ", "Ends with - "),
+            ("Alcove Fixture", "Alcove Fixture"),
+            ("well-known", "well-known"),
+            ("", ""),
+        ]
+        for (title, expected) in parts { XCTAssertEqual(ScriptBuilder.stablePart(ofTitle: title), expected, title) }
+
+        func shows(_ title: String) -> JSON { ["observation": ["settled": true, "foreground": .string(title)]] }
+        let script = build([
+            entry(1, "vm.key.press", ["keys": "a", "observe": "summary"], result: shows("Untitled - Notepad")),
+            entry(2, "vm.key.press", ["keys": "b", "observe": "summary"], result: shows("*Untitled - Notepad")),
+            entry(3, "vm.key.press", ["keys": "c", "observe": "summary"], result: shows("Save As")),
+            entry(4, "vm.key.press", ["keys": "d", "observe": "summary"], result: shows("report-final.docx - Word")),
+            entry(5, "vm.key.press", ["keys": "e", "observe": "summary"], result: shows("other.docx - Word")),
+        ])
+        XCTAssertEqual(script.steps.map(\.expect), [[], [], [["type": "window_title", "contains": "Save As"]], [["type": "window_title", "contains": "Word"]], []])
     }
 
     func testWindowIdsAndRefsOfWaitsDoNotReachTheScript() throws {
