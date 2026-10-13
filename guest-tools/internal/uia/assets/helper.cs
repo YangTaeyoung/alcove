@@ -743,6 +743,7 @@ namespace Alcove
         const int ActWaitMs = 1500;
         const int ActSettleMs = 100;
         const int ActRespondMs = 500;
+        const int RefGoneWaitMs = 500;
 
         readonly Dictionary<string, RefEntry> refsByKey = new Dictionary<string, RefEntry>();
         readonly Dictionary<int, RefEntry> refsByNumber = new Dictionary<int, RefEntry>();
@@ -1669,6 +1670,16 @@ namespace Alcove
             }
             catch (COMException)
             {
+                ForgetRef(entry);
+                throw new HelperException(gone);
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                // The ref is gone when its window stops existing within RefGoneWaitMs of the failed read.
+                if (entry.Window == IntPtr.Zero || !WaitUntil(delegate { return !Native.IsWindow(entry.Window); }, RefGoneWaitMs))
+                {
+                    throw;
+                }
                 ForgetRef(entry);
                 throw new HelperException(gone);
             }
