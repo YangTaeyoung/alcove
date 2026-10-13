@@ -2426,6 +2426,88 @@ final class ControlUITests: XCTestCase {
         XCTAssertNotNil(sentence.range(of: #"^the UI helper has not answered ui\.find for \d+ s$"#, options: .regularExpression), sentence)
     }
 
+    func testAWaitWhoseAgentCallIsNotAnsweredSaysSo() async throws {
+        WaitTiming.agentCallTimeout = .seconds(300)
+        let conditions: [JSON] = [
+            ["type": "file_exists", "path": "C:\\never"], ["type": "process_started", "processName": "setup"],
+            ["type": "port_listening", "port": 8080], ["type": "log_matches", "path": "C:\\app.log", "pattern": "ready"],
+            ["type": "job_output_matches", "job": "stuck", "pattern": "done"],
+        ]
+        let ops = ["fs.stat", "proc.list", "exec.run", "fs.tail", "exec.read"]
+        let quiet = quietJob
+        let (h, _, agent) = try await rig([
+            "fs.stat": { _, _ in .silent }, "proc.list": { _, _ in .silent }, "exec.run": { _, _ in .silent }, "fs.tail": { _, _ in .silent },
+            "exec.read": { m, n in m["job"]?.stringValue == "stuck" ? .silent : quiet(m, n) },
+        ])
+        let allSent: @Sendable () async -> Bool = {
+            let sent = agentRequests(agent, "exec.read").filter { $0["job"]?.stringValue == "stuck" }.count
+            return sent >= 1 && ops.dropLast().allSatisfy { !agentRequests(agent, $0).isEmpty }
+        }
+
+        WaitTiming.reportedSilence = .zero
+        let silent = try await waitEndedByItsJob(h, conditions, when: allSent)
+        let problems = try XCTUnwrap(silent["problems"]?.arrayValue)
+        XCTAssertEqual(problems.count, conditions.count)
+        for (index, op) in ops.enumerated() where index < problems.count {
+            XCTAssertEqual(problems[index]["condition"]?.intValue, index)
+            XCTAssertEqual(problems[index]["type"], conditions[index]["type"])
+            XCTAssertNil(problems[index]["failures"])
+            let sentence = try XCTUnwrap(problems[index]["error"]?.stringValue)
+            let expected = "^the guest agent has not answered " + NSRegularExpression.escapedPattern(for: op) + #" for \d+ s$"#
+            XCTAssertNotNil(sentence.range(of: expected, options: .regularExpression), sentence)
+        }
+
+        WaitTiming.reportedSilence = .seconds(600)
+        let young = try await waitEndedByItsJob(h, conditions) {
+            let sent = agentRequests(agent, "exec.read").filter { $0["job"]?.stringValue == "stuck" }.count
+            return sent >= 2 && ops.dropLast().allSatisfy { agentRequests(agent, $0).count >= 2 }
+        }
+        XCTAssertNil(young["problems"])
+    }
+
+    func testAgentCallsThatRunOutOfTimeInARowAreReportedFromTheFirstOfThem() async throws {
+        WaitTiming.agentCallTimeout = .milliseconds(50)
+        WaitTiming.reportedSilence = .milliseconds(150)
+        let (h, _, agent) = try await rig(["fs.stat": { _, _ in .silent }, "exec.read": quietJob])
+        let r = try await waitEndedByItsJob(h, [["type": "file_exists", "path": "C:\\never"]]) { agentRequests(agent, "fs.stat").count >= 6 }
+        let problem = try XCTUnwrap(r["problems"]?.arrayValue?.first { $0["condition"]?.intValue == 0 }, "\(r)")
+        XCTAssertEqual(problem["type"]?.stringValue, "file_exists")
+        XCTAssertNil(problem["failures"])
+        let sentence = try XCTUnwrap(problem["error"]?.stringValue)
+        XCTAssertNotNil(sentence.range(of: #"^the guest agent has not answered fs\.stat for \d+ s$"#, options: .regularExpression), sentence)
+    }
+
+    func testACancelledWaitStartsNoFurtherReadingOrProbe() async throws {
+        WaitTiming.tick = .seconds(600)
+        let later: [(condition: JSON, hasStarted: @Sendable (ControlHandler, FakeAgent) async -> Bool)] = [
+            (["type": "file_exists", "path": "C:\\never"], { _, agent in !agentRequests(agent, "fs.stat").isEmpty }),
+            (["type": "ui_exists", "name": "Later"], { h, _ in await h.helperGate.waiterCount(for: "Win") == 1 }),
+        ]
+        for (condition, hasStarted) in later {
+            let (h, t, agent) = try await rig(["ui.find": { _, _ in .silent }, "fs.stat": { _, _ in .silent }])
+            let wait = Task {
+                try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 300, "conditions": [
+                    ["type": "ui_gone", "name": "Busy"], condition, ["type": "screen_idle", "seconds": 100],
+                ]])
+            }
+            let firstSent = await eventually { agentRequests(agent, "ui.find").count == 1 }
+            XCTAssertTrue(firstSent)
+            let started = LockedBox(false)
+            await t.setFrameHook { started.value = await eventually { await hasStarted(h, agent) } }
+            wait.cancel()
+            do {
+                _ = try await completed(wait, "the cancelled wait went on")
+                XCTFail("the cancelled wait returned a result")
+            } catch {
+                XCTAssertTrue(error is CancellationError, "\(error)")
+            }
+            XCTAssertFalse(started.value, "\(condition)")
+            XCTAssertEqual(requestOps(agent), ["ui.find"])
+            let left = await eventually { await h.helperGate.waiterCount(for: "Win") == 0 }
+            XCTAssertTrue(left)
+        }
+    }
+
     // MARK: - answers that arrive while another condition is evaluated
 
     func testAnAnswerIsJudgedWhileAnotherUIConditionWaitsForTheHelper() async throws {

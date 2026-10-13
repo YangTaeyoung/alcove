@@ -40,6 +40,7 @@ final class WaitTests: XCTestCase {
         WaitTiming.agentPeriod = .milliseconds(500)
         WaitTiming.agentCallTimeout = .seconds(5)
         WaitTiming.recognitionGrace = .seconds(1)
+        WaitTiming.reportedSilence = .milliseconds(500)
         WaitTiming.jobByteBudget = 4 * 1024 * 1024
         WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) }
     }
@@ -658,6 +659,35 @@ final class WaitTests: XCTestCase {
         let r = try await waitFor(h, [["type": "file_exists", "path": "/x"]], timeout: 1)
         XCTAssertEqual(r["matched"]?.intValue, -1)
         XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(1800))
+    }
+
+    func testAgentSilenceCountsFromTheFirstOfTheEvaluationsInARowThatGotNoAnswer() {
+        WaitTiming.reportedSilence = .milliseconds(500)
+        let start = ContinuousClock.now
+        func at(_ milliseconds: Int) -> ContinuousClock.Instant { start + .milliseconds(milliseconds) }
+        var silence = AgentSilence()
+        XCTAssertNil(silence.sentence(inFlight: nil, now: at(9000)))
+        XCTAssertNil(silence.sentence(inFlight: (nil, at(0)), now: at(9000)))
+        XCTAssertNil(silence.sentence(inFlight: ("fs.stat", at(0)), now: at(499)))
+        XCTAssertEqual(silence.sentence(inFlight: ("fs.stat", at(0)), now: at(500)), "the guest agent has not answered fs.stat for 1 s")
+        XCTAssertEqual(silence.sentence(inFlight: ("proc.list", at(1000)), now: at(8400)), "the guest agent has not answered proc.list for 7 s")
+
+        silence.ended(openCall: "fs.tail", started: at(1000))
+        XCTAssertNil(silence.sentence(inFlight: nil, now: at(1400)))
+        XCTAssertEqual(silence.sentence(inFlight: nil, now: at(3000)), "the guest agent has not answered fs.tail for 2 s")
+        silence.ended(openCall: "fs.stat", started: at(6000))
+        XCTAssertEqual(silence.sentence(inFlight: nil, now: at(11_000)), "the guest agent has not answered fs.stat for 10 s")
+        XCTAssertEqual(silence.sentence(inFlight: ("exec.read", at(10_900)), now: at(11_000)), "the guest agent has not answered exec.read for 10 s")
+        XCTAssertEqual(silence.sentence(inFlight: (nil, at(10_900)), now: at(11_000)), "the guest agent has not answered fs.stat for 10 s")
+
+        silence.ended(openCall: nil, started: at(11_000))
+        XCTAssertNil(silence.sentence(inFlight: nil, now: at(60_000)))
+        XCTAssertNil(silence.sentence(inFlight: ("fs.stat", at(59_900)), now: at(60_000)))
+        silence.ended(openCall: "fs.stat", started: at(59_900))
+        XCTAssertEqual(silence.sentence(inFlight: ("fs.stat", at(64_950)), now: at(65_000)), "the guest agent has not answered fs.stat for 5 s")
+
+        WaitTiming.reportedSilence = .zero
+        XCTAssertEqual(AgentSilence().sentence(inFlight: ("fs.stat", at(0)), now: at(0)), "the guest agent has not answered fs.stat for 0 s")
     }
 
     // MARK: - validation

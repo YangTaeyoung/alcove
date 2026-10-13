@@ -13,12 +13,37 @@ enum WaitTiming {
     nonisolated(unsafe) static var recognitionGrace = Duration.seconds(1)
     /// How long a wait's helper call must have gone without an answer, counted from the moment it began to wait for
     /// its turn, before the wait reports it; also how long a sent call must have been unanswered before the wait's
-    /// observation leaves the UI facts out instead of waiting for the helper.
+    /// observation leaves the UI facts out instead of waiting for the helper, and how long the guest agent must have
+    /// left the calls of an agent condition unanswered before the wait reports that.
     nonisolated(unsafe) static var reportedSilence = Duration.milliseconds(500)
-    /// Output bytes one job condition reads per tick.
+    /// Output bytes one evaluation of a job condition reads.
     nonisolated(unsafe) static var jobByteBudget = 4 * 1024 * 1024
     /// Text recognition on a frame.
     nonisolated(unsafe) static var recognizer: @Sendable (Frame, [String]) throws -> [TextMatch] = { try ScreenText.recognize($0, languages: $1) }
+}
+
+/// How long the guest agent has left the calls of one agent condition of a wait without an answer.
+struct AgentSilence {
+    /// The op of the latest call that ran out of time, and the start of the first of the evaluations in a row that
+    /// ended with such a call. Nil when the latest evaluation that ended got its answers.
+    private(set) var unanswered: (op: String, since: ContinuousClock.Instant)?
+
+    /// Takes in an evaluation that began at `started` and has ended. `openCall` is the op of its call that ran out
+    /// of time; nil when every call it made was answered.
+    mutating func ended(openCall: String?, started: ContinuousClock.Instant) {
+        unanswered = openCall.map { ($0, unanswered?.since ?? started) }
+    }
+
+    /// The sentence for a wait that ends at `now`, or nil. `inFlight` is the evaluation that has not ended: the op
+    /// of its call without an answer so far and its start. The silence counts from the start of the first evaluation
+    /// in the row of unanswered ones that reaches up to `now`, and is reported from `WaitTiming.reportedSilence` on.
+    func sentence(inFlight: (openCall: String?, started: ContinuousClock.Instant)?, now: ContinuousClock.Instant) -> String? {
+        guard let op = inFlight?.openCall ?? unanswered?.op, let since = unanswered?.since ?? inFlight?.started else { return nil }
+        let silent = now - since
+        guard silent >= WaitTiming.reportedSilence else { return nil }
+        let seconds = (Double(silent.components.seconds) + Double(silent.components.attoseconds) / 1e18).rounded()
+        return "the guest agent has not answered \(op) for \(Int(seconds)) s"
+    }
 }
 
 /// The text a `text_visible` or `text_gone` condition looks for.

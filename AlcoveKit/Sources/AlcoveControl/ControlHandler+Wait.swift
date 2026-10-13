@@ -36,8 +36,23 @@ extension ControlHandler {
         let job: JobOutput
     }
 
+    /// The agent op one evaluation of an agent condition has sent and has no answer to. It stays set when the call
+    /// ran out of time.
+    private final class OpenCall: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: String?
+
+        var op: String? {
+            get { lock.withLock { value } }
+            set { lock.withLock { value = newValue } }
+        }
+    }
+
     /// The agent calls of one evaluation of an agent condition, running in a task of their own.
     private struct AgentProbe: Sendable {
+        /// When the evaluation began.
+        let started: ContinuousClock.Instant
+        let openCall: OpenCall
         let answer: CallAnswer<AgentReading>
         let task: Task<Void, Never>
     }
@@ -63,6 +78,8 @@ extension ControlHandler {
         var reading: AgentProbe?
         /// Whether the latest helper call waited `WaitTiming.reportedSilence` or longer for its turn at the helper and did not get it.
         var helperWasBusy = false
+        /// The agent calls of an agent condition that ran out of time, over the evaluations that have ended.
+        var agentSilence = AgentSilence()
         /// The sequence number of the newest guest event this condition has looked at.
         var eventCursor = 0
 
@@ -216,7 +233,7 @@ extension ControlHandler {
                 if states[index].failures > 0, let error = states[index].lastError {
                     problem["error"] = .string(error)
                     problem["failures"] = .int(Int64(states[index].failures))
-                } else if let silence = await helperSilence(states[index], now: ending) {
+                } else if let silence = await helperSilence(states[index], now: ending) ?? agentSilence(states[index], now: ending) {
                     problem["error"] = .string(silence)
                 } else {
                     continue
@@ -258,6 +275,12 @@ extension ControlHandler {
         case .done:
             return nil
         }
+    }
+
+    /// Why an agent condition without a recorded failure got no answer from the guest agent: `AgentSilence.sentence`
+    /// for its evaluation in flight and the ones that ended.
+    private func agentSilence(_ state: WaitState, now: ContinuousClock.Instant) -> String? {
+        state.agentSilence.sentence(inFlight: state.reading.map { ($0.openCall.op, $0.started) }, now: now)
     }
 
     private func outside(_ index: Int, _ frame: Frame) -> ControlError {
@@ -315,13 +338,14 @@ extension ControlHandler {
     ///
     /// An evaluation in flight is only looked at. Without one, and before the deadline, one is started and waited for
     /// until `tickEnd` at most; an agent condition is due again one period after the tick that started it. The verdict
-    /// is `unanswered` while the evaluation has not ended.
+    /// is `unanswered` while the evaluation has not ended. A cancelled task starts none and throws `CancellationError`.
     private func step(_ condition: WaitCondition, state: inout WaitState, vm: String, agent: AgentClient,
                       now tickStart: ContinuousClock.Instant, clock: ContinuousClock,
                       tickEnd: ContinuousClock.Instant, deadline: ContinuousClock.Instant) async throws -> Verdict {
         var limit = clock.now
         if !state.isInFlight {
             guard limit < deadline else { return .unanswered }
+            try Task.checkCancellation()
             if condition.kind == .ui {
                 let request = ControlHandler.probeRequest(condition)
                 state.probe = startHelperCall(agent, request.op, request.fields, vm: vm, turnBy: deadline)
@@ -355,6 +379,7 @@ extension ControlHandler {
             guard let outcome = await reading.answer.outcome(until: limit) else { return nil }
             state.reading = nil
             state.job = outcome.result.job
+            state.agentSilence.ended(openCall: reading.openCall.op, started: reading.started)
             return outcome.result.verdict
         }
         return nil
@@ -364,18 +389,20 @@ extension ControlHandler {
     private nonisolated func startReading(_ condition: WaitCondition, job: JobOutput, script: String?, agent: AgentClient,
                                           clock: ContinuousClock, deadline: ContinuousClock.Instant) -> AgentProbe {
         let answer = CallAnswer<AgentReading>()
+        let openCall = OpenCall()
+        let started = clock.now
         let task = Task {
             var progress = job
             let verdict: Result<Verdict, Error>
             do {
                 verdict = .success(try await self.evaluateAgent(condition, job: &progress, script: script, agent: agent,
-                                                                clock: clock, deadline: deadline))
+                                                                clock: clock, deadline: deadline, openCall: openCall))
             } catch {
                 verdict = .failure(error)
             }
             await answer.finish(AgentReading(verdict: verdict, job: progress))
         }
-        return AgentProbe(answer: answer, task: task)
+        return AgentProbe(started: started, openCall: openCall, answer: answer, task: task)
     }
 
     private func tickFrame(_ tick: inout Tick, _ t: VMTarget) async throws -> Frame {
@@ -452,12 +479,22 @@ extension ControlHandler {
     // MARK: - agent conditions
 
     /// One agent call bounded by the per-call limit and the deadline; nil when the call timed out. A cancelled task
-    /// makes no call.
+    /// makes no call. `openCall` holds `op` from the moment the call is made until its answer or error arrived.
     private nonisolated func callAgent(_ agent: AgentClient, _ op: String, _ params: [String: JSON], clock: ContinuousClock,
-                                       deadline: ContinuousClock.Instant) async throws -> JSON? {
+                                       deadline: ContinuousClock.Instant, openCall: OpenCall) async throws -> JSON? {
         try Task.checkCancellation()
         let limit = min(WaitTiming.agentCallTimeout, max(deadline - clock.now, .milliseconds(200)))
-        do { return try await agent.call(op, params, timeout: limit) } catch AgentClient.AgentError.timeout { return nil }
+        openCall.op = op
+        do {
+            let reply = try await agent.call(op, params, timeout: limit)
+            openCall.op = nil
+            return reply
+        } catch AgentClient.AgentError.timeout {
+            return nil
+        } catch {
+            openCall.op = nil
+            throw error
+        }
     }
 
     /// The helper call that reads what a UI condition asks about.
@@ -538,9 +575,10 @@ extension ControlHandler {
 
     /// The agent calls of one evaluation of an agent condition and what they mean. `job` holds the job output read so far.
     private nonisolated func evaluateAgent(_ condition: WaitCondition, job state: inout JobOutput, script: String?, agent: AgentClient,
-                                           clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
+                                           clock: ContinuousClock, deadline: ContinuousClock.Instant,
+                                           openCall: OpenCall) async throws -> Verdict {
         func call(_ op: String, _ params: [String: JSON]) async throws -> JSON? {
-            try await callAgent(agent, op, params, clock: clock, deadline: deadline)
+            try await callAgent(agent, op, params, clock: clock, deadline: deadline, openCall: openCall)
         }
         switch condition {
         case .processStarted(let name):

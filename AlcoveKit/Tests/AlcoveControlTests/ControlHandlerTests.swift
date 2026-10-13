@@ -65,7 +65,11 @@ actor FakeTarget: VMTarget {
     func pause() async throws { stateValue = .paused }
     func resume() async throws { stateValue = .running }
     func screenshotPNG() async throws -> Data { png }
+    /// Runs at the start of every `frame()` call when set.
+    var frameHook: (@Sendable () async -> Void)?
+    func setFrameHook(_ hook: (@Sendable () async -> Void)?) { frameHook = hook }
     func frame() async throws -> Frame {
+        await frameHook?()
         frameCalls += 1
         if failingFrameCalls.contains(frameCalls - 1) { throw FrameUnavailable() }
         if frames.count > 1 { return frames.removeFirst() }
