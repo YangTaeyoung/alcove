@@ -69,6 +69,8 @@ public actor ControlHandler {
     let engineDescription: String?
     /// The base directory of new recordings; nil selects `~/Library/Application Support/Alcove/Recordings`.
     let recordingsDirectory: URL?
+    /// The base directory of new diagnostics bundles; nil selects `~/Library/Application Support/Alcove/Diagnostics`.
+    let diagnosticsDirectory: URL?
     var recordings = RecordingTable()
     var recordingSeams = RecordingSeams()
     /// A position in the event sequence of one target object, which the mark does not keep alive.
@@ -89,13 +91,14 @@ public actor ControlHandler {
 
     public init(registry: VMRegistry, hostKind: String, clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
                 engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() },
-                recordingsDirectory: URL? = nil) {
+                recordingsDirectory: URL? = nil, diagnosticsDirectory: URL? = nil) {
         self.registry = registry
         self.hostKind = hostKind
         self.clock = clock
         self.engineDescription = engineDescription
         self.wallClock = now
         self.recordingsDirectory = recordingsDirectory
+        self.diagnosticsDirectory = diagnosticsDirectory
     }
 
     /// Every op name the dispatcher accepts.
@@ -116,7 +119,7 @@ public actor ControlHandler {
         "vm.record.start", "vm.record.stop", "vm.record.status",
         "script.run",
         "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",
-        "vm.app.launch", "vm.deploy", "vm.events",
+        "vm.app.launch", "vm.deploy", "vm.events", "vm.collect_diagnostics",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -129,14 +132,14 @@ public actor ControlHandler {
         "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
         "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
         "vm.wait_for", "vm.record.status", "vm.window.list", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.events",
-        "vm.event_log", "vm.crash_dumps.list", "vm.crash_dumps.pull",
+        "vm.event_log", "vm.crash_dumps.list", "vm.crash_dumps.pull", "vm.collect_diagnostics",
     ]
 
     /// Whether `op` runs outside the per-connection request order.
     public static func isConcurrent(op: String) -> Bool {
         op.hasPrefix("vm.exec") || op.hasPrefix("vm.process.") || op.hasPrefix("vm.fs.")
             || op == "vm.push_file" || op == "vm.pull_file" || op == "vm.sync_dir" || op == "vm.find_text"
-            || op == "vm.crash_dumps.pull"
+            || op == "vm.crash_dumps.pull" || op == "vm.collect_diagnostics"
             || op == "script.run"
             || concurrentUIOps.contains(op)
     }
@@ -281,6 +284,8 @@ public actor ControlHandler {
             return try await waitFor(params)
         case "vm.record.start", "vm.record.stop", "vm.record.status":
             return try await record(op: op, params: params)
+        case "vm.collect_diagnostics":
+            return try await collectDiagnostics(params)
         case "script.run":
             return try await scriptRun(params)
         case "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",

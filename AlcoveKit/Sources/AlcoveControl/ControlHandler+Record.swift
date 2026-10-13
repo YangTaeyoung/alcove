@@ -196,12 +196,14 @@ extension ControlHandler {
         return number
     }
 
-    private func recordingDirectory(_ params: JSON, vm: String) throws -> URL {
+    /// The `dir` parameter as an absolute path; without it a folder named after the VM and the time below `base`
+    /// (`recordingsDirectory`, or the Recordings folder of the Alcove support directory, when `base` is nil).
+    func recordingDirectory(_ params: JSON, vm: String, base: URL? = nil) throws -> URL {
         if let value = params["dir"] {
             guard let path = value.stringValue, path.hasPrefix("/") else { throw ControlError.failed("dir must be an absolute path") }
             return URL(fileURLWithPath: path)
         }
-        let base = recordingsDirectory ?? FileManager.default.homeDirectoryForCurrentUser
+        let base = base ?? recordingsDirectory ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Alcove/Recordings")
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")

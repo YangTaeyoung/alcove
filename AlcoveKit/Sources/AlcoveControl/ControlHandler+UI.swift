@@ -595,7 +595,7 @@ extension ControlHandler {
 
     // MARK: - events
 
-    private func guestEvents(_ params: JSON) async throws -> JSON {
+    func guestEvents(_ params: JSON) async throws -> JSON {
         var since = 0
         if let value = params["since"], value != .null {
             guard let n = value.intValue, n >= 0 else {

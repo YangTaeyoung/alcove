@@ -153,6 +153,7 @@ extension AgentClient {
         var offset = 0
         do {
             while true {
+                try Task.checkCancellation()
                 let r = try await call("fs.read", [
                     "path": .string(guestPath), "offset": .int(Int64(offset)), "length": .int(Int64(transferPiece)),
                 ], timeout: timeout)

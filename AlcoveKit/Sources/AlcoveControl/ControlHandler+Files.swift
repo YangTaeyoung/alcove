@@ -83,7 +83,7 @@ extension ControlHandler {
 
     /// The last `tail` lines through `fs.tail`, or up to `length` bytes from `offset` through `fs.read`, decoded as text;
     /// as UTF-16LE when the agent reports that encoding for the file.
-    private func readText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
+    func readText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
         let path = try string(params, "path")
         var range: [String: JSON] = [:]
         try pass(params, "tail", to: &range, as: "lines", type: .integer)
