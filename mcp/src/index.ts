@@ -10,12 +10,14 @@ import { register as registerActions } from "./tools/actions.js";
 import { register as registerShell } from "./tools/shell.js";
 import { register as registerFiles } from "./tools/files.js";
 import { register as registerState } from "./tools/state.js";
+import { register as registerUi } from "./tools/ui.js";
 
 const INSTRUCTIONS =
   "Alcove drives virtual machines. Text tools (alcove_exec, alcove_fs_*, alcove_process_*) are cheaper and more reliable than screenshots: prefer them whenever the guest tools are connected. " +
   "Run long commands such as builds and test suites with alcove_exec_start and follow them with alcove_exec_read instead of blocking in alcove_exec. " +
   "Action tools report what changed on screen; ask for observe: \"diff\" or \"image\" only when the text summary is not enough, and use alcove_find_text to read the screen. " +
   "Move build output into the guest with alcove_sync_dir. " +
+  "On Windows guests read the UI with alcove_ui_tree before taking screenshots, act with alcove_ui_click and alcove_ui_type, and wait for streamed output with alcove_wait_for ui_text_stable. " +
   "Take a snapshot with alcove_snapshot_create before risky changes and return to it with alcove_snapshot_restore; alcove_clone_vm gives a linked clone for parallel work; alcove_lease_acquire keeps other agents off a VM.";
 
 let enabled;
@@ -34,6 +36,7 @@ registerActions(reg, client);
 registerShell(reg, client);
 registerFiles(reg, client);
 registerState(reg, client);
+registerUi(reg, client);
 
 async function main() {
   const transport = new StdioServerTransport();

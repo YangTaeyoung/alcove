@@ -1,7 +1,7 @@
 // The core toolset: VM lifecycle, screen, pointer, keyboard, clipboard, exec and file push.
 import { z } from "zod";
 import type { ControlClient } from "../control.js";
-import { actionResult, actionTimeout, observeParams, observePayload, screenshotCaption, type ObserveArgs } from "../observation.js";
+import { actionResult, actionTimeout, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
 import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, type Registrar } from "../toolkit.js";
 
 export function register(r: Registrar, client: ControlClient): void {
@@ -102,7 +102,7 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Screenshot",
       description:
-        "Capture the VM screen as a PNG or JPEG image. Coordinates for click/move/drag tools are guest pixels in the full-resolution frame. The text part gives the guest frame size and where the returned image sits: guest = origin + image_pixel / scale. Use region to capture one rectangle, scale or max_width to shrink the image.",
+        "Capture the VM screen as a PNG or JPEG image. Coordinates for click/move/drag tools are guest pixels in the full-resolution frame. The text part gives the guest frame size and where the returned image sits: guest = origin + image_pixel / scale. Use region to capture one rectangle, window to capture one window (Windows guests), marks to number the interactive elements on the image and list them in the text, scale or max_width to shrink the image.",
       inputSchema: {
         name: vmName,
         region: z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() }).optional().describe("Capture only this guest-pixel rectangle {x, y, w, h}"),
@@ -110,10 +110,12 @@ export function register(r: Registrar, client: ControlClient): void {
         max_width: z.number().int().min(64).max(4096).optional().describe("Downscale the returned image to this width (default 1280) to save tokens; coordinates stay in full guest pixels"),
         format: z.enum(["png", "jpeg"]).optional().describe("Image format (default png); jpeg is smaller"),
         quality: z.number().min(0.1).max(1).optional().describe("JPEG quality (default 0.8)"),
+        window: z.string().optional().describe("Crop to this window: a window id from alcove_list_windows, \"foreground\", or a part of the title (Windows guests)"),
+        marks: z.boolean().optional().describe("Draw numbered rectangles over the interactive elements and list them (number, ref, role, name) in the text; pass the ref to alcove_ui_click (Windows guests)"),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ name, region, scale, max_width, format, quality }) => {
+    async ({ name, region, scale, max_width, format, quality, window, marks }) => {
       try {
         const r = await client.call("vm.screenshot", {
           name,
@@ -122,11 +124,13 @@ export function register(r: Registrar, client: ControlClient): void {
           ...(scale !== undefined ? { scale } : {}),
           ...(format ? { format } : {}),
           ...(quality !== undefined ? { quality } : {}),
+          ...(window !== undefined ? { window } : {}),
+          ...(marks !== undefined ? { marks } : {}),
         }, 60000);
         const jpeg = typeof r.jpeg === "string";
         return {
           content: [
-            { type: "text", text: screenshotCaption(name, r) },
+            { type: "text", text: screenshotCaption(name, r) + marksLegend(r.marks) },
             jpeg ? { type: "image", data: r.jpeg as string, mimeType: "image/jpeg" } : { type: "image", data: r.png as string, mimeType: "image/png" },
           ],
         };

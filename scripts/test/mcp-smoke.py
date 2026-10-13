@@ -38,9 +38,13 @@ def main():
         "alcove_port_forward_add", "alcove_port_forward_remove", "alcove_port_forward_list", "alcove_set_network",
         "alcove_set_resolution", "alcove_set_environment", "alcove_doctor",
     }
-    toolsets = {"core": core, "shell": shell, "files": files, "state": state}
+    ui = {
+        "alcove_list_windows", "alcove_window_action", "alcove_ui_tree", "alcove_ui_find", "alcove_ui_get_text",
+        "alcove_ui_click", "alcove_ui_type", "alcove_ui_action", "alcove_launch_app", "alcove_deploy", "alcove_events",
+    }
+    toolsets = {"core": core, "shell": shell, "files": files, "state": state, "ui": ui}
     selected = [s.strip() for s in env.get("ALCOVE_MCP_TOOLSETS", "").split(",") if s.strip()]
-    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files | state
+    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files | state | ui
     missing = expected - set(names)
     extra = set(names) - expected
     if missing or extra:
