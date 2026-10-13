@@ -30,9 +30,13 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     private var failure: String?
     private var dropped = 0
 
+    private var renderFailures = 0
+
+    /// Removes a file already at `url`.
     init(url: URL, fps: Int) {
         self.url = url
         self.fps = fps
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// The size of the video for a first frame of `width` x `height`.
@@ -60,6 +64,32 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
 
     /// Encodes `frame` at `time` after the start of the recording; a frame not later than the previous one is dropped.
     func append(frame: Frame, at time: Duration) {
+        append(frame, at: time, countDrop: true)
+    }
+
+    /// Encodes the last frame of the recording: waits up to 500 ms for the encoder and does not count it as dropped.
+    func appendFinal(frame: Frame, at time: Duration) async {
+        _ = await waitUntilReady(timeout: .milliseconds(500))
+        append(frame, at: time, countDrop: false)
+    }
+
+    /// Waits until the encoder accepts another frame; false when `timeout` passes first.
+    func waitUntilReady(timeout: Duration = .seconds(5)) async -> Bool {
+        let limit = ContinuousClock.now + timeout
+        while ContinuousClock.now < limit {
+            if lock.withLock({ input?.isReadyForMoreMediaData ?? true }) { return true }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return false
+    }
+
+    /// The next `count` frames fail to render.
+    func failNextRenders(_ count: Int) { lock.withLock { renderFailures = count } }
+
+    /// Cancels the underlying writer as if the encoder had stopped.
+    func stopWriterForTesting() { lock.withLock { writer?.cancelWriting() } }
+
+    private func append(_ frame: Frame, at time: Duration, countDrop: Bool) {
         lock.withLock {
             guard !finished, failure == nil else { return }
             let seconds = Double(time.components.seconds) + Double(time.components.attoseconds) / 1e18
@@ -71,9 +101,17 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 failure = describe(writer.error)
                 return
             }
-            guard input.isReadyForMoreMediaData else { dropped += 1; return }
+            guard input.isReadyForMoreMediaData else {
+                if countDrop { dropped += 1 }
+                return
+            }
+            if renderFailures > 0 {
+                renderFailures -= 1
+                if countDrop { dropped += 1 }
+                return
+            }
             guard let buffer = makeBuffer(adaptor), render(frame, into: buffer) else {
-                dropped += 1
+                if countDrop { dropped += 1 }
                 return
             }
             if adaptor.append(buffer, withPresentationTime: presentation) {
@@ -84,20 +122,33 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
         }
     }
 
-    /// Completes the file; later calls do nothing, and later frames are ignored.
+    /// Completes the file; later calls do nothing, and later frames are ignored. A writer that failed, or a session
+    /// without an appended frame, is cancelled and its file removed.
     func finish() async {
-        let pending: (AVAssetWriter, AVAssetWriterInput, CMTime)? = lock.withLock {
+        let pending: (AVAssetWriter, CMTime)? = lock.withLock {
             guard !finished else { return nil }
             finished = true
-            guard let writer, let input, writer.status == .writing else { return nil }
-            input.markAsFinished()
-            return (writer, input, lastTime)
+            guard let writer else { return nil }
+            if failure == nil, writer.status != .writing {
+                failure = describe(writer.status == .failed ? writer.error : nil)
+            }
+            if failure == nil, !lastTime.isValid { failure = "no frame could be recorded for the video" }
+            if failure != nil {
+                writer.cancelWriting()
+                try? FileManager.default.removeItem(at: url)
+                return nil
+            }
+            input?.markAsFinished()
+            return (writer, lastTime)
         }
-        guard let (writer, _, last) = pending else { return }
+        guard let (writer, last) = pending else { return }
         writer.endSession(atSourceTime: last)
         await writer.finishWriting()
         lock.withLock {
-            if writer.status == .failed, failure == nil { failure = describe(writer.error) }
+            if writer.status == .failed, failure == nil {
+                failure = describe(writer.error)
+                try? FileManager.default.removeItem(at: url)
+            }
         }
     }
 
@@ -105,7 +156,6 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     private func open(firstFrame frame: Frame, at time: CMTime) -> Bool {
         let size = VideoRecorder.fittedSize(width: frame.width, height: frame.height)
         do {
-            try? FileManager.default.removeItem(at: url)
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
             writer.movieTimeScale = VideoRecorder.timeScale
             let settings: [String: Any] = [
@@ -126,7 +176,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 kCVPixelBufferHeightKey as String: size.height,
             ])
             guard writer.canAdd(input) else {
-                failure = "the video encoder does not accept the screen size \(size.width)x\(size.height); the trace is unaffected"
+                failure = "the video encoder does not accept the screen size \(size.width)x\(size.height)"
                 return false
             }
             writer.add(input)
@@ -149,7 +199,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     }
 
     private func describe(_ error: Error?) -> String {
-        "the video could not be written (\(error?.localizedDescription ?? "unknown error")); the trace is unaffected"
+        "the video could not be written: \(error?.localizedDescription ?? "the encoder stopped before the recording ended")"
     }
 
     private func makeBuffer(_ adaptor: AVAssetWriterInputPixelBufferAdaptor) -> CVPixelBuffer? {

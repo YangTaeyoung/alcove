@@ -13,12 +13,15 @@ protocol VideoSink: Sendable {
     var appendedSeconds: Double { get }
     /// A sentence describing why the video could not be written; nil when it can.
     var errorMessage: String? { get }
+    /// Adds the last frame of the recording; an encoder that is busy is given a moment, and the frame is not counted as dropped.
+    func appendFinal(frame: Frame, at time: Duration) async
 }
 
 extension VideoSink {
     var droppedFrames: Int { 0 }
     var appendedSeconds: Double { 0 }
     var errorMessage: String? { nil }
+    func appendFinal(frame: Frame, at time: Duration) async { append(frame: frame, at: time) }
 }
 
 /// A sink that discards everything.
@@ -121,24 +124,34 @@ actor Recording {
         if video {
             let interval = Duration.seconds(1.0 / Double(fps))
             sampler = Task { [weak self] in
+                var tick = ContinuousClock.now
                 while !Task.isCancelled {
                     await self?.sample()
-                    try? await Task.sleep(for: interval)
+                    tick = Recording.nextTick(after: tick, now: .now, interval: interval)
+                    try? await Task.sleep(until: tick, clock: .continuous)
                 }
             }
         }
+    }
+
+    /// The sampling tick after `tick`: one `interval` later, or the first later tick on the same schedule that is still ahead of `now`.
+    static func nextTick(after tick: ContinuousClock.Instant, now: ContinuousClock.Instant, interval: Duration) -> ContinuousClock.Instant {
+        let next = tick + interval
+        guard next <= now else { return next }
+        let missed = Int(((now - next) / interval).rounded(.down)) + 1
+        return next + interval * missed
     }
 
     /// Reads one frame and encodes it unless it repeats the previous one.
     private func sample() async {
         guard isActive, let frame = await framesSource() else { return }
         guard isActive, !Task.isCancelled else { return }
-        appendVideo(frame, force: false)
+        appendVideo(frame)
     }
 
-    private func appendVideo(_ frame: Frame, force: Bool) {
+    private func appendVideo(_ frame: Frame) {
         let elapsed = startedInstant.duration(to: clock())
-        if !force, let last = lastVideoFrame, last == frame, elapsed - lastVideoAt < Recording.videoKeepAlive { return }
+        if let last = lastVideoFrame, last == frame, elapsed - lastVideoAt < Recording.videoKeepAlive { return }
         sink.append(frame: frame, at: elapsed)
         lastVideoFrame = frame
         lastVideoAt = elapsed
@@ -215,12 +228,14 @@ actor Recording {
             await sampler.value
             self.sampler = nil
         }
-        if video, let last = await framesSource() ?? lastVideoFrame { appendVideo(last, force: true) }
+        if video, let last = await framesSource() ?? lastVideoFrame {
+            await sink.appendFinal(frame: last, at: startedInstant.duration(to: clock()))
+        }
         await sink.finish()
         if let message = sink.errorMessage { noteWriteError(message) }
         let videoURL = directory.appendingPathComponent("video.mp4")
         let size = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int) ?? nil
-        let hasVideo = video && (size ?? 0) > 0
+        let hasVideo = video && sink.errorMessage == nil && (size ?? 0) > 0
         return Summary(dir: directory.path, video: hasVideo ? videoURL.path : nil,
                        trace: directory.appendingPathComponent(TraceWriter.traceName).path, frames: frameCount,
                        seconds: (seconds * 10).rounded() / 10, ops: lineCount,

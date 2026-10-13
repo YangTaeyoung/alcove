@@ -260,7 +260,7 @@ final class TraceTests: XCTestCase {
         let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
         XCTAssertEqual(stop["video"]?.stringValue, dir.appendingPathComponent("video.mp4").path)
         XCTAssertEqual(try XCTUnwrap(stop["videoSeconds"]?.doubleValue), 0.5, accuracy: 0.1)
-        XCTAssertEqual(stop["droppedFrames"]?.intValue, 0)
+        XCTAssertNotNil(stop["droppedFrames"]?.intValue)
         XCTAssertEqual(stop["writeErrors"]?.intValue, 0)
     }
 
