@@ -64,7 +64,8 @@ extension ControlHandler {
         }
     }
 
-    /// The last `tail` lines through `fs.tail`, or up to `length` bytes from `offset` through `fs.read`, decoded as text.
+    /// The last `tail` lines through `fs.tail`, or up to `length` bytes from `offset` through `fs.read`, decoded as text;
+    /// as UTF-16LE when the agent reports that encoding for the file.
     private func readText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
         let path = try string(params, "path")
         var range: [String: JSON] = [:]
@@ -80,7 +81,7 @@ extension ControlHandler {
             r = try await agent.call("fs.read", ["path": .string(path), "offset": range["offset"] ?? 0, "length": .int(Int64(length))])
         }
         let data = Data(base64Encoded: r["data"]?.stringValue ?? "") ?? Data()
-        return ["text": .string(GuestText.decode(data)), "size": r["size"] ?? 0,
+        return ["text": .string(GuestText.decode(data, utf16: r["encoding"]?.stringValue == "utf-16le")), "size": r["size"] ?? 0,
                 "eof": .bool(range["lines"] != nil || r["eof"]?.boolValue == true)]
     }
 

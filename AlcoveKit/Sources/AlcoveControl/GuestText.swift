@@ -2,12 +2,14 @@ import Foundation
 
 /// Decodes text files read from a guest.
 enum GuestText {
-    /// UTF-16LE when `data` starts with `FF FE`, UTF-8 with a leading BOM
-    /// stripped, otherwise UTF-8. Invalid sequences become U+FFFD.
-    static func decode(_ data: Data) -> String {
+    /// UTF-16LE when `utf16` is set or `data` starts with `FF FE` (a leading
+    /// `FF FE` is dropped), UTF-8 with a leading BOM stripped, otherwise
+    /// UTF-8. Invalid sequences become U+FFFD.
+    static func decode(_ data: Data, utf16: Bool = false) -> String {
         let bytes = [UInt8](data)
-        if bytes.starts(with: [0xFF, 0xFE]) {
-            let body = bytes.dropFirst(2)
+        let marked = bytes.starts(with: [0xFF, 0xFE])
+        if utf16 || marked {
+            let body = marked ? bytes.dropFirst(2) : bytes[...]
             var units: [UInt16] = []
             units.reserveCapacity(body.count / 2 + 1)
             var index = body.startIndex

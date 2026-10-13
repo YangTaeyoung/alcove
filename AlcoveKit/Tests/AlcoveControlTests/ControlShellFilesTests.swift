@@ -368,6 +368,27 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "fs.read").count, 3)
     }
 
+    func testFsReadDecodesPiecesAndTailOfAUTF16File() async throws {
+        func utf16le(_ text: String) -> Data {
+            var data = Data()
+            for unit in text.utf16 { data.append(UInt8(unit & 0xFF)); data.append(UInt8(unit >> 8)) }
+            return data
+        }
+        let piece = utf16le("줄 2\r\n").base64EncodedString()
+        let lines = utf16le("줄 4\r\n줄 5\r\n").base64EncodedString()
+        let (h, _) = try await setup { m, _ in
+            switch m["op"]?.stringValue {
+            case "fs.read": return [agentReply(m, ["data": .string(piece), "size": 40, "eof": false, "encoding": "utf-16le"])]
+            case "fs.tail": return [agentReply(m, ["data": .string(lines), "size": 40, "encoding": "utf-16le"])]
+            default: return []
+            }
+        }
+        let part = try await h.handle(op: "vm.fs.read", params: ["name": "Win", "path": "C:\\ps.log", "offset": 12, "length": 10])
+        XCTAssertEqual(part, ["text": "줄 2\r\n", "size": 40, "eof": false])
+        let tail = try await h.handle(op: "vm.fs.read", params: ["name": "Win", "path": "C:\\ps.log", "tail": 2])
+        XCTAssertEqual(tail, ["text": "줄 4\r\n줄 5\r\n", "size": 40, "eof": true])
+    }
+
     func testFsWriteAppend() async throws {
         let file = LockedBox(Data())
         let (h, agent) = try await setup { m, _ in
@@ -495,6 +516,16 @@ final class GuestTextTests: XCTestCase {
         XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE])), "")
         XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE, 0x41, 0x00, 0x42])), "A\u{FFFD}")
         XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE, 0x00, 0xD8, 0x41, 0x00])), "\u{FFFD}A")
+    }
+
+    func testUTF16LittleEndianWithoutBOMWhenTheFileIsUTF16() {
+        var data = Data()
+        for unit in "한글 😀\n".utf16 { data.append(UInt8(unit & 0xFF)); data.append(UInt8(unit >> 8)) }
+        XCTAssertEqual(GuestText.decode(data, utf16: true), "한글 😀\n")
+        XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE]) + data, utf16: true), "한글 😀\n")
+        XCTAssertEqual(GuestText.decode(Data(), utf16: true), "")
+        XCTAssertEqual(GuestText.decode(Data([0x41, 0x00, 0x42]), utf16: true), "A\u{FFFD}")
+        XCTAssertEqual(GuestText.decode(Data("plain".utf8), utf16: false), "plain")
     }
 
     func testUTF8WithBOMIsStripped() {
