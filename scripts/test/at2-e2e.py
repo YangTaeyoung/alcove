@@ -588,7 +588,7 @@ def _(run):
     return message
 
 
-@check("vm.set_environment sets theme, time zone, clock and display scale, reports takesEffect and refuses bad values")
+@check("vm.set_environment sets theme, time zone, clock and display scale, reports the applied scale and takesEffect, and refuses bad values")
 def _(run):
     def applied(**settings):
         return run.call("vm.set_environment", 200, **settings)["applied"]
@@ -639,13 +639,22 @@ def _(run):
 
     run.dpi = percent
     other = 125 if percent != 125 else 100
-    for value in (other, percent):
-        row = one("dpiScale", dpiScale=value)
-        expect(row["ok"] is True and row["takesEffect"] == "now" and row["detail"] == f"scale: {value} %", f"dpiScale={value} answered {row!r}")
-        end = time.time() + 15
-        while run.doctor_row("scale")["detail"] != f"{value} %":
-            expect(time.time() < end, f"15 s after dpiScale={value} vm.doctor reports scale {run.doctor_row('scale')['detail']!r}")
-            time.sleep(1)
+    row = one("dpiScale", dpiScale=other)
+    expect(row["ok"] is True and row["takesEffect"] == "now" and row["detail"] == f"scale: {other} %", f"dpiScale={other} answered {row!r}")
+    read = run.doctor_row("scale")["detail"]
+    expect(read == f"{other} %", f"dpiScale={other} answered {row['detail']!r} and a new process in the guest reads {read!r}")
+    row = one("dpiScale", dpiScale=500)
+    refused = re.fullmatch(r"scale: (\d+) % was applied, not 500 %; the largest scale the guest offers at its resolution is (\d+) %; "
+                           r"request it, or set a larger resolution with vm.set_resolution first", row["detail"])
+    expect(row["ok"] is False and row["takesEffect"] == "now" and refused and refused.group(1) == refused.group(2),
+           f"dpiScale=500 answered {row!r}; it must fail and name the applied scale as the largest offered one")
+    largest = int(refused.group(1))
+    read = run.doctor_row("scale")["detail"]
+    expect(read == f"{largest} %", f"dpiScale=500 reported {largest} % as applied and a new process in the guest reads {read!r}")
+    row = one("dpiScale", dpiScale=percent)
+    expect(row["ok"] is True and row["takesEffect"] == "now" and row["detail"] == f"scale: {percent} %", f"dpiScale={percent} answered {row!r}")
+    read = run.doctor_row("scale")["detail"]
+    expect(read == f"{percent} %", f"dpiScale={percent} answered {row['detail']!r} and a new process in the guest reads {read!r}")
     run.dpi = None
 
     row = one("timeZone", timeZone="No Such Zone")
@@ -662,7 +671,8 @@ def _(run):
         message = run.refusal("vm.set_environment", **settings)
         expect(message == sentence, f"vm.set_environment {settings!r} failed with {message!r}")
     run.theme = run.time_zone = None
-    return f"theme dark/light, time zone {target} and back to {original_zone}, clock +120 s and host, scale {other} % and back to {percent} % without signing out"
+    return (f"theme dark/light, time zone {target} and back to {original_zone}, clock +120 s and host, scale {other} % read back, "
+            f"500 % refused with {largest} % applied, back to {percent} % without signing out")
 
 
 @check("vm.set_resolution changes the guest screen and the screenshot size")
