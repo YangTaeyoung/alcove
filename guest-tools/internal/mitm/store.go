@@ -32,6 +32,8 @@ type Exchange struct {
 
 	ReqHeaders   [][2]string
 	ResHeaders   [][2]string
+	ReqTrailers  [][2]string
+	ResTrailers  [][2]string
 	ReqBody      []byte
 	ResBody      []byte
 	ReqTruncated bool

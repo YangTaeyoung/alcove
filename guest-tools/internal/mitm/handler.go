@@ -4,13 +4,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
 
-const websocketRefusal = "websocket interception is not supported; exclude this host with the hosts filter"
+const (
+	websocketRefusal = "websocket interception is not supported; exclude this host with the hosts filter"
+	badTargetRefusal = "request target must start with '/'"
+	clientClosed     = "the client closed the connection"
+	maxDrainBytes    = 64 << 20
+)
 
 var hopByHop = []string{
 	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
@@ -30,6 +36,18 @@ func removeHopByHop(h http.Header) {
 	}
 }
 
+// wantsTrailers reports whether the Te header lists "trailers".
+func wantsTrailers(h http.Header) bool {
+	for _, v := range h.Values("Te") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "trailers") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func headerPairs(h http.Header) [][2]string {
 	names := make([]string, 0, len(h))
 	for name := range h {
@@ -46,6 +64,9 @@ func headerPairs(h http.Header) [][2]string {
 }
 
 func redactPairs(pairs [][2]string) [][2]string {
+	if pairs == nil {
+		return nil
+	}
 	out := make([][2]string, len(pairs))
 	for i, kv := range pairs {
 		out[i] = kv
@@ -61,6 +82,8 @@ func (p *Proxy) record(ex *Exchange) {
 	if !p.config().secrets {
 		ex.ReqHeaders = redactPairs(ex.ReqHeaders)
 		ex.ResHeaders = redactPairs(ex.ResHeaders)
+		ex.ReqTrailers = redactPairs(ex.ReqTrailers)
+		ex.ResTrailers = redactPairs(ex.ResTrailers)
 	}
 	p.store.add(ex)
 }
@@ -74,12 +97,15 @@ func (p *Proxy) handler(scheme, authority string) http.Handler {
 	})
 }
 
+// drainBody reads the rest of the request body through the capture tee.
+func drainBody(r *http.Request) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxDrainBytes))
+}
+
 func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, authority string) {
 	start := time.Now()
-	var target string
-	if authority != "" {
-		target = scheme + "://" + authority + r.URL.RequestURI()
-	} else {
+	u := &url.URL{Scheme: scheme, Host: authority, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery}
+	if authority == "" {
 		if !r.URL.IsAbs() || r.URL.Host == "" {
 			http.Error(w, "alcove-proxy is an HTTP proxy; send the request with an absolute URL", http.StatusBadRequest)
 			return
@@ -88,12 +114,10 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 			http.Error(w, "alcove-proxy forwards http:// URLs here and https:// through CONNECT", http.StatusBadRequest)
 			return
 		}
-		target = r.URL.String()
+		u.Scheme, u.Host = "http", r.URL.Host
 	}
-	host := r.URL.Hostname()
-	if authority != "" {
-		host, _ = splitAuthority(authority, "")
-	}
+	target := u.String()
+	host := u.Hostname()
 
 	untouched := authority == "" && !p.intercepts(host)
 	cfg := p.config()
@@ -116,6 +140,9 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		ex.Ms = time.Since(start).Milliseconds()
 		ex.ReqBody, ex.ReqBytes, ex.ReqTruncated = reqCap.snapshot()
 		ex.ResBody, ex.ResBytes, ex.ResTruncated = resCap.snapshot()
+		if !untouched {
+			ex.ReqTrailers = headerPairs(r.Trailer)
+		}
 		p.record(ex)
 	}()
 
@@ -126,8 +153,15 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 	}{io.TeeReader(reqBody, reqCap), reqBody}
 
 	if untouched {
-		p.forward(w, r, target, ex, resCap)
+		p.forward(w, r, u, ex, resCap)
 		ex.ResHeaders = nil
+		return
+	}
+
+	if authority != "" && !strings.HasPrefix(r.RequestURI, "/") {
+		drainBody(r)
+		ex.Error = badTargetRefusal
+		respondText(w, ex, resCap, http.StatusBadRequest, badTargetRefusal)
 		return
 	}
 
@@ -146,19 +180,22 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 			}
 		}
 		if act.Drop {
+			drainBody(r)
 			panic(http.ErrAbortHandler)
 		}
 		if act.synthesizes() {
+			drainBody(r)
 			p.synthesize(w, ex, resCap, act)
 			return
 		}
 	}
 
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		drainBody(r)
 		respondText(w, ex, resCap, http.StatusNotImplemented, websocketRefusal)
 		return
 	}
-	p.forward(w, r, target, ex, resCap)
+	p.forward(w, r, u, ex, resCap)
 }
 
 func respondText(w http.ResponseWriter, ex *Exchange, resCap *capBuf, status int, text string) {
@@ -188,24 +225,36 @@ func (p *Proxy) synthesize(w http.ResponseWriter, ex *Exchange, resCap *capBuf, 
 	_, _ = io.WriteString(io.MultiWriter(w, resCap), act.Body)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, ex *Exchange, resCap *capBuf) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *Exchange, resCap *capBuf) {
 	var body io.Reader = r.Body
 	if r.ContentLength == 0 {
 		body = nil
 	}
-	out, err := http.NewRequestWithContext(r.Context(), r.Method, target, body)
+	out, err := http.NewRequestWithContext(r.Context(), r.Method, "http://forward.invalid/", body)
 	if err != nil {
 		ex.Error = "the request cannot be forwarded: " + err.Error()
 		respondText(w, ex, resCap, http.StatusBadRequest, ex.Error)
 		return
 	}
+	out.URL = u
 	out.ContentLength = r.ContentLength
 	out.Header = r.Header.Clone()
 	removeHopByHop(out.Header)
+	if wantsTrailers(r.Header) {
+		out.Header.Set("Te", "trailers")
+	}
+	if len(r.Trailer) > 0 {
+		out.Trailer = r.Trailer
+		out.ContentLength = -1
+	}
 	out.Host = r.Host
 
 	resp, err := p.upstream().RoundTrip(out)
 	if err != nil {
+		if r.Context().Err() != nil {
+			ex.Error = clientClosed
+			return
+		}
 		ex.Error = "the upstream request failed: " + err.Error()
 		respondText(w, ex, resCap, http.StatusBadGateway,
 			"alcove-proxy could not complete the upstream request ("+err.Error()+"); check the address and that the Mac can reach it")
@@ -216,6 +265,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, e
 	h := w.Header()
 	for k, vs := range resp.Header {
 		h[k] = vs
+	}
+	if len(resp.Trailer) > 0 {
+		h.Del("Content-Length")
+	}
+	for k := range resp.Trailer {
+		h.Add("Trailer", k)
 	}
 	ex.Status = resp.StatusCode
 	ex.ResHeaders = headerPairs(resp.Header)
@@ -228,18 +283,28 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, e
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				ex.Error = "the client closed the connection before the response ended"
+				ex.Error = clientClosed
 				return
 			}
 			resCap.Write(buf[:n])
 			_ = rc.Flush()
 		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				ex.Error = "the upstream response ended early: " + rerr.Error()
-				panic(http.ErrAbortHandler)
-			}
-			return
+		if rerr == io.EOF {
+			break
 		}
+		if rerr != nil {
+			if r.Context().Err() != nil {
+				ex.Error = clientClosed
+				return
+			}
+			ex.Error = "the upstream response ended early: " + rerr.Error()
+			panic(http.ErrAbortHandler)
+		}
+	}
+	if len(resp.Trailer) > 0 {
+		for k, vs := range resp.Trailer {
+			h[http.TrailerPrefix+k] = vs
+		}
+		ex.ResTrailers = headerPairs(resp.Trailer)
 	}
 }

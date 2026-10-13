@@ -267,9 +267,9 @@ func (p *Proxy) opGet(params map[string]any) (map[string]any, error) {
 	if !ok {
 		return nil, fmt.Errorf("no exchange with id %d; the store keeps the newest %d exchanges and 'clear' removes them all", id, maxExchanges)
 	}
-	headers, body, truncated := e.ReqHeaders, e.ReqBody, e.ReqTruncated
+	headers, body, truncated, trailers := e.ReqHeaders, e.ReqBody, e.ReqTruncated, e.ReqTrailers
 	if part == "response" {
-		headers, body, truncated = e.ResHeaders, e.ResBody, e.ResTruncated
+		headers, body, truncated, trailers = e.ResHeaders, e.ResBody, e.ResTruncated, e.ResTrailers
 	}
 	decoded, encoding, undecodable := decodeBody(headers, body, truncated)
 	if headers == nil {
@@ -281,6 +281,9 @@ func (p *Proxy) opGet(params map[string]any) (map[string]any, error) {
 	}
 	if e.BodyDropped {
 		res["bodyDropped"] = true
+	}
+	if len(trailers) > 0 {
+		res["trailers"] = trailers
 	}
 	view := decoded
 	if truncated && !undecodable {

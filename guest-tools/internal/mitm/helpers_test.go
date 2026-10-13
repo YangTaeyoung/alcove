@@ -66,6 +66,26 @@ func (e *testEnv) newClient(trustCA bool) *http.Client {
 	return &http.Client{Transport: tr, Timeout: 30 * time.Second}
 }
 
+// newProtoClient returns a client trusting the proxy CA that speaks only
+// HTTP/1.1 unless h2 is true.
+func (e *testEnv) newProtoClient(h2 bool) *http.Client {
+	c := e.newClient(true)
+	tr := c.Transport.(*http.Transport)
+	if !h2 {
+		tr.ForceAttemptHTTP2 = false
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	return c
+}
+
+// protoName names the client protocol for subtests.
+func protoName(h2 bool) string {
+	if h2 {
+		return "http2"
+	}
+	return "http1"
+}
+
 func (e *testEnv) call(op string, params map[string]any) map[string]any {
 	e.t.Helper()
 	res, err := e.proxy.Handle(op, params)

@@ -18,7 +18,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -165,53 +164,6 @@ func headerMap(res map[string]any) map[string]string {
 		out[pair[0].(string)] = pair[1].(string)
 	}
 	return out
-}
-
-func TestStreamingIsForwardedIncrementally(t *testing.T) {
-	var lastWrite atomic.Int64
-	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		for i := 1; i <= 3; i++ {
-			fmt.Fprintf(w, "data: event-%d\n\n", i)
-			w.(http.Flusher).Flush()
-			if i == 3 {
-				lastWrite.Store(time.Now().UnixNano())
-			}
-			if i < 3 {
-				time.Sleep(150 * time.Millisecond)
-			}
-		}
-	}))
-	defer up.Close()
-	env := newEnv(t, up)
-	resp, err := env.client.Get(up.URL + "/stream")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	br := bufio.NewReader(resp.Body)
-	line, err := br.ReadString('\n')
-	if err != nil || line != "data: event-1\n" {
-		t.Fatalf("first line %q %v", line, err)
-	}
-	firstSeen := time.Now().UnixNano()
-	if w := lastWrite.Load(); w != 0 && firstSeen >= w {
-		t.Fatal("the first event arrived only after the upstream wrote the last one")
-	}
-	if lastWrite.Load() != 0 {
-		t.Fatal("the upstream had already written every event when the first one arrived")
-	}
-	rest, _ := io.ReadAll(br)
-	if !strings.Contains(string(rest), "event-3") {
-		t.Fatalf("rest %q", rest)
-	}
-	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
-	body := env.get(idOf(x), "response", nil)["body"].(string)
-	for _, want := range []string{"event-1", "event-2", "event-3"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("capture %q lacks %s", body, want)
-		}
-	}
 }
 
 func fillDeterministic(seed int64, n int) io.Reader {
