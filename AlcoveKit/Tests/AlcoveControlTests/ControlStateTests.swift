@@ -71,7 +71,68 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(delete, "snapshot delete failed: Device 'disk0' is not writable")
         await t.setSnapshotError(QMPClient.QMPError.disconnected("peer closed"))
         let restore = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
-        XCTAssertEqual(restore, "snapshot restore failed: the engine closed its control connection; check vm.status")
+        XCTAssertEqual(restore, "snapshot restore failed: the engine closed the connection (peer closed); check vm.status")
+    }
+
+    func testSnapshotListFailureCarriesTheEngineText() async throws {
+        let (h, t) = setup()
+        await t.setSnapshotListError(VMController.ControllerError.snapshotListFailed("qemu-img: Could not open 'disk0.qcow2': Permission denied\n"))
+        let list = await failure(h, "vm.snapshot.list", ["name": "Win"])
+        XCTAssertEqual(list, "snapshot list failed: qemu-img: Could not open 'disk0.qcow2': Permission denied")
+        let create = await failure(h, "vm.snapshot.create", ["name": "Win", "snapshot": "fresh"])
+        XCTAssertEqual(create, "snapshot list failed: qemu-img: Could not open 'disk0.qcow2': Permission denied")
+    }
+
+    func testSetNetworkFailureIsASentence() async throws {
+        let (h, t) = setup()
+        await t.setLinkError(QMPClient.QMPError.command(name: "set_link", class: "DeviceNotFound", desc: "Device 'net0' not found"))
+        let command = await failure(h, "vm.set_network", ["name": "Win", "up": false])
+        XCTAssertEqual(command, "set network failed: Device 'net0' not found")
+        await t.setLinkError(QMPClient.QMPError.notConnected)
+        let gone = await failure(h, "vm.set_network", ["name": "Win", "up": true])
+        XCTAssertEqual(gone, "set network failed: the connection to the engine is gone; check vm.status and restart the VM with vm.stop and vm.start")
+    }
+
+    func testEngineReasonNamesEveryQMPError() async throws {
+        let (h, _) = setup()
+        let restart = "restart the VM with vm.stop and vm.start"
+        let cases: [(QMPClient.QMPError, String)] = [
+            (.notConnected, "the connection to the engine is gone; check vm.status and \(restart)"),
+            (.connect("No such file or directory"), "could not connect to the engine (No such file or directory); check vm.status and \(restart)"),
+            (.disconnected("peer closed"), "the engine closed the connection (peer closed); check vm.status"),
+            (.command(name: "stop", class: "GenericError", desc: "VM is stopped"), "VM is stopped"),
+            (.protocolViolation("bad greeting"), "the engine sent a message Alcove cannot read (bad greeting); \(restart)"),
+            (.timeout("query-status"), "the engine did not answer query-status in time; check vm.status"),
+            (.job(id: "j1", error: "No space left on device"), "No space left on device"),
+            (.unexpectedReturn(command: "query-block", value: .null), "the engine answered query-block with a value Alcove does not expect; \(restart)"),
+        ]
+        for (error, sentence) in cases {
+            XCTAssertEqual(h.engineReason(error), sentence)
+        }
+    }
+
+    func testEngineReasonNamesEveryControllerError() async throws {
+        let (h, _) = setup()
+        let restart = "restart the VM with vm.stop and vm.start"
+        let cases: [(VMController.ControllerError, String)] = [
+            (.notRunning, "the VM is not running; check vm.status"),
+            (.alreadyRunning, "the VM is already running; check vm.status"),
+            (.engineDidNotStart("exit 1"), "the engine did not start (exit 1); check vm.status and call vm.start again"),
+            (.qmpUnavailable("no socket"), "the engine's control connection is unavailable (no socket); check vm.status and \(restart)"),
+            (.invalidSnapshotName("a\nb"), "snapshot name must be 1 to 128 characters without a line break; choose another name"),
+            (.snapshotListFailed("qemu-img: failed\n"), "qemu-img: failed"),
+            (.snapshotListFailed(" \n"), "qemu-img could not read the snapshots of the disk; check the VM's disk file"),
+        ]
+        for (error, sentence) in cases {
+            XCTAssertEqual(h.engineReason(error), sentence)
+        }
+    }
+
+    func testEngineReasonDoesNotDumpOtherErrors() async throws {
+        struct Unknown: Error {}
+        let (h, _) = setup()
+        XCTAssertEqual(h.engineReason(Unknown()), "the engine failed in a way Alcove cannot describe; check vm.status and restart the VM with vm.stop and vm.start")
+        XCTAssertEqual(h.engineReason(CocoaError(.fileNoSuchFile)), CocoaError(.fileNoSuchFile).localizedDescription)
     }
 
     func testRestoreUnknownSnapshot() async throws {
@@ -176,6 +237,16 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(removed, [:])
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
         XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+    }
+
+    func testForwardRemoveReportsAnEmptyReply() async throws {
+        let (h, t) = setup()
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
+        await t.setMonitorReplies([""])
+        let message = await failure(h, "vm.forward.remove", ["name": "Win", "hostPort": 13389])
+        XCTAssertEqual(message, "port forward failed: the engine gave no answer")
+        let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(list["forwards"]?.arrayValue?.count, 2)
     }
 
     func testForwardRemoveReportsAnotherEngineReply() async throws {

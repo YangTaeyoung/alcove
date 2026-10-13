@@ -130,8 +130,8 @@ extension ControlHandler {
                 throw ControlError.failed("no runtime forward on host port \(hostPort) in '\(t.name)'; call vm.forward.list (forwards from the VM configuration cannot be removed while it runs)")
             }
             let removed = try await forwardLine(t, "hostfwd_remove \(VMController.netdevID) tcp:127.0.0.1:\(hostPort)")
-            guard removed.isEmpty || removed.hasSuffix(" removed") || removed.hasSuffix(" not found") else {
-                throw ControlError.failed("port forward failed: \(removed)")
+            guard removed.hasSuffix(" removed") || removed.hasSuffix(" not found") else {
+                throw ControlError.failed("port forward failed: \(removed.isEmpty ? "the engine gave no answer" : removed)")
             }
             runtimeForwards[t.name]?.removeAll { $0.hostPort == hostPort }
             return [:]
@@ -148,7 +148,7 @@ extension ControlHandler {
             return ["forwards": .array(rows)]
         case "vm.set_network":
             guard let up = params["up"]?.boolValue else { throw ControlError.missing("up") }
-            do { try await t.setNetworkLink(up: up) } catch { throw ControlError.failed("set network failed: \(error)") }
+            do { try await t.setNetworkLink(up: up) } catch { throw ControlError.failed("set network failed: \(engineReason(error))") }
             return ["up": .bool(up)]
         default:
             throw ControlError.unknownOp(op)
@@ -178,7 +178,7 @@ extension ControlHandler {
     }
 
     private func snapshotList(_ t: VMTarget) async throws -> [VMController.SnapshotInfo] {
-        do { return try await t.snapshots() } catch { throw ControlError.failed("snapshot list failed: \(error)") }
+        do { return try await t.snapshots() } catch { throw ControlError.failed("snapshot list failed: \(engineReason(error))") }
     }
 
     private func requireSnapshot(_ snapshot: String, in t: VMTarget) async throws {
@@ -198,15 +198,36 @@ extension ControlHandler {
         }
     }
 
-    /// The engine's own message for a QMP error; the error's description otherwise.
+    /// A sentence for an engine failure: the engine's own message when it gave one, otherwise the next step.
     nonisolated func engineReason(_ error: Error) -> String {
+        let restart = "restart the VM with vm.stop and vm.start"
         switch error {
-        case QMPClient.QMPError.job(_, let message): return message
-        case QMPClient.QMPError.command(_, _, let message): return message
-        case QMPClient.QMPError.disconnected: return "the engine closed its control connection; check vm.status"
-        case QMPClient.QMPError.timeout(let what): return "the engine did not answer \(what) in time; check vm.status"
-        case VMController.ControllerError.notRunning: return "the VM is not running; check vm.status"
-        default: return "\(error)"
+        case let e as QMPClient.QMPError:
+            switch e {
+            case .job(_, let message): return message
+            case .command(_, _, let message): return message
+            case .disconnected(let reason): return "the engine closed the connection (\(reason)); check vm.status"
+            case .timeout(let what): return "the engine did not answer \(what) in time; check vm.status"
+            case .notConnected: return "the connection to the engine is gone; check vm.status and \(restart)"
+            case .connect(let reason): return "could not connect to the engine (\(reason)); check vm.status and \(restart)"
+            case .protocolViolation(let reason): return "the engine sent a message Alcove cannot read (\(reason)); \(restart)"
+            case .unexpectedReturn(let command, _): return "the engine answered \(command) with a value Alcove does not expect; \(restart)"
+            }
+        case let e as VMController.ControllerError:
+            switch e {
+            case .notRunning: return "the VM is not running; check vm.status"
+            case .alreadyRunning: return "the VM is already running; check vm.status"
+            case .engineDidNotStart(let reason): return "the engine did not start (\(reason)); check vm.status and call vm.start again"
+            case .qmpUnavailable(let reason): return "the engine's control connection is unavailable (\(reason)); check vm.status and \(restart)"
+            case .invalidSnapshotName: return "snapshot name must be 1 to 128 characters without a line break; choose another name"
+            case .snapshotListFailed(let text):
+                let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return message.isEmpty ? "qemu-img could not read the snapshots of the disk; check the VM's disk file" : message
+            }
+        case let e as CocoaError:
+            return e.localizedDescription
+        default:
+            return "the engine failed in a way Alcove cannot describe; check vm.status and \(restart)"
         }
     }
 

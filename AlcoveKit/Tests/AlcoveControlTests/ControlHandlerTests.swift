@@ -68,7 +68,13 @@ actor FakeTarget: VMTarget {
         }
         return agentClient
     }
-    func snapshots() async throws -> [VMController.SnapshotInfo] { snapshotList }
+    func snapshots() async throws -> [VMController.SnapshotInfo] {
+        if let snapshotListError { throw snapshotListError }
+        return snapshotList
+    }
+    /// What `snapshots()` throws when set.
+    var snapshotListError: Error?
+    func setSnapshotListError(_ e: Error?) { snapshotListError = e }
     func createSnapshot(named name: String) async throws {
         snapshotCalls.append("create:\(name)")
         if let snapshotError { throw snapshotError }
@@ -87,9 +93,17 @@ actor FakeTarget: VMTarget {
     func setSnapshotError(_ e: Error?) { snapshotError = e }
     func monitorCommand(_ line: String) async throws -> String {
         monitorLines.append(line)
-        return monitorReplies.isEmpty ? "" : monitorReplies.removeFirst()
+        if !monitorReplies.isEmpty { return monitorReplies.removeFirst() }
+        let remove = "hostfwd_remove \(VMController.netdevID) "
+        return line.hasPrefix(remove) ? "host forwarding rule for \(line.dropFirst(remove.count)) removed\r\n" : ""
     }
-    func setNetworkLink(up: Bool) async throws { linkCalls.append(up) }
+    func setNetworkLink(up: Bool) async throws {
+        linkCalls.append(up)
+        if let linkError { throw linkError }
+    }
+    /// What `setNetworkLink` throws when set.
+    var linkError: Error?
+    func setLinkError(_ e: Error?) { linkError = e }
     func staticForwards() async -> [VMConfig.PortForward] { forwards }
     func engineInstance() async -> Int { instance }
     func agentHostPort() async -> Int { agentPort }

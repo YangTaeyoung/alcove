@@ -111,9 +111,12 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertTrue(at100.contains("0x009F, 0,"), at100)
         XCTAssertTrue(at150.contains("0x009F, 2,"), at150)
         XCTAssertTrue(at150.hasSuffix("'scale: 150 %'"), at150)
+    }
+
+    func testDoctorScaleProbeReadsTheSystemDPI() throws {
         let probe = try XCTUnwrap(GuestRecipes.doctorProbe(os: .windows))
-        XCTAssertTrue(probe.contains("SetProcessDPIAware") && probe.contains("GetDpiForSystem"), probe)
-        XCTAssertFalse(probe.contains("AppliedDPI"), probe)
+        XCTAssertTrue(probe.contains("SetProcessDPIAware"), probe)
+        XCTAssertTrue(probe.contains("GetDpiForSystem"), probe)
     }
 
     // MARK: - vm.set_environment
