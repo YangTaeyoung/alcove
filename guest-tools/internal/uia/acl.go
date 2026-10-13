@@ -1,6 +1,9 @@
 package uia
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // lockedSDDL gives Administrators and SYSTEM full control of a directory and
 // everything created in it, and nobody else any access; it takes no entries
@@ -13,14 +16,7 @@ const lockedSDDL = "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)"
 // directory and what is created in it.
 func isLockedSDDL(sddl string) bool {
 	dacl := strings.Index(sddl, "D:")
-	if !strings.HasPrefix(sddl, "O:") || dacl < 0 {
-		return false
-	}
-	owner := sddl[2:dacl]
-	if g := strings.Index(owner, "G:"); g >= 0 {
-		owner = owner[:g]
-	}
-	if owner != "BA" && owner != "SY" {
+	if dacl < 0 || !isTrustedOwner(sddlOwner(sddl)) {
 		return false
 	}
 	rest := sddl[dacl+2:]
@@ -50,6 +46,32 @@ func isLockedSDDL(sddl string) bool {
 	return want["BA"] && want["SY"]
 }
 
+// sddlOwner returns the owner of a descriptor in SDDL form: an alias such as
+// BA or a SID string, or "" when the text does not begin with an owner.
+func sddlOwner(sddl string) string {
+	if !strings.HasPrefix(sddl, "O:") {
+		return ""
+	}
+	owner := sddl[2:]
+	for _, next := range []string{"G:", "D:", "S:"} {
+		if i := strings.Index(owner, next); i >= 0 {
+			owner = owner[:i]
+		}
+	}
+	return owner
+}
+
+// isTrustedOwner reports whether an SDDL owner is Administrators or SYSTEM.
+func isTrustedOwner(owner string) bool {
+	return owner == "BA" || owner == "SY"
+}
+
+// untrustedName returns the path a folder with another owner is renamed to:
+// dir followed by ".untrusted-" and the UTC time as yyyyMMddHHmmss.
+func untrustedName(dir string, now time.Time) string {
+	return dir + ".untrusted-" + now.UTC().Format("20060102150405")
+}
+
 const (
 	invalidFileAttributes  = 0xFFFFFFFF
 	fileAttributeDirectory = 0x00000010
@@ -74,15 +96,20 @@ const (
 	entryRemoveLink = iota // delete the reparse point itself
 	entryRemove            // delete the entry and what is below it
 	entryInherit           // give the entry the directory's owner and access list
+	entryLeave             // do nothing with the entry
 )
 
 // entryAction returns what the lock does with a directory entry of the given
-// name and attribute bits. A reparse point is deleted. With a non-nil keep,
-// an entry whose lower-cased name is not in keep is deleted. Every other entry
-// takes its access from the directory.
-func entryAction(name string, attributes uint32, keep map[string]bool) int {
+// name and attribute bits. A reparse point is deleted. An entry whose
+// lower-cased name is in leave is left as it is. With a non-nil keep, an entry
+// whose lower-cased name is not in keep is deleted. Every other entry takes
+// its access from the directory.
+func entryAction(name string, attributes uint32, keep, leave map[string]bool) int {
 	if isReparseAttributes(attributes) {
 		return entryRemoveLink
+	}
+	if leave[strings.ToLower(name)] {
+		return entryLeave
 	}
 	if keep != nil && !keep[strings.ToLower(name)] {
 		return entryRemove

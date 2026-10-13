@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -123,14 +125,14 @@ func fileAttributes(path string) uint32 {
 }
 
 // LockHelperFolders locks the uia folder and the parent Alcove folder to
-// Administrators and SYSTEM. The parent keeps its files (the agent logs); the
-// uia folder keeps only its logs. An error means a folder is not known to be
-// locked.
+// Administrators and SYSTEM. The parent keeps its files (the agent logs) and
+// leaves the uia entry to the lock of the uia folder; the uia folder keeps
+// only its logs. An error means a folder is not known to be locked.
 func LockHelperFolders(parent, dir string) error {
-	if err := secureDir(parent, nil); err != nil {
+	if err := secureDir(parent, nil, map[string]bool{strings.ToLower(filepath.Base(dir)): true}); err != nil {
 		return err
 	}
-	return secureDir(dir, map[string]bool{"helper.log": true, "helper.log.1": true})
+	return secureDir(dir, map[string]bool{"helper.log": true, "helper.log.1": true}, nil)
 }
 
 // openDir opens what is at path itself, without following a reparse point,
@@ -146,13 +148,64 @@ func openDir(path string) (syscall.Handle, error) {
 		syscall.FILE_FLAG_OPEN_REPARSE_POINT|syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
 }
 
+// openPlainDir opens dir with openDir, checks on the handle that it is a
+// directory and not a reparse point, and returns the handle with the owner
+// and access list read through it in SDDL form.
+func openPlainDir(dir string) (syscall.Handle, string, error) {
+	h, err := openDir(dir)
+	if err != nil {
+		return syscall.InvalidHandle, "", fmt.Errorf("open %s: %v", dir, err)
+	}
+	var info syscall.ByHandleFileInformation
+	if err := syscall.GetFileInformationByHandle(h, &info); err != nil {
+		syscall.CloseHandle(h)
+		return syscall.InvalidHandle, "", fmt.Errorf("read the attributes of %s: %v", dir, err)
+	}
+	if isReparseAttributes(info.FileAttributes) {
+		syscall.CloseHandle(h)
+		return syscall.InvalidHandle, "", fmt.Errorf("%s is a reparse point; remove it", dir)
+	}
+	if !isPlainDirAttributes(info.FileAttributes) {
+		syscall.CloseHandle(h)
+		return syscall.InvalidHandle, "", fmt.Errorf("%s is not a directory; remove it and restart alcove-agent", dir)
+	}
+	have, err := handleOwnerAndDACL(h)
+	if err != nil {
+		syscall.CloseHandle(h)
+		return syscall.InvalidHandle, "", err
+	}
+	return h, have, nil
+}
+
+// ownerAccount returns the owner of an open file or directory as
+// DOMAIN\name, or fallback when the account cannot be looked up.
+func ownerAccount(h syscall.Handle, fallback string) string {
+	var sid *syscall.SID
+	var sd uintptr
+	if r, _, _ := procGetSecurityInfo.Call(uintptr(h), seFileObject, ownerSecurityInfo,
+		uintptr(unsafe.Pointer(&sid)), 0, 0, 0, uintptr(unsafe.Pointer(&sd))); r != 0 || sid == nil {
+		return fallback
+	}
+	defer procLocalFree.Call(sd)
+	account, domain, _, err := sid.LookupAccount("")
+	if err != nil || account == "" {
+		return fallback
+	}
+	if domain == "" {
+		return account
+	}
+	return domain + `\` + account
+}
+
 // secureDir makes dir a directory that only Administrators and SYSTEM can read
 // or change. A new directory is created that way. An existing one is opened
-// without following a reparse point; on that handle it is checked to be a
-// directory and not a reparse point, and any other owner or access list is
-// replaced by lockedSDDL. The entries are handled as entryAction says. An
-// error means the directory is not known to be locked.
-func secureDir(dir string, keep map[string]bool) error {
+// without following a reparse point and checked on that handle to be a
+// directory and not a reparse point. When its owner, read through the handle,
+// is neither Administrators nor SYSTEM, it is renamed to untrustedName and a
+// new directory is created in its place. Any other owner or access list is
+// replaced by lockedSDDL on the handle. The entries are handled as entryAction
+// says. An error means the directory is not known to be locked.
+func secureDir(dir string, keep, leave map[string]bool) error {
 	d, err := newLockedDescriptor()
 	if err != nil {
 		return err
@@ -168,27 +221,32 @@ func secureDir(dir string, keep map[string]bool) error {
 	sa := syscall.SecurityAttributes{SecurityDescriptor: d.sd}
 	sa.Length = uint32(unsafe.Sizeof(sa))
 	err = syscall.CreateDirectory(name, &sa)
-	if err != nil && err != errorAlreadyExists {
+	existed := err == errorAlreadyExists
+	if err != nil && !existed {
 		return fmt.Errorf("create %s: %v", dir, err)
 	}
-	h, err := openDir(dir)
-	if err != nil {
-		return fmt.Errorf("open %s: %v", dir, err)
-	}
-	defer syscall.CloseHandle(h)
-	var info syscall.ByHandleFileInformation
-	if err := syscall.GetFileInformationByHandle(h, &info); err != nil {
-		return fmt.Errorf("read the attributes of %s: %v", dir, err)
-	}
-	if isReparseAttributes(info.FileAttributes) {
-		return fmt.Errorf("%s is a reparse point; remove it", dir)
-	}
-	if !isPlainDirAttributes(info.FileAttributes) {
-		return fmt.Errorf("%s is not a directory; remove it and restart alcove-agent", dir)
-	}
-	have, err := handleOwnerAndDACL(h)
+	h, have, err := openPlainDir(dir)
 	if err != nil {
 		return err
+	}
+	defer func() { syscall.CloseHandle(h) }()
+	if existed && !isTrustedOwner(sddlOwner(have)) {
+		owner := ownerAccount(h, sddlOwner(have))
+		syscall.CloseHandle(h)
+		h = syscall.InvalidHandle
+		moved := os.Rename(dir, untrustedName(dir, time.Now()))
+		if le, ok := moved.(*os.LinkError); ok {
+			moved = le.Err
+		}
+		if moved == nil {
+			moved = syscall.CreateDirectory(name, &sa)
+		}
+		if moved != nil {
+			return fmt.Errorf("%s belongs to %s and could not be moved aside (%v); remove it as an administrator and restart alcove-agent", dir, owner, moved)
+		}
+		if h, have, err = openPlainDir(dir); err != nil {
+			return err
+		}
 	}
 	if !isLockedSDDL(have) {
 		if err := setHandleSecurity(h, ownerSecurityInfo|daclSecurityInfo|protectedDaclInfo, d.owner, d.dacl); err != nil {
@@ -208,13 +266,15 @@ func secureDir(dir string, keep map[string]bool) error {
 	emptyACL := [2]uint32{emptyACLRevisionAndLen, 0}
 	for _, e := range entries {
 		path := filepath.Join(dir, e.Name())
-		switch entryAction(e.Name(), fileAttributes(path), keep) {
+		switch entryAction(e.Name(), fileAttributes(path), keep, leave) {
 		case entryRemoveLink:
 			if err = os.Remove(path); os.IsNotExist(err) {
 				err = nil
 			}
 		case entryRemove:
 			err = os.RemoveAll(path)
+		case entryLeave:
+			err = nil
 		default:
 			err = setSecurity(path, ownerSecurityInfo|daclSecurityInfo|unprotectedDaclInfo, d.owner, unsafe.Pointer(&emptyACL))
 			runtime.KeepAlive(&emptyACL)
