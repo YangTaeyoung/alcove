@@ -153,7 +153,7 @@ public final class FakeFS: @unchecked Sendable {
             if corruptWrites, !piece.isEmpty { piece[piece.startIndex] ^= 0xFF }
             let target = key(for: path)
             var data = m["truncate"]?.boolValue == true ? Data() : (store[target] ?? Data())
-            let offset = m["offset"]?.intValue ?? 0
+            let offset = m["append"]?.boolValue == true ? data.count : (m["offset"]?.intValue ?? 0)
             if data.count < offset { data.append(Data(count: offset - data.count)) }
             data.replaceSubrange(offset..<min(offset + piece.count, data.count), with: piece)
             store[target] = data

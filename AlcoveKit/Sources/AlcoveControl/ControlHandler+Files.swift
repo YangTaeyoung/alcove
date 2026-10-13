@@ -16,6 +16,7 @@ extension ControlHandler {
                 let path = try string(params, "path")
                 var target: [String: JSON] = [:]
                 try pass(params, "guestPath", to: &target, where: isString)
+                let overwrite = try optional(params, "overwrite", .boolean)?.boolValue ?? false
                 let agent = try await tools(t)
                 try requireHostFile(path)
                 let url = URL(fileURLWithPath: path)
@@ -23,7 +24,7 @@ extension ControlHandler {
                     let dest: AgentClient.Destination = params["dest"]?.stringValue == "downloads" ? .downloads : .desktop
                     return ["guestPath": .string(try await agent.pushFile(url, to: dest))]
                 }
-                let r = try await agent.pushFile(url, toGuestPath: guestPath, overwrite: params["overwrite"]?.boolValue ?? false)
+                let r = try await agent.pushFile(url, toGuestPath: guestPath, overwrite: overwrite)
                 return ["guestPath": .string(r.guestPath), "bytes": .int(Int64(r.bytes)), "sha256": .string(r.sha256)]
             case "vm.pull_file":
                 let guestPath = try string(params, "guestPath")
@@ -33,18 +34,19 @@ extension ControlHandler {
             case "vm.sync_dir":
                 let path = try string(params, "path")
                 let guestPath = try string(params, "guestPath")
+                let deleteExtras = try optional(params, "delete", .boolean)?.boolValue ?? false
                 let agent = try await tools(t)
                 var isDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
                     throw ControlError.failed("'\(path)' is not a directory on the host; check the path")
                 }
                 let r = try await agent.syncDirectory(URL(fileURLWithPath: path), toGuestPath: guestPath,
-                                                      deleteExtras: params["delete"]?.boolValue ?? false)
+                                                      deleteExtras: deleteExtras)
                 return ["sent": .array(r.sent.map(JSON.string)), "skipped": .int(Int64(r.skipped)),
                         "deleted": .array(r.deleted.map(JSON.string)), "bytes": .int(Int64(r.bytes))]
             case "vm.fs.list":
                 var request: [String: JSON] = ["path": .string(try string(params, "path"))]
-                try pass(params, "recursive", to: &request, where: isBool)
+                try pass(params, "recursive", to: &request, type: .boolean)
                 let r = try await tools(t).call("fs.list", request)
                 let entries = (r["entries"]?.arrayValue ?? []).map { pick($0, ["name", "dir", "size", "mtime"]) }
                 return ["entries": .array(entries), "truncated": .bool(r["truncated"]?.boolValue ?? false)]
@@ -54,7 +56,7 @@ extension ControlHandler {
                 return try await writeText(t, params)
             case "vm.fs.delete":
                 var request: [String: JSON] = ["path": .string(try string(params, "path"))]
-                try pass(params, "recursive", to: &request, where: isBool)
+                try pass(params, "recursive", to: &request, type: .boolean)
                 return pick(try await tools(t).call("fs.delete", request), ["deleted"])
             default:
                 throw ControlError.unknownOp(op)
@@ -69,9 +71,9 @@ extension ControlHandler {
     private func readText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
         let path = try string(params, "path")
         var range: [String: JSON] = [:]
-        try pass(params, "tail", to: &range, as: "lines", where: isInt)
-        try pass(params, "offset", to: &range, where: isInt)
-        try pass(params, "length", to: &range, where: isInt)
+        try pass(params, "tail", to: &range, as: "lines", type: .integer)
+        try pass(params, "offset", to: &range, type: .integer)
+        try pass(params, "length", to: &range, type: .integer)
         let agent = try await tools(t)
         let r: JSON
         if let lines = range["lines"] {
@@ -89,7 +91,7 @@ extension ControlHandler {
     private func writeText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
         let path = try string(params, "path")
         let data = Data(try string(params, "text").utf8)
-        let append = params["append"]?.boolValue ?? false
+        let append = try optional(params, "append", .boolean)?.boolValue ?? false
         let agent = try await tools(t)
         var size: JSON = 0
         var offset = 0

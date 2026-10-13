@@ -17,15 +17,15 @@ extension ControlHandler {
                 return pick(r, ["job", "pid"])
             case "vm.exec.read":
                 var request: [String: JSON] = ["job": .string(try string(params, "job"))]
-                try pass(params, "outOffset", to: &request, as: "out_offset", where: isInt)
-                try pass(params, "errOffset", to: &request, as: "err_offset", where: isInt)
-                try pass(params, "max", to: &request, where: isInt)
+                try pass(params, "outOffset", to: &request, as: "out_offset", type: .integer)
+                try pass(params, "errOffset", to: &request, as: "err_offset", type: .integer)
+                try pass(params, "max", to: &request, type: .integer)
                 let r = try await tools(t).call("exec.read", request)
                 return pick(r, ["state", "code", "pid", "out", "err", "out_next", "err_next", "dropped"],
                             renamed: ["out_next": "outNext", "err_next": "errNext"])
             case "vm.exec.write":
                 var request: [String: JSON] = ["job": .string(try string(params, "job")), "data": .string(try string(params, "data"))]
-                try pass(params, "eof", to: &request, where: isBool)
+                try pass(params, "eof", to: &request, type: .boolean)
                 _ = try await tools(t).call("exec.write", request)
                 return [:]
             case "vm.exec.kill":
@@ -44,10 +44,10 @@ extension ControlHandler {
                 return ["processes": .array(rows)]
             case "vm.process.kill":
                 var request: [String: JSON] = [:]
-                try pass(params, "pid", to: &request, where: isInt)
+                try pass(params, "pid", to: &request, type: .integer)
                 try pass(params, "processName", to: &request, as: "name", where: isString)
                 guard !request.isEmpty else { throw ControlError.oneOf("pid", "processName") }
-                try pass(params, "tree", to: &request, where: isBool)
+                try pass(params, "tree", to: &request, type: .boolean)
                 return pick(try await tools(t).call("proc.kill", request), ["killed"])
             default:
                 throw ControlError.unknownOp(op)
@@ -106,6 +106,18 @@ extension ControlHandler {
         request[name ?? key] = value
     }
 
+    /// The optional parameter `key`: nil when absent or null, an error when present with a JSON type other than `type`.
+    nonisolated func optional(_ params: JSON, _ key: String, _ type: ParamType) throws -> JSON? {
+        guard let value = params[key], value != .null else { return nil }
+        guard type.accepts(value) else { throw ControlError.wrongType(key, type) }
+        return value
+    }
+
+    /// Copies the optional boolean or integer parameter `key` into `request` under `name`.
+    nonisolated func pass(_ params: JSON, _ key: String, to request: inout [String: JSON], as name: String? = nil, type: ParamType) throws {
+        if let value = try optional(params, key, type) { request[name ?? key] = value }
+    }
+
     /// The fields `keys` of `source` that are present, stored under their `renamed` name when one is given.
     nonisolated func pick(_ source: JSON, _ keys: [String], renamed: [String: String] = [:]) -> JSON {
         var result: [String: JSON] = [:]
@@ -115,5 +127,3 @@ extension ControlHandler {
 }
 
 func isString(_ value: JSON) -> Bool { value.stringValue != nil }
-func isInt(_ value: JSON) -> Bool { value.intValue != nil }
-func isBool(_ value: JSON) -> Bool { value.boolValue != nil }

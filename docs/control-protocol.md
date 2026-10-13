@@ -174,6 +174,8 @@ VM 'Win' is stopped; call vm.start first
 guest tools are not connected in 'Win'; install alcove-agent in the guest
 missing parameter; pass 'command' or 'argv'
 missing or invalid parameter 'env'
+parameter 'append' must be a boolean
+parameter 'offset' must be an integer
 timeout must be between 1 and 86400 seconds
 no job 'j9'; call exec.list
 'C:\out\app.exe' exists in the guest; pass overwrite

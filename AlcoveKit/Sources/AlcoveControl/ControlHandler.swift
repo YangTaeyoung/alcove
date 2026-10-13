@@ -6,9 +6,18 @@ import AlcoveDisplayProtocol
 
 /// Executes control-protocol operations (docs/control-protocol.md) against a registry.
 public actor ControlHandler {
+    /// The JSON type of an optional boolean or integer parameter.
+    public enum ParamType: Sendable {
+        case boolean, integer
+
+        var article: String { self == .boolean ? "a boolean" : "an integer" }
+        func accepts(_ value: JSON) -> Bool { self == .boolean ? value.boolValue != nil : value.intValue != nil }
+    }
+
     public enum ControlError: Error, CustomStringConvertible, Sendable {
         case unknownOp(String)
         case missing(String)
+        case wrongType(String, ParamType)
         case noSuchVM(String)
         case notRunning(String, VMController.State)
         case noDisplay(String)
@@ -21,6 +30,7 @@ public actor ControlHandler {
         public var description: String {
             switch self {
             case .unknownOp(let op): return "unknown op '\(op)'"
+            case .wrongType(let p, let type): return "parameter '\(p)' must be \(type.article)"
             case .missing(let p): return "missing or invalid parameter '\(p)'"
             case .noSuchVM(let n): return "no VM named '\(n)'; call vm.list"
             case .notRunning(let n, let s): return "VM '\(n)' is \(describe(s)); call vm.start first"

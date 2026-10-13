@@ -452,6 +452,70 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertEqual(again, ["deleted": false])
     }
 
+    // MARK: - parameter types
+
+    func testWrongTypedBooleanAndIntegerParametersAreRefused() async throws {
+        let fs = FakeFS()
+        fs["/g/a.txt"] = Data("abc".utf8)
+        let dir = try tempDir()
+        let (h, agent) = try await setup(fs: fs)
+        let base: [String: JSON] = ["name": "Win"]
+        let before = agent.receivedCount()
+        func params(_ extra: [String: JSON]) -> JSON { .object(base.merging(extra) { $1 }) }
+
+        let cases: [(op: String, extra: [String: JSON], message: String)] = [
+            ("vm.fs.write", ["path": "/g/a.txt", "text": "x", "append": "true"], "parameter 'append' must be a boolean"),
+            ("vm.sync_dir", ["path": .string(dir.path), "guestPath": "/g/in", "delete": 1], "parameter 'delete' must be a boolean"),
+            ("vm.push_file", ["path": .string(dir.path), "guestPath": "/g/x", "overwrite": "yes"], "parameter 'overwrite' must be a boolean"),
+            ("vm.fs.read", ["path": "/g/a.txt", "offset": "0"], "parameter 'offset' must be an integer"),
+            ("vm.fs.read", ["path": "/g/a.txt", "length": 1.5], "parameter 'length' must be an integer"),
+            ("vm.fs.read", ["path": "/g/a.txt", "tail": true], "parameter 'tail' must be an integer"),
+            ("vm.fs.list", ["path": "/g", "recursive": "true"], "parameter 'recursive' must be a boolean"),
+            ("vm.fs.delete", ["path": "/g/a.txt", "recursive": 1], "parameter 'recursive' must be a boolean"),
+            ("vm.exec.read", ["job": "j1", "max": "10"], "parameter 'max' must be an integer"),
+            ("vm.exec.read", ["job": "j1", "outOffset": "0"], "parameter 'outOffset' must be an integer"),
+            ("vm.exec.read", ["job": "j1", "errOffset": false], "parameter 'errOffset' must be an integer"),
+            ("vm.exec.write", ["job": "j1", "data": "x", "eof": "true"], "parameter 'eof' must be a boolean"),
+            ("vm.process.kill", ["pid": "7"], "parameter 'pid' must be an integer"),
+            ("vm.process.kill", ["pid": 7, "tree": "yes"], "parameter 'tree' must be a boolean"),
+        ]
+        for c in cases {
+            let text = await failure(h, c.op, params(c.extra))
+            XCTAssertEqual(text, c.message, c.op)
+        }
+        XCTAssertEqual(agent.receivedCount(), before)
+        XCTAssertEqual(fs["/g/a.txt"], Data("abc".utf8))
+    }
+
+    func testNullAndAbsentOptionalParametersUseTheirDefaults() async throws {
+        let fs = FakeFS()
+        fs["/g/a.txt"] = Data("abc".utf8)
+        let (h, _) = try await setup(fs: fs)
+        let r = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "/g/a.txt", "text": "z", "append": .null])
+        XCTAssertEqual(r, ["size": 1])
+        XCTAssertEqual(fs["/g/a.txt"], Data("z".utf8))
+        let read = try await h.handle(op: "vm.fs.read", params: ["name": "Win", "path": "/g/a.txt", "offset": .null, "length": .null])
+        XCTAssertEqual(read["text"]?.stringValue, "z")
+    }
+
+    func testCorrectlyTypedParametersStillReachTheAgent() async throws {
+        let fs = FakeFS()
+        fs["/g/a.txt"] = Data("abc".utf8)
+        let dir = try tempDir()
+        try Data("q".utf8).write(to: dir.appendingPathComponent("q.txt"))
+        let (h, agent) = try await setup(fs: fs)
+        _ = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "/g/a.txt", "text": "d", "append": true])
+        XCTAssertEqual(fs["/g/a.txt"], Data("abcd".utf8))
+        let read = try await h.handle(op: "vm.fs.read", params: ["name": "Win", "path": "/g/a.txt", "offset": 1, "length": 2])
+        XCTAssertEqual(read["text"]?.stringValue, "bc")
+        let synced = try await h.handle(op: "vm.sync_dir", params: ["name": "Win", "path": .string(dir.path), "guestPath": "/g/in", "delete": false])
+        XCTAssertEqual(synced["sent"], ["q.txt"])
+        let pushed = try await h.handle(op: "vm.push_file", params: ["name": "Win", "path": .string(dir.appendingPathComponent("q.txt").path), "guestPath": "/g/a.txt", "overwrite": true])
+        XCTAssertEqual(pushed["guestPath"]?.stringValue, "/g/a.txt")
+        XCTAssertEqual(fs["/g/a.txt"], Data("q".utf8))
+        XCTAssertFalse(agentRequests(agent, "fs.rename").isEmpty)
+    }
+
     // MARK: - errors
 
     func testOldAgentErrorNamesTheUpdate() async throws {
