@@ -25,7 +25,7 @@ struct ScriptResult: Sendable {
 
 /// What a script run calls an op for; a recording writes it to the trace line of the call as `script`.
 enum ScriptCall: String, Sendable {
-    /// The op of a step, or the click at a step's fallback coordinates.
+    /// The op of a step, its second run with `altSelector`, or the click at a step's fallback coordinates.
     case step
     /// The `vm.wait_for` of one expectation of a step.
     case expect
@@ -194,11 +194,13 @@ struct ScriptRunner: Sendable {
             }
             result.stepsRun = number
             let began = ContinuousClock.now
-            let (outcome, usedFallback) = await perform(step, number: number, vm: vm, token: token)
+            let run = await perform(step, number: number, vm: vm, token: token)
+            let outcome = run.outcome
             let seconds = ScriptRunner.seconds(began.duration(to: ContinuousClock.now))
             var entry: [String: JSON] = ["step": .int(Int64(number)), "op": .string(step.op), "seconds": .double(seconds)]
             if let label = step.label { entry["label"] = .string(label) }
-            if usedFallback { entry["usedFallback"] = true }
+            if run.usedAltSelector { entry["usedAltSelector"] = true }
+            if run.usedFallback { entry["usedFallback"] = true }
             switch outcome {
             case .success: entry["ok"] = true
             case .failure(let error):
@@ -255,37 +257,72 @@ struct ScriptRunner: Sendable {
         return HelperSentence(message).saysAbsent(ref: params["ref"]?.stringValue, orNoMatch: true)
     }
 
+    /// Whether `error` is the UI helper saying that no element matches a selector.
+    static func matchedNothing(_ error: Error) -> Bool {
+        guard case ControlHandler.ControlError.failed(let message) = error else { return false }
+        return HelperSentence(message) == .noMatch
+    }
+
+    /// What running one step brought.
+    private struct StepRun {
+        var outcome: Result<JSON, Error>
+        /// Whether the step's op ran a second time with `altSelector` as its selector.
+        var usedAltSelector = false
+        /// Whether the step went on to the click at its `fallback` coordinates.
+        var usedFallback = false
+    }
+
     /// Runs one step: its op, then each expectation with the time left of the step's timeout, counted from the op's end.
-    /// A `vm.ui.click` step with a `fallback` whose element is not there clicks the fallback's coordinates with the
-    /// step's button, count and observe options; `usedFallback` says that the step went on to this click.
-    private func perform(_ step: Script.Step, number: Int, vm: String, token: String?) async -> (outcome: Result<JSON, Error>, usedFallback: Bool) {
+    /// A step with a `selector` and an `altSelector` whose selector matches no element runs its op once more with
+    /// `altSelector` as the selector. A `vm.ui.click` step with a `fallback` whose element is still not there clicks
+    /// the fallback's coordinates with the step's button, count and observe options.
+    private func perform(_ step: Script.Step, number: Int, vm: String, token: String?) async -> StepRun {
+        var run = StepRun(outcome: .failure(CancellationError()))
         var params = step.params
         if step.op == "vm.wait_for", params["timeout"] == nil { params["timeout"] = .int(Int64(step.timeout)) }
         var fallback: JSON?
         if step.op == "vm.ui.click", let point = params.removeValue(forKey: "fallback"), point != .null { fallback = point }
-        var usedFallback = false
-        let value: JSON
-        do {
-            value = try await call(.step, step.op, base(vm, token, params))
-        } catch {
-            guard let fallback, ScriptRunner.foundNothing(error, params: params) else { return (.failure(error), false) }
+        var alt: JSON?
+        if let other = params.removeValue(forKey: "altSelector"), other != .null, (params["selector"] ?? .null) != .null { alt = other }
+        var acted: Result<JSON, Error>
+        do { acted = .success(try await call(.step, step.op, base(vm, token, params))) } catch { acted = .failure(error) }
+        if case .failure(let first) = acted, let alt, ScriptRunner.matchedNothing(first) {
+            run.usedAltSelector = true
+            params["selector"] = alt
+            do {
+                acted = .success(try await call(.step, step.op, base(vm, token, params)))
+            } catch is CancellationError {
+                return run
+            } catch let second {
+                guard fallback != nil, ScriptRunner.foundNothing(second, params: params) else {
+                    run.outcome = .failure(ScriptError(step: number, message: "the selector matched no element (\(first)) and the retry with altSelector failed: \(second)"))
+                    return run
+                }
+                acted = .failure(second)
+            }
+        }
+        if case .failure(let missing) = acted, let fallback, ScriptRunner.foundNothing(missing, params: params) {
             var click = params
             click["ref"] = nil
             click["selector"] = nil
             click["x"] = fallback["x"]
             click["y"] = fallback["y"]
-            usedFallback = true
+            run.usedFallback = true
             do {
-                value = try await call(.step, "vm.mouse.click", base(vm, token, click))
+                acted = .success(try await call(.step, "vm.mouse.click", base(vm, token, click)))
             } catch is CancellationError {
-                return (.failure(CancellationError()), true)
+                return run
             } catch let second {
                 let point = "(\(fallback["x"]?.intValue ?? 0), \(fallback["y"]?.intValue ?? 0))"
-                return (.failure(ScriptError(step: number, message: "the element was not found (\(error)) and the click at the fallback point \(point) failed: \(second)")), true)
+                run.outcome = .failure(ScriptError(step: number, message: "the element was not found (\(missing)) and the click at the fallback point \(point) failed: \(second)"))
+                return run
             }
         }
-        let outcome = await expectations(of: step, number: number, vm: vm, token: token, after: value)
-        return (outcome, usedFallback)
+        switch acted {
+        case .success(let value): run.outcome = await expectations(of: step, number: number, vm: vm, token: token, after: value)
+        case .failure(let error): run.outcome = .failure(error)
+        }
+        return run
     }
 
     /// Checks the result of a `vm.wait_for` step and waits for each expectation of `step`; `value` on success.

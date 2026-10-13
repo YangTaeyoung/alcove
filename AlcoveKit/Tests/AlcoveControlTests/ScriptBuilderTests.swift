@@ -6,11 +6,12 @@ import AlcoveQMP
 import AlcoveDisplayProtocol
 import AlcoveTestSupport
 
-/// What the fake agent answers to one op: result fields, an error sentence, or nothing.
-private enum Reply: Sendable {
+/// What the fake agent answers to one op: result fields, an error sentence, nothing, or what a request is answered with.
+private indirect enum Reply: Sendable {
     case ok([String: JSON])
     case fail(String)
     case silent
+    case by(@Sendable (JSON) -> Reply)
 }
 
 /// One trace line of VM "Win" in the shape a recording writes; `extra` holds further fields of the line.
@@ -94,10 +95,12 @@ final class ScriptBuilderTests: XCTestCase {
         agent.caps = caps
         agent.handler = { m, _ in
             guard m["t"]?.stringValue == "req", let op = m["op"]?.stringValue else { return [] }
-            switch answers.value[op] {
+            var reply = answers.value[op]
+            while case .by(let choose) = reply { reply = choose(m) }
+            switch reply {
             case .ok(let fields): return [agentReply(m, fields)]
             case .fail(let message): return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": .string(message)]]
-            case .silent: return []
+            case .silent, .by: return []
             case nil: return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": .string("unknown op '\(op)'; update alcove-agent")]]
             }
         }
@@ -679,6 +682,136 @@ final class ScriptBuilderTests: XCTestCase {
         let result = await ScriptRunner(handler: h).run(built, vm: nil, variables: [:], progress: nil)
         XCTAssertEqual(result.stepsRun, 0)
         XCTAssertEqual(result.error, cases[0].1)
+        XCTAssertTrue(agentRequests(agent, "ui.rect").isEmpty)
+    }
+
+    /// Answers `ui.rect` and `ui.act` by the selector field a request carries: `byID` for `automationId`, `byName` for `name`.
+    private func bySelector(byID: Reply, byName: Reply) -> Reply {
+        .by { $0["automationId"] != nil ? byID : byName }
+    }
+
+    private let aidSelector = "\"selector\": {\"window\": \"Alcove Fixture\", \"role\": \"Button\", \"automationId\": \"send\"}"
+    private let nameSelector = "\"altSelector\": {\"window\": \"Alcove Fixture\", \"role\": \"Button\", \"name\": \"Send\", \"index\": 2}"
+    private let noAidMatch = "no element matches {\"automationId\":\"send\",\"role\":\"Button\",\"window\":\"Alcove Fixture\"}; call ui.tree to see what exists"
+    private let noNameMatch = "no element matches {\"index\":2,\"name\":\"Send\",\"role\":\"Button\",\"window\":\"Alcove Fixture\"}; call ui.tree to see what exists"
+
+    func testRunnerRetriesWithAltSelectorWhenNoElementMatches() async throws {
+        let found: Reply = .ok(["node": sendButton, "cx": 200, "cy": 120, "clickable": true])
+        let answers = LockedBox<[String: Reply]>(["ui.rect": bySelector(byID: .fail(noAidMatch), byName: found)])
+        let (h, t, agent) = try await rig(answers)
+        let click = "{\"op\": \"vm.ui.click\", \"params\": {\(aidSelector), \(nameSelector), \"fallback\": {\"x\": 190, \"y\": 112}}}"
+
+        let retried = try await run(h, click)
+        XCTAssertTrue(retried.passed, retried.error ?? "")
+        XCTAssertEqual(retried.stepResults[0]["usedAltSelector"], true)
+        XCTAssertNil(retried.stepResults[0]["usedFallback"])
+        XCTAssertEqual(agentRequests(agent, "ui.rect").map(fields), [
+            ["window": "Alcove Fixture", "role": "Button", "automationId": "send", "scroll": true],
+            ["window": "Alcove Fixture", "role": "Button", "name": "Send", "index": 2, "scroll": true],
+        ])
+        var sent = await t.sent
+        XCTAssertEqual(sent.first, absolute(200, 120))
+        XCTAssertEqual(sent.count, 5)
+
+        answers.value["ui.rect"] = bySelector(byID: .fail(noAidMatch), byName: .fail(noNameMatch))
+        let neither = try await run(h, click)
+        XCTAssertTrue(neither.passed, neither.error ?? "")
+        XCTAssertEqual(neither.stepResults[0]["usedAltSelector"], true)
+        XCTAssertEqual(neither.stepResults[0]["usedFallback"], true)
+        sent = await t.sent
+        XCTAssertEqual(Array(sent.dropFirst(5)).first, absolute(190, 112))
+        XCTAssertEqual(sent.count, 10)
+
+        answers.value["ui.rect"] = bySelector(byID: .fail("no window has \"Alcove Fixture\" in its title; call win.list to see the open windows"), byName: found)
+        let closed = try await run(h, click)
+        XCTAssertTrue(closed.passed, closed.error ?? "")
+        XCTAssertNil(closed.stepResults[0]["usedAltSelector"])
+        XCTAssertEqual(closed.stepResults[0]["usedFallback"], true)
+        XCTAssertEqual(agentRequests(agent, "ui.rect").count, 5)
+
+        answers.value["ui.rect"] = bySelector(byID: found, byName: .fail(noNameMatch))
+        let first = try await run(h, click)
+        XCTAssertTrue(first.passed, first.error ?? "")
+        XCTAssertNil(first.stepResults[0]["usedAltSelector"])
+        XCTAssertNil(first.stepResults[0]["usedFallback"])
+        XCTAssertEqual(agentRequests(agent, "ui.rect").count, 6)
+
+        answers.value["ui.rect"] = bySelector(byID: .fail(noAidMatch), byName: .fail("the UI helper is shut down; reconnect the guest tools"))
+        let down = try await run(h, click)
+        XCTAssertFalse(down.passed)
+        XCTAssertEqual(down.error, "step 1 failed: the selector matched no element (\(noAidMatch)) and the retry with altSelector failed: "
+            + "the UI helper is shut down; reconnect the guest tools")
+        XCTAssertEqual(down.stepResults[0]["usedAltSelector"], true)
+        XCTAssertNil(down.stepResults[0]["usedFallback"])
+        sent = await t.sent
+        XCTAssertEqual(sent.count, 20)
+    }
+
+    func testTypeAndActionStepsRetryWithAltSelector() async throws {
+        let field = node("e4", "Edit", "Message", aid: "send")
+        let answers = LockedBox<[String: Reply]>([
+            "ui.rect": bySelector(byID: .fail(noAidMatch), byName: .ok(["node": field, "cx": 200, "cy": 120, "clickable": true])),
+            "ui.act": bySelector(byID: .fail(noAidMatch), byName: .ok(["node": field])),
+        ])
+        let (h, t, agent) = try await rig(answers)
+        let typed = try await run(h, "{\"op\": \"vm.ui.type\", \"params\": {\(aidSelector), \(nameSelector), \"text\": \"a\"}}")
+        XCTAssertTrue(typed.passed, typed.error ?? "")
+        XCTAssertEqual(typed.stepResults[0]["usedAltSelector"], true)
+        let sent = await t.sent
+        XCTAssertEqual(sent.first, absolute(200, 120))
+        XCTAssertEqual(sent.count, 7)
+
+        let step = "{\"op\": \"vm.ui.action\", \"params\": {\(aidSelector), \(nameSelector), \"action\": \"invoke\"}}"
+        let acted = try await run(h, step)
+        XCTAssertTrue(acted.passed, acted.error ?? "")
+        XCTAssertEqual(acted.stepResults[0]["usedAltSelector"], true)
+        XCTAssertEqual(agentRequests(agent, "ui.act").map(fields), [
+            ["window": "Alcove Fixture", "role": "Button", "automationId": "send", "action": "invoke"],
+            ["window": "Alcove Fixture", "role": "Button", "name": "Send", "index": 2, "action": "invoke"],
+        ])
+
+        answers.value["ui.act"] = bySelector(byID: .fail(noAidMatch), byName: .fail(noNameMatch))
+        let neither = try await run(h, step)
+        XCTAssertFalse(neither.passed)
+        XCTAssertEqual(neither.error, "step 1 failed: the selector matched no element (\(noAidMatch)) and the retry with altSelector failed: \(noNameMatch)")
+        XCTAssertEqual(neither.stepResults[0]["usedAltSelector"], true)
+
+        let bare = try await run(h, "{\"op\": \"vm.ui.action\", \"params\": {\(aidSelector), \"action\": \"invoke\"}}")
+        XCTAssertFalse(bare.passed)
+        XCTAssertEqual(bare.error, "step 1 failed: \(noAidMatch)")
+        XCTAssertNil(bare.stepResults[0]["usedAltSelector"])
+    }
+
+    func testAltSelectorIsCheckedBeforeAnyStep() async throws {
+        let (h, _, agent) = try await rig(LockedBox(["ui.rect": .fail(noMatch)]))
+        let selector = "\"selector\": {\"name\": \"Send\"}"
+        let cases: [(String, String)] = [
+            ("{\"op\": \"vm.mouse.click\", \"params\": {\"x\": 1, \"y\": 2, \"altSelector\": {\"name\": \"Send\"}}}",
+             "step 1 has an altSelector, which only vm.ui.click, vm.ui.type, vm.ui.action, vm.ui.find and vm.ui.text take; remove it"),
+            ("{\"op\": \"vm.ui.tree\", \"params\": {\"altSelector\": {\"name\": \"Send\"}}}",
+             "step 1 has an altSelector, which only vm.ui.click, vm.ui.type, vm.ui.action, vm.ui.find and vm.ui.text take; remove it"),
+            ("{\"op\": \"vm.ui.click\", \"params\": {\"ref\": \"e5\", \"altSelector\": {\"name\": \"Send\"}}}",
+             "step 1 has an altSelector without a selector; add the selector it stands in for or remove it"),
+            ("{\"op\": \"vm.ui.click\", \"params\": {\(selector), \"altSelector\": \"Send\"}}",
+             "step 1 has an altSelector that is not a selector: selector must be an object with window, role, name, nameContains, automationId or index"),
+            ("{\"op\": \"vm.ui.type\", \"params\": {\(selector), \"text\": \"a\", \"altSelector\": {\"title\": \"Send\"}}}",
+             "step 1 has an altSelector that is not a selector: selector has no field 'title'; valid fields: window, role, name, nameContains, automationId, index"),
+            ("{\"op\": \"vm.ui.action\", \"params\": {\(selector), \"action\": \"invoke\", \"altSelector\": {\"window\": \"Notes\", \"index\": 1}}}",
+             "step 1 has an altSelector without any of role, name, nameContains, automationId; add one or remove it"),
+        ]
+        for (step, expected) in cases {
+            XCTAssertThrowsError(try Script.parse(Data("{\"version\": 1, \"steps\": [\(step)]}".utf8)), step) { XCTAssertEqual("\($0)", expected) }
+        }
+        for op in ["vm.ui.click", "vm.ui.type", "vm.ui.action", "vm.ui.find", "vm.ui.text"] {
+            let step = "{\"op\": \"\(op)\", \"params\": {\(selector), \"altSelector\": {\"role\": \"Button\", \"index\": 0}}}"
+            XCTAssertNoThrow(try Script.parse(Data("{\"version\": 1, \"steps\": [\(step)]}".utf8)), op)
+        }
+        let built = Script(vm: "Win", variables: [:], steps: [
+            Script.Step(label: nil, op: "vm.ui.click", params: ["selector": ["name": "Send"], "altSelector": ["index": 1]], expect: [], timeout: 5),
+        ])
+        let result = await ScriptRunner(handler: h).run(built, vm: nil, variables: [:], progress: nil)
+        XCTAssertEqual(result.stepsRun, 0)
+        XCTAssertEqual(result.error, cases[5].1)
         XCTAssertTrue(agentRequests(agent, "ui.rect").isEmpty)
     }
 

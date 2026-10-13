@@ -34,6 +34,9 @@ struct Script: Sendable, Equatable {
         !refusedOps.contains { $0.hasSuffix(".") ? op.hasPrefix($0) : op == $0 }
     }
 
+    /// The ops that name an element by a `selector`, which a step may back up with `altSelector`.
+    static let selectorOps = ["vm.ui.click", "vm.ui.type", "vm.ui.action", "vm.ui.find", "vm.ui.text"]
+
     // MARK: - parsing
 
     private static let scriptKeys = ["version", "vm", "variables", "steps"]
@@ -141,6 +144,22 @@ struct Script: Sendable, Equatable {
             guard step.op == "vm.ui.click" else { throw fail("has a fallback, which only vm.ui.click takes; remove it") }
             guard fallback["x"]?.intValue != nil, fallback["y"]?.intValue != nil else {
                 throw fail("has a fallback without integer 'x' and 'y'; write it as {\"x\": 120, \"y\": 80} or remove it")
+            }
+        }
+        if let alt = step.params["altSelector"], alt != .null {
+            guard selectorOps.contains(step.op) else {
+                let ops = selectorOps.dropLast().joined(separator: ", ") + " and " + (selectorOps.last ?? "")
+                throw fail("has an altSelector, which only \(ops) take; remove it")
+            }
+            guard let selector = step.params["selector"], selector != .null else {
+                throw fail("has an altSelector without a selector; add the selector it stands in for or remove it")
+            }
+            do {
+                _ = try UISelector.agentFields(ref: nil, selector: alt)
+            } catch UISelector.Invalid.field(let message) {
+                throw fail("has an altSelector that is not a selector: \(message)")
+            } catch {
+                throw fail("has an altSelector without any of \(UISelector.criteria.joined(separator: ", ")); add one or remove it")
             }
         }
         guard (1...maxTimeout).contains(step.timeout) else { throw fail(timeoutProblem) }
