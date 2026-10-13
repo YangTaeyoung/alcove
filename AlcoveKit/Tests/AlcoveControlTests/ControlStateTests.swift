@@ -66,7 +66,7 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(restored["tools"]?.boolValue, true)
         let r = try await h.handle(op: "vm.exec", params: ["name": "Win", "command": "echo ok"])
         XCTAssertEqual(r["code"]?.intValue, 0)
-        XCTAssertEqual(agentRequests(second, "exec.run").count, 1)
+        XCTAssertEqual(agentRequests(second, "exec.run").count, 2)
         XCTAssertEqual(agentRequests(first, "exec.run").count, 0)
     }
 

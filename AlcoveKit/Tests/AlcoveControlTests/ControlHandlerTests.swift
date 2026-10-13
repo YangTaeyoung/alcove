@@ -26,7 +26,9 @@ actor FakeTarget: VMTarget {
     var restoreHook: (@Sendable (FakeTarget) async -> Void)?
 
     init(name: String, state: VMController.State, png: Data) { self.name = name; self.stateValue = state; self.png = png }
-    func guestOS() async -> VMConfig.GuestOS { .windows }
+    var os: VMConfig.GuestOS = .windows
+    func guestOS() async -> VMConfig.GuestOS { os }
+    func setOS(_ value: VMConfig.GuestOS) { os = value }
     func state() async -> VMController.State { stateValue }
     func isSuspended() async -> Bool { false }
     func start() async throws { startCount += 1; stateValue = .running }

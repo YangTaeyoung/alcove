@@ -15,6 +15,7 @@ public final class FakeAgent: @unchecked Sendable {
     public private(set) var received: [JSON] = []
     public var token = "tok"
     public var proto: Int? = 2
+    public var caps: [String] = ["clipboard", "files", "exec"]
     public var handler: (@Sendable (JSON, FakeAgent) -> [JSON])?
 
     public init() {
@@ -36,7 +37,7 @@ public final class FakeAgent: @unchecked Sendable {
         let fd = accept(listenFD, nil, nil)
         guard fd >= 0 else { return }
         lock.lock(); clientFD = fd; lock.unlock()
-        var hello: JSON = ["t": "hello", "v": 1, "os": "windows", "agent": "0.1.0", "token": .string(token), "caps": ["clipboard", "files", "exec"]]
+        var hello: JSON = ["t": "hello", "v": 1, "os": "windows", "agent": "0.1.0", "token": .string(token), "caps": .array(caps.map(JSON.string))]
         if let proto, case .object(var o) = hello { o["proto"] = .int(Int64(proto)); hello = .object(o) }
         sendLine(hello)
         var pending = Data(); var buf = [UInt8](repeating: 0, count: 65536)

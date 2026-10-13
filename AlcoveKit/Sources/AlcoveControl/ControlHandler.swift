@@ -46,13 +46,20 @@ public actor ControlHandler {
 
     var leases = LeaseTable()
     let clock: @Sendable () -> ContinuousClock.Instant
+    /// The host's wall-clock time, used for guest clock settings and the doctor's skew check.
+    let wallClock: @Sendable () -> Date
+    /// The engine binary the host runs VMs with; nil when the app manages the engine.
+    let engineDescription: String?
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
-    public init(registry: VMRegistry, hostKind: String, clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now }) {
+    public init(registry: VMRegistry, hostKind: String, clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
+                engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() }) {
         self.registry = registry
         self.hostKind = hostKind
         self.clock = clock
+        self.engineDescription = engineDescription
+        self.wallClock = now
     }
 
     /// Every op name the dispatcher accepts.
@@ -67,7 +74,7 @@ public actor ControlHandler {
         "vm.snapshot.list", "vm.snapshot.create", "vm.snapshot.restore", "vm.snapshot.delete",
         "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network",
         "vm.lease.acquire", "vm.lease.release", "vm.set_resolution",
-        "vm.wait_idle",
+        "vm.wait_idle", "vm.set_environment", "vm.doctor",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -237,6 +244,8 @@ public actor ControlHandler {
             return try await state(op: op, params: params)
         case "vm.lease.acquire", "vm.lease.release", "vm.set_resolution":
             return try await leaseOrResolution(op: op, params: params)
+        case "vm.set_environment", "vm.doctor":
+            return try await guest(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of thumbnail pixels changing between samples
