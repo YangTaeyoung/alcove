@@ -25,6 +25,15 @@ func hideWindow(c *exec.Cmd) {
 	c.SysProcAttr.CreationFlags |= createNoWindow
 }
 
+// setRawCommandLine makes the child receive line verbatim instead of
+// re-escaped arguments.
+func setRawCommandLine(c *exec.Cmd, line string) {
+	if c.SysProcAttr == nil {
+		c.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	c.SysProcAttr.CmdLine = line
+}
+
 func prepareTree(*exec.Cmd) {}
 
 func taskkill(args ...string) ([]byte, error) {

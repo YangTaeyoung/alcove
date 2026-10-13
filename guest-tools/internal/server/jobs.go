@@ -13,6 +13,8 @@ import (
 var (
 	jobBufferBytes = 1 << 20
 	maxJobs        = 64
+
+	stdinWriteTimeout = 10 * time.Second
 )
 
 const maxReadBytes = 262144
@@ -86,11 +88,18 @@ type job struct {
 	err     *ring
 	done    chan struct{}
 
+	inputMu  sync.Mutex
 	mu       sync.Mutex
 	stdin    io.WriteCloser
 	stdinOff bool
 	exited   bool
 	code     int
+}
+
+func (j *job) processID() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.pid
 }
 
 func (j *job) state() (exited bool, code int) {
@@ -127,8 +136,9 @@ func (t *jobTable) get(id string) (*job, error) {
 	return j, nil
 }
 
-// add registers a job, forgetting the oldest exited jobs to stay within maxJobs.
-func (t *jobTable) add(j *job) error {
+// reserve assigns the job an id and a table slot, forgetting the oldest
+// exited jobs to stay within maxJobs.
+func (t *jobTable) reserve(j *job) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for len(t.order) >= maxJobs {
@@ -145,16 +155,27 @@ func (t *jobTable) add(j *job) error {
 			return fmt.Errorf("%d jobs are running; stop one with exec.kill", len(t.order))
 		}
 	}
+	t.next++
+	j.id = fmt.Sprintf("j%d", t.next)
 	t.jobs[j.id] = j
 	t.order = append(t.order, j.id)
 	return nil
 }
 
-func (t *jobTable) nextID() string {
+// release gives a reserved slot back.
+func (t *jobTable) release(j *job) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.next++
-	return fmt.Sprintf("j%d", t.next)
+	delete(t.jobs, j.id)
+	for i, id := range t.order {
+		if id == j.id {
+			t.order = append(t.order[:i], t.order[i+1:]...)
+			break
+		}
+	}
+	if j.id == fmt.Sprintf("j%d", t.next) {
+		t.next--
+	}
 }
 
 func (t *jobTable) list() []*job {
@@ -181,7 +202,6 @@ func (s *Server) execStart(req proto.Message) (proto.Message, error) {
 		return nil, err
 	}
 	j := &job{
-		id:      s.jobs.nextID(),
 		cmdline: commandLine(req),
 		started: time.Now(),
 		out:     newRing(jobBufferBytes),
@@ -192,15 +212,16 @@ func (s *Server) execStart(req proto.Message) (proto.Message, error) {
 	if j.stdin, err = c.StdinPipe(); err != nil {
 		return nil, startError(err)
 	}
-	if err := c.Start(); err != nil {
-		return nil, startError(err)
-	}
-	j.pid = c.Process.Pid
-	if err := s.jobs.add(j); err != nil {
-		_ = killTree(j.pid)
-		go c.Wait()
+	if err := s.jobs.reserve(j); err != nil {
 		return nil, err
 	}
+	if err := c.Start(); err != nil {
+		s.jobs.release(j)
+		return nil, startError(err)
+	}
+	j.mu.Lock()
+	j.pid = c.Process.Pid
+	j.mu.Unlock()
 	go func() {
 		_ = c.Wait()
 		code := -1
@@ -213,7 +234,7 @@ func (s *Server) execStart(req proto.Message) (proto.Message, error) {
 		close(j.done)
 		s.emit("job.exited", proto.Message{"job": j.id, "code": code})
 	}()
-	return proto.Message{"job": j.id, "pid": j.pid}, nil
+	return proto.Message{"job": j.id, "pid": j.processID()}, nil
 }
 
 func (s *Server) execRead(req proto.Message) (proto.Message, error) {
@@ -237,7 +258,7 @@ func (s *Server) execRead(req proto.Message) (proto.Message, error) {
 	}
 	res := proto.Message{
 		"state":    "running",
-		"pid":      j.pid,
+		"pid":      j.processID(),
 		"out":      text(out),
 		"err":      text(errOut),
 		"out_next": outNext,
@@ -251,6 +272,28 @@ func (s *Server) execRead(req proto.Message) (proto.Message, error) {
 	return res, nil
 }
 
+// writeInput writes data to the job's stdin and then closes it when eof is
+// set. Calls for one job run one after another.
+func (j *job) writeInput(data string, eof bool) error {
+	j.inputMu.Lock()
+	defer j.inputMu.Unlock()
+	if data != "" {
+		j.mu.Lock()
+		closed := j.stdinOff
+		j.mu.Unlock()
+		if closed {
+			return fmt.Errorf("stdin of job '%s' is closed; start a new job with exec.start", j.id)
+		}
+		if _, err := io.WriteString(j.stdin, data); err != nil {
+			return fmt.Errorf("cannot write to job '%s': %v; call exec.list to check its state", j.id, err)
+		}
+	}
+	if eof {
+		j.closeStdin()
+	}
+	return nil
+}
+
 func (s *Server) execWrite(req proto.Message) (proto.Message, error) {
 	j, err := s.jobs.get(req.String("job"))
 	if err != nil {
@@ -259,19 +302,16 @@ func (s *Server) execWrite(req proto.Message) (proto.Message, error) {
 	if exited, _ := j.state(); exited {
 		return nil, fmt.Errorf("job '%s' has exited; start a new job with exec.start", j.id)
 	}
-	if data := req.String("data"); data != "" {
-		j.mu.Lock()
-		closed := j.stdinOff
-		j.mu.Unlock()
-		if closed {
-			return nil, fmt.Errorf("stdin of job '%s' is closed; start a new job with exec.start", j.id)
+	data, eof := req.String("data"), req.Bool("eof")
+	result := make(chan error, 1)
+	go func() { result <- j.writeInput(data, eof) }()
+	select {
+	case err := <-result:
+		if err != nil {
+			return nil, err
 		}
-		if _, err := io.WriteString(j.stdin, data); err != nil {
-			return nil, fmt.Errorf("cannot write to job '%s': %v; call exec.list to check its state", j.id, err)
-		}
-	}
-	if req.Bool("eof") {
-		j.closeStdin()
+	case <-time.After(stdinWriteTimeout):
+		return nil, fmt.Errorf("job '%s' is not reading its input; exec.kill it or retry later", j.id)
 	}
 	return proto.Message{}, nil
 }
@@ -282,7 +322,7 @@ func (s *Server) execKill(req proto.Message) (proto.Message, error) {
 		return nil, err
 	}
 	if exited, _ := j.state(); !exited {
-		_ = killTree(j.pid)
+		_ = killTree(j.processID())
 		select {
 		case <-j.done:
 		case <-time.After(5 * time.Second):
@@ -303,7 +343,7 @@ func (s *Server) execList(proto.Message) (proto.Message, error) {
 		exited, code := j.state()
 		m := map[string]any{
 			"job":     j.id,
-			"pid":     j.pid,
+			"pid":     j.processID(),
 			"state":   "running",
 			"cmd":     j.cmdline,
 			"started": j.started.Format(time.RFC3339),

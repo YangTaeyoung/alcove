@@ -57,6 +57,7 @@ func buildCommand(req proto.Message, goos string) (*exec.Cmd, error) {
 				return nil, errors.New("shell 'cmd' exists only on Windows; use shell 'sh'")
 			}
 			c = exec.Command("cmd.exe", "/C", cmdline)
+			setRawCommandLine(c, "cmd.exe /C "+cmdline)
 		case "sh":
 			c = exec.Command("/bin/sh", "-c", cmdline)
 		default:

@@ -14,6 +14,9 @@ import (
 
 func hideWindow(*exec.Cmd) {}
 
+// setRawCommandLine has no effect outside Windows.
+func setRawCommandLine(*exec.Cmd, string) {}
+
 // prepareTree puts the child in its own process group.
 func prepareTree(c *exec.Cmd) {
 	if c.SysProcAttr == nil {

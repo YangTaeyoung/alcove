@@ -1,6 +1,8 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -197,5 +199,64 @@ func TestJobExitedEventReachesOtherConnection(t *testing.T) {
 	ev := c2.event("job.exited")
 	if ev.String("job") != job {
 		t.Fatalf("event %v", ev)
+	}
+}
+
+func TestRejectedStartDoesNotRunCommand(t *testing.T) {
+	old := maxJobs
+	maxJobs = 2
+	t.Cleanup(func() { maxJobs = old })
+	c, _ := newRPCClient(t, Options{})
+	var jobs []string
+	for i := 0; i < 2; i++ {
+		jobs = append(jobs, c.ok("exec.start", proto.Message{"cmd": "sleep 30"}).String("job"))
+	}
+	t.Cleanup(func() {
+		for _, j := range jobs {
+			c.call("exec.kill", proto.Message{"job": j})
+		}
+	})
+	marker := filepath.Join(t.TempDir(), "marker")
+	res := c.call("exec.start", proto.Message{"cmd": "touch " + marker})
+	if res["ok"] != false {
+		t.Fatalf("res %v", res)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("rejected start ran its command")
+	}
+}
+
+func TestFailedStartLeavesNoJob(t *testing.T) {
+	c, _ := newRPCClient(t, Options{})
+	res := c.call("exec.start", proto.Message{"shell": "none", "argv": []any{"/nonexistent/binary"}})
+	if res["ok"] != false {
+		t.Fatalf("res %v", res)
+	}
+	if jobs, _ := c.ok("exec.list", nil)["jobs"].([]any); len(jobs) != 0 {
+		t.Fatalf("leftover jobs %v", jobs)
+	}
+	if id := c.ok("exec.start", proto.Message{"cmd": "true"}).String("job"); id != "j1" {
+		t.Fatalf("next job id %q", id)
+	}
+}
+
+func TestJobWriteTimesOutWhenInputIsNotRead(t *testing.T) {
+	old := stdinWriteTimeout
+	stdinWriteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { stdinWriteTimeout = old })
+	c, _ := newRPCClient(t, Options{})
+	job := c.ok("exec.start", proto.Message{"cmd": "sleep 30"}).String("job")
+	t.Cleanup(func() { c.call("exec.kill", proto.Message{"job": job}) })
+	started := time.Now()
+	res := c.call("exec.write", proto.Message{"job": job, "data": strings.Repeat("x", 512<<10)})
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("write took %v", time.Since(started))
+	}
+	if res["ok"] != false || res.String("error") != "job '"+job+"' is not reading its input; exec.kill it or retry later" {
+		t.Fatalf("res %v", res)
+	}
+	if st := c.ok("exec.kill", proto.Message{"job": job}).String("state"); st != "exited" {
+		t.Fatalf("state %q", st)
 	}
 }
