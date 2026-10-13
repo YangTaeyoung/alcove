@@ -16,12 +16,12 @@ import (
 
 const createNoWindow = 0x08000000
 
-// hideWindow starts the child without a console window.
+// hideWindow starts the child without a console window; windows the child
+// creates itself keep their normal show state.
 func hideWindow(c *exec.Cmd) {
 	if c.SysProcAttr == nil {
 		c.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	c.SysProcAttr.HideWindow = true
 	c.SysProcAttr.CreationFlags |= createNoWindow
 }
 
