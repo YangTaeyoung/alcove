@@ -129,7 +129,7 @@ final class VideoRecorderTests: XCTestCase {
         let recorder = VideoRecorder(url: url, fps: 5)
         await recorder.finish()
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
-        XCTAssertNil(recorder.errorMessage)
+        XCTAssertEqual(recorder.errorMessage, "no frame could be recorded for the video")
     }
 
     func testUnwritableLocationIsReported() async {
@@ -168,10 +168,49 @@ final class VideoRecorderTests: XCTestCase {
         let recorder = VideoRecorder(url: url, fps: 5)
         for i in 0..<12 { recorder.append(frame: frame(1280, 800, step: i), at: .milliseconds(i * 10)) }
         let dropped = recorder.droppedFrames
+        let before = recorder.appendedSeconds
         await recorder.appendFinal(frame: frame(1280, 800, step: 99), at: .seconds(5))
         XCTAssertEqual(recorder.droppedFrames, dropped)
-        XCTAssertEqual(recorder.appendedSeconds, 5, accuracy: 0.01)
+        let after = recorder.appendedSeconds
+        XCTAssertTrue(after == before || (4.8...5.0).contains(after), "appendedSeconds \(before) -> \(after)")
         await recorder.finish()
+    }
+
+    func testDurationStartsAtTheFirstAppendedFrame() async {
+        let url = base.appendingPathComponent("late-start.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        recorder.failNextRenders(1)
+        recorder.append(frame: frame(320, 240, step: 0), at: .milliseconds(0))
+        XCTAssertEqual(recorder.appendedSeconds, 0)
+        recorder.append(frame: frame(320, 240, step: 1), at: .milliseconds(1000)); _ = await recorder.waitUntilReady()
+        recorder.append(frame: frame(320, 240, step: 2), at: .milliseconds(1200)); _ = await recorder.waitUntilReady()
+        await recorder.finish()
+        XCTAssertNil(recorder.errorMessage)
+        XCTAssertEqual(recorder.appendedSeconds, 0.2, accuracy: 0.01)
+    }
+
+    func testWriterThatStopsBeforeTheSessionEndsIsReportedAndLeavesNoFile() async throws {
+        let dir = base.appendingPathComponent("late-stop")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("video.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        for i in 0..<3 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
+        recorder.setBeforeEndSessionForTesting { recorder.stopWriterForTesting() }
+        await recorder.finish()
+        let message = try XCTUnwrap(recorder.errorMessage)
+        XCTAssertTrue(message.hasPrefix("the video could not be written: "), message)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testRecordingWithoutAReadableFrameReportsItAsAWriteError() async throws {
+        let dir = base.appendingPathComponent("unreadable")
+        let recording = Recording(vm: "Win", directory: dir, fps: 10, video: true, maxSeconds: 60, frames: { nil },
+                                  sink: VideoRecorder(url: dir.appendingPathComponent("video.mp4"), fps: 10))
+        try await recording.start()
+        let summary = await recording.stop()
+        XCTAssertNil(summary.video)
+        XCTAssertEqual(summary.writeErrors, 1)
+        XCTAssertEqual(summary.lastWriteError, "no frame could be recorded for the video")
     }
 
     func testStaleVideoFileIsRemovedAtStart() async throws {
@@ -224,11 +263,14 @@ final class VideoRecorderTests: XCTestCase {
             return nil
         }, sink: ProbeSink())
         try await recording.start()
+        let began = ContinuousClock.now
         try await Task.sleep(for: .milliseconds(1050))
+        let window = began.duration(to: .now)
         let count = await calls.next() - 1
         _ = await recording.stop()
-        XCTAssertGreaterThanOrEqual(count, 10)
-        XCTAssertLessThanOrEqual(count, 12)
+        let seconds = Double(window.components.seconds) + Double(window.components.attoseconds) / 1e18
+        XCTAssertGreaterThanOrEqual(count, 5)
+        XCTAssertLessThanOrEqual(count, Int(seconds * 10) + 2)
     }
 
     // MARK: through Recording

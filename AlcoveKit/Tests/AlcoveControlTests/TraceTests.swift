@@ -512,6 +512,97 @@ final class TraceTests: XCTestCase {
         XCTAssertEqual(stop["dir"]?.stringValue, dirB.path)
     }
 
+    func testStopCollectingARecordingKeepsItsSummaryWhenANewRecordingStarts() async throws {
+        for collectorFirst in [true, false] {
+            let (h, _, _) = setup()
+            let slow = SlowFinishSink()
+            let sinks = SinkQueue([slow, NoVideoSink()])
+            await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in sinks.next() }))
+            let dirA = try await start(h, ["video": true, "dir": .string(base.appendingPathComponent("a-\(collectorFirst)").path)])
+            let dirB = base.appendingPathComponent("b-\(collectorFirst)")
+            let retire: Task<JSON, Error>?
+            let collector: Task<JSON, Error>
+            let second: Task<JSON, Error>
+            if collectorFirst {
+                retire = nil
+                collector = Task { try await h.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+                await slow.gate.waitUntilWaiting()
+                second = Task { try await h.handle(op: "vm.record.start", params: ["name": "Win", "dir": .string(dirB.path), "video": true]) }
+                try await Task.sleep(for: .milliseconds(100))
+            } else {
+                retire = Task { try await h.handle(op: "vm.stop", params: ["name": "Win"]) }
+                await slow.gate.waitUntilWaiting()
+                second = Task { try await h.handle(op: "vm.record.start", params: ["name": "Win", "dir": .string(dirB.path), "video": true]) }
+                try await Task.sleep(for: .milliseconds(100))
+                collector = Task { try await h.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            await slow.gate.open()
+            _ = try await retire?.value
+            let summary = try await collector.value
+            XCTAssertEqual(summary["dir"]?.stringValue, dirA.path, "collectorFirst=\(collectorFirst)")
+            let started = try await second.value
+            XCTAssertEqual(started["dir"]?.stringValue, dirB.path)
+            let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+            XCTAssertEqual(status["recording"]?.boolValue, true, "collectorFirst=\(collectorFirst)")
+            XCTAssertEqual(status["dir"]?.stringValue, dirB.path)
+            let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+            XCTAssertEqual(stop["dir"]?.stringValue, dirB.path)
+        }
+    }
+
+    func testCollectingStopReturnsItsSummaryAfterTheRetirementWasSettledElsewhere() async throws {
+        let (h, _, _) = setup()
+        let slow = SlowFinishSink()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in slow }))
+        let dir = try await start(h, ["video": true])
+        let collector = Task { try await h.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+        await slow.gate.waitUntilWaiting()
+        await h.clearRetirementState("Win")
+        await slow.gate.open()
+        let summary = try await collector.value
+        XCTAssertEqual(summary["dir"]?.stringValue, dir.path)
+        let again = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(again, "'Win' is not recording")
+    }
+
+    func testStopThatSawAnEndedRecordingDoesNotTouchTheNewerOne() async throws {
+        let (h, _, clock) = setup()
+        let slow = SlowFinishSink()
+        let sinks = SinkQueue([slow, NoVideoSink()])
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in sinks.next() }))
+        let dirA = try await start(h, ["video": true, "maxSeconds": 10, "dir": .string(base.appendingPathComponent("a").path)])
+        clock.advance(.seconds(11))
+        let dirB = base.appendingPathComponent("b")
+        let firstStop = Task { try await h.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+        await slow.gate.waitUntilWaiting()
+        let second = Task { try await h.handle(op: "vm.record.start", params: ["name": "Win", "dir": .string(dirB.path), "video": true]) }
+        try await Task.sleep(for: .milliseconds(100))
+        await slow.gate.open()
+        let first = try await firstStop.value
+        XCTAssertEqual(first["dir"]?.stringValue, dirA.path)
+        _ = try await second.value
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, true)
+        XCTAssertEqual(status["dir"]?.stringValue, dirB.path)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dirB.path)
+    }
+
+    func testStaleVMGoneEntryRetiresNothing() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        let stale = Recording(vm: "Win", directory: base.appendingPathComponent("stale"), fps: 5, video: false, maxSeconds: 60, frames: { nil })
+        await h.plantVMGone("Win", stale)
+        _ = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, true)
+        XCTAssertEqual(status["dir"]?.stringValue, dir.path)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dir.path)
+        XCTAssertEqual(stop["ops"]?.intValue, 1)
+    }
+
     func testFailedStartFinishesTheSink() async throws {
         let (h, _, _) = setup()
         let sink = FinishCountingSink()
@@ -596,6 +687,14 @@ final class TraceTests: XCTestCase {
         let active = await recording.isActive
         XCTAssertFalse(active)
     }
+}
+
+extension ControlHandler {
+    func clearRetirementState(_ vm: String) {
+        recordings.retiring[vm] = nil
+        recordings.ended[vm] = nil
+    }
+    func plantVMGone(_ vm: String, _ recording: Recording) { recordings.vmGone[vm] = recording }
 }
 
 private final class CountingSink: VideoSink, @unchecked Sendable {

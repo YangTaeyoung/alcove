@@ -14,6 +14,7 @@ import CoreVideo
 final class VideoRecorder: VideoSink, @unchecked Sendable {
     static let maxLongSide = 1920
     static let timeScale: CMTimeScale = 600
+    static let noFrameMessage = "no frame could be recorded for the video"
 
     let url: URL
     let fps: Int
@@ -31,6 +32,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     private var dropped = 0
 
     private var renderFailures = 0
+    private var beforeEndSession: (@Sendable () -> Void)?
 
     /// Removes a file already at `url`.
     init(url: URL, fps: Int) {
@@ -54,7 +56,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     /// Frames not appended because the encoder was not ready for them.
     var droppedFrames: Int { lock.withLock { dropped } }
 
-    /// Seconds between the first and the last appended frame.
+    /// Seconds between the first and the last appended frame; the session starts at the first appended frame.
     var appendedSeconds: Double {
         lock.withLock { firstTime.isValid && lastTime.isValid ? CMTimeGetSeconds(CMTimeSubtract(lastTime, firstTime)) : 0 }
     }
@@ -89,12 +91,15 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     /// Cancels the underlying writer as if the encoder had stopped.
     func stopWriterForTesting() { lock.withLock { writer?.cancelWriting() } }
 
+    /// Runs `hook` in `finish()` after the lock is released and before the session is ended.
+    func setBeforeEndSessionForTesting(_ hook: (@Sendable () -> Void)?) { lock.withLock { beforeEndSession = hook } }
+
     private func append(_ frame: Frame, at time: Duration, countDrop: Bool) {
         lock.withLock {
             guard !finished, failure == nil else { return }
             let seconds = Double(time.components.seconds) + Double(time.components.attoseconds) / 1e18
             let presentation = CMTime(seconds: max(0, seconds), preferredTimescale: VideoRecorder.timeScale)
-            if writer == nil, !open(firstFrame: frame, at: presentation) { return }
+            if writer == nil, !open(firstFrame: frame) { return }
             guard let writer, let input, let adaptor else { return }
             if lastTime.isValid, CMTimeCompare(presentation, lastTime) <= 0 { return }
             guard writer.status == .writing else {
@@ -114,7 +119,10 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 if countDrop { dropped += 1 }
                 return
             }
+            let startsSession = !firstTime.isValid
+            if startsSession { writer.startSession(atSourceTime: presentation) }
             if adaptor.append(buffer, withPresentationTime: presentation) {
+                if startsSession { firstTime = presentation }
                 lastTime = presentation
             } else {
                 failure = describe(writer.error)
@@ -123,16 +131,19 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     }
 
     /// Completes the file; later calls do nothing, and later frames are ignored. A writer that failed, or a session
-    /// without an appended frame, is cancelled and its file removed.
+    /// without an appended frame, is cancelled and its file removed; without any writer the error is that no frame could be recorded.
     func finish() async {
         let pending: (AVAssetWriter, CMTime)? = lock.withLock {
             guard !finished else { return nil }
             finished = true
-            guard let writer else { return nil }
+            guard let writer else {
+                if failure == nil { failure = VideoRecorder.noFrameMessage }
+                return nil
+            }
             if failure == nil, writer.status != .writing {
                 failure = describe(writer.status == .failed ? writer.error : nil)
             }
-            if failure == nil, !lastTime.isValid { failure = "no frame could be recorded for the video" }
+            if failure == nil, !lastTime.isValid { failure = VideoRecorder.noFrameMessage }
             if failure != nil {
                 writer.cancelWriting()
                 try? FileManager.default.removeItem(at: url)
@@ -142,6 +153,18 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
             return (writer, lastTime)
         }
         guard let (writer, last) = pending else { return }
+        let hook = lock.withLock { beforeEndSession }
+        hook?()
+        let writing = lock.withLock {
+            guard writer.status == .writing else {
+                failure = describe(writer.error)
+                writer.cancelWriting()
+                try? FileManager.default.removeItem(at: url)
+                return false
+            }
+            return true
+        }
+        guard writing else { return }
         writer.endSession(atSourceTime: last)
         await writer.finishWriting()
         lock.withLock {
@@ -153,7 +176,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     }
 
     // Callers hold `lock`.
-    private func open(firstFrame frame: Frame, at time: CMTime) -> Bool {
+    private func open(firstFrame frame: Frame) -> Bool {
         let size = VideoRecorder.fittedSize(width: frame.width, height: frame.height)
         do {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
@@ -184,13 +207,11 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 failure = describe(writer.error)
                 return false
             }
-            writer.startSession(atSourceTime: time)
             self.writer = writer
             self.input = input
             self.adaptor = adaptor
             width = size.width
             height = size.height
-            firstTime = time
             return true
         } catch {
             failure = describe(error)
