@@ -5,7 +5,8 @@ import AlcoveAgent
 import AlcoveQMP
 import AlcoveDisplayProtocol
 
-/// A scripted VM: records display messages, serves the queued frames or a fixed PNG, and hands out the agent set with `setAgent`.
+/// A scripted VM: records display messages, serves the queued frames or a fixed PNG, hands out the agent set with `setAgent`
+/// and keeps the events of that agent.
 actor FakeTarget: VMTarget {
     nonisolated let name: String
     var stateValue: VMController.State
@@ -17,6 +18,8 @@ actor FakeTarget: VMTarget {
     /// The `frame()` calls, counted from 0, that throw `FrameUnavailable`.
     var failingFrameCalls: Set<Int> = []
     var agentClient: AgentClient?
+    let guestEvents = EventBuffer()
+    var eventFeed: Task<Void, Never>?
     var startCount = 0, stopCount = 0
     var agentWait: Duration = .zero
     var agentWaits = 0, cancelledAgentWaits = 0
@@ -122,7 +125,12 @@ actor FakeTarget: VMTarget {
     func setMonitorReplies(_ r: [String]) { monitorReplies = r }
     func setForwards(_ f: [VMConfig.PortForward]) { forwards = f }
     func setRestoreHook(_ h: (@Sendable (FakeTarget) async -> Void)?) { restoreHook = h }
-    func setAgent(_ a: AgentClient?) { agentClient = a }
+    func setAgent(_ a: AgentClient?) {
+        agentClient = a
+        eventFeed?.cancel()
+        eventFeed = a.map { guestEvents.follow($0) }
+    }
+    func events(since seq: Int) async -> (events: [GuestEvent], next: Int) { await guestEvents.since(seq) }
     func setAgentWait(_ d: Duration) { agentWait = d }
     func setPNG(_ d: Data) { png = d }
     func setFrames(_ f: [Frame]) { frames = f }

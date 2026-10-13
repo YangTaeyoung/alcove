@@ -43,9 +43,22 @@ enum WaitCondition: Sendable {
     case portListening(Int)
     case logMatches(path: String, pattern: NSRegularExpression)
     case jobOutputMatches(job: String, pattern: NSRegularExpression)
+    /// An element exists; `element` holds the agent fields that select it.
+    case uiExists(element: [String: JSON])
+    case uiGone(element: [String: JSON])
+    /// An element exists without the `disabled` flag.
+    case uiEnabled(element: [String: JSON])
+    /// A top-level window has a title containing `contains` (case ignored) or matching `pattern`.
+    case windowTitle(contains: String?, pattern: NSRegularExpression?)
+    /// The text of an element stayed the same for `quietMs`.
+    case uiTextStable(element: [String: JSON], quietMs: Int)
+    /// A guest event named `name` arrived, with a window title containing `titleContains` when given.
+    case event(name: String, titleContains: String?)
 
     static let typeNames = ["screen_idle", "region_changed", "text_visible", "text_gone", "process_started", "process_exited",
-                            "file_exists", "port_listening", "log_matches", "job_output_matches"]
+                            "file_exists", "port_listening", "log_matches", "job_output_matches",
+                            "ui_exists", "ui_gone", "ui_enabled", "window_title", "ui_text_stable", "event"]
+    static let maxQuietMs = 600_000
 
     var typeName: String {
         switch self {
@@ -59,27 +72,39 @@ enum WaitCondition: Sendable {
         case .portListening: return "port_listening"
         case .logMatches: return "log_matches"
         case .jobOutputMatches: return "job_output_matches"
+        case .uiExists: return "ui_exists"
+        case .uiGone: return "ui_gone"
+        case .uiEnabled: return "ui_enabled"
+        case .windowTitle: return "window_title"
+        case .uiTextStable: return "ui_text_stable"
+        case .event: return "event"
         }
     }
 
-    enum Kind { case screen, text, agent }
+    /// What a condition reads: frames, recognized text, agent calls, agent calls that need the `ui` capability,
+    /// or the guest events of the VM.
+    enum Kind { case screen, text, agent, ui, event }
 
     var kind: Kind {
         switch self {
         case .screenIdle, .regionChanged: return .screen
         case .textVisible, .textGone: return .text
+        case .uiExists, .uiGone, .uiEnabled, .windowTitle, .uiTextStable: return .ui
+        case .event: return .event
         default: return .agent
         }
     }
 
-    var needsFrame: Bool { kind != .agent }
-    var needsAgent: Bool { kind == .agent }
+    var needsFrame: Bool { kind == .screen || kind == .text }
+    var needsAgent: Bool { !needsFrame }
+    var needsUI: Bool { kind == .ui }
 
     var period: Duration {
         switch kind {
         case .screen: return WaitTiming.screenPeriod
         case .text: return WaitTiming.ocrPeriod
-        case .agent: return WaitTiming.agentPeriod
+        case .agent, .ui: return WaitTiming.agentPeriod
+        case .event: return WaitTiming.tick
         }
     }
 
@@ -148,6 +173,19 @@ enum WaitCondition: Sendable {
             return WaitText(query: query, expression: expression, region: try region(), languages: languages)
         }
 
+        func element() throws -> [String: JSON] {
+            let selector = fields.filter { UISelector.fieldNames.contains($0.key) && $0.value != .null }
+            do {
+                return try UISelector.agentFields(ref: fields["ref"], selector: selector.isEmpty ? nil : .object(selector))
+            } catch UISelector.Invalid.neither, UISelector.Invalid.noCriteria {
+                throw fail("\(type) needs 'ref' or at least one of \(UISelector.criteria.joined(separator: ", "))")
+            } catch UISelector.Invalid.both {
+                throw fail("\(type) takes 'ref' or selector fields, not both")
+            } catch UISelector.Invalid.field(let message) {
+                throw fail(message)
+            }
+        }
+
         switch type {
         case "screen_idle":
             var seconds = 2.0
@@ -187,6 +225,26 @@ enum WaitCondition: Sendable {
         case "job_output_matches":
             let job = try text("job")!
             return .jobOutputMatches(job: job, pattern: try pattern(.anchorsMatchLines))
+        case "ui_exists":
+            return .uiExists(element: try element())
+        case "ui_gone":
+            return .uiGone(element: try element())
+        case "ui_enabled":
+            return .uiEnabled(element: try element())
+        case "ui_text_stable":
+            var quietMs = 1500
+            if let v = fields["quietMs"], v != .null {
+                guard let ms = v.intValue, (0...maxQuietMs).contains(ms) else { throw fail("'quietMs' must be an integer between 0 and \(maxQuietMs)") }
+                quietMs = ms
+            }
+            return .uiTextStable(element: try element(), quietMs: quietMs)
+        case "window_title":
+            let contains = try text("contains", required: false)
+            let source = try text("regex", required: false)
+            guard (contains == nil) != (source == nil) else { throw fail("window_title needs exactly one of 'contains' and 'regex'") }
+            return .windowTitle(contains: contains, pattern: try source.map { try compile($0, regexOptions: [], index: index) })
+        case "event":
+            return .event(name: try text("event")!, titleContains: try text("titleContains", required: false))
         default:
             throw fail("unknown type '\(type)'; valid types: \(typeNames.joined(separator: ", "))")
         }

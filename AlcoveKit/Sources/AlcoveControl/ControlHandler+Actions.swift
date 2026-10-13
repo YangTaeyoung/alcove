@@ -134,7 +134,7 @@ extension ControlHandler {
     }
 
     /// The current frame of `t`, read before `op` sends any input.
-    private func frame(of t: VMTarget, before op: String) async throws -> Frame {
+    func frame(of t: VMTarget, before op: String) async throws -> Frame {
         let frame: Frame
         do {
             frame = try await t.frame()
@@ -148,13 +148,16 @@ extension ControlHandler {
     }
 
     /// Waits for the screen to settle after `op` and sets `observation` in `out`, or `observationError`
-    /// when a frame cannot be read. Cancellation is thrown.
+    /// when a frame cannot be read. The observation carries the UI facts of a guest whose connected agent
+    /// has the `ui` capability. Cancellation is thrown.
     func addObservation(to out: inout [String: JSON], _ t: VMTarget, after op: String, before: Frame,
                                 _ options: ObserveOptions) async throws {
         do {
-            let result = try await observe(t, before: before, level: options.level, settleMs: options.settleMs,
+            var result = try await observe(t, before: before, level: options.level, settleMs: options.settleMs,
                                            settleTimeoutMs: options.settleTimeoutMs)
             lastSize[t.name] = (result.width, result.height)
+            await addUIFacts(to: &result, t, level: options.level)
+            try Task.checkCancellation()
             out["observation"] = result.json()
         } catch is CancellationError {
             throw CancellationError()
@@ -164,7 +167,7 @@ extension ControlHandler {
     }
 
     /// Sends the display messages of one action op to `t`.
-    private func send(_ op: String, to t: VMTarget, _ params: JSON) async throws {
+    func send(_ op: String, to t: VMTarget, _ params: JSON) async throws {
         switch op {
         case "vm.mouse.move":
             try await move(t, x: try int(params, "x"), y: try int(params, "y"))
@@ -233,7 +236,7 @@ extension ControlHandler {
         }
     }
 
-    private func button(_ name: String?) throws -> InputButton {
+    func button(_ name: String?) throws -> InputButton {
         switch (name ?? "left").lowercased() {
         case "left": return .left
         case "right": return .right

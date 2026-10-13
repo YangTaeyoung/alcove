@@ -2,7 +2,7 @@ import Foundation
 import AlcoveQMP
 
 /// How much an action op reports about what the screen did.
-enum ObserveLevel: String, CaseIterable, Sendable { case none, summary, diff, image }
+enum ObserveLevel: String, CaseIterable, Sendable { case none, summary, diff, image, ui }
 
 /// What the screen did after an action. Rectangles are guest pixels of the full frame.
 struct ScreenObservation: Sendable, Equatable {
@@ -27,6 +27,16 @@ struct ScreenObservation: Sendable, Equatable {
     var imageRect: Frame.Rect?
     /// Image pixels per guest pixel.
     var imageScale: Double?
+    /// Title of the foreground window.
+    var foreground: String?
+    /// The element with the keyboard focus as `Role "name"`.
+    var focused: String?
+    /// Guest events since the previous observation of the VM, oldest first, as the event name with its window title.
+    var events: [String]?
+    /// Text tree of the foreground window.
+    var tree: String?
+    /// Why UI facts are missing.
+    var uiError: String?
 
     func json() -> JSON {
         var obj: [String: JSON] = ["settled": .bool(settled), "changedFraction": .double(changedFraction),
@@ -35,6 +45,11 @@ struct ScreenObservation: Sendable, Equatable {
         if let image { obj["png"] = .string(image.base64EncodedString()) }
         if let imageRect { obj["imageRect"] = imageRect.json }
         if let imageScale { obj["imageScale"] = .double(imageScale) }
+        if let foreground { obj["foreground"] = .string(foreground) }
+        if let focused { obj["focused"] = .string(focused) }
+        if let events { obj["events"] = .array(events.map(JSON.string)) }
+        if let tree { obj["tree"] = .string(tree) }
+        if let uiError { obj["uiError"] = .string(uiError) }
         return .object(obj)
     }
 }
@@ -69,7 +84,7 @@ func observe(_ t: VMTarget, before: Frame, level: ObserveLevel, settleMs: Int, s
                                          width: last.width, height: last.height)
     var shown: Frame.Rect?
     switch level {
-    case .none, .summary:
+    case .none, .summary, .ui:
         break
     case .diff:
         if let r = diff.rect {

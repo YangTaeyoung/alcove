@@ -33,6 +33,10 @@ extension ControlHandler {
         /// Evaluations in a row that failed, and the sentence of the latest failure.
         var failures = 0
         var lastError: String?
+        /// The element text of the previous evaluation.
+        var lastText: String?
+        /// The sequence number of the newest guest event this condition has looked at.
+        var eventCursor = 0
     }
 
     /// Frames and recognitions shared by the conditions of one tick.
@@ -52,7 +56,11 @@ extension ControlHandler {
         let clock = ContinuousClock()
 
         var agent: AgentClient?
-        if conditions.contains(where: \.needsAgent) { agent = try await tools(t) }
+        if conditions.contains(where: \.needsUI) {
+            agent = try await uiAgent(t, op: "vm.wait_for")
+        } else if conditions.contains(where: \.needsAgent) {
+            agent = try await tools(t)
+        }
 
         var states: [WaitState] = []
         for (index, condition) in conditions.enumerated() {
@@ -62,6 +70,10 @@ extension ControlHandler {
                     throw ControlError.failed("condition \(index): port_listening is not supported for this guest OS")
                 }
                 state.script = script
+            }
+            if case .event = condition {
+                let newest = await t.events(since: .max).next
+                state.eventCursor = min(eventBaseline[t.name] ?? newest, newest)
             }
             states.append(state)
         }
@@ -170,6 +182,21 @@ extension ControlHandler {
                            "cx": .int(Int64(first.x + first.w / 2)), "cy": .int(Int64(first.y + first.h / 2))])
         case .textGone(let text):
             return try await recognize(text, index: index, tick: &tick, vm: t, clock: clock, deadline: deadline).isEmpty ? .holds(nil) : .pending
+        case .event(let name, let titleContains):
+            guard let agent else { throw ControlError.noTools(t.name) }
+            let batch = await t.events(since: state.eventCursor)
+            state.eventCursor = max(state.eventCursor, batch.next)
+            let found = batch.events.first { event in
+                guard event.name == name else { return false }
+                guard let titleContains else { return true }
+                return event.windowTitle?.range(of: titleContains, options: .caseInsensitive) != nil
+            }
+            guard let found else {
+                guard await agent.isConnected else { throw AgentClient.AgentError.disconnected }
+                return .pending
+            }
+            eventBaseline[t.name] = max(eventBaseline[t.name] ?? 0, found.seq)
+            return .holds(found.json)
         default:
             guard let agent else { throw ControlError.noTools(t.name) }
             return try await evaluateAgent(condition, index: index, state: &state, vm: t.name, agent: agent, clock: clock, deadline: deadline)
@@ -338,6 +365,48 @@ extension ControlHandler {
                 return .holds(nil)
             }
             return exited && drained ? .over(.string("job exited")) : .pending
+        case .uiExists(let element), .uiGone(let element), .uiEnabled(let element):
+            let reply: JSON?
+            do { reply = try await call("ui.rect", element) }
+            catch AgentClient.AgentError.remote(let message) where UISelector.isMissingElement(message) {
+                if case .uiGone = condition { return .holds(nil) }
+                return .pending
+            }
+            guard let node = reply?["node"] else { return .pending }
+            switch condition {
+            case .uiGone: return .pending
+            case .uiEnabled: return (node["flags"]?.arrayValue ?? []).contains("disabled") ? .pending : .holds(node)
+            default: return .holds(node)
+            }
+        case .windowTitle(let contains, let pattern):
+            guard let r = try await call("win.list", [:]) else { return .pending }
+            for window in r["windows"]?.arrayValue ?? [] {
+                guard let title = window["title"]?.stringValue else { continue }
+                let matches: Bool
+                if let contains {
+                    matches = title.range(of: contains, options: .caseInsensitive) != nil
+                } else {
+                    matches = pattern?.firstMatch(in: title, range: NSRange(title.startIndex..., in: title)) != nil
+                }
+                if matches { return .holds(["id": window["id"] ?? .null, "title": .string(title), "foreground": window["foreground"] ?? false]) }
+            }
+            return .pending
+        case .uiTextStable(let element, let quietMs):
+            let reply: JSON?
+            do { reply = try await call("ui.text", element) }
+            catch AgentClient.AgentError.remote(let message) where UISelector.isMissingElement(message) {
+                return .over(.string(message))
+            }
+            guard let r = reply else { return .pending }
+            let text = r["text"]?.stringValue ?? ""
+            let now = clock.now
+            guard text == state.lastText else {
+                state.lastText = text
+                state.quietSince = now
+                return .pending
+            }
+            guard now - state.quietSince >= .milliseconds(quietMs) else { return .pending }
+            return .holds(r["total"] ?? .int(Int64(text.utf16.count)))
         default:
             return .pending
         }

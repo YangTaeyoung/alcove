@@ -28,8 +28,12 @@ public protocol VMTarget: Sendable {
     /// Send a display-protocol message (input) to the engine; false when no display.
     @discardableResult func sendDisplay(_ message: ToQEMU) async -> Bool
     /// The guest agent, connecting on demand; nil when the VM is not running
-    /// or the agent is not reachable within `timeout`.
+    /// or the agent is not reachable within `timeout`. A zero `timeout` returns
+    /// the agent only when it is already connected.
     func agent(timeout: Duration) async -> AgentClient?
+    /// The guest events with a sequence number above `seq`, oldest first, and the
+    /// sequence number of the newest event. The events outlive the agent connection.
+    func events(since seq: Int) async -> (events: [GuestEvent], next: Int)
     func snapshots() async throws -> [VMController.SnapshotInfo]
     func createSnapshot(named name: String) async throws
     func restoreSnapshot(named name: String) async throws
@@ -70,8 +74,14 @@ public actor ControllerTarget: VMTarget {
     public nonisolated let name: String
     public let controller: VMController
     private var agentClient: AgentClient?
+    /// Counts the times the agent client was dropped; a connection begun under an older count is not adopted.
     private var agentGeneration = 0
     private let frameSource = FrameSource()
+    private let guestEvents = EventBuffer()
+    /// Feeds the events of `agentClient` into `guestEvents`.
+    private var eventFeed: Task<Void, Never>?
+    /// The connection attempt started by a zero-timeout `agent` call.
+    private var warmUp: Task<Void, Never>?
 
     public init(name: String, controller: VMController) {
         self.name = name
@@ -86,9 +96,10 @@ public actor ControllerTarget: VMTarget {
     public func isEphemeral() async -> Bool { await controller.isEphemeral }
     public func cloneOf() async -> String? { await controller.config.cloneOf }
     public func stop(force: Bool) async throws {
-        await agentClient?.disconnect(); agentClient = nil
+        await dropAgentClient()
         try await controller.shutdown(force: force)
     }
+    public func events(since seq: Int) async -> (events: [GuestEvent], next: Int) { await guestEvents.since(seq) }
     public func pause() async throws { try await controller.pause() }
     public func resume() async throws { try await controller.resume() }
 
@@ -122,11 +133,30 @@ public actor ControllerTarget: VMTarget {
         await dropAgentClient()
     }
 
-    /// Forgets the cached agent client synchronously, then disconnects it.
+    /// Forgets the cached agent client and ends its event feed synchronously, then disconnects it.
     private func dropAgentClient() async {
         let client = agentClient
         agentClient = nil
+        agentGeneration += 1
+        eventFeed?.cancel()
+        eventFeed = nil
         await client?.disconnect()
+    }
+
+    /// Makes `client` the cached agent client and the one source of guest events.
+    private func adopt(_ client: AgentClient) {
+        eventFeed?.cancel()
+        eventFeed = guestEvents.follow(client)
+        agentClient = client
+    }
+
+    /// Starts one connection attempt that nobody waits for, unless one is running.
+    private func startWarmUp() {
+        guard warmUp == nil else { return }
+        warmUp = Task {
+            _ = await self.agent(timeout: .milliseconds(1))
+            self.warmUp = nil
+        }
     }
     public func engineInstance() async -> Int { await controller.engineInstance }
     public func agentHostPort() async -> Int { await controller.config.agentHostPort }
@@ -141,18 +171,30 @@ public actor ControllerTarget: VMTarget {
     public func agent(timeout: Duration) async -> AgentClient? {
         let st = await controller.state
         guard st == .running || st == .paused else {
-            await agentClient?.disconnect(); agentClient = nil
+            await dropAgentClient()
             return nil
         }
         if let a = agentClient, await a.isConnected { return a }
-        agentClient = nil
+        guard timeout > .zero else {
+            startWarmUp()
+            return nil
+        }
         let config = await controller.config
         let deadline = ContinuousClock.now + timeout
         repeat {
+            let generation = agentGeneration
             let client = AgentClient()
             do {
                 try await client.connect(port: config.agentHostPort, expectedToken: config.agentToken, timeout: .seconds(5))
-                agentClient = client
+                if let current = agentClient, await current.isConnected {
+                    await client.disconnect()
+                    return current
+                }
+                guard generation == agentGeneration else {
+                    await client.disconnect()
+                    continue
+                }
+                adopt(client)
                 return client
             } catch {
                 try? await Task.sleep(for: .seconds(1))

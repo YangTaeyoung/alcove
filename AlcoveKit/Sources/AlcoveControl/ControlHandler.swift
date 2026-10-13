@@ -24,6 +24,7 @@ public actor ControlHandler {
         case untypable(String)
         case oneOf(String, String)
         case toolsTooOld(vm: String, op: String)
+        case noUI(String)
         case recognitionFailed(String)
         case failed(String)
 
@@ -39,6 +40,7 @@ public actor ControlHandler {
             case .untypable(let s): return "cannot type \(s) with the US keyboard layout; use vm.clipboard.set + ctrl+v or connect guest tools"
             case .oneOf(let a, let b): return "missing parameter; pass '\(a)' or '\(b)'"
             case .toolsTooOld(let vm, let op): return "guest tools in '\(vm)' are too old for \(op); update alcove-agent in the guest"
+            case .noUI(let vm): return "UI Automation is only available on Windows guests with current guest tools; update alcove-agent in '\(vm)'"
             case .recognitionFailed(let m): return "text recognition failed: \(m)"
             case .failed(let m): return m
             }
@@ -65,6 +67,11 @@ public actor ControlHandler {
     let recordingsDirectory: URL?
     var recordings = RecordingTable()
     var recordingSeams = RecordingSeams()
+    /// Per VM: the newest event sequence number when its latest op outside the read-only set began, or
+    /// that of the event its latest `event` wait matched, whichever is higher.
+    var eventBaseline: [String: Int] = [:]
+    /// Per VM: the newest event sequence number its latest observation reported.
+    var observedEvents: [String: Int] = [:]
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
@@ -95,6 +102,8 @@ public actor ControlHandler {
         "vm.wait_idle", "vm.wait_for", "vm.set_environment", "vm.doctor", "vm.find_text",
         "vm.record.start", "vm.record.stop", "vm.record.status",
         "script.run",
+        "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",
+        "vm.app.launch", "vm.deploy", "vm.events",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -106,7 +115,7 @@ public actor ControlHandler {
         "hello", "vm.list", "vm.status", "vm.screenshot", "vm.wait_idle", "vm.clipboard.get", "vm.exec.read",
         "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
         "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
-        "vm.wait_for", "vm.record.status",
+        "vm.wait_for", "vm.record.status", "vm.window.list", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.events",
     ]
 
     /// Whether `op` runs outside the per-connection request order.
@@ -114,11 +123,17 @@ public actor ControlHandler {
         op.hasPrefix("vm.exec") || op.hasPrefix("vm.process.") || op.hasPrefix("vm.fs.")
             || op == "vm.push_file" || op == "vm.pull_file" || op == "vm.sync_dir" || op == "vm.find_text"
             || op == "script.run"
+            || concurrentUIOps.contains(op)
     }
 
-    /// Whether `op` sends mouse or keyboard input to a guest.
+    private static let concurrentUIOps: Set<String> = [
+        "vm.window.list", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.app.launch", "vm.deploy",
+    ]
+
+    /// Whether `op` sends mouse or keyboard input to a guest or acts on its windows and elements.
     static func isInput(op: String) -> Bool {
         op.hasPrefix("vm.mouse.") || op.hasPrefix("vm.key.") || op == "vm.type" || op == "vm.batch"
+            || op == "vm.ui.click" || op == "vm.ui.type" || op == "vm.ui.action" || op == "vm.window.action"
     }
 
     /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
@@ -129,8 +144,11 @@ public actor ControlHandler {
         }
         let traced = !op.hasPrefix("script.")
         let run: @Sendable () async throws -> JSON = {
-            if traced { return try await self.recorded(op: op, params: params) { try await self.perform(op: op, params: params) } }
-            return try await self.perform(op: op, params: params)
+            guard traced else { return try await self.perform(op: op, params: params) }
+            return try await self.recorded(op: op, params: params) {
+                await self.noteEventBaseline(op: op, params: params)
+                return try await self.perform(op: op, params: params)
+            }
         }
         if ControlHandler.isInput(op: op), let vm = params["name"]?.stringValue {
             return try await inputGate.withLock(vm, run)
@@ -241,6 +259,11 @@ public actor ControlHandler {
             return try await record(op: op, params: params)
         case "script.run":
             return try await scriptRun(params)
+        case "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",
+             "vm.app.launch", "vm.events":
+            return try await ui(op: op, params: params)
+        case "vm.deploy":
+            return try await deploy(params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of the frame's tiles changing between samples 250 ms apart
@@ -273,12 +296,21 @@ public actor ControlHandler {
         return t
     }
 
-    /// Drops the lease, the runtime forwards and the cached frame size of `vm`.
+    /// Drops the lease, the runtime forwards, the cached frame size and the event positions of `vm`.
     func forget(vm: String) {
         leases.forget(vm: vm)
         runtimeForwards[vm] = nil
         forwardInstances[vm] = nil
         lastSize[vm] = nil
+        eventBaseline[vm] = nil
+        observedEvents[vm] = nil
+    }
+
+    /// Before an op outside the read-only set runs: remembers the newest event sequence number of its VM.
+    private func noteEventBaseline(op: String, params: JSON) async {
+        guard !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
+              let t = await registry.target(named: vm) else { return }
+        eventBaseline[vm] = await t.events(since: .max).next
     }
 
     func running(_ params: JSON) async throws -> VMTarget {
@@ -426,6 +458,8 @@ public actor ControlHandler {
             format = f
         }
 
+        let view = try await screenshotView(t, params, hasRegion: region != nil)
+
         let frame = try await screenshot(t)
         var area = frame.bounds
         if let region {
@@ -434,20 +468,32 @@ public actor ControlHandler {
             }
             area = clamped
         }
-        let cropped = area == frame.bounds ? frame : frame.crop(area)
+        if let window = view.window { area = try windowArea(window, in: frame) }
+        var cropped = area == frame.bounds ? frame : frame.crop(area)
         var factor = scale
         if let maxWidth = params["maxWidth"]?.intValue, maxWidth > 0, maxWidth < Int((Double(cropped.width) * scale).rounded()) {
             factor = Double(maxWidth) / Double(cropped.width)
         }
+        var legend: [JSON]?
+        if let nodes = view.nodes {
+            let marks = ControlHandler.marks(for: nodes, in: area)
+            cropped = cropped.drawingMarks(marks.map { Frame.Mark(number: $0.number, rect: $0.rect.offset(x: -area.x, y: -area.y)) }, scale: 1 / factor)
+            legend = marks.map(\.json)
+        }
         let image = cropped.scaled(by: factor)
         let key = format == .png ? "png" : "jpeg"
-        return [key: .string(image.encoded(format, quality: quality).base64EncodedString()),
-                "mime": .string(format == .png ? "image/png" : "image/jpeg"),
-                "width": .int(Int64(frame.width)), "height": .int(Int64(frame.height)),
-                "sentWidth": .int(Int64(image.width)), "sentHeight": .int(Int64(image.height)),
-                "x": .int(Int64(area.x)), "y": .int(Int64(area.y)),
-                "areaWidth": .int(Int64(area.w)), "areaHeight": .int(Int64(area.h)),
-                "scale": .double(Double(image.width) / Double(area.w))]
+        var out: [String: JSON] = [
+            key: .string(image.encoded(format, quality: quality).base64EncodedString()),
+            "mime": .string(format == .png ? "image/png" : "image/jpeg"),
+            "width": .int(Int64(frame.width)), "height": .int(Int64(frame.height)),
+            "sentWidth": .int(Int64(image.width)), "sentHeight": .int(Int64(image.height)),
+            "x": .int(Int64(area.x)), "y": .int(Int64(area.y)),
+            "areaWidth": .int(Int64(area.w)), "areaHeight": .int(Int64(area.h)),
+            "scale": .double(Double(image.width) / Double(area.w)),
+        ]
+        if let window = view.window { out["window"] = window }
+        if let legend { out["marks"] = .array(legend) }
+        return .object(out)
     }
 }
 

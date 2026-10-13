@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreText
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -79,6 +80,65 @@ public struct Frame: Sendable, Equatable {
         CGImageDestinationAddImage(dest, image, options as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return Data() }
         return data as Data
+    }
+
+    /// A numbered rectangle to draw over the frame.
+    public struct Mark: Sendable, Equatable {
+        public var number: Int
+        public var rect: Rect
+        public init(number: Int, rect: Rect) { self.number = number; self.rect = rect }
+    }
+
+    /// The outline colours of marks; mark `n` uses entry `(n - 1) % count`.
+    static let markColors: [(red: UInt8, green: UInt8, blue: UInt8)] = [
+        (230, 0, 92), (0, 122, 255), (0, 153, 68), (255, 128, 0), (153, 51, 204), (0, 163, 163),
+    ]
+
+    /// The frame with each mark drawn as an outlined rectangle and its number in a filled tag: above the
+    /// rectangle's top-left corner, or inside that corner when the tag does not fit above. `scale` multiplies
+    /// the outline width (2 pixels) and the tag's text size (13 pixels). Parts outside the frame are cut off.
+    public func drawingMarks(_ marks: [Mark], scale: Double = 1) -> Frame {
+        guard !marks.isEmpty else { return self }
+        let line = max(1, (2 * max(1, scale)).rounded())
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, CGFloat(13 * max(1, scale)), nil)
+        let padding = CGFloat(line)
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let white = CGColor(colorSpace: space, components: [1, 1, 1, 1]) else { return self }
+        let attributes: [CFString: Any] = [kCTFontAttributeName: font, kCTForegroundColorAttributeName: white]
+        var data = pixels
+        let drawn: Bool = data.withUnsafeMutableBytes { buffer in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: space, bitmapInfo: Frame.bitmapInfo) else { return false }
+            for mark in marks {
+                let rgb = Frame.markColors[((mark.number - 1) % Frame.markColors.count + Frame.markColors.count) % Frame.markColors.count]
+                guard let color = CGColor(colorSpace: space, components: [CGFloat(rgb.red) / 255, CGFloat(rgb.green) / 255, CGFloat(rgb.blue) / 255, 1]) else { continue }
+                let box = CGRect(x: CGFloat(mark.rect.x), y: CGFloat(height - mark.rect.y - mark.rect.h),
+                                 width: CGFloat(mark.rect.w), height: CGFloat(mark.rect.h))
+                ctx.setShouldAntialias(false)
+                ctx.setStrokeColor(color)
+                ctx.setLineWidth(CGFloat(line))
+                ctx.stroke(box.insetBy(dx: CGFloat(line) / 2, dy: CGFloat(line) / 2))
+
+                guard let text = CFAttributedStringCreate(nil, "\(mark.number)" as CFString, attributes as CFDictionary) else { continue }
+                let label = CTLineCreateWithAttributedString(text)
+                var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+                let textWidth = CGFloat(CTLineGetTypographicBounds(label, &ascent, &descent, &leading))
+                let tagWidth = (textWidth + 2 * padding).rounded(.up), tagHeight = (ascent + descent + 2 * padding).rounded(.up)
+                var tag = CGRect(x: box.minX, y: box.maxY, width: tagWidth, height: tagHeight)
+                if tag.maxY > CGFloat(height) {
+                    tag.origin = CGPoint(x: box.minX + CGFloat(line), y: box.maxY - CGFloat(line) - tagHeight)
+                }
+                ctx.setFillColor(color)
+                ctx.fill(tag)
+                ctx.setShouldAntialias(true)
+                ctx.textPosition = CGPoint(x: tag.minX + padding, y: tag.minY + padding + descent)
+                CTLineDraw(label, ctx)
+            }
+            return true
+        }
+        guard drawn else { return self }
+        for i in stride(from: 3, to: data.count, by: 4) { data[i] = 255 }
+        return Frame(width: width, height: height, pixels: data)
     }
 
     private static let bitmapInfo = CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue

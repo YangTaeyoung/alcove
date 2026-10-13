@@ -227,8 +227,8 @@ final class ObservationTests: XCTestCase {
     func testObserveParametersAreCheckedBeforeInput() async throws {
         let (h, t) = await setup(frames: [solid(320, 192, 40)])
         let cases: [(JSON, String)] = [
-            (["observe": "everything"], "observe must be one of none, summary, diff, image"),
-            (["observe": 1], "observe must be one of none, summary, diff, image"),
+            (["observe": "everything"], "observe must be one of none, summary, diff, image, ui"),
+            (["observe": 1], "observe must be one of none, summary, diff, image, ui"),
             (["observe": "summary", "settleMs": -1], "settleMs must be between 0 and 10000"),
             (["settleMs": 10001], "settleMs must be between 0 and 10000"),
             (["observe": "diff", "settleMs": "fast"], "settleMs must be between 0 and 10000"),

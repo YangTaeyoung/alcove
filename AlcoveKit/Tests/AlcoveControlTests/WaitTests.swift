@@ -756,7 +756,7 @@ final class WaitTests: XCTestCase {
     func testObserveOptionsAreValidated() async throws {
         let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
         let level = await failure(h, ["name": "Win", "conditions": [["type": "screen_idle"]], "observe": "loud"])
-        XCTAssertEqual(level, "observe must be one of none, summary, diff, image")
+        XCTAssertEqual(level, "observe must be one of none, summary, diff, image, ui")
         let settle = await failure(h, ["name": "Win", "conditions": [["type": "screen_idle"]], "observe": "summary", "settleMs": -5])
         XCTAssertEqual(settle, "settleMs must be between 0 and 10000")
     }

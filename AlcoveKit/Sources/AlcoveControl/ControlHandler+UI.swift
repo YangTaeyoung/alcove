@@ -1,0 +1,527 @@
+import Foundation
+import AlcoveAgent
+import AlcoveQMP
+
+/// The clocks of the UI ops.
+enum UITiming {
+    /// Longest the host waits for one window or element op of the agent.
+    nonisolated(unsafe) static var callTimeout = Duration.seconds(160)
+    /// Longest an observation waits for the focused element.
+    nonisolated(unsafe) static var factTimeout = Duration.seconds(5)
+    /// Longest an observation waits for the tree of the foreground window.
+    nonisolated(unsafe) static var treeFactTimeout = Duration.seconds(20)
+    /// Pause between the click of `vm.ui.type` and its first key.
+    nonisolated(unsafe) static var focusDelay = Duration.milliseconds(120)
+    /// Pause between two reads of the process list while `vm.deploy` waits for stopped processes to exit.
+    nonisolated(unsafe) static var processPoll = Duration.milliseconds(200)
+    /// Longest `vm.deploy` waits for stopped processes to exit.
+    nonisolated(unsafe) static var processExitTimeout = Duration.seconds(5)
+}
+
+/// How a control op or a wait condition names one element: a ref, or selector fields.
+enum UISelector {
+    static let fieldNames = ["window", "role", "name", "nameContains", "automationId", "index"]
+    static let criteria = ["role", "name", "nameContains", "automationId"]
+
+    enum Invalid: Error {
+        case neither
+        case both
+        case noCriteria
+        case field(String)
+    }
+
+    /// The agent fields that select one element: `ref` alone, or the fields of the `selector` object. Null counts as absent.
+    static func agentFields(ref: JSON?, selector: JSON?) throws -> [String: JSON] {
+        let ref = ref.flatMap { $0 == .null ? nil : $0 }
+        let selector = selector.flatMap { $0 == .null ? nil : $0 }
+        if ref != nil, selector != nil { throw Invalid.both }
+        if let ref {
+            guard let text = ref.stringValue, isRef(text) else {
+                throw Invalid.field("ref must be an element ref such as e12; take one from vm.ui.tree or vm.ui.find")
+            }
+            return ["ref": .string(text)]
+        }
+        guard let selector else { throw Invalid.neither }
+        guard let fields = selector.objectValue else {
+            throw Invalid.field("selector must be an object with window, role, name, nameContains, automationId or index")
+        }
+        var out: [String: JSON] = [:]
+        for (key, value) in fields.sorted(by: { $0.key < $1.key }) where value != .null {
+            guard fieldNames.contains(key) else {
+                throw Invalid.field("selector has no field '\(key)'; valid fields: \(fieldNames.joined(separator: ", "))")
+            }
+            if key == "index" {
+                guard let index = value.intValue, index >= 0 else { throw Invalid.field("selector field 'index' must be an integer of 0 or more") }
+            } else {
+                guard value.stringValue != nil else { throw Invalid.field("selector field '\(key)' must be a string") }
+            }
+            out[key] = value
+        }
+        guard criteria.contains(where: { out[$0] != nil }) else { throw Invalid.noCriteria }
+        return out
+    }
+
+    /// Whether `text` is `e` followed by digits.
+    static func isRef(_ text: String) -> Bool {
+        text.hasPrefix("e") && text.count > 1 && text.dropFirst().allSatisfy { $0.isASCII && $0.isNumber }
+    }
+
+    /// Whether an agent error says that the selected element does not exist.
+    static func isMissingElement(_ message: String) -> Bool {
+        message.hasPrefix("no element matches") || (message.hasPrefix("element ") && message.contains(" no longer exists"))
+    }
+}
+
+/// One numbered element of a marked screenshot.
+struct UIMark {
+    let number: Int
+    let node: JSON
+    /// The element's rectangle in guest pixels of the full frame.
+    let rect: Frame.Rect
+
+    /// `{n, ref, role, name, x, y, w, h}`.
+    var json: JSON {
+        ["n": .int(Int64(number)), "ref": node["ref"] ?? .null, "role": node["role"] ?? .null, "name": node["name"] ?? "",
+         "x": .int(Int64(rect.x)), "y": .int(Int64(rect.y)), "w": .int(Int64(rect.w)), "h": .int(Int64(rect.h))]
+    }
+}
+
+/// What a screenshot asks of the guest's UI: the window to crop to and the elements to mark.
+struct ScreenshotView {
+    var window: JSON?
+    var nodes: [JSON]?
+}
+
+extension Frame.Rect {
+    func offset(x dx: Int, y dy: Int) -> Frame.Rect { Frame.Rect(x: x + dx, y: y + dy, w: w, h: h) }
+
+    func intersects(_ other: Frame.Rect) -> Bool {
+        x < other.x + other.w && other.x < x + w && y < other.y + other.h && other.y < y + h
+    }
+}
+
+/// Windows, UI Automation elements, app launch and guest events of Windows guests, carried by the agent's
+/// `win.*`, `ui.*` and `app.launch` operations. Clicks and keys go through the display like `vm.mouse.click` and `vm.type`.
+extension ControlHandler {
+    static let windowActions = ["focus", "minimize", "maximize", "restore", "close", "move", "resize"]
+    static let elementActions = ["invoke", "toggle", "expand", "collapse", "select", "set_value", "focus", "scroll_into_view"]
+    static let textModes = ["auto", "pattern", "descendants"]
+    /// The control types a marked screenshot numbers, in lower case.
+    static let markRoles: Set<String> = [
+        "button", "checkbox", "combobox", "edit", "hyperlink", "listitem", "menuitem", "radiobutton", "slider", "spinner",
+        "splitbutton", "tabitem", "treeitem", "dataitem", "document",
+    ]
+    static let maxMarks = 100
+    static let maxObservedEvents = 20
+    static let observedTreeNodes = 150
+    static let defaultLaunchWaitSeconds = 15.0
+    static let maxWaitWindowSeconds = 300.0
+
+    func ui(op: String, params: JSON) async throws -> JSON {
+        switch op {
+        case "vm.window.list":
+            let t = try await running(params)
+            let agent = try await uiAgent(t, op: op)
+            let r = try await uiCall(agent, "win.list", [:], vm: t.name, op: op)
+            return ["windows": r["windows"] ?? []]
+        case "vm.window.action": return try await windowAction(params)
+        case "vm.ui.tree": return try await uiTree(params)
+        case "vm.ui.find": return try await uiFind(params)
+        case "vm.ui.text": return try await uiText(params)
+        case "vm.ui.click": return try await uiClick(params)
+        case "vm.ui.type": return try await uiType(params)
+        case "vm.ui.action": return try await uiAction(params)
+        case "vm.app.launch": return try await launchApp(params)
+        case "vm.events": return try await guestEvents(params)
+        default: throw ControlError.unknownOp(op)
+        }
+    }
+
+    // MARK: - shared helpers
+
+    /// The agent of `t`, checked for request/response support and the `ui` capability.
+    func uiAgent(_ t: VMTarget, op: String) async throws -> AgentClient {
+        let agent = try await tools(t)
+        guard let hello = await agent.hello, hello.rpcVersion >= 2 else { throw ControlError.toolsTooOld(vm: t.name, op: op) }
+        guard hello.capabilities.contains("ui") else { throw ControlError.noUI(t.name) }
+        return agent
+    }
+
+    /// One agent call on behalf of the control op `op`; failures become control errors.
+    func uiCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, op: String,
+                timeout: Duration = UITiming.callTimeout) async throws -> JSON {
+        do { return try await agent.call(agentOp, fields, timeout: timeout) } catch { throw agentFailure(error, vm: vm, op: op) }
+    }
+
+    /// The agent fields that select the element of a control op: its `ref`, or the fields of its `selector` object.
+    nonisolated func elementFields(_ params: JSON) throws -> [String: JSON] {
+        do {
+            return try UISelector.agentFields(ref: params["ref"], selector: params["selector"])
+        } catch UISelector.Invalid.neither {
+            throw ControlError.failed("pass ref or selector")
+        } catch UISelector.Invalid.both {
+            throw ControlError.failed("pass ref or selector, not both")
+        } catch UISelector.Invalid.noCriteria {
+            throw ControlError.failed("selector needs at least one of \(UISelector.criteria.joined(separator: ", "))")
+        } catch UISelector.Invalid.field(let message) {
+            throw ControlError.failed(message)
+        }
+    }
+
+    /// Runs `body`; unless the level is `none`, its result also carries what the screen did afterwards,
+    /// or `observationError` when the screen could not be read after `body` finished.
+    private func observed(_ t: VMTarget, op: String, _ options: ObserveOptions,
+                          _ body: () async throws -> [String: JSON]) async throws -> JSON {
+        let before = options.level == .none ? nil : try await frame(of: t, before: op)
+        var out = try await body()
+        if let before { try await addObservation(to: &out, t, after: op, before: before, options) }
+        return .object(out)
+    }
+
+    /// Scrolls the element into view and returns it with its clickable point in guest pixels of the full frame.
+    private func clickPoint(_ agent: AgentClient, _ element: [String: JSON], vm: String, op: String) async throws -> (node: JSON, x: Int, y: Int) {
+        var request = element
+        request["scroll"] = true
+        let r = try await uiCall(agent, "ui.rect", request, vm: vm, op: op)
+        let node = r["node"] ?? .null
+        guard r["clickable"]?.boolValue == true, let x = r["cx"]?.intValue, let y = r["cy"]?.intValue else {
+            let ref = node["ref"]?.stringValue ?? element["ref"]?.stringValue
+            throw ControlError.failed("element \(ref ?? "of this selector") has no clickable point (off screen or covered); use vm.ui.action or scroll it into view")
+        }
+        return (node, x, y)
+    }
+
+    // MARK: - windows
+
+    private func windowAction(_ params: JSON) async throws -> JSON {
+        let op = "vm.window.action"
+        let options = try observeOptions(params)
+        guard let window = params["window"]?.stringValue, !window.isEmpty else { throw ControlError.missing("window") }
+        guard let action = params["action"]?.stringValue, ControlHandler.windowActions.contains(action) else {
+            throw ControlError.failed("action must be one of \(ControlHandler.windowActions.joined(separator: ", "))")
+        }
+        var request: [String: JSON] = ["window": .string(window), "action": .string(action)]
+        if action == "move" {
+            guard let x = params["x"]?.intValue, let y = params["y"]?.intValue else {
+                throw ControlError.failed("move needs integer 'x' and 'y' in guest pixels")
+            }
+            request["x"] = .int(Int64(x)); request["y"] = .int(Int64(y))
+        }
+        if action == "resize" {
+            guard let w = params["width"]?.intValue, let h = params["height"]?.intValue, w > 0, h > 0 else {
+                throw ControlError.failed("resize needs integer 'width' and 'height' above 0 in guest pixels")
+            }
+            request["w"] = .int(Int64(w)); request["h"] = .int(Int64(h))
+        }
+        let t = try await running(params)
+        let agent = try await uiAgent(t, op: op)
+        let fields = request
+        return try await observed(t, op: op, options) {
+            let r = try await self.uiCall(agent, "win.action", fields, vm: t.name, op: op)
+            return ["window": r["window"] ?? .null]
+        }
+    }
+
+    // MARK: - tree, find, text
+
+    private func uiTree(_ params: JSON) async throws -> JSON {
+        let op = "vm.ui.tree"
+        var request: [String: JSON] = [:]
+        try pass(params, "window", to: &request, where: isString)
+        try pass(params, "root", to: &request, where: isString)
+        try pass(params, "depth", to: &request, type: .integer)
+        try pass(params, "max", to: &request, type: .integer)
+        try pass(params, "filter", to: &request, where: isString)
+        if let depth = request["depth"]?.intValue, depth < 0 { throw ControlError.failed("depth must be 0 or more") }
+        if let max = request["max"]?.intValue, !(1...2000).contains(max) { throw ControlError.failed("max must be between 1 and 2000") }
+        if let filter = request["filter"]?.stringValue, filter != "interactive", filter != "all" {
+            throw ControlError.failed("filter must be 'interactive' or 'all'")
+        }
+        let t = try await running(params)
+        let agent = try await uiAgent(t, op: op)
+        let r = try await uiCall(agent, "ui.tree", request, vm: t.name, op: op)
+        let nodes = r["nodes"]?.arrayValue ?? []
+        var out: [String: JSON] = ["tree": .string(UITreeText.render(nodes)), "count": .int(Int64(nodes.count)),
+                                   "truncated": .bool(r["truncated"]?.boolValue ?? false)]
+        if let window = r["window"] { out["window"] = window }
+        return .object(out)
+    }
+
+    private func uiFind(_ params: JSON) async throws -> JSON {
+        let op = "vm.ui.find"
+        var request = try elementFields(params)
+        let byRef = request["ref"] != nil
+        if let limit = try optional(params, "limit", .integer) {
+            guard let n = limit.intValue, n >= 1 else { throw ControlError.failed("limit must be 1 or more") }
+            if !byRef { request["limit"] = limit }
+        }
+        let t = try await running(params)
+        let agent = try await uiAgent(t, op: op)
+        let nodes: [JSON]
+        if byRef {
+            nodes = [try await uiCall(agent, "ui.rect", request, vm: t.name, op: op)["node"]].compactMap { $0 }
+        } else {
+            nodes = try await uiCall(agent, "ui.find", request, vm: t.name, op: op)["nodes"]?.arrayValue ?? []
+        }
+        return ["nodes": .array(nodes), "text": .string(UITreeText.render(nodes))]
+    }
+
+    private func uiText(_ params: JSON) async throws -> JSON {
+        let op = "vm.ui.text"
+        var request = try elementFields(params)
+        try pass(params, "mode", to: &request, where: isString)
+        try pass(params, "offset", to: &request, type: .integer)
+        try pass(params, "length", to: &request, type: .integer)
+        if let mode = request["mode"]?.stringValue, !ControlHandler.textModes.contains(mode) {
+            throw ControlError.failed("mode must be one of \(ControlHandler.textModes.joined(separator: ", "))")
+        }
+        if let offset = request["offset"]?.intValue, offset < 0 { throw ControlError.failed("offset must be 0 or more") }
+        if let length = request["length"]?.intValue, !(1...200_000).contains(length) {
+            throw ControlError.failed("length must be between 1 and 200000")
+        }
+        let t = try await running(params)
+        let agent = try await uiAgent(t, op: op)
+        return pick(try await uiCall(agent, "ui.text", request, vm: t.name, op: op), ["text", "total", "source"])
+    }
+
+    // MARK: - click, type, action
+
+    private func uiClick(_ params: JSON) async throws -> JSON {
+        let op = "vm.ui.click"
+        let options = try observeOptions(params)
+        let element = try elementFields(params)
+        _ = try button(params["button"]?.stringValue)
+        var click: [String: JSON] = [:]
+        try pass(params, "button", to: &click, where: isString)
+        try pass(params, "count", to: &click, type: .integer)
+        let t = try await running(params)
+        let agent = try await uiAgent(t, op: op)
+        let extra = click
+        return try await observed(t, op: op, options) {
+            let target = try await self.clickPoint(agent, element, vm: t.name, op: op)
+            var input = extra
+            input["x"] = .int(Int64(target.x)); input["y"] = .int(Int64(target.y))
+            try await self.send("vm.mouse.click", to: t, .object(input))
+            return ["x": .int(Int64(target.x)), "y": .int(Int64(target.y)), "node": target.node]
+        }
+    }
+
+    private func uiType(_ params: JSON) async throws -> JSON {
+        let op = "vm.ui.type"
+        let options = try observeOptions(params)
+        let element = try elementFields(params)
+        let text = try string(params, "text")
+        let clear = try optional(params, "clear", .boolean)?.boolValue ?? false
+        let submit = try optional(params, "submit", .boolean)?.boolValue ?? false
+        let t = try await running(params)
+        let agent = try await uiAgent(t, op: op)
+        return try await observed(t, op: op, options) {
+            let target = try await self.clickPoint(agent, element, vm: t.name, op: op)
+            try await self.send("vm.mouse.click", to: t, ["x": .int(Int64(target.x)), "y": .int(Int64(target.y))])
+            try await Task.sleep(for: UITiming.focusDelay)
+            if clear { try await self.send("vm.key.press", to: t, ["keys": "ctrl+a"]) }
+            if !text.isEmpty {
+                try await self.send("vm.type", to: t, ["text": .string(text)])
+            } else if clear {
+                try await self.send("vm.key.press", to: t, ["keys": "backspace"])
+            }
+            if submit { try await self.send("vm.key.press", to: t, ["keys": "enter"]) }
+            return ["node": target.node]
+        }
+    }
+
+    private func uiAction(_ params: JSON) async throws -> JSON {
+        let op = "vm.ui.action"
+        let options = try observeOptions(params)
+        var request = try elementFields(params)
+        guard let action = params["action"]?.stringValue, ControlHandler.elementActions.contains(action) else {
+            throw ControlError.failed("action must be one of \(ControlHandler.elementActions.joined(separator: ", "))")
+        }
+        request["action"] = .string(action)
+        try pass(params, "value", to: &request, where: isString)
+        if action == "set_value", request["value"] == nil { throw ControlError.failed("set_value needs a string 'value'; pass the new text") }
+        let t = try await running(params)
+        let agent = try await uiAgent(t, op: op)
+        let fields = request
+        return try await observed(t, op: op, options) {
+            let r = try await self.uiCall(agent, "ui.act", fields, vm: t.name, op: op)
+            return ["node": r["node"] ?? .null]
+        }
+    }
+
+    // MARK: - launch
+
+    /// The `waitWindow` parameter in milliseconds: `fallback` seconds when absent, otherwise 0 to 300 seconds.
+    nonisolated func waitWindowMilliseconds(_ params: JSON, default fallback: Double) throws -> Int {
+        guard let value = params["waitWindow"], value != .null else { return Int((fallback * 1000).rounded()) }
+        guard let seconds = value.doubleValue, (0...ControlHandler.maxWaitWindowSeconds).contains(seconds) else {
+            throw ControlError.failed("waitWindow must be between 0 and \(Int(ControlHandler.maxWaitWindowSeconds)) seconds")
+        }
+        return Int((seconds * 1000).rounded())
+    }
+
+    /// `app.launch` with `request` and a window wait of `waitMs`; the agent call outlasts the wait by 30 s.
+    func launch(_ agent: AgentClient, _ request: [String: JSON], waitMs: Int) async throws -> JSON {
+        var fields = request
+        fields["wait_window_ms"] = .int(Int64(waitMs))
+        return pick(try await agent.call("app.launch", fields, timeout: .milliseconds(waitMs + 30_000)), ["pid", "window"])
+    }
+
+    private func launchApp(_ params: JSON) async throws -> JSON {
+        let op = "vm.app.launch"
+        guard let path = params["path"]?.stringValue, !path.isEmpty else { throw ControlError.missing("path") }
+        var request: [String: JSON] = ["path": .string(path)]
+        try pass(params, "args", to: &request) { $0.arrayValue.map { $0.allSatisfy(isString) } ?? false }
+        try pass(params, "cwd", to: &request, where: isString)
+        try pass(params, "env", to: &request) { $0.objectValue.map { $0.values.allSatisfy(isString) } ?? false }
+        let waitMs = try waitWindowMilliseconds(params, default: ControlHandler.defaultLaunchWaitSeconds)
+        let t = try await running(params)
+        let agent = try await tools(t)
+        do { return try await launch(agent, request, waitMs: waitMs) } catch { throw agentFailure(error, vm: t.name, op: op) }
+    }
+
+    // MARK: - events
+
+    private func guestEvents(_ params: JSON) async throws -> JSON {
+        var since = 0
+        if let value = params["since"], value != .null {
+            guard let n = value.intValue, n >= 0 else {
+                throw ControlError.failed("since must be an integer of 0 or more; pass the next value of an earlier vm.events reply")
+            }
+            since = n
+        }
+        let t = try await target(params)
+        _ = await t.agent(timeout: .zero)
+        let batch = await t.events(since: since)
+        return ["events": .array(batch.events.map(\.json)), "next": .int(Int64(batch.next))]
+    }
+
+    /// The observation lines of `events`: the newest `maxObservedEvents`, preceded by a count of the ones left out.
+    static func eventLines(_ events: [GuestEvent]) -> [String] {
+        let shown = events.suffix(maxObservedEvents)
+        var lines = shown.map(eventLine)
+        if events.count > shown.count { lines.insert("\(events.count - shown.count) earlier events; call vm.events", at: 0) }
+        return lines
+    }
+
+    /// The event name followed by its window title in quotes, or by the file name of its `path` or its `job`, and by `code <n>` when it has a code.
+    static func eventLine(_ event: GuestEvent) -> String {
+        var line = event.name
+        if let title = event.windowTitle {
+            line += " " + UITreeText.quoted(title)
+        } else if let path = event.payload["path"]?.stringValue, let file = path.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last {
+            line += " " + file
+        } else if let job = event.payload["job"]?.stringValue {
+            line += " " + job
+        }
+        if let code = event.payload["code"]?.intValue { line += " code \(code)" }
+        return line
+    }
+
+    // MARK: - observation
+
+    /// Adds the foreground window title, the focused element, the events since the VM's previous observation and,
+    /// at level `ui`, the tree of the foreground window. Needs a connected agent with the `ui` capability; without one
+    /// only level `ui` says so in `uiError`.
+    func addUIFacts(to observation: inout ScreenObservation, _ t: VMTarget, level: ObserveLevel) async {
+        guard let agent = await t.agent(timeout: .zero), let hello = await agent.hello, hello.rpcVersion >= 2,
+              hello.capabilities.contains("ui") else {
+            if level == .ui { observation.uiError = ControlError.noUI(t.name).description }
+            return
+        }
+        do {
+            let r = try await agent.call("ui.focused", [:], timeout: UITiming.factTimeout)
+            observation.foreground = r["window"]?["title"]?.stringValue
+            observation.focused = r["node"].map(UITreeText.label)
+        } catch {
+            let reason = agentFailure(error, vm: t.name, op: "the observation").description
+            observation.uiError = "the foreground window and focused element could not be read: \(reason)"
+        }
+        if level == .ui, observation.uiError == nil {
+            do {
+                let request: [String: JSON] = ["window": "foreground", "max": .int(Int64(ControlHandler.observedTreeNodes))]
+                let r = try await agent.call("ui.tree", request, timeout: UITiming.treeFactTimeout)
+                var text = UITreeText.render(r["nodes"]?.arrayValue ?? [])
+                if r["truncated"]?.boolValue == true { text += "\n… more elements; call vm.ui.tree to read the whole window" }
+                observation.tree = text
+                if observation.foreground == nil { observation.foreground = r["window"]?["title"]?.stringValue }
+            } catch {
+                let reason = agentFailure(error, vm: t.name, op: "the observation").description
+                observation.uiError = "the UI tree could not be read: \(reason)"
+            }
+        }
+        let cursor = observedEvents[t.name] ?? eventBaseline[t.name] ?? .max
+        var batch = await t.events(since: cursor)
+        if cursor != .max, batch.next < cursor { batch = await t.events(since: 0) }
+        observedEvents[t.name] = batch.next
+        observation.events = ControlHandler.eventLines(batch.events)
+    }
+
+    // MARK: - screenshot
+
+    /// The window and elements `vm.screenshot` asked for with `window` and `marks`; empty without either.
+    /// `window` together with an explicit region is refused.
+    func screenshotView(_ t: VMTarget, _ params: JSON, hasRegion: Bool) async throws -> ScreenshotView {
+        let op = "vm.screenshot"
+        var spec: String?
+        if let value = params["window"], value != .null {
+            guard let text = value.stringValue, !text.isEmpty else { throw ControlError.missing("window") }
+            spec = text
+        }
+        let marks = try optional(params, "marks", .boolean)?.boolValue ?? false
+        guard spec != nil || marks else { return ScreenshotView() }
+        if spec != nil, hasRegion {
+            throw ControlError.failed("pass region or window, not both; region is a rectangle of the frame, window crops to a window's rectangle")
+        }
+        let agent = try await uiAgent(t, op: op)
+        var view = ScreenshotView()
+        if let spec {
+            let windows = try await uiCall(agent, "win.list", [:], vm: t.name, op: op)["windows"]?.arrayValue ?? []
+            guard let window = ControlHandler.window(matching: spec, in: windows) else {
+                throw ControlError.failed("no window matches '\(spec)'; call vm.window.list")
+            }
+            view.window = window
+        }
+        if marks {
+            let request: [String: JSON] = ["window": view.window?["id"] ?? "foreground", "filter": "interactive", "max": 300]
+            view.nodes = try await uiCall(agent, "ui.tree", request, vm: t.name, op: op)["nodes"]?.arrayValue ?? []
+        }
+        return view
+    }
+
+    /// The window `spec` names: `foreground`, a window id, or a part of a title (the foreground window first among several).
+    /// Ids and titles compare without regard to case.
+    static func window(matching spec: String, in windows: [JSON]) -> JSON? {
+        let wanted = spec.lowercased()
+        if wanted == "foreground" { return windows.first { $0["foreground"]?.boolValue == true } }
+        if let byID = windows.first(where: { $0["id"]?.stringValue?.lowercased() == wanted }) { return byID }
+        let titled = windows.filter { $0["title"]?.stringValue?.range(of: spec, options: .caseInsensitive) != nil }
+        return titled.first { $0["foreground"]?.boolValue == true } ?? titled.first
+    }
+
+    /// The part of `frame` that `window` covers.
+    nonisolated func windowArea(_ window: JSON, in frame: Frame) throws -> Frame.Rect {
+        guard window["state"]?.stringValue != "minimized",
+              let x = window["x"]?.intValue, let y = window["y"]?.intValue, let w = window["w"]?.intValue, let h = window["h"]?.intValue,
+              let area = frame.clamp(Frame.Rect(x: x, y: y, w: w, h: h)) else {
+            let title = window["title"]?.stringValue ?? window["id"]?.stringValue ?? ""
+            throw ControlError.failed("window '\(title)' is minimized or outside the \(frame.width)x\(frame.height) frame; restore it with vm.window.action")
+        }
+        return area
+    }
+
+    /// The elements of `nodes` to number: those with a control type in `markRoles`, a rectangle that is not empty and
+    /// reaches into `area`, and without the `offscreen` flag; at most `maxMarks`, numbered from 1 in tree order.
+    static func marks(for nodes: [JSON], in area: Frame.Rect) -> [UIMark] {
+        var marks: [UIMark] = []
+        for node in nodes where marks.count < maxMarks {
+            guard let role = node["role"]?.stringValue, markRoles.contains(role.lowercased()),
+                  let x = node["x"]?.intValue, let y = node["y"]?.intValue, let w = node["w"]?.intValue, let h = node["h"]?.intValue,
+                  w > 0, h > 0, !(node["flags"]?.arrayValue ?? []).contains("offscreen") else { continue }
+            let rect = Frame.Rect(x: x, y: y, w: w, h: h)
+            guard rect.intersects(area) else { continue }
+            marks.append(UIMark(number: marks.count + 1, node: node, rect: rect))
+        }
+        return marks
+    }
+}
