@@ -29,8 +29,14 @@ extension ControlHandler {
             case "vm.pull_file":
                 let guestPath = try string(params, "guestPath")
                 let path = try string(params, "path")
-                let r = try await tools(t).pullFile(guestPath: guestPath, to: URL(fileURLWithPath: path))
-                return ["path": .string(path), "bytes": .int(Int64(r.bytes)), "sha256": .string(r.sha256)]
+                return try await pull(t, guestPath: guestPath, to: path)
+            case "vm.crash_dumps.pull":
+                guard await t.guestOS() == .windows else { throw ControlError.failed(ControlHandler.windowsOnlyDumps) }
+                let file = try string(params, "file")
+                guard ControlHandler.isWindowsFileName(file, suffix: ".dmp") else {
+                    throw ControlError.failed("file must be the name of a .dmp file listed by vm.crash_dumps.list, without a folder")
+                }
+                return try await pull(t, guestPath: GuestRecipes.dumpFolder + "\\" + file, to: try string(params, "path"))
             case "vm.sync_dir":
                 let path = try string(params, "path")
                 let guestPath = try string(params, "guestPath")
@@ -104,6 +110,12 @@ extension ControlHandler {
             offset += piece.count
         } while offset < data.count
         return ["size": size]
+    }
+
+    /// Copies the guest file `guestPath` to the host path `path` and reports its size and SHA-256.
+    private func pull(_ t: VMTarget, guestPath: String, to path: String) async throws -> JSON {
+        let r = try await tools(t).pullFile(guestPath: guestPath, to: URL(fileURLWithPath: path))
+        return ["path": .string(path), "bytes": .int(Int64(r.bytes)), "sha256": .string(r.sha256)]
     }
 
     private nonisolated func requireHostFile(_ path: String) throws {

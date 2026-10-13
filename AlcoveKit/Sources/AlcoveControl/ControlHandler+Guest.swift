@@ -11,7 +11,12 @@ extension ControlHandler {
     private static let maximumClockSkew: TimeInterval = 5
 
     func guest(op: String, params: JSON) async throws -> JSON {
-        op == "vm.set_environment" ? try await setEnvironment(params) : try await doctor(params)
+        switch op {
+        case "vm.set_environment": return try await setEnvironment(params)
+        case "vm.doctor": return try await doctor(params)
+        case "vm.event_log": return try await eventLog(params)
+        default: return try await crashDumps(op: op, params: params)
+        }
     }
 
     // MARK: - vm.set_environment
@@ -259,5 +264,175 @@ extension ControlHandler {
             rows.append(check("scale", true, notChecked))
         }
         return rows
+    }
+
+    // MARK: - vm.event_log
+
+    private static let eventLogLevels = ["critical", "error", "warning", "info"]
+    private static let maximumSinceMinutes = 5_256_000
+
+    private func eventLog(_ params: JSON) async throws -> JSON {
+        func text(_ key: String) throws -> String? {
+            guard let value = params[key], value != .null else { return nil }
+            guard let s = value.stringValue else { throw ControlError.missing(key) }
+            return s
+        }
+        let log = try text("log") ?? "Application"
+        guard Self.isLogName(log) else {
+            throw ControlError.failed("log must be a plain log name such as Application, System or Microsoft-Windows-PowerShell/Operational")
+        }
+        let level = try text("level")
+        if let level, !Self.eventLogLevels.contains(level) {
+            throw ControlError.failed("level must be one of \(Self.eventLogLevels.joined(separator: ", "))")
+        }
+        let provider = try text("provider")
+        if provider?.isEmpty == true { throw ControlError.failed("provider must not be empty; leave it out to read all providers") }
+        let contains = try text("contains")
+        if contains?.isEmpty == true { throw ControlError.failed("contains must not be empty; leave it out to read all entries") }
+        let since = try optional(params, "sinceMinutes", .integer)?.intValue ?? 60
+        guard (1...Self.maximumSinceMinutes).contains(since) else {
+            throw ControlError.failed("sinceMinutes must be between 1 and \(Self.maximumSinceMinutes)")
+        }
+        let max = try optional(params, "max", .integer)?.intValue ?? 50
+        guard (1...500).contains(max) else {
+            throw ControlError.failed("max must be between 1 and 500; pass a smaller number or narrow with level, provider or contains")
+        }
+        let t = try await running(params)
+        let os = await t.guestOS()
+        guard let script = GuestRecipes.eventLog(log: log, level: level, provider: provider, sinceMinutes: since,
+                                                 contains: contains, max: max, os: os) else {
+            throw ControlError.failed("the event log is not supported on this guest OS")
+        }
+        let agent = try await execAgent(t, op: "vm.event_log")
+        let result = await runRecipe(agent, script, vm: t.name, op: "vm.event_log")
+        guard result.ok else { throw ControlError.failed(result.detail) }
+        if os == .linux {
+            return ["entries": .array(Array(Self.journalEntries(result.stdout).prefix(max)))]
+        }
+        guard let parsed = Self.eventEntries(result.stdout) else {
+            throw ControlError.failed("the guest printed no event log JSON; run vm.doctor to check the guest shell")
+        }
+        var reply: [String: JSON] = ["entries": .array(parsed.entries)]
+        if parsed.truncated { reply["truncated"] = true }
+        return .object(reply)
+    }
+
+    private static func isLogName(_ s: String) -> Bool {
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _-./".unicodeScalars)
+        return (1...255).contains(s.unicodeScalars.count) && !s.hasPrefix("-") && s.unicodeScalars.allSatisfy(allowed.contains)
+    }
+
+    private static func cutMessage(_ s: String) -> String {
+        s.count > GuestRecipes.eventMessageLimit ? String(s.prefix(GuestRecipes.eventMessageLimit)) : s
+    }
+
+    /// The entries of the Windows recipe output: a `{entries, truncated}` object, an array or one entry object; nil for text that is no JSON.
+    private static func eventEntries(_ output: String) -> (entries: [JSON], truncated: Bool)? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return ([], false) }
+        guard let json = try? JSON.parse(Data(trimmed.utf8)) else { return nil }
+        var truncated = false
+        let items: [JSON]
+        if let array = json.arrayValue {
+            items = array
+        } else if let wrapped = json["entries"]?.arrayValue {
+            items = wrapped
+            truncated = json["truncated"]?.boolValue ?? false
+        } else if json.objectValue != nil {
+            items = [json]
+        } else {
+            return nil
+        }
+        let entries = items.filter { $0.objectValue != nil }.map { item -> JSON in
+            ["time": .string(item["time"]?.stringValue ?? ""), "id": .int(Int64(item["id"]?.intValue ?? 0)),
+             "level": .string(item["level"]?.stringValue ?? "info"), "provider": .string(item["provider"]?.stringValue ?? ""),
+             "message": .string(cutMessage(item["message"]?.stringValue ?? ""))]
+        }
+        return (entries, truncated)
+    }
+
+    /// The entries of `journalctl -o json` output, one JSON object per line; lines that are no JSON object are skipped.
+    private static func journalEntries(_ output: String) -> [JSON] {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        func text(_ value: JSON?) -> String? {
+            if let s = value?.stringValue { return s }
+            if let bytes = value?.arrayValue { return String(decoding: bytes.compactMap { $0.intValue.map { UInt8(truncatingIfNeeded: $0) } }, as: UTF8.self) }
+            return nil
+        }
+        var entries: [JSON] = []
+        for line in output.split(whereSeparator: \.isNewline) where line.hasPrefix("{") {
+            guard let json = try? JSON.parse(Data(line.utf8)), json.objectValue != nil else { continue }
+            let micros = Double(text(json["__REALTIME_TIMESTAMP"]) ?? "") ?? 0
+            let priority = Int(text(json["PRIORITY"]) ?? "") ?? 6
+            let level = priority <= 2 ? "critical" : priority == 3 ? "error" : priority == 4 ? "warning" : "info"
+            let pid = Int(text(json["_PID"]) ?? "") ?? Int(text(json["SYSLOG_PID"]) ?? "") ?? 0
+            entries.append(["time": .string(formatter.string(from: Date(timeIntervalSince1970: micros / 1_000_000))),
+                            "id": .int(Int64(pid)), "level": .string(level),
+                            "provider": .string(text(json["SYSLOG_IDENTIFIER"]) ?? text(json["_COMM"]) ?? ""),
+                            "message": .string(cutMessage(text(json["MESSAGE"]) ?? ""))])
+        }
+        return entries
+    }
+
+    // MARK: - vm.crash_dumps.enable, disable, list
+
+    static let windowsOnlyDumps = "crash dumps are only collected on Windows guests"
+
+    private func crashDumps(op: String, params: JSON) async throws -> JSON {
+        var exe = ""
+        if op != "vm.crash_dumps.list" {
+            exe = try string(params, "exe")
+            guard Self.isWindowsFileName(exe, suffix: ".exe") else {
+                throw ControlError.failed("exe must be an image name such as MyApp.exe: no folder, ends with .exe, no characters that a Windows file name cannot hold")
+            }
+        }
+        let full = try optional(params, "full", .boolean)?.boolValue ?? false
+        let t = try await running(params)
+        let os = await t.guestOS()
+        let script: String?
+        switch op {
+        case "vm.crash_dumps.enable": script = GuestRecipes.enableDumps(exe: exe, full: full, os: os)
+        case "vm.crash_dumps.disable": script = GuestRecipes.disableDumps(exe: exe, os: os)
+        default: script = GuestRecipes.listDumps(os: os)
+        }
+        guard let script else { throw ControlError.failed(Self.windowsOnlyDumps) }
+        let agent = try await execAgent(t, op: op)
+        let result = await runRecipe(agent, script, vm: t.name, op: op)
+        guard result.ok else { throw ControlError.failed(result.detail) }
+        switch op {
+        case "vm.crash_dumps.enable":
+            return ["folder": .string(Self.lastJSONObject(result.stdout)?["folder"]?.stringValue ?? GuestRecipes.dumpFolder)]
+        case "vm.crash_dumps.disable":
+            return [:]
+        default:
+            return ["dumps": .array(Self.dumpItems(result.stdout).map { item -> JSON in
+                ["file": .string(item["file"]?.stringValue ?? ""), "exe": .string(item["exe"]?.stringValue ?? ""),
+                 "bytes": .int(Int64(item["bytes"]?.intValue ?? 0)), "time": .string(item["time"]?.stringValue ?? "")]
+            })]
+        }
+    }
+
+    /// Whether `s` is a bare Windows file name ending in `suffix` (any case) with a non-empty stem and no character
+    /// a Windows file name cannot hold.
+    static func isWindowsFileName(_ s: String, suffix: String) -> Bool {
+        let invalid = Set("<>:\"/\\|?*".unicodeScalars)
+        guard s.lowercased().hasSuffix(suffix), s.count > suffix.count, s.utf16.count <= 255 else { return false }
+        return s.unicodeScalars.allSatisfy { $0.value >= 0x20 && !invalid.contains($0) }
+    }
+
+    private static func lastJSONObject(_ output: String) -> JSON? {
+        for line in output.split(whereSeparator: \.isNewline).reversed() where line.hasPrefix("{") {
+            if let json = try? JSON.parse(Data(line.utf8)), json.objectValue != nil { return json }
+        }
+        return nil
+    }
+
+    /// The dump rows of the recipe output: a JSON array or one row object; empty output is no rows.
+    private static func dumpItems(_ output: String) -> [JSON] {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let json = try? JSON.parse(Data(trimmed.utf8)) else { return [] }
+        if let array = json.arrayValue { return array.filter { $0.objectValue != nil } }
+        return json.objectValue != nil ? [json] : []
     }
 }

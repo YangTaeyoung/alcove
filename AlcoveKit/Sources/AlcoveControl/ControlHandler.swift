@@ -112,6 +112,7 @@ public actor ControlHandler {
         "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network",
         "vm.lease.acquire", "vm.lease.release", "vm.set_resolution",
         "vm.wait_idle", "vm.wait_for", "vm.set_environment", "vm.doctor", "vm.find_text",
+        "vm.event_log", "vm.crash_dumps.enable", "vm.crash_dumps.disable", "vm.crash_dumps.list", "vm.crash_dumps.pull",
         "vm.record.start", "vm.record.stop", "vm.record.status",
         "script.run",
         "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",
@@ -128,12 +129,14 @@ public actor ControlHandler {
         "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
         "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
         "vm.wait_for", "vm.record.status", "vm.window.list", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.events",
+        "vm.event_log", "vm.crash_dumps.list", "vm.crash_dumps.pull",
     ]
 
     /// Whether `op` runs outside the per-connection request order.
     public static func isConcurrent(op: String) -> Bool {
         op.hasPrefix("vm.exec") || op.hasPrefix("vm.process.") || op.hasPrefix("vm.fs.")
             || op == "vm.push_file" || op == "vm.pull_file" || op == "vm.sync_dir" || op == "vm.find_text"
+            || op == "vm.crash_dumps.pull"
             || op == "script.run"
             || concurrentUIOps.contains(op)
     }
@@ -264,14 +267,15 @@ public actor ControlHandler {
             let agent = try await tools(t)
             do { try await agent.setClipboard(text: text) } catch { throw agentFailure(error, vm: t.name, op: op) }
             return [:]
-        case "vm.push_file", "vm.pull_file", "vm.sync_dir", "vm.fs.list", "vm.fs.read", "vm.fs.write", "vm.fs.delete":
+        case "vm.push_file", "vm.pull_file", "vm.crash_dumps.pull", "vm.sync_dir", "vm.fs.list", "vm.fs.read", "vm.fs.write", "vm.fs.delete":
             return try await files(op: op, params: params)
         case "vm.snapshot.list", "vm.snapshot.create", "vm.snapshot.restore", "vm.snapshot.delete",
              "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network":
             return try await state(op: op, params: params)
         case "vm.lease.acquire", "vm.lease.release", "vm.set_resolution":
             return try await leaseOrResolution(op: op, params: params)
-        case "vm.set_environment", "vm.doctor":
+        case "vm.set_environment", "vm.doctor", "vm.event_log",
+             "vm.crash_dumps.enable", "vm.crash_dumps.disable", "vm.crash_dumps.list":
             return try await guest(op: op, params: params)
         case "vm.wait_for":
             return try await waitFor(params)

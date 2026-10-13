@@ -221,4 +221,140 @@ enum GuestRecipes {
             return nil
         }
     }
+
+    // MARK: - event log and crash dumps
+
+    /// The folder Windows Error Reporting writes crash dumps into.
+    static let dumpFolder = "C:\\alcove-dumps"
+    /// The most characters of one event message the host returns.
+    static let eventMessageLimit = 2000
+    /// The Windows event levels of `level` and everything more severe.
+    static func windowsLevels(_ level: String) -> [Int]? {
+        switch level {
+        case "critical": return [1]
+        case "error": return [1, 2]
+        case "warning": return [1, 2, 3]
+        case "info": return [1, 2, 3, 4]
+        default: return nil
+        }
+    }
+
+    /// The journal priority of `level`; the journal reports that priority and every more severe one.
+    static func journalPriority(_ level: String) -> Int? {
+        ["critical": 2, "error": 3, "warning": 4, "info": 6][level]
+    }
+
+    /// Escapes the regular expression metacharacters of `text`.
+    static func regexEscaped(_ text: String) -> String {
+        var out = ""
+        for ch in text {
+            if "\\.^$*+?()[]{}|".contains(ch) { out.append("\\") }
+            out.append(ch)
+        }
+        return out
+    }
+
+    /// Windows: prints one JSON object `{entries, truncated}` with `entries` newest first, each `{time, id, level, provider,
+    /// message}`; `time` is ISO 8601 UTC and `message` is cut at `eventMessageLimit` characters; `truncated` is true when
+    /// the output budget ended the list before `max` entries. Linux: prints the journal as one JSON object per line.
+    /// `level` is `critical`, `error`, `warning` or `info`.
+    static func eventLog(log: String, level: String?, provider: String?, sinceMinutes: Int, contains: String?, max: Int,
+                         os: VMConfig.GuestOS) -> String? {
+        switch os {
+        case .windows:
+            var script = windowsPrelude + "$log = \(quote(log, os: os))\n"
+            script += "if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue)) { throw \"the guest has no event log named '$log'; list the logs with Get-WinEvent -ListLog *\" }\n"
+            script += "$filter = @{ LogName = $log; StartTime = (Get-Date).AddMinutes(-\(sinceMinutes)) }\n"
+            if let level, let levels = windowsLevels(level) {
+                script += "$filter.Level = @(\(levels.map(String.init).joined(separator: ",")))\n"
+            }
+            if let provider { script += "$filter.ProviderName = \(quote(provider, os: os))\n" }
+            var pipeline = "Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue"
+            if let contains {
+                script += "$needle = \(quote(contains, os: os))\n"
+                pipeline += " | Where-Object { $_.Message -and $_.Message.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 }"
+            }
+            script += "$events = @(\(pipeline) | Select-Object -First \(max))\n"
+            script += """
+            $levels = @{ 1 = 'critical'; 2 = 'error'; 3 = 'warning'; 4 = 'info' }
+            $out = New-Object System.Collections.ArrayList
+            $bytes = 0
+            $truncated = $false
+            foreach ($e in $events) {
+              $m = [string]$e.Message
+              if ($m.Length -gt \(eventMessageLimit)) { $m = $m.Substring(0, \(eventMessageLimit)) }
+              $size = [Text.Encoding]::UTF8.GetByteCount($m) + 300
+              if ($out.Count -gt 0 -and $bytes + $size -gt 70000) { $truncated = $true; break }
+              $bytes += $size
+              $level = $levels[[int]$e.Level]
+              if (-not $level) { $level = 'info' }
+              [void]$out.Add([pscustomobject][ordered]@{
+                time = $e.TimeCreated.ToUniversalTime().ToString('o')
+                id = [int]$e.Id
+                level = $level
+                provider = [string]$e.ProviderName
+                message = $m
+              })
+            }
+            [pscustomobject][ordered]@{ entries = @($out); truncated = $truncated } | ConvertTo-Json -Compress -Depth 4
+            """
+            return script
+        case .linux:
+            var command = "journalctl -o json --no-pager -r -n \(max) --since=-\(sinceMinutes)min"
+            command += " --output-fields=PRIORITY,SYSLOG_IDENTIFIER,_COMM,_PID,SYSLOG_PID,MESSAGE"
+            if let level, let priority = journalPriority(level) { command += " -p \(priority)" }
+            if let provider { command += " -t \(quote(provider, os: os))" }
+            if let contains { command += " --case-sensitive=false --grep=\(quote(regexEscaped(contains), os: os))" }
+            return "command -v journalctl >/dev/null 2>&1 || { echo \"journalctl is not installed in the guest; read the logs with vm.exec instead\" >&2; exit 127; }\n"
+                + command
+        case .other:
+            return nil
+        }
+    }
+
+    private static func localDumpsKey(_ exe: String) -> String {
+        "$sub = 'SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\' + \(quote(exe, os: .windows))\n"
+            + "$hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)\n"
+    }
+
+    /// Windows only: creates `dumpFolder`, makes it writable for the Users group and sets the Windows Error Reporting
+    /// local dump values for `exe` (`DumpFolder`, `DumpCount` 5, `DumpType` 1 mini or 2 full). Prints `{"folder": ...}`.
+    static func enableDumps(exe: String, full: Bool, os: VMConfig.GuestOS) -> String? {
+        guard os == .windows else { return nil }
+        return windowsPrelude + localDumpsKey(exe) + """
+        $folder = '\(dumpFolder)'
+        [void](New-Item -ItemType Directory -Force -Path $folder)
+        [void](& icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M')
+        $key = $hklm.CreateSubKey($sub)
+        $key.SetValue('DumpFolder', $folder, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        $key.SetValue('DumpCount', 5, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $key.SetValue('DumpType', \(full ? 2 : 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+        $key.Close()
+        [pscustomobject]@{ folder = $folder } | ConvertTo-Json -Compress
+        """
+    }
+
+    /// Windows only: removes the local dump key of `exe`; other images keep theirs.
+    static func disableDumps(exe: String, os: VMConfig.GuestOS) -> String? {
+        guard os == .windows else { return nil }
+        return windowsPrelude + localDumpsKey(exe) + "$hklm.DeleteSubKeyTree($sub, $false)\n'ok'"
+    }
+
+    /// Windows only: prints a JSON array of the `.dmp` files in `dumpFolder`, newest first, each `{file, exe, bytes, time}`.
+    /// A missing folder prints `[]`.
+    static func listDumps(os: VMConfig.GuestOS) -> String? {
+        guard os == .windows else { return nil }
+        return windowsPrelude + """
+        $folder = '\(dumpFolder)'
+        $items = @()
+        if (Test-Path -LiteralPath $folder) {
+          $items = @(Get-ChildItem -LiteralPath $folder -File -Filter *.dmp | Sort-Object LastWriteTimeUtc -Descending | ForEach-Object {
+            $exe = ''
+            if ($_.Name -match '^(.+\\.exe)\\.[0-9]+\\.dmp$') { $exe = $Matches[1] }
+            [pscustomobject][ordered]@{ file = $_.Name; exe = $exe; bytes = [int64]$_.Length; time = $_.LastWriteTimeUtc.ToString('o') }
+          })
+        }
+        ConvertTo-Json -InputObject @($items) -Compress -Depth 4
+        """
+    }
 }
