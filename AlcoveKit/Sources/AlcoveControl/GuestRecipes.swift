@@ -230,13 +230,13 @@ enum GuestRecipes {
     static let eventOutputBudget = 150_000
     /// The most characters of one event message the host returns.
     static let eventMessageLimit = 2000
-    /// The Windows event levels of `level` and everything more severe.
+    /// The Windows event levels of `level` and everything more severe; empty for `info`, which names every level.
     static func windowsLevels(_ level: String) -> [Int]? {
         switch level {
         case "critical": return [1]
         case "error": return [1, 2]
         case "warning": return [1, 2, 3]
-        case "info": return [1, 2, 3, 4]
+        case "info": return []
         default: return nil
         }
     }
@@ -256,48 +256,78 @@ enum GuestRecipes {
         return out
     }
 
-    /// Windows: prints one JSON object `{entries, truncated}` with `entries` newest first, each `{time, id, level, provider,
-    /// message}`; `time` is ISO 8601 UTC and `message` is cut at `eventMessageLimit` characters; `truncated` is true when
-    /// the next entry did not fit `eventOutputBudget` bytes of serialised output. Linux: prints the journal as one JSON object per line in time order, so a cut output loses the oldest lines.
+    /// Windows: prints one JSON object `{entries, truncated}` with `entries` in the log's record order, newest record first,
+    /// each `{time, id, level, provider, message}`; `time` is ISO 8601 UTC and `message` is cut at `eventMessageLimit`
+    /// UTF-16 units, one less when the cut would split a surrogate pair; `truncated` is true when the next entry did not
+    /// fit `eventOutputBudget` bytes of serialised output. The log, the time window, the levels and a provider name
+    /// without an apostrophe are selected by an XPath query; a provider name with an apostrophe and `contains` are
+    /// matched in the pipeline. A log that is missing or closed to the agent's user and a failed read each print one
+    /// sentence on stderr and exit with 2.
+    /// Linux: prints the journal as one JSON object per line in time order, so a cut output loses the oldest lines.
     /// `level` is `critical`, `error`, `warning` or `info`.
     static func eventLog(log: String, level: String?, provider: String?, sinceMinutes: Int, contains: String?, max: Int,
                          os: VMConfig.GuestOS) -> String? {
         switch os {
         case .windows:
             var script = windowsPrelude + "$log = \(quote(log, os: os))\n"
-            script += "if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine(\"the guest has no event log named '$log'; list the logs with Get-WinEvent -ListLog *\"); exit 2 }\n"
-            script += "$filter = @{ LogName = $log; StartTime = (Get-Date).AddMinutes(-\(sinceMinutes)) }\n"
-            if let level, let levels = windowsLevels(level) {
-                script += "$filter.Level = @(\(levels.map(String.init).joined(separator: ",")))\n"
+            script += """
+            if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue -ErrorVariable listErrors)) {
+              if ($listErrors | Where-Object { $_.FullyQualifiedErrorId -like 'LogInfoUnavailable*' }) { [Console]::Error.WriteLine("guest tools may not read the event log '$log'; check that alcove-agent runs elevated"); exit 2 }
+              [Console]::Error.WriteLine("the guest has no event log named '$log'; list the logs with Get-WinEvent -ListLog *"); exit 2
             }
-            if let provider { script += "$filter.ProviderName = \(quote(provider, os: os))\n" }
-            var pipeline = "Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue"
+
+            """
+            var query = "\"*[System[TimeCreated[@SystemTime>='\" + (Get-Date).ToUniversalTime().AddMinutes(-\(sinceMinutes)).ToString('o') + \"']"
+            if let level, let levels = windowsLevels(level), !levels.isEmpty {
+                query += " and (" + levels.map { "Level=\($0)" }.joined(separator: " or ") + ")"
+            }
+            query += "\""
+            var pipeline = "Get-WinEvent -LogName $log -FilterXPath $query -ErrorAction SilentlyContinue"
+            if let provider {
+                script += "$provider = \(quote(provider, os: os))\n"
+                if provider.unicodeScalars.contains("'") {
+                    pipeline += " | Where-Object { $_.ProviderName -eq $provider }"
+                } else {
+                    query += " + \" and Provider[@Name='\" + $provider + \"']\""
+                }
+            }
+            query += " + ']]'"
             if let contains {
                 script += "$needle = \(quote(contains, os: os))\n"
                 pipeline += " | Where-Object { $_.Message -and $_.Message.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 }"
             }
-            script += "$events = @(\(pipeline) | Select-Object -First \(max))\n"
             script += """
-            $levels = @{ 1 = 'critical'; 2 = 'error'; 3 = 'warning'; 4 = 'info' }
             $parts = New-Object System.Collections.ArrayList
-            $bytes = 0
             $truncated = $false
-            foreach ($e in $events) {
-              $m = [string]$e.Message
-              if ($m.Length -gt \(eventMessageLimit)) { $m = $m.Substring(0, \(eventMessageLimit)) }
-              $level = $levels[[int]$e.Level]
-              if (-not $level) { $level = 'info' }
-              $json = [pscustomobject][ordered]@{
-                time = $e.TimeCreated.ToUniversalTime().ToString('o')
-                id = [int]$e.Id
-                level = $level
-                provider = [string]$e.ProviderName
-                message = $m
-              } | ConvertTo-Json -Compress -Depth 3
-              $size = [Text.Encoding]::UTF8.GetByteCount($json) + 1
-              if ($bytes + $size -gt \(eventOutputBudget)) { $truncated = $true; break }
-              $bytes += $size
-              [void]$parts.Add($json)
+            try {
+              $query = \(query)
+              $events = @(\(pipeline) | Select-Object -First \(max))
+              $levels = @{ 1 = 'critical'; 2 = 'error'; 3 = 'warning' }
+              $bytes = 0
+              foreach ($e in $events) {
+                $m = [string]$e.Message
+                if ($m.Length -gt \(eventMessageLimit)) {
+                  $cut = \(eventMessageLimit)
+                  if ([char]::IsHighSurrogate($m[$cut - 1])) { $cut = $cut - 1 }
+                  $m = $m.Substring(0, $cut)
+                }
+                $level = $levels[[int]$e.Level]
+                if (-not $level) { $level = 'info' }
+                $json = [pscustomobject][ordered]@{
+                  time = $e.TimeCreated.ToUniversalTime().ToString('o')
+                  id = [int]$e.Id
+                  level = $level
+                  provider = [string]$e.ProviderName
+                  message = $m
+                } | ConvertTo-Json -Compress -Depth 3
+                $size = [Text.Encoding]::UTF8.GetByteCount($json) + 1
+                if ($bytes + $size -gt \(eventOutputBudget)) { $truncated = $true; break }
+                $bytes += $size
+                [void]$parts.Add($json)
+              }
+            } catch {
+              [Console]::Error.WriteLine("could not read the event log '$log': " + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated, or read the log with vm.exec')
+              exit 2
             }
             '{"entries":[' + ($parts -join ',') + '],"truncated":' + $(if ($truncated) { 'true' } else { 'false' }) + '}'
             """

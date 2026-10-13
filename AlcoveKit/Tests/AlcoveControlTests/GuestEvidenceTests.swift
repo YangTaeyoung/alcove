@@ -56,7 +56,10 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertTrue(script.contains("'Application'"), script)
         XCTAssertTrue(script.contains("AddMinutes(-60)"), script)
         XCTAssertTrue(script.contains("-First 50"), script)
-        XCTAssertFalse(script.contains("$filter.Level"), script)
+        XCTAssertTrue(script.contains("Get-WinEvent -LogName $log -FilterXPath $query -ErrorAction SilentlyContinue"), script)
+        XCTAssertTrue(script.contains("TimeCreated[@SystemTime>='"), script)
+        XCTAssertFalse(script.contains("Level="), script)
+        XCTAssertFalse(script.contains("$provider"), script)
         XCTAssertTrue(script.contains("-gt 150000"), script)
         XCTAssertTrue(script.contains("ConvertTo-Json -Compress -Depth 3"), script)
     }
@@ -91,13 +94,19 @@ final class GuestEvidenceTests: XCTestCase {
     }
 
     func testEventLogLevelMapping() async throws {
-        let expected = ["critical": "1", "error": "1,2", "warning": "1,2,3", "info": "1,2,3,4"]
-        for (level, levels) in expected {
+        let expected = ["critical": " and (Level=1)", "error": " and (Level=1 or Level=2)", "warning": " and (Level=1 or Level=2 or Level=3)"]
+        for (level, clause) in expected {
             let (h, agent) = try await setup(stdout: "[]")
             _ = try await h.handle(op: "vm.event_log", params: ["name": "Win", "level": .string(level)])
             let script = try XCTUnwrap(commands(agent).first)
-            XCTAssertTrue(script.contains("$filter.Level = @(\(levels))"), "\(level): \(script)")
+            XCTAssertTrue(script.contains("']\(clause)\""), "\(level): \(script)")
         }
+    }
+
+    func testEventLogLevelInfoReadsEveryLevel() async throws {
+        let (h, agent) = try await setup(stdout: "[]")
+        _ = try await h.handle(op: "vm.event_log", params: ["name": "Win", "level": "info"])
+        XCTAssertFalse(try XCTUnwrap(commands(agent).first).contains("Level="))
     }
 
     func testEventLogParametersReachTheScript() async throws {
@@ -106,10 +115,70 @@ final class GuestEvidenceTests: XCTestCase {
                                                             "contains": "bad block", "max": 7])
         let script = try XCTUnwrap(commands(agent).first)
         XCTAssertTrue(script.contains("'System'"), script)
-        XCTAssertTrue(script.contains("$filter.ProviderName = 'Disk'"), script)
+        XCTAssertTrue(script.contains("$provider = 'Disk'\n"), script)
+        XCTAssertTrue(script.contains(" and Provider[@Name='\" + $provider + \"']"), script)
+        XCTAssertFalse(script.contains("$_.ProviderName"), script)
         XCTAssertTrue(script.contains("AddMinutes(-5)"), script)
         XCTAssertTrue(script.contains("'bad block'"), script)
         XCTAssertTrue(script.contains("-First 7"), script)
+    }
+
+    func testEventLogProviderWithAnApostropheIsMatchedInThePipeline() async throws {
+        let (h, agent) = try await setup(stdout: "[]")
+        _ = try await h.handle(op: "vm.event_log", params: ["name": "Win", "provider": "Bob's App"])
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("$provider = 'Bob''s App'\n"), script)
+        XCTAssertTrue(script.contains("| Where-Object { $_.ProviderName -eq $provider } | Select-Object -First 50"), script)
+        XCTAssertFalse(script.contains("Provider[@Name="), script)
+    }
+
+    func testEventLogEntriesAreNewestFirst() async throws {
+        func row(_ time: String, _ id: Int) -> String {
+            "{\"time\":\"\(time)\",\"id\":\(id),\"level\":\"info\",\"provider\":\"p\",\"message\":\"\"}"
+        }
+        let rows = [row("2026-10-13T22:06:57.3595543Z", 6000), row("2026-10-13T22:06:56.3934525Z", 5615),
+                    row("2026-10-13T22:06:56.5844096Z", 6003), row("2026-10-13T22:06:56.5844096Z", 6004),
+                    row("2026-10-13T22:06:55.4163154Z", 1531)]
+        let (h, _) = try await setup(stdout: "{\"entries\":[\(rows.joined(separator: ","))],\"truncated\":false}")
+        let r = try await h.handle(op: "vm.event_log", params: ["name": "Win"])
+        XCTAssertEqual(r["entries"]?.arrayValue?.compactMap { $0["id"]?.intValue }, [6000, 6003, 6004, 5615, 1531])
+    }
+
+    func testEventLogCutsAMessageBeforeASplitSurrogatePair() async throws {
+        let (h, agent) = try await setup(stdout: "[]")
+        _ = try await h.handle(op: "vm.event_log", params: ["name": "Win"])
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("if ([char]::IsHighSurrogate($m[$cut - 1])) { $cut = $cut - 1 }"), script)
+        XCTAssertTrue(script.contains("$cut = 2000\n"), script)
+    }
+
+    func testEventLogReadFailureSentenceComesFromTheScript() async throws {
+        let sentence = "could not read the event log 'Security': Attempted to perform an unauthorized operation.; check that alcove-agent runs elevated, or read the log with vm.exec"
+        let (h, agent) = try await setup(stdout: "", code: 2, stderr: sentence + "\r\n")
+        let text = await failure(h, "vm.event_log", ["name": "Win", "log": "Security"])
+        XCTAssertEqual(text, sentence)
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("} catch {\n  [Console]::Error.WriteLine(\"could not read the event log '$log': \" + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated, or read the log with vm.exec')\n  exit 2\n}"), script)
+    }
+
+    func testEventLogRefusesTextTheGuestShellCannotTake() async throws {
+        let (h, agent) = try await setup(stdout: "[]")
+        let long = String(repeating: "x", count: 1001)
+        let cases: [(JSON, String)] = [
+            (["contains": "a\u{0}b"], "contains must not hold a NUL character; remove it"),
+            (["provider": "a\u{0}b"], "provider must not hold a NUL character; remove it"),
+            (["contains": .string(long)], "contains must be at most 1000 characters; pass a shorter part of the message"),
+            (["provider": .string(long)], "provider must be at most 1000 characters; pass the provider name as the entries show it"),
+        ]
+        for (extra, message) in cases {
+            var params: [String: JSON] = ["name": "Win"]
+            for (k, v) in extra.objectValue ?? [:] { params[k] = v }
+            let text = await failure(h, "vm.event_log", .object(params))
+            XCTAssertEqual(text, message)
+        }
+        XCTAssertEqual(commands(agent), [])
+        _ = try await h.handle(op: "vm.event_log", params: ["name": "Win", "contains": .string(String(repeating: "x", count: 1000))])
+        XCTAssertEqual(commands(agent).count, 1)
     }
 
     func testEventLogQuotesCallerText() async throws {
@@ -204,6 +273,16 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertEqual(text, "the guest has no event log named 'Nope'; list the logs with Get-WinEvent -ListLog *")
         let script = try XCTUnwrap(commands(agent).first)
         XCTAssertTrue(script.contains("[Console]::Error.WriteLine(\"the guest has no event log named '$log'; list the logs with Get-WinEvent -ListLog *\"); exit 2"), script)
+    }
+
+    func testLogTheGuestToolsMayNotReadSentenceComesFromTheScript() async throws {
+        let sentence = "guest tools may not read the event log 'Security'; check that alcove-agent runs elevated"
+        let (h, agent) = try await setup(stdout: "", code: 2, stderr: sentence + "\r\n")
+        let text = await failure(h, "vm.event_log", ["name": "Win", "log": "Security"])
+        XCTAssertEqual(text, sentence)
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("-ErrorVariable listErrors"), script)
+        XCTAssertTrue(script.contains("if ($listErrors | Where-Object { $_.FullyQualifiedErrorId -like 'LogInfoUnavailable*' }) { [Console]::Error.WriteLine(\"guest tools may not read the event log '$log'; check that alcove-agent runs elevated\"); exit 2 }"), script)
     }
 
     func testEventLogOutputThatIsNoJSONIsAnError() async throws {

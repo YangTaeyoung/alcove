@@ -285,6 +285,8 @@ extension ControlHandler {
 
     private static let eventLogLevels = ["critical", "error", "warning", "info"]
     private static let maximumSinceMinutes = 5_256_000
+    /// The most UTF-16 units of `provider` and of `contains`.
+    private static let maximumFilterLength = 1000
 
     private func eventLog(_ params: JSON) async throws -> JSON {
         func text(_ key: String) throws -> String? {
@@ -304,6 +306,14 @@ extension ControlHandler {
         if provider?.isEmpty == true { throw ControlError.failed("provider must not be empty; leave it out to read all providers") }
         let contains = try text("contains")
         if contains?.isEmpty == true { throw ControlError.failed("contains must not be empty; leave it out to read all entries") }
+        for (key, value, shorter) in [("provider", provider, "pass the provider name as the entries show it"),
+                                      ("contains", contains, "pass a shorter part of the message")] {
+            guard let value else { continue }
+            if value.unicodeScalars.contains("\0") { throw ControlError.failed("\(key) must not hold a NUL character; remove it") }
+            if value.utf16.count > Self.maximumFilterLength {
+                throw ControlError.failed("\(key) must be at most \(Self.maximumFilterLength) characters; \(shorter)")
+            }
+        }
         let since = try optional(params, "sinceMinutes", .integer)?.intValue ?? 60
         guard (1...Self.maximumSinceMinutes).contains(since) else {
             throw ControlError.failed("sinceMinutes must be between 1 and \(Self.maximumSinceMinutes)")
@@ -357,7 +367,8 @@ extension ControlHandler {
         s.count > GuestRecipes.eventMessageLimit ? String(s.prefix(GuestRecipes.eventMessageLimit)) : s
     }
 
-    /// The entries of the Windows recipe output: a `{entries, truncated}` object, an array or one entry object; nil for text that is no JSON.
+    /// The entries of the Windows recipe output, newest `time` first and in the output's order within one time:
+    /// a `{entries, truncated}` object, an array or one entry object; nil for text that is no JSON.
     private static func eventEntries(_ output: String) -> (entries: [JSON], truncated: Bool)? {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return ([], false) }
@@ -379,7 +390,11 @@ extension ControlHandler {
              "level": .string(item["level"]?.stringValue ?? "info"), "provider": .string(item["provider"]?.stringValue ?? ""),
              "message": .string(cutMessage(item["message"]?.stringValue ?? ""))]
         }
-        return (entries, truncated)
+        let newestFirst = entries.enumerated().sorted {
+            let (a, b) = ($0.element["time"]?.stringValue ?? "", $1.element["time"]?.stringValue ?? "")
+            return a == b ? $0.offset < $1.offset : a > b
+        }.map(\.element)
+        return (newestFirst, truncated)
     }
 
     /// The entries of `journalctl -o json` output, one JSON object per line in time order, newest first in the result; lines that are no JSON object are skipped.
