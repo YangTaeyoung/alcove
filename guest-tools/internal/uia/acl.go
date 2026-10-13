@@ -49,3 +49,43 @@ func isLockedSDDL(sddl string) bool {
 	}
 	return want["BA"] && want["SY"]
 }
+
+const (
+	invalidFileAttributes  = 0xFFFFFFFF
+	fileAttributeDirectory = 0x00000010
+	fileAttributeReparse   = 0x00000400
+)
+
+// isReparseAttributes reports whether file attribute bits belong to a reparse
+// point (a junction or a symbolic link). Attributes that could not be read
+// count as a reparse point.
+func isReparseAttributes(a uint32) bool {
+	return a == invalidFileAttributes || a&fileAttributeReparse != 0
+}
+
+// isPlainDirAttributes reports whether file attribute bits belong to a
+// directory that is not a reparse point.
+func isPlainDirAttributes(a uint32) bool {
+	return a != invalidFileAttributes && a&fileAttributeDirectory != 0 && a&fileAttributeReparse == 0
+}
+
+// What the lock does with one entry of a locked directory.
+const (
+	entryRemoveLink = iota // delete the reparse point itself
+	entryRemove            // delete the entry and what is below it
+	entryInherit           // give the entry the directory's owner and access list
+)
+
+// entryAction returns what the lock does with a directory entry of the given
+// name and attribute bits. A reparse point is deleted. With a non-nil keep,
+// an entry whose lower-cased name is not in keep is deleted. Every other entry
+// takes its access from the directory.
+func entryAction(name string, attributes uint32, keep map[string]bool) int {
+	if isReparseAttributes(attributes) {
+		return entryRemoveLink
+	}
+	if keep != nil && !keep[strings.ToLower(name)] {
+		return entryRemove
+	}
+	return entryInherit
+}
