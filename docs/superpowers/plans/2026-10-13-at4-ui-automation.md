@@ -176,15 +176,16 @@ Events (the helper compares the window list every 300 ms): `window.opened`, `win
 | `vm.window.list` | `name` | `{windows}` |
 | `vm.window.action` | `name`, `window`, `action`, `x?`, `y?`, `width?`, `height?` | `{window}` |
 | `vm.ui.tree` | `name`, `window?`, `root?`, `depth?`, `max?`, `filter?` | `{tree (text), count, truncated, window}` |
-| `vm.ui.find` | `name`, selector fields, `limit?` | `{nodes, text}` |
-| `vm.ui.text` | `name`, `ref?` or selector, `mode?`, `offset?`, `length?` | `{text, total, source}` |
-| `vm.ui.click` | `name`, `ref?` or selector, `button?`, `count?`, observe params | `{x, y, node, observation?}` — `ui.rect` with `scroll: true`, then the click of `vm.mouse.click` |
-| `vm.ui.type` | `name`, `ref?` or selector, `text`, `clear?` (ctrl+a first), `submit?` (enter after), observe params | `{node, observation?}` — clicks the element, then types as `vm.type` does |
-| `vm.ui.action` | `name`, `ref?` or selector, `action`, `value?`, observe params | `{node, observation?}` |
+| `vm.ui.find` | `name`, `selector`, `limit?` | `{nodes, text}` |
+| `vm.ui.text` | `name`, `ref` or `selector`, `mode?`, `offset?`, `length?` | `{text, total, source}` |
+| `vm.ui.click` | `name`, `ref` or `selector`, `button?`, `count?`, observe params | `{x, y, node, observation?}` — `ui.rect` with `scroll: true`, then the click of `vm.mouse.click` |
+| `vm.ui.type` | `name`, `ref` or `selector`, `text`, `clear?` (ctrl+a first), `submit?` (enter after), observe params | `{node, observation?}` — clicks the element, then types as `vm.type` does |
+| `vm.ui.action` | `name`, `ref` or `selector`, `action`, `value?`, observe params | `{node, observation?}` |
 | `vm.app.launch` | `name`, `path`, `args?`, `cwd?`, `env?`, `waitWindow?` s | `{pid, window?}` |
 | `vm.deploy` | `name`, `path` (host file or directory), `guestDir?` (default `C:\alcove-apps\<base name>`), `install?` (`{kind: "msi"|"exe", file, args?}`), `launch?` (`{exe, args?, env?, cwd?}`), `waitWindow?` s (default 20), `killRunning?` (default true) | `{guestDir, sent, skipped, bytes, installCode?, pid?, window?}` |
 | `vm.events` | `name`, `since?` | `{events: [{seq, time, name, ...payload}], next}` |
 
+  - In control ops `selector` is the selector object of Global Constraints, passed as one nested param (`name` at the top level is the VM); the handler flattens it into the agent op. A call with neither `ref` nor `selector` → `pass ref or selector`. Wait conditions carry the selector fields flat.
   - `vm.ui.click` on an element that is not clickable after scrolling → `element <ref> has no clickable point (off screen or covered); use vm.ui.action or scroll it into view`.
   - `vm.deploy`: with `killRunning`, processes whose path lies under `guestDir` are killed first; a directory is synced with deletion of extras, a file is pushed with overwrite; `install` runs `msiexec /i <file> /qn /norestart` or the executable with `args` and fails the call on a non-zero code (3010 counts as success); `launch.exe` is relative to `guestDir` unless absolute.
   - Observations gain `foreground` (title), `focused` (`Role "name"`) and `events` (names with window titles since the previous observation of that VM) when the agent has `ui`; level `ui` adds `tree` (text of the foreground window, 150 nodes).
