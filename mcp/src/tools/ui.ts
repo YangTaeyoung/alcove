@@ -1,18 +1,19 @@
 // The ui toolset: windows, the UI Automation tree of Windows guests, element
 // actions, app launch, deploy and guest events.
 import { z } from "zod";
-import type { ControlClient } from "../control.js";
+import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, observeParams, observePayload, type ObserveArgs } from "../observation.js";
-import { elementSelectorParams, toolSelector } from "../selector.js";
+import { selectorParams, toSelector } from "../selector.js";
 import { clip, fail, text, vmName, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
-/** `<id> "<title>" <process> (pid) x,y WxH [foreground] [minimized] [NOT RESPONDING]` */
+/** `<id> "<title>" <process> (pid) x,y WxH [foreground] [minimized] [modal] [NOT RESPONDING]` */
 export function windowLine(w: Obj): string {
   const flags = [
     w.foreground ? "[foreground]" : "",
     w.state === "minimized" ? "[minimized]" : "",
+    w.modal ? "[modal]" : "",
     w.responding === false ? "[NOT RESPONDING]" : "",
   ].filter(Boolean);
   return [`${w.id} "${w.title}" ${w.process} (${w.pid}) ${w.x},${w.y} ${w.w}x${w.h}`, ...flags].join(" ");
@@ -28,7 +29,7 @@ const windowRef = z.string().min(1).describe("Window id from alcove_list_windows
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("ui", "alcove_list_windows", {
     title: "List windows",
-    description: "List the top-level windows of a Windows guest, one per line: id, title, process, pid, rectangle in guest pixels and flags (foreground, minimized, NOT RESPONDING). Prefer this over a screenshot to see which windows exist and which one has the focus.",
+    description: "List the top-level windows of a Windows guest, one per line: id, title, process, pid, rectangle in guest pixels and flags (foreground, minimized, modal, NOT RESPONDING). Prefer this over a screenshot to see which windows exist and which one has the focus.",
     inputSchema: { name: vmName },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ name }) => {
@@ -58,6 +59,8 @@ export function register(r: Registrar, client: ControlClient): void {
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async (a) => {
     try {
+      if (a.action === "move" && (a.x === undefined || a.y === undefined)) throw new ControlError("move needs x and y; pass both in guest pixels");
+      if (a.action === "resize" && (a.width === undefined || a.height === undefined)) throw new ControlError("resize needs width and height; pass both in guest pixels");
       const reply = await client.call("vm.window.action", {
         name: a.name,
         window: a.window,
@@ -113,14 +116,14 @@ export function register(r: Registrar, client: ControlClient): void {
     description: "Find elements of a Windows guest window by role, name or automation id and return them as tree lines with refs. Use it when you know what you are looking for; use alcove_ui_tree to explore.",
     inputSchema: {
       name: vmName,
-      ...elementSelectorParams,
+      ...selectorParams,
       limit: z.number().int().min(1).max(200).optional().describe("Most matches to return (default 20)"),
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => {
     try {
       const { name, limit, ...sel } = a;
-      const reply = await client.call("vm.ui.find", { name, ...toolSelector(sel), ...(limit !== undefined ? { limit } : {}) }, 60000);
+      const reply = await client.call("vm.ui.find", { name, ...toSelector(sel), ...(limit !== undefined ? { limit } : {}) }, 60000);
       const nodes = (reply.nodes as Obj[]) ?? [];
       const body = nodes.length === 0 ? "no matches" : `${nodes.length} matches\n${String(reply.text ?? "")}`;
       return text(body, { nodes });
@@ -134,7 +137,7 @@ export function register(r: Registrar, client: ControlClient): void {
     description: "Read the text of one element of a Windows guest: the content of a document or edit control, a value, or the joined names of its children. Returns the text, its total length and where it came from. Prefer this over OCR for text inside controls; page long text with offset and length.",
     inputSchema: {
       name: vmName,
-      ...elementSelectorParams,
+      ...selectorParams,
       mode: z.enum(["auto", "pattern", "descendants"]).optional().describe("auto (default) tries the text pattern, the value, the children, then the name; pattern: text pattern only; descendants: names of the children"),
       offset: z.number().int().min(0).optional().describe("Start position in characters"),
       length: z.number().int().min(1).max(200000).optional().describe("Characters to return (default and maximum 200000)"),
@@ -145,7 +148,7 @@ export function register(r: Registrar, client: ControlClient): void {
       const { name, mode, offset, length, ...sel } = a;
       const reply = await client.call("vm.ui.text", {
         name,
-        ...toolSelector(sel),
+        ...toSelector(sel),
         ...(mode !== undefined ? { mode } : {}),
         ...(offset !== undefined ? { offset } : {}),
         ...(length !== undefined ? { length } : {}),
@@ -153,7 +156,9 @@ export function register(r: Registrar, client: ControlClient): void {
       const body = String(reply.text ?? "");
       const start = offset ?? 0;
       const head = `source ${reply.source}, ${reply.total} characters in total, showing from ${start}`;
-      return text(`${head}\n${clip(body, 60000, "pass offset and length to read the rest")}`, { text: body, total: reply.total, source: reply.source });
+      const shown = body.length > 60000 ? 60000 : body.length;
+      const hint = `use offset ${start + shown} to read the rest`;
+      return text(`${head}\n${clip(body, 60000, hint)}`, { total: reply.total, source: reply.source, offset: start, returned: shown });
     } catch (e) {
       return fail(e);
     }
@@ -164,7 +169,7 @@ export function register(r: Registrar, client: ControlClient): void {
     description: "Click the centre of a UI element of a Windows guest with a real mouse click, scrolling it into view first. Select the element by ref or by role, name or automation id. Returns the clicked point and what changed on screen. Prefer this over alcove_click with guessed coordinates.",
     inputSchema: {
       name: vmName,
-      ...elementSelectorParams,
+      ...selectorParams,
       button: z.enum(["left", "right", "middle"]).optional(),
       count: z.number().int().min(1).max(3).optional().describe("2 for a double-click"),
       ...observeParams,
@@ -176,7 +181,7 @@ export function register(r: Registrar, client: ControlClient): void {
       const obs: ObserveArgs = { observe, settle_ms, settle_timeout_ms };
       const reply = await client.call("vm.ui.click", {
         name,
-        ...toolSelector(sel),
+        ...toSelector(sel),
         button: button ?? "left",
         count: count ?? 1,
         ...observePayload(obs, "summary"),
@@ -193,7 +198,7 @@ export function register(r: Registrar, client: ControlClient): void {
     description: "Click a UI element of a Windows guest to focus it and type text with real key presses. clear selects all existing text first; submit presses enter afterwards. Returns what changed on screen. To set a value without typing use alcove_ui_action with set_value.",
     inputSchema: {
       name: vmName,
-      ...elementSelectorParams,
+      ...selectorParams,
       text: z.string().max(100000).describe("Text to type"),
       clear: z.boolean().optional().describe("Press ctrl+a before typing so the text replaces the content"),
       submit: z.boolean().optional().describe("Press enter after typing"),
@@ -206,7 +211,7 @@ export function register(r: Registrar, client: ControlClient): void {
       const obs: ObserveArgs = { observe, settle_ms, settle_timeout_ms };
       const reply = await client.call("vm.ui.type", {
         name,
-        ...toolSelector(sel),
+        ...toSelector(sel),
         text: typed,
         ...(clear !== undefined ? { clear } : {}),
         ...(submit !== undefined ? { submit } : {}),
@@ -224,7 +229,7 @@ export function register(r: Registrar, client: ControlClient): void {
     description: "Act on a UI element of a Windows guest through UI Automation patterns instead of the mouse: invoke, toggle, expand, collapse, select, set_value (needs value), focus or scroll_into_view. Works on covered or off-screen elements where alcove_ui_click cannot. Returns the element after the action and what changed on screen.",
     inputSchema: {
       name: vmName,
-      ...elementSelectorParams,
+      ...selectorParams,
       action: z.enum(["invoke", "toggle", "expand", "collapse", "select", "set_value", "focus", "scroll_into_view"]),
       value: z.string().optional().describe("New value for set_value"),
       ...observeParams,
@@ -233,10 +238,11 @@ export function register(r: Registrar, client: ControlClient): void {
   }, async (a) => {
     try {
       const { name, action, value, observe, settle_ms, settle_timeout_ms, ...sel } = a;
+      if (action === "set_value" && value === undefined) throw new ControlError("set_value needs value; pass the new value");
       const obs: ObserveArgs = { observe, settle_ms, settle_timeout_ms };
       const reply = await client.call("vm.ui.action", {
         name,
-        ...toolSelector(sel),
+        ...toSelector(sel),
         action,
         ...(value !== undefined ? { value } : {}),
         ...observePayload(obs, "summary"),
@@ -259,7 +265,7 @@ export function register(r: Registrar, client: ControlClient): void {
       args: z.array(z.string()).optional().describe("Command-line arguments"),
       cwd: z.string().optional().describe("Working directory inside the guest"),
       env: z.record(z.string()).optional().describe("Extra environment variables"),
-      wait_window_s: z.number().min(0).max(300).optional().describe("Seconds to wait for a window of the new process"),
+      wait_window_s: z.number().min(0).max(300).optional().describe("Seconds to wait for a window of the new process (default 20)"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, async (a) => {

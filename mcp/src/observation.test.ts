@@ -35,6 +35,21 @@ test("optional foreground, focused, events and tree lines", () => {
   assert.equal((out[0] as { text: string }).text, "screen settled\nnothing changed\nforeground: Notepad\nfocused: Edit\nevents: dialog opened\nwindow\n  button");
 });
 
+test("foreground, focused and events lines print in order", () => {
+  const out = renderObservation({ ...base, foreground: "Notepad", focused: "Edit \"Text\"", events: "dialog opened" });
+  assert.equal((out[0] as { text: string }).text, "screen settled\nnothing changed\nforeground: Notepad\nfocused: Edit \"Text\"\nevents: dialog opened");
+});
+
+test("absent foreground, focused and events print nothing", () => {
+  const out = renderObservation({ ...base, events: [] });
+  assert.equal((out[0] as { text: string }).text, "screen settled\nnothing changed");
+});
+
+test("an events array is joined with semicolons without JSON", () => {
+  const out = renderObservation({ ...base, events: ["window.opened Save As", "dialog.opened Save As"] });
+  assert.match((out[0] as { text: string }).text, /\nevents: window\.opened Save As; dialog\.opened Save As$/);
+});
+
 test("undefined observation yields no content", () => {
   assert.deepEqual(renderObservation(undefined), []);
 });

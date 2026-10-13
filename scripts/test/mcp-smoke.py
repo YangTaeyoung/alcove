@@ -43,7 +43,7 @@ def main():
         "alcove_ui_click", "alcove_ui_type", "alcove_ui_action", "alcove_launch_app", "alcove_deploy", "alcove_events",
     }
     evidence = {
-        "alcove_record_start", "alcove_record_stop", "alcove_event_log", "alcove_crash_dumps", "alcove_collect_diagnostics",
+        "alcove_record_start", "alcove_record_stop", "alcove_record_status", "alcove_event_log", "alcove_crash_dumps", "alcove_collect_diagnostics",
     }
     http = {"alcove_http_capture_start", "alcove_http_capture_stop", "alcove_http_requests", "alcove_http_rule"}
     toolsets = {"core": core, "shell": shell, "files": files, "state": state, "ui": ui, "evidence": evidence, "http": http}

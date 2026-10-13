@@ -1,18 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { register } from "./tools/evidence.js";
-import { eventLogText } from "./tools/evidence.js";
-import type { ControlClient } from "./control.js";
-import type { Registrar, ToolHandler } from "./toolkit.js";
-
-function rig(reply: Record<string, unknown>) {
-  const calls: Array<{ op: string; params: Record<string, unknown> }> = [];
-  const handlers = new Map<string, ToolHandler>();
-  const registrar: Registrar = { tool: (_set, name, _config, handler) => void handlers.set(name, handler) };
-  const client = { call: async (op: string, params: Record<string, unknown> = {}) => (calls.push({ op, params }), reply) } as unknown as ControlClient;
-  register(registrar, client);
-  return { calls, run: (tool: string, args: Record<string, unknown>) => handlers.get(tool)!(args) };
-}
+import { register, eventLogText } from "./tools/evidence.js";
+import { rig, textOf } from "./test-rig.js";
 
 test("eventLogText prints a header line and the indented message per entry", () => {
   assert.equal(
@@ -23,14 +12,44 @@ test("eventLogText prints a header line and the indented message per entry", () 
 });
 
 test("alcove_crash_dumps refuses enable without exe before calling the control op", async () => {
-  const t = rig({});
+  const t = rig(register);
   const r = await t.run("alcove_crash_dumps", { name: "vm", action: "enable" });
   assert.equal(r.isError, true);
   assert.equal(t.calls.length, 0);
 });
 
+test("alcove_crash_dumps list and pull map to their control ops", async () => {
+  const list = rig(register, { dumps: [{ file: "a.dmp", exe: "a.exe", bytes: 5, time: "t" }] });
+  assert.equal(textOf(await list.run("alcove_crash_dumps", { name: "vm", action: "list" })), "a.dmp a.exe 5 bytes t");
+  assert.deepEqual(list.calls[0], { op: "vm.crash_dumps.list", params: { name: "vm" } });
+  const pull = rig(register, { path: "/tmp/a.dmp", bytes: 5, sha256: "ab" });
+  await pull.run("alcove_crash_dumps", { name: "vm", action: "pull", file: "a.dmp", path: "/tmp/a.dmp" });
+  assert.deepEqual(pull.calls[0], { op: "vm.crash_dumps.pull", params: { name: "vm", file: "a.dmp", path: "/tmp/a.dmp" } });
+});
+
 test("alcove_event_log maps since_minutes", async () => {
-  const t = rig({ entries: [] });
+  const t = rig(register, { entries: [] });
   await t.run("alcove_event_log", { name: "vm", since_minutes: 5, level: "error" });
   assert.deepEqual(t.calls[0], { op: "vm.event_log", params: { name: "vm", level: "error", sinceMinutes: 5 } });
+});
+
+test("alcove_record_start maps max_seconds to maxSeconds", async () => {
+  const t = rig(register, { dir: "/d" });
+  await t.run("alcove_record_start", { name: "vm", fps: 10, video: false, max_seconds: 60, dir: "/d" });
+  assert.deepEqual(t.calls[0], { op: "vm.record.start", params: { name: "vm", fps: 10, video: false, maxSeconds: 60, dir: "/d" } });
+});
+
+test("alcove_record_status reports a running and an idle recording", async () => {
+  const on = rig(register, { recording: true, dir: "/d", seconds: 12, ops: 3 });
+  assert.equal(textOf(await on.run("alcove_record_status", { name: "vm" })), "recording to /d; 12 s, 3 operations so far");
+  assert.equal(on.calls[0].op, "vm.record.status");
+  const off = rig(register, { recording: false });
+  assert.equal(textOf(await off.run("alcove_record_status", { name: "vm" })), "not recording");
+});
+
+test("alcove_collect_diagnostics maps log_files and process_name and lists the files", async () => {
+  const t = rig(register, { dir: "/d", files: ["screenshot.png"], summary: "ok" });
+  const r = await t.run("alcove_collect_diagnostics", { name: "vm", since_minutes: 10, log_files: ["C:\\a.log"], process_name: "a.exe" });
+  assert.deepEqual(t.calls[0].params, { name: "vm", sinceMinutes: 10, logFiles: ["C:\\a.log"], processName: "a.exe" });
+  assert.equal(textOf(r), "ok\ndirectory: /d\nfiles:\n  screenshot.png");
 });

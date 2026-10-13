@@ -68,6 +68,21 @@ export function register(r: Registrar, client: ControlClient): void {
     }
   });
 
+  r.tool("evidence", "alcove_record_status", {
+    title: "Recording status",
+    description: "Say whether a VM is being recorded and, if so, the directory, the seconds recorded so far and the number of operations traced. Use it to check that a recording is still running before relying on it.",
+    inputSchema: { name: vmName },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async ({ name }) => {
+    try {
+      const reply = await client.call("vm.record.status", { name }, 60000);
+      if (reply.recording !== true) return text("not recording", { recording: false });
+      return text(`recording to ${reply.dir}; ${reply.seconds ?? 0} s, ${reply.ops ?? 0} operations so far`, { recording: true, dir: reply.dir, seconds: reply.seconds, ops: reply.ops });
+    } catch (e) {
+      return fail(e);
+    }
+  });
+
   r.tool("evidence", "alcove_event_log", {
     title: "Read the guest event log",
     description: "Read entries of the guest's event log (Windows event log, Linux journal), newest first, as blocks of `time level provider (id)` with the message indented. Use it to find crashes and errors an application logged. Needs guest tools with exec allowed.",
@@ -164,10 +179,10 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(a.since_minutes !== undefined ? { sinceMinutes: a.since_minutes } : {}),
         ...(a.log_files !== undefined ? { logFiles: a.log_files } : {}),
         ...(a.process_name !== undefined ? { processName: a.process_name } : {}),
-      }, 600000);
+      }, 1800000);
       const files = (reply.files as string[]) ?? [];
       const body = [String(reply.summary ?? ""), `directory: ${reply.dir}`, "files:", ...files.map((f) => `  ${f}`)].join("\n");
-      return text(clip(body, 60000), { dir: reply.dir, files, summary: reply.summary });
+      return text(clip(body, 60000, `the full files are in ${reply.dir}`), { dir: reply.dir, files, summary: reply.summary });
     } catch (e) {
       return fail(e);
     }

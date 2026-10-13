@@ -17,9 +17,13 @@ export function formatScale(scale: unknown): string {
   return String(Math.round(Number(scale ?? 1) * 10000) / 10000);
 }
 
-/** A string as is, any other present value as compact JSON, nothing for an absent or empty one. */
+/** A string as is, an array of strings joined with `; `, any other present value as compact JSON, nothing for an absent or empty one. */
 function field(v: unknown): string | undefined {
   if (v === undefined || v === null || v === "") return undefined;
+  if (Array.isArray(v) && v.every((i) => typeof i === "string")) {
+    const items = (v as string[]).filter((i) => i !== "");
+    return items.length === 0 ? undefined : items.join("; ");
+  }
   return typeof v === "string" ? v : JSON.stringify(v);
 }
 

@@ -1,19 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { register, exchangeLine, exchangeDetail } from "./tools/http.js";
-import type { ControlClient } from "./control.js";
-import type { Registrar, ToolHandler } from "./toolkit.js";
-
-function rig(reply: Record<string, unknown>) {
-  const calls: Array<{ op: string; params: Record<string, unknown> }> = [];
-  const handlers = new Map<string, ToolHandler>();
-  const registrar: Registrar = { tool: (_set, name, _config, handler) => void handlers.set(name, handler) };
-  const client = { call: async (op: string, params: Record<string, unknown> = {}) => (calls.push({ op, params }), reply) } as unknown as ControlClient;
-  register(registrar, client);
-  return { calls, run: (tool: string, args: Record<string, unknown>) => handlers.get(tool)!(args) };
-}
-
-const textOf = (r: { content: Array<{ type: string; text?: string }> }) => r.content.map((c) => c.text ?? "").join("\n");
+import { rig, textOf } from "./test-rig.js";
 
 test("exchangeLine prints the documented list format", () => {
   assert.equal(
@@ -24,36 +12,86 @@ test("exchangeLine prints the documented list format", () => {
 
 test("exchangeDetail puts headers, a blank line and the body together", () => {
   const out = exchangeDetail(3, "response", { headers: [["content-type", "text/plain"]], body: "hi", total: 2 }, 0);
-  assert.equal(out, "#3 response: 2 bytes in total, body from 0\ncontent-type: text/plain\n\nhi");
+  assert.equal(out, "#3 response: 2 bytes in total, body from byte 0\ncontent-type: text/plain\n\nhi");
 });
 
-test("exchangeDetail clips a long body with an offset hint", () => {
-  const out = exchangeDetail(1, "request", { headers: [], body: "a".repeat(60001), total: 60001 }, 0);
-  assert.match(out, /\.\.\.\[truncated; use offset 60000 and length to read further\]$/);
+test("exchangeDetail hints the next byte offset of clipped text from its UTF-8 length", () => {
+  const body = "\u00e9".repeat(60001);
+  const out = exchangeDetail(1, "request", { headers: [], body, total: 200000 }, 10);
+  assert.match(out, /\.\.\.\[truncated; offsets count bytes; use offset 120010 to read further\]$/);
 });
 
-test("alcove_http_requests with id reads one exchange part", async () => {
-  const t = rig({ headers: [], body: "x", total: 1 });
-  await t.run("alcove_http_requests", { name: "vm", id: 4, part: "request", offset: 5, length: 9 });
-  assert.deepEqual(t.calls[0], { op: "vm.http.request", params: { name: "vm", id: 4, part: "request", offset: 5, length: 9 } });
+test("exchangeDetail hints 45000-byte pages for a clipped base64 body", () => {
+  const out = exchangeDetail(1, "response", { headers: [], body: "A".repeat(80000), base64: true, total: 60000 }, 5);
+  assert.match(out, /use offset 45005 and length 45000 to read further\]$/);
+});
+
+test("exchangeDetail uses the reply's returned length for the next offset when more remains", () => {
+  const out = exchangeDetail(1, "response", { headers: [], body: "abc", length: 3, total: 10 }, 0);
+  assert.match(out, /\n\nabc\n\.\.\.\[more; offsets count bytes; use offset 3 to read further\]$/);
+});
+
+test("alcove_http_requests with id reads one exchange part with a default length and metadata-only structuredContent", async () => {
+  const t = rig(register, { headers: [["a", "b"]], body: "x", total: 1, bodyTruncated: false });
+  const r = await t.run("alcove_http_requests", { name: "vm", id: 4, part: "request", offset: 5 });
+  assert.deepEqual(t.calls[0], { op: "vm.http.request", params: { name: "vm", id: 4, part: "request", offset: 5, length: 60000 } });
+  assert.deepEqual(r.structuredContent, { total: 1, bodyTruncated: false, base64: undefined, encoding: undefined });
 });
 
 test("alcove_http_requests shows the pending count when it is not zero", async () => {
-  const t = rig({ exchanges: [], next: 0, pending: 2 });
+  const t = rig(register, { exchanges: [], next: 0, pending: 2 });
   const r = await t.run("alcove_http_requests", { name: "vm", status: "4xx" });
   assert.equal(t.calls[0].op, "vm.http.requests");
   assert.match(textOf(r), /2 more request\(s\) still in flight/);
 });
 
+test("alcove_http_requests clear calls vm.http.clear on its own", async () => {
+  const t = rig(register);
+  const r = await t.run("alcove_http_requests", { name: "vm", clear: true });
+  assert.deepEqual(t.calls[0], { op: "vm.http.clear", params: { name: "vm" } });
+  assert.equal(textOf(r), "captured exchanges cleared");
+});
+
+test("alcove_http_requests clear with an id or a filter is refused", async () => {
+  const t = rig(register);
+  for (const extra of [{ id: 1 }, { host: "a" }, { limit: 5 }]) {
+    const r = await t.run("alcove_http_requests", { name: "vm", clear: true, ...extra });
+    assert.equal(r.isError, true);
+    assert.equal(textOf(r), "clear takes no id or filters; call it on its own");
+  }
+  assert.equal(t.calls.length, 0);
+});
+
+test("alcove_http_capture_start maps system_proxy and prints env, CA path and the exec note", async () => {
+  const t = rig(register, { proxy: "10.0.2.2:8080", env: { HTTP_PROXY: "http://10.0.2.2:8080" }, caInstalled: true, systemProxySet: false, guestCAPath: "C:\\ca.pem" });
+  const r = await t.run("alcove_http_capture_start", { name: "vm", hosts: ["a.test"], secrets: true, bodies: false, system_proxy: false });
+  assert.deepEqual(t.calls[0].params, { name: "vm", hosts: ["a.test"], secrets: true, bodies: false, systemProxy: false });
+  const out = textOf(r);
+  assert.match(out, /capturing through proxy 10\.0\.2\.2:8080/);
+  assert.match(out, /system proxy not set/);
+  assert.match(out, /alcove_exec does not/);
+  assert.match(out, /\nHTTP_PROXY=http:\/\/10\.0\.2\.2:8080/);
+  assert.match(out, /CA file in the guest: C:\\ca\.pem/);
+});
+
 test("alcove_http_rule add maps response to the rule action", async () => {
-  const t = rig({ rule: 1 });
+  const t = rig(register, { rule: 1 });
   await t.run("alcove_http_rule", { name: "vm", action: "add", match: { host: "a.test" }, response: { status: 500, delay_ms: 20, times: 1 } });
   assert.deepEqual(t.calls[0].params, { name: "vm", match: { host: "a.test" }, action: { status: 500, times: 1, delayMs: 20 } });
 });
 
-test("alcove_http_rule add without a response fails before calling the control op", async () => {
-  const t = rig({});
-  const r = await t.run("alcove_http_rule", { name: "vm", action: "add", match: { host: "a.test" } });
-  assert.equal(r.isError, true);
+test("alcove_http_rule add without match matches all requests", async () => {
+  const t = rig(register, { rule: 1 });
+  await t.run("alcove_http_rule", { name: "vm", action: "add", response: { drop: true } });
+  assert.deepEqual(t.calls[0].params, { name: "vm", match: {}, action: { drop: true } });
+});
+
+test("alcove_http_rule add needs a status, body, delay or drop", async () => {
+  const t = rig(register);
+  for (const response of [undefined, { headers: { a: "b" } }, { times: 1 }]) {
+    const r = await t.run("alcove_http_rule", { name: "vm", action: "add", match: { host: "a.test" }, response });
+    assert.equal(r.isError, true);
+    assert.equal(textOf(r), "pass response with at least one of status, body, delay_ms, drop");
+  }
   assert.equal(t.calls.length, 0);
 });

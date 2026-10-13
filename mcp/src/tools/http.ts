@@ -16,16 +16,31 @@ export function exchangeLine(e: Obj): string {
   return parts.join(" ");
 }
 
-/** Headers, a blank line, then the body clipped at 60000 characters with a paging hint. */
+const DETAIL_CHARS = 60000;
+const BASE64_BYTES_PER_PAGE = 45000;
+
+/** Headers, a blank line, then the body clipped at 60000 characters; the paging hint counts bytes of the part. */
 export function exchangeDetail(id: number, part: string, r: Obj, offset: number): string {
   const headers = ((r.headers as string[][]) ?? []).map(([k, v]) => `${k}: ${v}`);
   const body = String(r.body ?? "");
-  const notes = [`#${id} ${part}: ${r.total ?? body.length} bytes in total, body from ${offset}`];
-  if (r.base64 === true) notes.push("body is base64 (not text)");
+  const base64 = r.base64 === true;
+  const total = Number(r.total ?? 0);
+  const notes = [`#${id} ${part}: ${total} bytes in total, body from byte ${offset}`];
+  if (base64) notes.push("body is base64 (not text)");
   if (r.encoding) notes.push(`content encoding ${r.encoding} not decoded`);
   if (r.bodyTruncated === true) notes.push("the capture kept only the first 2 MiB of this body");
-  const hint = `use offset ${offset + 60000} and length to read further`;
-  return [notes.join("; "), ...headers, "", clip(body, 60000, hint)].join("\n");
+  const returned = typeof r.length === "number" ? r.length : base64 ? Math.floor((body.length * 3) / 4) : Buffer.byteLength(body, "utf8");
+  let hint = "";
+  if (body.length > DETAIL_CHARS) {
+    hint = base64
+      ? `offsets and length count bytes; use offset ${offset + BASE64_BYTES_PER_PAGE} and length ${BASE64_BYTES_PER_PAGE} to read further`
+      : `offsets count bytes; use offset ${offset + Buffer.byteLength(body.slice(0, DETAIL_CHARS), "utf8")} to read further`;
+  } else if (offset + returned < total) {
+    hint = `offsets count bytes; use offset ${offset + returned} to read further`;
+  }
+  const shown = body.length > DETAIL_CHARS ? clip(body, DETAIL_CHARS, hint) : body;
+  const tail = body.length <= DETAIL_CHARS && hint ? `\n...[more; ${hint}]` : "";
+  return [notes.join("; "), ...headers, "", shown + tail].join("\n");
 }
 
 function ruleLine(rule: Obj): string {
@@ -59,7 +74,10 @@ export function register(r: Registrar, client: ControlClient): void {
         `CA certificate ${reply.caInstalled ? "installed in the guest" : "NOT installed in the guest (HTTPS will fail certificate checks)"}`,
         `system proxy ${reply.systemProxySet ? "set" : "not set"}`,
         "apps started with alcove_launch_app or alcove_deploy receive the proxy environment automatically",
+        "a process started through alcove_exec does not: set these variables in its environment yourself",
+        ...Object.entries((reply.env as Record<string, unknown>) ?? {}).map(([k, v]) => `${k}=${v}`),
       ];
+      if (reply.guestCAPath) lines.push(`CA file in the guest: ${reply.guestCAPath}`);
       return text(lines.join("\n"), reply);
     } catch (e) {
       return fail(e);
@@ -68,7 +86,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("http", "alcove_http_capture_stop", {
     title: "Stop HTTP capture",
-    description: "Stop the capture of a VM: restores the guest's proxy settings, removes the CA certificate from the guest and stops the proxy. Returns how many exchanges were captured; read them before stopping, they are discarded.",
+    description: "Stop the capture of a VM: restores the guest's proxy settings, removes the CA certificate from the guest and stops the proxy. Returns how many exchanges were captured; read them with alcove_http_requests before stopping, they are discarded. To empty the list and keep capturing use alcove_http_requests with clear.",
     inputSchema: { name: vmName },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async ({ name }) => {
@@ -82,7 +100,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("http", "alcove_http_requests", {
     title: "List or read captured requests",
-    description: "Without id: list the newest captured exchanges (limit, default 50), one per line as `#id time METHOD url -> status (ms, request/response bytes) [rule n]`, filtered by host, path or status; tunnelled hosts appear as TUNNEL rows. With id: read one exchange part (request or response) as headers and body, paged with offset and length. Prefer a list with filters over reading everything.",
+    description: "Without id: list the newest captured exchanges (limit, default 50), one per line as `#id time METHOD url -> status (ms, request/response bytes) [rule n]`, filtered by host, path or status; tunnelled hosts appear as TUNNEL rows. With id: read one exchange part (request or response) as headers and body, paged with offset and length. Prefer a list with filters over reading everything. With clear: true (alone) the captured exchanges are discarded and capture continues.",
     inputSchema: {
       name: vmName,
       id: z.number().int().min(0).optional().describe("Exchange id to read; with it the list filters are ignored"),
@@ -94,10 +112,17 @@ export function register(r: Registrar, client: ControlClient): void {
       path: z.string().optional().describe("List only URLs containing this path text"),
       status: z.union([z.number().int(), z.string().regex(/^[1-5]xx$/)]).optional().describe("List only this status, e.g. 404, or a class such as 4xx"),
       limit: z.number().int().min(1).max(500).optional().describe("Most exchanges to list (default 50)"),
+      clear: z.boolean().optional().describe("Discard all captured exchanges; give no id or filters"),
     },
-    annotations: { readOnlyHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async (a) => {
     try {
+      if (a.clear) {
+        const others = ["id", "part", "offset", "length", "since", "host", "path", "status", "limit"] as const;
+        if (others.some((k) => a[k] !== undefined)) throw new ControlError("clear takes no id or filters; call it on its own");
+        await client.call("vm.http.clear", { name: a.name }, 60000);
+        return text("captured exchanges cleared");
+      }
       if (a.id !== undefined) {
         const part = a.part ?? "response";
         const offset = a.offset ?? 0;
@@ -106,9 +131,9 @@ export function register(r: Registrar, client: ControlClient): void {
           id: a.id,
           part,
           ...(a.offset !== undefined ? { offset: a.offset } : {}),
-          ...(a.length !== undefined ? { length: a.length } : {}),
+          length: a.length ?? DETAIL_CHARS,
         }, 60000);
-        return text(exchangeDetail(a.id, part, reply, offset), reply);
+        return text(exchangeDetail(a.id, part, reply, offset), { total: reply.total, bodyTruncated: reply.bodyTruncated, base64: reply.base64, encoding: reply.encoding });
       }
       const reply = await client.call("vm.http.requests", {
         name: a.name,
@@ -131,7 +156,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("http", "alcove_http_rule", {
     title: "Manage response rules",
-    description: "Change what the guest's apps get back during a capture. add (needs match and response) creates a rule: requests matching host/path/method are answered with the given status, headers and body without contacting the server, or delayed (delay_ms alone), or dropped (drop). list shows rules with hit counts; remove (needs rule) deletes one; clear deletes all. Use it to test error handling and timeouts.",
+    description: "Change what the guest's apps get back during a capture. add (needs response; match defaults to all requests) creates a rule: requests matching host/path/method are answered with the given status, headers and body without contacting the server, or delayed (delay_ms alone), or dropped (drop). list shows rules with hit counts; remove (needs rule) deletes one; clear deletes all. Use it to test error handling and timeouts.",
     inputSchema: {
       name: vmName,
       action: z.enum(["add", "list", "remove", "clear"]),
@@ -142,7 +167,7 @@ export function register(r: Registrar, client: ControlClient): void {
       }).optional().describe("add: which requests the rule applies to"),
       response: z.object({
         status: z.number().int().min(100).max(599).optional().describe("Status code of the canned answer (default 200 when body is given)"),
-        headers: z.record(z.string()).optional(),
+        headers: z.record(z.string()).optional().describe("Response headers as {name: value}; they replace defaults such as content-type"),
         body: z.string().optional().describe("Response body; content-type defaults to application/json when it parses as JSON, else text/plain"),
         delay_ms: z.number().int().min(0).max(600000).optional().describe("Wait this long before answering or forwarding"),
         drop: z.boolean().optional().describe("Close the connection without a response"),
@@ -155,10 +180,13 @@ export function register(r: Registrar, client: ControlClient): void {
     try {
       switch (a.action) {
         case "add": {
-          if (!a.match || !a.response) throw new ControlError("the add action needs match and response");
-          const { delay_ms, ...rest } = a.response as Obj;
+          const resp = (a.response ?? {}) as Obj;
+          if (resp.status === undefined && resp.body === undefined && resp.delay_ms === undefined && resp.drop === undefined) {
+            throw new ControlError("pass response with at least one of status, body, delay_ms, drop");
+          }
+          const { delay_ms, ...rest } = resp;
           const action = { ...rest, ...(delay_ms !== undefined ? { delayMs: delay_ms } : {}) };
-          const reply = await client.call("vm.http.rule.add", { name: a.name, match: a.match, action }, 60000);
+          const reply = await client.call("vm.http.rule.add", { name: a.name, match: a.match ?? {}, action }, 60000);
           return text(`rule ${reply.rule} added`, { rule: reply.rule });
         }
         case "list": {

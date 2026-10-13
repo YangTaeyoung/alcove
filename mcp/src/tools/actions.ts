@@ -139,7 +139,10 @@ export function register(r: Registrar, client: ControlClient): void {
         "Wait until one of several conditions becomes true, or the timeout passes. Each condition is an object with a `type` and its fields: " +
         "screen_idle {seconds}, region_changed {region}, text_visible {text, regex?, region?}, text_gone {text, regex?, region?}, " +
         "process_started {process_name}, process_exited {pid | process_name}, file_exists {path}, port_listening {port}, " +
-        "log_matches {path, pattern}, job_output_matches {job, pattern}. Condition indices are 0-based. Returns the index and type of the first true condition; running out of time is not an error.",
+        "log_matches {path, pattern}, job_output_matches {job, pattern}; " +
+        "on Windows guests also ui_exists | ui_gone | ui_enabled {ref | window, role, name, name_contains, automation_id, index} (element conditions; here `name` is the element's accessible name), " +
+        "ui_text_stable {ref | the same selector fields, quiet_ms (default 1500)} (true once the element's text has not changed for quiet_ms; detail is the final text length; an element that disappears ends the wait with the error text), " +
+        "window_title {contains | regex}, event {event, title_contains}. Condition indices are 0-based. Returns the index and type of the first true condition; running out of time is not an error.",
       inputSchema: {
         name: vmName,
         conditions: z.array(z.object({ type: z.string() }).passthrough()).min(1).max(8),
