@@ -105,7 +105,7 @@ func TestBuildCommandForms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"cmd.exe", "/C", "dir"}; !reflect.DeepEqual(cmd.Args, want) {
+	if want := []string{"cmd.exe", "/S", "/C", "dir"}; !reflect.DeepEqual(cmd.Args, want) {
 		t.Fatalf("cmd args %q", cmd.Args)
 	}
 
@@ -147,6 +147,19 @@ func TestBuildCommandForms(t *testing.T) {
 	_, err = buildCommand(proto.Message{}, "linux")
 	if err == nil || err.Error() != "missing cmd or argv" {
 		t.Fatalf("empty request: %v", err)
+	}
+}
+
+func TestCmdExeLineWrapsCommandInOuterQuotes(t *testing.T) {
+	for cmdline, want := range map[string]string{
+		`dir`:                         `cmd.exe /S /C "dir"`,
+		`echo hello & dir "C:\a b"`:   `cmd.exe /S /C "echo hello & dir "C:\a b""`,
+		`"C:\a b\x.exe" /C "echo ok"`: `cmd.exe /S /C ""C:\a b\x.exe" /C "echo ok""`,
+		`"C:\a b\x.exe"`:              `cmd.exe /S /C ""C:\a b\x.exe""`,
+	} {
+		if got := cmdExeLine(cmdline); got != want {
+			t.Errorf("cmdExeLine(%s) = %s, want %s", cmdline, got, want)
+		}
 	}
 }
 

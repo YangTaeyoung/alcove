@@ -56,8 +56,8 @@ func buildCommand(req proto.Message, goos string) (*exec.Cmd, error) {
 			if goos != "windows" {
 				return nil, errors.New("shell 'cmd' exists only on Windows; use shell 'sh'")
 			}
-			c = exec.Command("cmd.exe", "/C", cmdline)
-			setRawCommandLine(c, "cmd.exe /C "+cmdline)
+			c = exec.Command("cmd.exe", "/S", "/C", cmdline)
+			setRawCommandLine(c, cmdExeLine(cmdline))
 		case "sh":
 			c = exec.Command("/bin/sh", "-c", cmdline)
 		default:
@@ -78,6 +78,12 @@ func buildCommand(req proto.Message, goos string) (*exec.Cmd, error) {
 		}
 	}
 	return c, nil
+}
+
+// cmdExeLine is the raw command line that makes cmd.exe run cmdline verbatim:
+// with /S, cmd.exe removes exactly the outer pair of quotes.
+func cmdExeLine(cmdline string) string {
+	return `cmd.exe /S /C "` + cmdline + `"`
 }
 
 // commandLine is the text shown for a request in job listings.
