@@ -42,12 +42,42 @@ public actor ControlHandler {
     /// Port forwards added with `vm.forward.add`, per VM name.
     var runtimeForwards: [String: [Forward]] = [:]
 
+    var leases = LeaseTable()
+    let clock: @Sendable () -> ContinuousClock.Instant
+
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
-    public init(registry: VMRegistry, hostKind: String) {
+    public init(registry: VMRegistry, hostKind: String, clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now }) {
         self.registry = registry
         self.hostKind = hostKind
+        self.clock = clock
     }
+
+    /// Every op name the dispatcher accepts.
+    static let knownOps: [String] = [
+        "hello", "vm.list", "vm.status", "vm.start", "vm.stop", "vm.pause", "vm.resume", "vm.screenshot",
+        "vm.mouse.move", "vm.mouse.click", "vm.mouse.drag", "vm.mouse.scroll",
+        "vm.key.press", "vm.key.down", "vm.key.up", "vm.type",
+        "vm.exec", "vm.exec.start", "vm.exec.read", "vm.exec.write", "vm.exec.kill", "vm.exec.list",
+        "vm.process.list", "vm.process.kill",
+        "vm.clipboard.get", "vm.clipboard.set",
+        "vm.push_file", "vm.pull_file", "vm.sync_dir", "vm.fs.list", "vm.fs.read", "vm.fs.write", "vm.fs.delete",
+        "vm.snapshot.list", "vm.snapshot.create", "vm.snapshot.restore", "vm.snapshot.delete",
+        "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network",
+        "vm.lease.acquire", "vm.lease.release", "vm.set_resolution",
+        "vm.wait_idle",
+    ]
+
+    /// Whether `op` is exempt from the lease guard.
+    static func isReadOnly(op: String) -> Bool {
+        readOnlyOps.contains(op)
+    }
+
+    private static let readOnlyOps: Set<String> = [
+        "hello", "vm.list", "vm.status", "vm.screenshot", "vm.wait_idle", "vm.clipboard.get", "vm.exec.read",
+        "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
+        "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor",
+    ]
 
     /// Whether `op` runs outside the per-connection request order.
     public static func isConcurrent(op: String) -> Bool {
@@ -62,6 +92,10 @@ public actor ControlHandler {
 
     /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
     public func handle(op: String, params: JSON) async throws -> JSON {
+        if !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
+           let refusal = leases.refusal(vm: vm, token: params["lease"]?.stringValue, now: clock()) {
+            throw ControlError.failed(refusal)
+        }
         if ControlHandler.isInput(op: op), let vm = params["name"]?.stringValue {
             return try await inputGate.withLock(vm) { try await self.perform(op: op, params: params) }
         }
@@ -198,6 +232,8 @@ public actor ControlHandler {
         case "vm.snapshot.list", "vm.snapshot.create", "vm.snapshot.restore", "vm.snapshot.delete",
              "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network":
             return try await state(op: op, params: params)
+        case "vm.lease.acquire", "vm.lease.release", "vm.set_resolution":
+            return try await leaseOrResolution(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of thumbnail pixels changing between samples
@@ -224,7 +260,7 @@ public actor ControlHandler {
 
     // MARK: - helpers
 
-    private func target(_ params: JSON) async throws -> VMTarget {
+    func target(_ params: JSON) async throws -> VMTarget {
         guard let name = params["name"]?.stringValue else { throw ControlError.missing("name") }
         guard let t = await registry.target(named: name) else { throw ControlError.noSuchVM(name) }
         return t
@@ -265,7 +301,7 @@ public actor ControlHandler {
         return v
     }
 
-    private func int(_ params: JSON, _ key: String) throws -> Int {
+    func int(_ params: JSON, _ key: String) throws -> Int {
         guard let v = params[key]?.intValue else { throw ControlError.missing(key) }
         return v
     }
@@ -285,6 +321,7 @@ public actor ControlHandler {
                                    "state": .string(describe(st)), "suspended": .bool(await t.isSuspended())]
         if let (w, h) = lastSize[t.name] { obj["width"] = .int(Int64(w)); obj["height"] = .int(Int64(h)) }
         if case .failed(let msg) = st { obj["error"] = .string(msg) }
+        if let lease = leases.active(vm: t.name, now: clock()) { obj["leasedBy"] = .string(lease.owner) }
         if !quick, st == .running || st == .paused {
             if lastSize[t.name] == nil, let png = try? await screenshot(t), let (w, h) = PNGInfo.size(of: png) {
                 obj["width"] = .int(Int64(w)); obj["height"] = .int(Int64(h))
@@ -299,7 +336,7 @@ public actor ControlHandler {
         return .object(obj)
     }
 
-    private func screenshot(_ t: VMTarget) async throws -> Data {
+    func screenshot(_ t: VMTarget) async throws -> Data {
         let png: Data
         do { png = try await t.screenshotPNG() } catch { throw ControlError.failed("screenshot failed: \(error)") }
         if let (w, h) = PNGInfo.size(of: png) { lastSize[t.name] = (w, h) }

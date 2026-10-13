@@ -2,8 +2,44 @@ import Foundation
 import AlcoveEngine
 import AlcoveQMP
 
-/// Snapshots, runtime port forwards and the network link of a running VM.
+/// Snapshots, runtime port forwards, the network link, leases and the guest resolution.
 extension ControlHandler {
+    func leaseOrResolution(op: String, params: JSON) async throws -> JSON {
+        switch op {
+        case "vm.lease.acquire":
+            let t = try await target(params)
+            let owner = params["owner"]?.stringValue ?? "unknown"
+            let seconds = max(1, min(3600, params["ttl"]?.intValue ?? 300))
+            let lease = try leases.acquire(vm: t.name, owner: owner, ttl: .seconds(seconds), token: params["lease"]?.stringValue, now: clock())
+            return ["lease": .string(lease.token), "expiresIn": .int(Int64(seconds))]
+        case "vm.lease.release":
+            let t = try await target(params)
+            try leases.release(vm: t.name, token: params["lease"]?.stringValue ?? "", now: clock())
+            return [:]
+        default:
+            return try await setResolution(params)
+        }
+    }
+
+    private func setResolution(_ params: JSON) async throws -> JSON {
+        let width = try int(params, "width"), height = try int(params, "height")
+        guard (320...7680).contains(width), (200...4320).contains(height) else {
+            throw ControlError.failed("width must be 320...7680 and height 200...4320")
+        }
+        let t = try await running(params)
+        let agent = try await tools(t)
+        let before = PNGInfo.size(of: try await screenshot(t)).map { [$0.width, $0.height] }
+        await agent.setResolution(width: width, height: height)
+        let deadline = ContinuousClock.now + .seconds(8)
+        var size = before ?? [0, 0]
+        while true {
+            try await Task.sleep(for: .milliseconds(500))
+            if let s = PNGInfo.size(of: try await screenshot(t)) { size = [s.width, s.height] }
+            if size != before || size == [width, height] || ContinuousClock.now >= deadline { break }
+        }
+        return ["width": .int(Int64(size[0])), "height": .int(Int64(size[1]))]
+    }
+
     func state(op: String, params: JSON) async throws -> JSON {
         let t = try await running(params)
         switch op {
