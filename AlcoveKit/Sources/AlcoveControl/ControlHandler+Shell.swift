@@ -60,7 +60,7 @@ extension ControlHandler {
     /// `exec.run` on agents with request/response support; the v1 `exec` message for a plain `command` otherwise.
     private func exec(_ t: VMTarget, _ params: JSON) async throws -> JSON {
         var request = try commandParams(params, stdin: true)
-        let seconds = params["timeout"]?.intValue ?? 120
+        let seconds = try commandTimeout(params)
         let agent = try await tools(t)
         if (await agent.hello?.rpcVersion ?? 1) >= 2 {
             request["timeout_ms"] = .int(Int64(seconds) * 1000)
@@ -74,6 +74,15 @@ extension ControlHandler {
         }
         let r = try await agent.exec(command, timeout: .seconds(seconds))
         return ["code": .int(Int64(r.code)), "output": .string(r.output)]
+    }
+
+    /// The `timeout` parameter in seconds: 120 when absent, otherwise an integer from 1 to 86400.
+    private nonisolated func commandTimeout(_ params: JSON) throws -> Int {
+        guard let value = params["timeout"], value != .null else { return 120 }
+        guard let seconds = value.intValue, (1...86_400).contains(seconds) else {
+            throw ControlError.failed("timeout must be between 1 and 86400 seconds")
+        }
+        return seconds
     }
 
     /// The agent parameters of `exec.run` / `exec.start` taken from `command`, `argv`, `cwd`, `env`, `shell` and, with `stdin`, `stdin`.

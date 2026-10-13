@@ -147,6 +147,56 @@ final class ControlServerTests: XCTestCase {
         XCTAssertEqual(server.concurrentTaskCount(), 0)
     }
 
+    /// The first connection sends `request` and closes while the fake agent holds the message selected by `holding`;
+    /// a second connection is then served, the fake agent sends `answer`, and the second connection's next reply is its own.
+    private func checkLateReplyIsDiscarded(request: String, holding: @escaping @Sendable (JSON) -> Bool, answer: @escaping @Sendable (JSON) -> JSON,
+                                           file: StaticString = #filePath, line: UInt = #line) async throws {
+        let held = LockedBox<JSON?>(nil)
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            if holding(m) { held.value = m }
+            return []
+        }
+        let (handler, _) = try await handlerWithAgent(agent, in: self)
+        let (server, path) = try startServer(handler)
+        let deadline = ContinuousClock.now + .seconds(5)
+
+        let first = connectClient(path)
+        send(request, on: first)
+        while held.value == nil, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        close(first)
+        while server.connectionCount() > 0, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(server.connectionCount(), 0, file: file, line: line)
+
+        let second = connectClient(path)
+        defer { close(second) }
+        send("{\"id\":100,\"op\":\"hello\"}\n", on: second)
+        XCTAssertEqual(readReply(second)["id"]?.intValue, 100, file: file, line: line)
+
+        guard let pending = held.value else { return XCTFail("the agent did not receive the request", file: file, line: line) }
+        agent.sendLine(answer(pending))
+        while server.discardedReplyCount() < 1, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(server.discardedReplyCount(), 1, file: file, line: line)
+        send("{\"id\":101,\"op\":\"hello\"}\n", on: second)
+        let reply = readReply(second)
+        XCTAssertEqual(reply["id"]?.intValue, 101, file: file, line: line)
+        XCTAssertEqual(reply["host"]?.stringValue, "test", file: file, line: line)
+    }
+
+    func testLateConcurrentReplyIsNotWrittenToTheNextConnection() async throws {
+        try await checkLateReplyIsDiscarded(
+            request: "{\"id\":1,\"op\":\"vm.exec\",\"name\":\"Win\",\"command\":\"slow\"}\n",
+            holding: { $0["op"]?.stringValue == "exec.run" },
+            answer: { agentReply($0, ["code": 0, "stdout": "stale output of the first connection", "stderr": ""]) })
+    }
+
+    func testLateSerialReplyIsNotWrittenToTheNextConnection() async throws {
+        try await checkLateReplyIsDiscarded(
+            request: "{\"id\":1,\"op\":\"vm.clipboard.get\",\"name\":\"Win\"}\n",
+            holding: { $0["t"]?.stringValue == "clipboard.get" },
+            answer: { _ in ["t": "clipboard.text", "text": "stale clipboard of the first connection"] })
+    }
+
     func testFinishedConcurrentOpsAreForgotten() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
         let (server, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"))

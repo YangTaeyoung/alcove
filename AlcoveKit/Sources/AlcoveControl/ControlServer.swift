@@ -20,9 +20,13 @@ public final class ControlServer: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var listenSource: DispatchSourceRead?
     private var clients: [Int32: Client] = [:]
+    private var nextConnectionID = 0
     private var nextTaskID = 0
+    private var discardedReplies = 0
 
     private final class Client {
+        /// Server-wide number of this connection; a later connection on the same descriptor has a different one.
+        let id: Int
         let fd: Int32
         var source: DispatchSourceRead?
         var pending = Data()
@@ -30,7 +34,7 @@ public final class ControlServer: @unchecked Sendable {
         var task: Task<Void, Never>?
         /// The running tasks of the concurrent lane by server-wide task id.
         var concurrent: [Int: Task<Void, Never>] = [:]
-        init(fd: Int32) { self.fd = fd }
+        init(id: Int, fd: Int32) { self.id = id; self.fd = fd }
 
         func cancelTasks() {
             task?.cancel()
@@ -100,7 +104,8 @@ public final class ControlServer: @unchecked Sendable {
             _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
             var one: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            let client = Client(fd: fd)
+            let client = Client(id: nextConnectionID, fd: fd)
+            nextConnectionID += 1
             let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
             source.setEventHandler { [weak self] in self?.readAvailable(client) }
             source.resume()
@@ -132,13 +137,14 @@ public final class ControlServer: @unchecked Sendable {
     /// Starts a concurrent operation in its own tracked task; chains any other request behind the connection's previous serial task.
     private func enqueue(_ line: Data, for client: Client) {
         let fd = client.fd
+        let connection = client.id
         let handler = self.handler
         if let op = (try? JSON.parse(line))?["op"]?.stringValue, ControlHandler.isConcurrent(op: op) {
             let id = nextTaskID
             nextTaskID += 1
             client.concurrent[id] = Task { [weak self] in
                 let reply = await ControlServer.process(line, handler: handler)
-                self?.write(reply, to: fd)
+                self?.write(reply, to: fd, connection: connection)
                 self?.forgetConcurrentTask(id, of: fd)
             }
             return
@@ -147,7 +153,7 @@ public final class ControlServer: @unchecked Sendable {
         client.task = Task { [weak self] in
             await previous?.value
             let reply = await ControlServer.process(line, handler: handler)
-            self?.write(reply, to: fd)
+            self?.write(reply, to: fd, connection: connection)
         }
     }
 
@@ -158,6 +164,16 @@ public final class ControlServer: @unchecked Sendable {
     /// The number of concurrent-lane tasks that are still tracked, over all connections.
     func concurrentTaskCount() -> Int {
         queue.sync { clients.values.reduce(0) { $0 + $1.concurrent.count } }
+    }
+
+    /// The number of open connections.
+    func connectionCount() -> Int {
+        queue.sync { clients.count }
+    }
+
+    /// The number of replies dropped because their connection had closed.
+    func discardedReplyCount() -> Int {
+        queue.sync { discardedReplies }
     }
 
     static func process(_ line: Data, handler: ControlHandler) async -> Data {
@@ -181,9 +197,10 @@ public final class ControlServer: @unchecked Sendable {
         return data
     }
 
-    private func write(_ data: Data, to fd: Int32) {
+    /// Writes `data` to `fd` while connection `connection` still owns it; drops the reply otherwise.
+    private func write(_ data: Data, to fd: Int32, connection: Int) {
         queue.async { [self] in
-            guard clients[fd] != nil else { return }
+            guard let client = clients[fd], client.id == connection else { discardedReplies += 1; return }
             var offset = 0
             while offset < data.count {
                 let n = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress! + offset, data.count - offset) }
@@ -194,7 +211,7 @@ public final class ControlServer: @unchecked Sendable {
                     continue
                 }
                 if n < 0, errno == EINTR { continue }
-                if let c = clients[fd] { closeClient(c) }
+                closeClient(client)
                 return
             }
         }

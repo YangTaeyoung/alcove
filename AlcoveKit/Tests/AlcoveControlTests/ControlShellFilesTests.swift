@@ -106,6 +106,25 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertEqual(r["code"]?.intValue, -1)
     }
 
+    func testExecRejectsTimeoutsOutsideOneSecondToOneDay() async throws {
+        let (h, agent) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [agentReply(m, ["code": 0, "stdout": "", "stderr": ""])] : []
+        }
+        for timeout in [0, -5, 86_401, Int64.max / 10] {
+            let text = await failure(h, "vm.exec", ["name": "Win", "command": "dir", "timeout": .int(timeout)])
+            XCTAssertEqual(text, "timeout must be between 1 and 86400 seconds", "\(timeout)")
+        }
+        let notANumber = await failure(h, "vm.exec", ["name": "Win", "command": "dir", "timeout": "soon"])
+        XCTAssertEqual(notANumber, "timeout must be between 1 and 86400 seconds")
+        XCTAssertTrue(agentRequests(agent, "exec.run").isEmpty)
+
+        for timeout in [1, 86_400] {
+            _ = try await h.handle(op: "vm.exec", params: ["name": "Win", "command": "dir", "timeout": .int(Int64(timeout))])
+            XCTAssertEqual(agentRequests(agent, "exec.run").last?["timeout_ms"]?.intValue, timeout * 1000)
+        }
+        XCTAssertEqual(agentRequests(agent, "exec.run").count, 2)
+    }
+
     func testExecFallsBackToV1() async throws {
         let (h, agent) = try await setup(proto: nil) { m, _ in
             m["t"]?.stringValue == "exec" ? [["t": "exec.result", "code": 5, "out": .string("ran: " + (m["cmd"]?.stringValue ?? ""))]] : []
@@ -121,6 +140,8 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertEqual(withEnv, "guest tools in 'Win' are too old for vm.exec; update alcove-agent in the guest")
         let withArgv = await failure(h, "vm.exec", ["name": "Win", "argv": ["hostname"]])
         XCTAssertEqual(withArgv, "guest tools in 'Win' are too old for vm.exec; update alcove-agent in the guest")
+        let zero = await failure(h, "vm.exec", ["name": "Win", "command": "hostname", "timeout": 0])
+        XCTAssertEqual(zero, "timeout must be between 1 and 86400 seconds")
 
         XCTAssertEqual(agent.received.filter { $0["t"]?.stringValue == "exec" }.count, 1)
         XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "req" })
