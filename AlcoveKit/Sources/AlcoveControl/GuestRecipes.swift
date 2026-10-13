@@ -34,7 +34,8 @@ enum GuestRecipes {
         case .windows:
             return "if (Get-NetTCPConnection -State Listen -LocalPort \(port) -ErrorAction SilentlyContinue) { '1' } else { '0' }"
         case .linux:
-            return "ss -ltn \"sport = :\(port)\" | tail -n +2 | grep -q . && echo 1 || echo 0"
+            return "command -v ss >/dev/null 2>&1 || { echo \"ss is not installed in the guest\" >&2; exit 127; }\n"
+                + "ss -ltn \"sport = :\(port)\" | tail -n +2 | grep -q . && echo 1 || echo 0"
         case .other:
             return nil
         }

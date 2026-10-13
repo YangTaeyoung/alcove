@@ -38,6 +38,8 @@ final class WaitTests: XCTestCase {
         WaitTiming.ocrPeriod = .milliseconds(700)
         WaitTiming.agentPeriod = .milliseconds(500)
         WaitTiming.agentCallTimeout = .seconds(5)
+        WaitTiming.jobByteBudget = 4 * 1024 * 1024
+        WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) }
     }
 
     /// A running VM "Win" serving `frames`, with no guest tools.
@@ -77,6 +79,7 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(r["matched"]?.intValue, 1)
         XCTAssertEqual(r["type"]?.stringValue, "file_exists")
         XCTAssertEqual(r["detail"], ["path": "C:\\b.txt", "size": 5])
+        XCTAssertNil(r["problems"])
         XCTAssertNotNil(r["waited"]?.doubleValue)
         XCTAssertNil(r["observation"])
     }
@@ -312,7 +315,8 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(GuestRecipes.portListening(8080, os: .windows),
                        "if (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue) { '1' } else { '0' }")
         XCTAssertEqual(GuestRecipes.portListening(8080, os: .linux),
-                       "ss -ltn \"sport = :8080\" | tail -n +2 | grep -q . && echo 1 || echo 0")
+                       "command -v ss >/dev/null 2>&1 || { echo \"ss is not installed in the guest\" >&2; exit 127; }\n"
+                       + "ss -ltn \"sport = :8080\" | tail -n +2 | grep -q . && echo 1 || echo 0")
         XCTAssertNil(GuestRecipes.portListening(8080, os: .other))
     }
 
@@ -369,18 +373,138 @@ final class WaitTests: XCTestCase {
         XCTAssertTrue(line.hasPrefix("ready xxx"))
     }
 
-    func testLogMatchesFailsForAnExistingFileTheAgentCannotRead() async throws {
+    func testLogReadErrorsOnAnExistingFileAreRetried() async throws {
+        let calls = LockedBox(0)
         let agent = FakeAgent()
         agent.handler = { m, _ in
             switch m["op"]?.stringValue {
-            case "fs.tail": return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "access denied"]]
+            case "fs.tail":
+                calls.value += 1
+                if calls.value <= 2 { return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "sharing violation"]] }
+                return [agentReply(m, ["data": base64("server ready\n"), "size": 13])]
             case "fs.stat": return [agentReply(m, ["exists": true, "dir": false, "size": 1])]
             default: return []
             }
         }
         let (h, _) = try await agentRig(agent)
-        let message = await failure(h, ["name": "Win", "conditions": [["type": "log_matches", "path": "C:\\x.log", "pattern": "a"]]])
-        XCTAssertEqual(message, "access denied")
+        let r = try await waitFor(h, [["type": "log_matches", "path": "C:\\x.log", "pattern": "ready"]])
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+        XCTAssertNil(r["problems"])
+    }
+
+    func testAWaitThatEndsUnmatchedNamesTheConditionThatKeptFailing() async throws {
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            switch m["op"]?.stringValue {
+            case "fs.tail": return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "access denied"]]
+            case "fs.stat": return [agentReply(m, ["exists": .bool(m["path"]?.stringValue == "C:\\x.log"), "dir": false, "size": 1])]
+            default: return []
+            }
+        }
+        let (h, _) = try await agentRig(agent)
+        let r = try await waitFor(h, [["type": "file_exists", "path": "C:\\never"], ["type": "log_matches", "path": "C:\\x.log", "pattern": "a"]], timeout: 1)
+        XCTAssertEqual(r["matched"]?.intValue, -1)
+        let problems = try XCTUnwrap(r["problems"]?.arrayValue, "\(r)")
+        XCTAssertEqual(problems.count, 1)
+        XCTAssertEqual(problems[0]["condition"]?.intValue, 1)
+        XCTAssertEqual(problems[0]["type"]?.stringValue, "log_matches")
+        XCTAssertEqual(problems[0]["error"]?.stringValue, "access denied")
+        XCTAssertGreaterThan(problems[0]["failures"]?.intValue ?? 0, 2)
+    }
+
+    func testAMatchCarriesNoProblems() async throws {
+        let fs = FakeFS()
+        fs["C:\\a"] = Data("a".utf8)
+        let agent = FakeAgent()
+        fs.install(on: agent)
+        let (h, _) = try await agentRig(agent)
+        let r = try await waitFor(h, [["type": "file_exists", "path": "C:\\a"]])
+        XCTAssertNil(r["problems"])
+    }
+
+    func testPortCheckWithANonZeroExitIsPending() async throws {
+        let calls = LockedBox(0)
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            guard m["op"]?.stringValue == "exec.run" else { return [] }
+            calls.value += 1
+            if calls.value <= 2 { return [agentReply(m, ["code": 127, "stdout": "", "stderr": "ss is not installed in the guest\n"])] }
+            return [agentReply(m, ["code": 0, "stdout": "1\n", "stderr": ""])]
+        }
+        let (h, _) = try await agentRig(agent)
+        let r = try await waitFor(h, [["type": "port_listening", "port": 22]])
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+
+        let failing = FakeAgent()
+        failing.handler = { m, _ in
+            guard m["op"]?.stringValue == "exec.run" else { return [] }
+            return [agentReply(m, ["code": 127, "stdout": "", "stderr": "ss is not installed in the guest\n"])]
+        }
+        let (h2, _) = try await agentRig(failing)
+        let timedOut = try await waitFor(h2, [["type": "port_listening", "port": 22]], timeout: 1)
+        XCTAssertEqual(timedOut["matched"]?.intValue, -1)
+        XCTAssertTrue(timedOut["problems"]?[0]?["error"]?.stringValue?.contains("ss is not installed in the guest") ?? false, "\(timedOut)")
+    }
+
+    func testRecognitionFailuresAreRetried() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { frame, languages in
+            calls.value += 1
+            if calls.value <= 3 { throw ControlHandler.ControlError.failed("text recognition failed: transient") }
+            return try ScreenText.recognize(frame, languages: languages)
+        }
+        let drawn = drawText([("Install complete", 100, 120)])
+        let (h, _) = await screenRig(frames: [drawn.frame])
+        let r = try await waitFor(h, [["type": "text_visible", "text": "install complete"]], timeout: 10)
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+        XCTAssertGreaterThan(calls.value, 3)
+    }
+
+    func testFrameReadFailuresAreRetried() async throws {
+        let a = solid(320, 192, 40)
+        let (h, t) = await screenRig(frames: [a, paint(a, tileX: 2, tileY: 1)])
+        await t.setFailingFrameCalls([1, 2, 3])
+        let r = try await waitFor(h, [["type": "region_changed", "region": ["x": 64, "y": 32, "w": 32, "h": 32]]])
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+    }
+
+    func testARegionThatNoLongerFitsTheFrameCountsAsChanged() async throws {
+        let (h, _) = await screenRig(frames: [solid(320, 192, 40), solid(64, 64, 40)])
+        let r = try await waitFor(h, [["type": "region_changed", "region": ["x": 200, "y": 100, "w": 32, "h": 32]]])
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+    }
+
+    func testJobOutputBeyondTheTickBudgetIsReadBeforeTheJobCountsAsExited() async throws {
+        WaitTiming.jobByteBudget = 16
+        let output = String(repeating: "abcd", count: 25) + "THE-END"
+        let bytes = Array(output.utf8)
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            guard m["op"]?.stringValue == "exec.read" else { return [] }
+            let offset = m["out_offset"]?.intValue ?? 0
+            let end = min(offset + 4, bytes.count)
+            let piece = String(decoding: bytes[offset..<end], as: UTF8.self)
+            return [agentReply(m, ["state": "exited", "code": 0, "out": .string(piece), "err": "", "out_next": .int(Int64(end)), "err_next": 0])]
+        }
+        let (h, _) = try await agentRig(agent)
+        let r = try await waitFor(h, [["type": "job_output_matches", "job": "j1", "pattern": "THE-END$"]], timeout: 10)
+        XCTAssertEqual(r["matched"]?.intValue, 0, "\(r)")
+
+        let miss = try await waitFor(h, [["type": "job_output_matches", "job": "j2", "pattern": "NOT-THERE"]], timeout: 10)
+        XCTAssertEqual(miss["matched"]?.intValue, -1)
+        XCTAssertEqual(miss["detail"]?.stringValue, "job exited")
+    }
+
+    func testProcessNameFilterDropsTheExecutableSuffix() async throws {
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            guard m["op"]?.stringValue == "proc.list" else { return [] }
+            return [agentReply(m, ["procs": [["pid": 9, "ppid": 1, "name": "foo"]]])]
+        }
+        let (h, _) = try await agentRig(agent)
+        let r = try await waitFor(h, [["type": "process_started", "processName": "Foo.EXE"]])
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+        XCTAssertEqual(agentRequests(agent, "proc.list").first?["name"]?.stringValue, "foo")
     }
 
     func testJobOutputMatchesAcrossReads() async throws {
@@ -476,7 +600,7 @@ final class WaitTests: XCTestCase {
         XCTAssertLessThan(ContinuousClock.now - start, .seconds(5))
     }
 
-    func testAnAgentCallThatNeverAnswersDoesNotHoldThePastTheDeadline() async throws {
+    func testAnAgentCallThatNeverAnswersDoesNotHoldTheWaitPastTheDeadline() async throws {
         WaitTiming.agentCallTimeout = .milliseconds(300)
         let agent = FakeAgent()
         agent.handler = { _, _ in [] }

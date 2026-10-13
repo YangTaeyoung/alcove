@@ -9,12 +9,16 @@ enum WaitTiming {
     nonisolated(unsafe) static var agentPeriod = Duration.milliseconds(500)
     /// Longest an agent call of one evaluation may take.
     nonisolated(unsafe) static var agentCallTimeout = Duration.seconds(5)
+    /// Output bytes one job condition reads per tick.
+    nonisolated(unsafe) static var jobByteBudget = 4 * 1024 * 1024
+    /// Text recognition on a frame.
+    nonisolated(unsafe) static var recognizer: @Sendable (Frame, [String]) throws -> [TextMatch] = { try ScreenText.recognize($0, languages: $1) }
 }
 
 /// The text a `text_visible` or `text_gone` condition looks for.
 struct WaitText: Sendable {
     let query: String
-    let regex: Bool
+    let expression: NSRegularExpression?
     let region: Frame.Rect?
     let languages: [String]
 
@@ -125,12 +129,11 @@ enum WaitCondition: Sendable {
         }
         func screenText() throws -> WaitText {
             let query = try text("text")!
-            var regex = false
+            var expression: NSRegularExpression?
             if let v = fields["regex"], v != .null {
                 guard let flag = v.boolValue else { throw fail("'regex' must be a boolean") }
-                regex = flag
+                if flag { expression = try compile(query, regexOptions: [.caseInsensitive], index: index) }
             }
-            if regex { _ = try compile(query, regexOptions: [.caseInsensitive], index: index) }
             var languages = ScreenText.defaultLanguages
             if let v = fields["languages"], v != .null {
                 guard let items = v.arrayValue, !items.isEmpty, items.allSatisfy({ $0.stringValue != nil }) else {
@@ -138,7 +141,7 @@ enum WaitCondition: Sendable {
                 }
                 languages = items.compactMap(\.stringValue)
             }
-            return WaitText(query: query, regex: regex, region: try region(), languages: languages)
+            return WaitText(query: query, expression: expression, region: try region(), languages: languages)
         }
 
         switch type {
