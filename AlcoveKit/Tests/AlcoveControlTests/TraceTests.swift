@@ -76,6 +76,24 @@ final class TraceTests: XCTestCase {
         XCTAssertEqual(out["other"]?["API_KEY"]?.stringValue, "visible")
     }
 
+    func testAssignmentsWithSecretNamesAreMaskedInCommandText() {
+        let cases: [(String, String)] = [
+            ("API_KEY=abc123 run", "API_KEY=<masked> run"),
+            ("MyApp.exe --token=SECRET123 --verbose", "MyApp.exe --token=<masked> --verbose"),
+            ("DB_PASSWORD=\"two words\" next", "DB_PASSWORD=<masked> next"),
+            ("MySecret='two words' next", "MySecret=<masked> next"),
+            ("env github_token=t PATH=/bin make", "env github_token=<masked> PATH=/bin make"),
+            ("x=TOKEN=abc", "x=TOKEN=<masked>"),
+            ("TOKEN=", "TOKEN=<masked>"),
+            ("PASSWORD=\"unclosed rest", "PASSWORD=<masked>"),
+            ("a.b-KEY=1;next", "a.b-KEY=<masked>"),
+        ]
+        for (input, expected) in cases { XCTAssertEqual(TraceSanitizer.maskAssignments(input), expected, input) }
+        for same in ["PATH=/usr/bin", "--token SECRET123", "-p hunter2", "password: hunter2", "curl https://user:pw@host/", "= KEY", "KEY =value", ""] {
+            XCTAssertEqual(TraceSanitizer.maskAssignments(same), same)
+        }
+    }
+
     // MARK: trace content
 
     func testTraceMasksSecrets() async throws {

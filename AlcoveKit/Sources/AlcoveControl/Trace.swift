@@ -80,9 +80,41 @@ enum TraceSanitizer {
         text.count > maxStringLength ? String(text.prefix(maxStringLength)) + "…" : text
     }
 
-    private static func isSecret(_ key: String) -> Bool {
+    /// Whether `key` contains one of `secretMarkers`, whatever its case.
+    static func isSecret(_ key: String) -> Bool {
         let upper = key.uppercased()
         return secretMarkers.contains { upper.contains($0) }
+    }
+
+    /// `text` with `<masked>` in place of the value of every `NAME=value` pair whose name `isSecret`. The name is the run
+    /// of ASCII letters, digits, `_`, `.` and `-` right before the `=`; the value starts right after it and ends at the
+    /// next white space, or at the closing quote when it starts with `"` or `'`.
+    static func maskAssignments(_ text: String) -> String {
+        var out = ""
+        var name = ""
+        var index = text.startIndex
+        while index < text.endIndex {
+            let character = text[index]
+            index = text.index(after: index)
+            out.append(character)
+            guard character == "=" else {
+                let inName = character.isASCII && (character.isLetter || character.isNumber || "_.-".contains(character))
+                name = inName ? name + String(character) : ""
+                continue
+            }
+            let secret = isSecret(name)
+            name = ""
+            guard secret else { continue }
+            if index < text.endIndex, text[index] == "\"" || text[index] == "'" {
+                let quote = text[index]
+                let close = text[text.index(after: index)...].firstIndex(of: quote)
+                index = close.map { text.index(after: $0) } ?? text.endIndex
+            } else {
+                while index < text.endIndex, !text[index].isWhitespace { index = text.index(after: index) }
+            }
+            out += "<masked>"
+        }
+        return out
     }
 }
 
