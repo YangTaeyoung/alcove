@@ -219,6 +219,35 @@ func TestFsListRecursive(t *testing.T) {
 	}
 }
 
+func TestFsListOmitsDigestOfUnreadableFile(t *testing.T) {
+	c, home := fsHome(t)
+	os.Mkdir(filepath.Join(home, "t"), 0o755)
+	os.WriteFile(filepath.Join(home, "t", "open.txt"), []byte("aa"), 0o644)
+	closed := filepath.Join(home, "t", "closed.txt")
+	os.WriteFile(closed, []byte("bbb"), 0o000)
+	if f, err := os.Open(closed); err == nil {
+		f.Close()
+		t.Skip("a file with mode 000 is readable here")
+	}
+
+	em := entryMap(c.ok("fs.list", proto.Message{"path": "t", "sha256": true}))
+	if len(em) != 2 {
+		t.Fatalf("entries %v", em)
+	}
+	sum := sha256.Sum256([]byte("aa"))
+	if em["open.txt"]["sha256"] != hex.EncodeToString(sum[:]) {
+		t.Fatalf("readable file %v", em["open.txt"])
+	}
+	if _, has := em["closed.txt"]["sha256"]; has || int(em["closed.txt"]["size"].(float64)) != 3 {
+		t.Fatalf("unreadable file %v", em["closed.txt"])
+	}
+
+	res := c.call("fs.stat", proto.Message{"path": "t/closed.txt", "sha256": true})
+	if res["ok"] != false || !strings.Contains(res.String("error"), "cannot hash") {
+		t.Fatalf("stat of the unreadable file %v", res)
+	}
+}
+
 func TestFsTail(t *testing.T) {
 	c, home := fsHome(t)
 	var sb strings.Builder

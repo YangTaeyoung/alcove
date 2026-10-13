@@ -126,7 +126,6 @@ func (s *Server) fsList(req proto.Message) (proto.Message, error) {
 
 	entries := []any{}
 	truncated := false
-	var hashErr error
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if p == root {
 			if err != nil {
@@ -161,12 +160,9 @@ func (s *Server) fsList(req proto.Message) (proto.Message, error) {
 		if !d.IsDir() {
 			e["size"] = info.Size()
 			if withSum && info.Mode().IsRegular() {
-				sum, err := fileDigest(p)
-				if err != nil {
-					hashErr = fmt.Errorf("cannot hash '%s': %v", p, err)
-					return fs.SkipAll
+				if sum, err := fileDigest(p); err == nil {
+					e["sha256"] = sum
 				}
-				e["sha256"] = sum
 			}
 		}
 		entries = append(entries, e)
@@ -175,9 +171,6 @@ func (s *Server) fsList(req proto.Message) (proto.Message, error) {
 		}
 		return nil
 	})
-	if hashErr != nil {
-		return nil, hashErr
-	}
 	if walkErr != nil {
 		return nil, fmt.Errorf("cannot list '%s': %v", root, walkErr)
 	}
