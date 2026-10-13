@@ -20,7 +20,7 @@ import (
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
 
-const AgentVersion = "0.1.0"
+const AgentVersion = "0.2.0"
 
 // Options configure the agent.
 type Options struct {
@@ -37,6 +37,10 @@ type Options struct {
 // Server serves one connection at a time (the app reconnects as needed).
 type Server struct {
 	opt Options
+
+	ops    map[string]opEntry
+	connMu sync.Mutex
+	conns  map[*conn]struct{}
 }
 
 func New(opt Options) *Server {
@@ -49,7 +53,9 @@ func New(opt Options) *Server {
 	if opt.HomeDir == "" {
 		opt.HomeDir, _ = os.UserHomeDir()
 	}
-	return &Server{opt: opt}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}}
+	s.registerBuiltins()
+	return s
 }
 
 // Serve accepts connections on l until it is closed.
@@ -70,6 +76,10 @@ func (s *Server) caps() []string {
 	}
 	if s.opt.AllowExec {
 		caps = append(caps, "exec")
+	}
+	caps = append(caps, "rpc")
+	if s.opt.AllowExec {
+		caps = append(caps, "jobs", "proc", "fs")
 	}
 	return caps
 }
@@ -96,7 +106,10 @@ func (s *Server) handle(c net.Conn) {
 			lg.Printf("send: %v", err)
 		}
 	}
-	send(proto.Message{"t": "hello", "v": proto.Version, "os": runtime.GOOS, "agent": AgentVersion,
+	cn := &conn{send: send}
+	s.addConn(cn)
+	defer s.removeConn(cn)
+	send(proto.Message{"t": "hello", "v": proto.Version, "proto": proto.RPCVersion, "os": runtime.GOOS, "agent": AgentVersion,
 		"token": s.opt.Token, "caps": s.caps()})
 
 	done := make(chan struct{})
@@ -131,6 +144,8 @@ func (s *Server) handle(c net.Conn) {
 		case "ping":
 			send(proto.Message{"t": "pong"})
 		case "pong", "welcome":
+		case "req":
+			go s.dispatch(m, send)
 		case "clipboard.get":
 			text, err := s.opt.Clipboard.Text()
 			if err != nil {

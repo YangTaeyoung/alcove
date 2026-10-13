@@ -11,6 +11,9 @@ import (
 
 const Version = 1
 
+// RPCVersion is the request/response layer revision announced in hello.
+const RPCVersion = 2
+
 // Message is a loosely typed envelope: every message carries "t"; the other
 // fields are decoded on demand.
 type Message map[string]any
@@ -36,6 +39,52 @@ func (m Message) Int(key string) int {
 		return v
 	}
 	return 0
+}
+
+// Bool returns a boolean field or false.
+func (m Message) Bool(key string) bool {
+	b, _ := m[key].(bool)
+	return b
+}
+
+// Has reports whether the key is present.
+func (m Message) Has(key string) bool {
+	_, ok := m[key]
+	return ok
+}
+
+// Strings returns a JSON array of strings, or nil when the field is missing,
+// not an array, or holds a non-string element.
+func (m Message) Strings(key string) []string {
+	arr, ok := m[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		s, ok := v.(string)
+		if !ok {
+			return nil
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// StringMap returns a JSON object of string values, or nil when the field is
+// missing or not an object. Non-string values are skipped.
+func (m Message) StringMap(key string) map[string]string {
+	obj, ok := m[key].(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(obj))
+	for k, v := range obj {
+		if s, ok := v.(string); ok {
+			out[k] = s
+		}
+	}
+	return out
 }
 
 // MaxLine bounds a single message (a file chunk of 256 KiB base64-encodes to ~350 KiB).
