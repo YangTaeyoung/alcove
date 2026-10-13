@@ -915,3 +915,23 @@ func TestOnStartRunsOncePerHelperThatBecameReady(t *testing.T) {
 		t.Fatalf("onStart ran %d times for two helpers, the second of which announced ready twice", got)
 	}
 }
+
+func TestFatalEventOfAReadyHelperIsReportedAsItIs(t *testing.T) {
+	const stopped = "the UI helper stopped: the pipe is being closed; retry, and restart alcove-agent if it repeats"
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		if n == 0 {
+			readRequests(in, func(map[string]any) bool { return false })
+			writeLine(out, map[string]any{"ev": "fatal", "error": stopped})
+			return
+		}
+		echoPlay(n, in, out)
+	})
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	if _, err := h.Call("ui.tree", nil, longWait); err == nil || err.Error() != stopped {
+		t.Fatalf("err %v", err)
+	}
+	if _, err := h.Call("ping", nil, longWait); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+}

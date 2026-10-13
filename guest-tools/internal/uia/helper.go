@@ -416,7 +416,14 @@ func (h *Helper) handleLine(c *child, line []byte) {
 	}
 	if name == "fatal" {
 		msg, _ := m["error"].(string)
-		h.terminate(c, fmt.Errorf("UI helper failed to start through PowerShell: %s", msg))
+		h.mu.Lock()
+		started := c.isReady
+		h.mu.Unlock()
+		if started {
+			h.terminate(c, errors.New(msg))
+		} else {
+			h.terminate(c, fmt.Errorf("UI helper failed to start through PowerShell: %s", msg))
+		}
 		return
 	}
 	if h.onEvent != nil {
