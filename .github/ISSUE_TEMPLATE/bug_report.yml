@@ -144,7 +144,7 @@ body:
 
         Guest agent:
 
-        - Windows: `C:\ProgramData\Alcove\agent.log`, and `C:\ProgramData\Alcove\install.log` for `--install` results
+        - Windows: `C:\ProgramData\Alcove\agent.log`, and `C:\ProgramData\Alcove\install.log` for `--install` results (the folder is readable by administrators only: read them from an elevated prompt)
         - Linux: `journalctl -u alcove-agent`
 
         Automation: run the MCP server or `alcovectl serve` in a terminal and paste its output.

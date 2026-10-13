@@ -78,7 +78,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   are `job.exited` ([Jobs](#jobs-execstart-execread-execwrite-execkill-execlist)),
   `process.exited` ([App launch](#app-launch-applaunch)), the window events
   ([Window events](#window-events)) and `events.dropped` (a connection's event
-  queue overflowed; `count` is how many events were dropped).
+  queue overflowed; it carries only `count`, the number of events dropped at
+  that place in the stream).
 
 ### Operations
 
@@ -212,7 +213,9 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - With `wait_window_ms` above 0 on an agent with the `ui` capability, the
   agent lists the windows before the start and then every 150 ms:
   - candidates are the titled windows that were not listed before the start
-    and not already claimed by another in-flight or finished `app.launch`;
+    and not already claimed by another in-flight or finished `app.launch` (a
+    claim ends when its window closes and when a helper starts; the agent
+    keeps the 1024 newest claims);
   - a candidate of the started process or one of its descendants is chosen,
     and beats a candidate of any other process whatever their sizes;
   - when the started process has exited, or 2 s after the start, a candidate
@@ -233,8 +236,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 ### Windows and UI Automation (`win.*`, `ui.*`)
 
 A Windows agent runs a helper (C# compiled by Windows PowerShell 5.1, .NET
-Framework UI Automation) as a child process in its own session and passes
-these operations to it. Other agents answer
+Framework UI Automation) as a child process in the agent's logon session and
+passes these operations to it. Other agents answer
 `UI Automation is only available on Windows guests`.
 
 **Helper process.** The agent starts the helper on the first `win.*` or
@@ -242,26 +245,46 @@ these operations to it. Other agents answer
 does not start on connect, so a wait for a window event must be preceded by
 `ui.ping` (and `app.launch` with `wait_window_ms: 0` does not start it). The
 helper runs in the agent's logon session. Its files are in
-`C:\ProgramData\Alcove\uia`: `bootstrap.ps1`, `helper.cs`,
-`helper-<first 16 hex digits of the SHA-256 of helper.cs>.dll`, `helper.log`
-and `helper.log.1` (1 MiB each), and a `tmp` folder the compile uses. That
+`C:\ProgramData\Alcove\uia`: `bootstrap.ps1`, `helper.cs`, `helper.log` and
+`helper.log.1` (1 MiB each), and a `tmp` folder the compile uses. Every start
+compiles `helper.cs` in memory; no compiled helper is stored. That
 folder and its parent `C:\ProgramData\Alcove` are given the owner
 Administrators and the access list "Administrators and SYSTEM: full control"
-with inheritance removed, through `SetNamedSecurityInfo` (`icacls` reads it
-back as `BUILTIN\Administrators:(OI)(CI)(F)` and
-`NT AUTHORITY\SYSTEM:(OI)(CI)(F)`). The lock is applied at install and
-re-checked at agent start and at every helper start; the parent keeps the
-agent's logs, the uia folder keeps only its logs, and a reparse point in
-either folder is removed rather than followed (the agent also refuses to open
-a log file that is a reparse point). When a folder cannot be locked the helper
-does not start:
-`the UI helper folder <dir> could not be locked (<reason>); fix its owner and access list, then retry`
-(a reparse point at the folder path gives `<dir> is a reparse point; remove it`
-as the reason). The helper's environment is the agent's without `COR_*`,
-`COMPlus_*`, `DOTNET_*` and `PSModulePath`, and `TEMP`/`TMP` point inside the
-locked folder. A start takes 0.25–0.35 s with a compiled helper and 0.5–1 s
-with a compile. The helper, and an app launched through `app.launch`, inherit
-the agent's elevated token.
+with inheritance removed (`icacls` reads it back as
+`BUILTIN\Administrators:(OI)(CI)(F)` and `NT AUTHORITY\SYSTEM:(OI)(CI)(F)`),
+so `agent.log`, `install.log` and `helper.log` are readable by administrators
+only. Each folder is opened without following a reparse point, and its owner
+and access list are checked and set on that handle (`SetSecurityInfo`). The lock is applied first thing at install and at
+agent start, before a log file is opened, and again at every helper start; the
+parent keeps the agent's logs, the uia folder keeps only its logs (every other
+entry is deleted at each start), and a reparse point in either folder,
+including one at the uia path, is removed rather than followed and the uia
+folder is created again. The agent opens no log file that is a reparse point
+and none inside a folder it could not lock. When a folder cannot be locked the
+helper does not start:
+`the UI helper folder <dir> could not be locked (<reason>); fix its owner and access list, then retry`.
+A reparse point at `C:\ProgramData\Alcove` itself gives the reason
+`C:\ProgramData\Alcove is a reparse point; remove it`; something at a folder
+path that is not a directory gives
+`<dir> is not a directory; remove it and restart alcove-agent`. Before a start
+the agent waits up to 10 s for the previous helper process to end
+(`the previous UI helper process has not ended after 10 s; retry`). A helper
+whose files cannot be written or compiled answers
+`the UI helper could not be prepared in <dir>: <reason>; check free space and the folder's access list`.
+On the wire these start failures follow
+`could not start the UI helper through PowerShell: ` (lock, wait and file
+failures) or `UI helper failed to start through PowerShell: ` (a failure the
+bootstrap script reports).
+The helper's environment is the agent's without `COR_*`, `COMPlus_*`,
+`DOTNET_*` and `PSModulePath`, and `TEMP`/`TMP` point inside the locked
+folder. Measured on the Windows 11 ARM64 test guest: the first `ui.ping` after
+an agent start answers after 0.59–0.60 s (1.1–1.3 s for the first one after a
+boot), of which the compile takes 0.35 s; a helper that was killed is replaced
+in 0.6–0.85 s. The helper, and an app launched through `app.launch`, inherit
+the agent's elevated token. `alcove-agent --install` locks the folders before
+it copies or registers anything and fails when they cannot be locked
+(`the Alcove data folder <dir> could not be locked (<reason>); fix its owner and access list with icacls, then run alcove-agent --install again`)
+or when `%ProgramData%` is empty; it then writes no `install.log`.
 
 **One request at a time.** The agent hands requests to the helper one by one
 in the order they arrived. An operation's time limit (20 s; 30 s for
@@ -332,11 +355,16 @@ than being hung, is not reported as not responding.
 - `close` posts `WM_CLOSE` and waits up to 2 s. `closed` says whether the
   window is gone; `window` is then `null`, otherwise the window as it is. A
   shell window (class `Progman`, `WorkerW`, `Shell_TrayWnd` or
-  `Shell_SecondaryTrayWnd`) is refused: `window <id> is part of the Windows shell and is not closed`.
-  A window the helper cannot post to answers
-  `window <id> belongs to a process the helper cannot send to`.
+  `Shell_SecondaryTrayWnd`) is refused:
+  `window <id> is part of the Windows shell and is not closed; close app windows only`.
+  When the message cannot be posted: a window that no longer exists answers
+  `closed: true` with `window: null`; one that denies the post answers
+  `window <id> belongs to a process the helper cannot send to`; any other
+  failure answers `window <id> could not be asked to close (error <n>); retry`
+  with the Windows error code.
 - A show-state change (`minimize`, `maximize`, `restore`) that does not take
-  within 2 s answers `window <id> "<title>" <what> within 2 s; the app may not allow it`
+  within 2 s answers
+  `window <id> "<title>" <what> within 2 s; the app may not allow it; use win.list to see its state`
   when the window still answers messages, and the
   `… check responding in win.list, then retry or end its process with proc.kill`
   form only when the window is hung.
@@ -388,7 +416,9 @@ interactive` keeps elements with a name, a value, keyboard focus support or
 an invoke pattern, and the control types people act on; `all` lists the raw
 view. `truncated` is true when a listed element did not fit in `max`, after
 20 s, and when an element disappeared during the walk. `depth` above 256
-answers `depth must be 256 or less; read deeper parts with root`.
+answers `depth must be 256 or less; read deeper parts with root`. A `root`
+that is a password field is listed alone, and a `root` below a password field
+is refused with the password sentence of `ui.text`.
 
 **`ui.text`** in `auto` mode returns the text pattern's document text, then
 the value, then the names (for edits and documents, the values) of the text,
@@ -397,10 +427,12 @@ then the element's name. `pattern` uses the text pattern alone
 (`the element has no text pattern; use mode auto or descendants`). A password
 field, or an element below one, answers
 `the element is a password field; its text is not read; it cannot be read through UI Automation`
-in every mode; a failed password-property read counts as a password field; and
+in every mode; a failed password-property read counts as a password field, as
+do a parent that cannot be read and a chain of more than 256 parents; and
 `ui.tree`, `ui.find` and the descendant text of `ui.text` do not list what is
-below a password field. The document text of a Chromium page shows a password
-field as bullets.
+below a password field. A node below a password field in a `ui.rect`, `ui.act`
+or `ui.focused` reply has the `password` flag, an empty `name` and no `value`.
+The document text of a Chromium page shows a password field as bullets.
 
 **`ui.rect`**: `cx`, `cy` are the centre of the element's rectangle;
 `clickable` is false with a `blocked` sentence when the rectangle is empty,
@@ -430,7 +462,9 @@ view first when it has a scroll-item pattern.
   within 0.5 s, `unresponsive: true` (a button that makes its window hang
   answers after about 2.1 s), otherwise `pending: true`.
 - When the element is gone after the action the reply carries the node as it
-  was before and `gone: true`.
+  was before and `gone: true`. The same reply is given when the element's
+  window no longer exists after the call and when the pattern call failed
+  because the element or its app went away during it.
 - A disabled element is refused before the call:
   `the element is disabled; wait until it is enabled`. More than eight `ui.act`
   calls still running in one app answer
@@ -463,17 +497,31 @@ agent sends one event per difference, each with the window object:
 | `window.foreground` | another window is in the foreground (also sent for a window without a title, such as the taskbar) |
 
 - An event arrives up to 300 ms after the change, plus under 2 ms for the
-  comparison. In one comparison the order is closed, opened (with
+  comparison (a `window.title` one comparison later). In one comparison the order is closed, opened (with
   `dialog.opened`), title, foreground.
 - The first comparison of a helper process sends nothing; changes while no
   helper runs are not reported. Events flow only while the helper runs, so a
   client that wants them sends `ui.ping` first to start it.
-- `window.title` and `window.foreground` are capped at one per window per
-  second, carrying the latest title or state.
-- Each connection has a bounded event queue. When it is full (a client that
-  does not read) events are dropped and counted, and once the connection
-  catches up the agent sends `{"t":"ev","name":"events.dropped","count":<n>}`;
-  a connection whose write stalls for 30 s is closed.
+- The first comparison of a helper also records the titles and the foreground
+  window, so a helper start sends no `window.title` or `window.foreground` for
+  windows that did not change.
+- At most one `window.title` is sent per window per second. A new title is
+  sent once it was the same in two comparisons in a row and a second has
+  passed since that window's previous `window.title`; a title that changes in
+  every comparison sends nothing until it rests, and a title that returns to
+  the one last sent sends nothing. The fixture's `Titles` button (a new title
+  every 50 ms for 5 s, then one held for 600 ms, then the base title) raises
+  two events: one for the held title and one for the base title.
+- At most one `window.foreground` is sent per window per second. One that
+  falls inside that second is sent once the second has passed, when the
+  window is still in front, so the last `window.foreground` names the window
+  in front.
+- Each connection has a bounded event queue of 256 messages. When it is full
+  (a client that does not read) events are dropped and counted, and the agent
+  puts `{"t":"ev","name":"events.dropped","count":<n>}` in the place of the
+  dropped events: before the next event that is queued, or after the last
+  queued message when no event follows. It carries only the count. A
+  connection whose write stalls for 30 s is closed.
 - A window that gets its title after it was shown is reported as opened at
   that moment. Short-lived system windows are reported like any other
   (`PopupHost` of class `Xaml_WindowedPopupClass` from the shell, the `Ghost`
@@ -573,9 +621,13 @@ reply can be several megabytes long. What bounds each reply the agent writes:
   `window.opened` show it.
 - UI Automation lists only the realized rows of a virtualized list, and the
   first read of a Chromium window after a page load can lack the page.
+- A Win32 edit control takes its `name` from the label before it in the
+  z-order of its siblings. `ui.act set_value` sometimes moves the edit in
+  front of its label; its `name` is then its own text (empty for a password
+  field). A `ref` or `automationId` keeps addressing it.
 - The helper serves no request while a UI Automation call into an
   unresponsive application waits; windows the system already reports as not
   responding are refused before the call.
 - A connection that does not read its events loses them: the agent drops the
-  overflow and reports the count with an `events.dropped` event once the
-  connection reads again.
+  overflow and reports the count with an `events.dropped` event at the place
+  of the dropped events.
