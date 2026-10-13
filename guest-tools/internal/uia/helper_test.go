@@ -101,20 +101,55 @@ func TestCallRoundTrip(t *testing.T) {
 	}
 }
 
-func TestConcurrentCallsMatchedByID(t *testing.T) {
-	const n = 20
+// waitQueued blocks until n calls wait for their turn.
+func waitQueued(t *testing.T, h *Helper, n int) {
+	t.Helper()
+	deadline := time.Now().Add(longWait)
+	for {
+		h.mu.Lock()
+		got := len(h.waiters)
+		h.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d calls wait for their turn, expected %d", got, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCallsReachTheHelperOneAtATimeInArrivalOrder(t *testing.T) {
+	const n = 12
+	var inside, most atomic.Int32
+	var mu sync.Mutex
+	var order []float64
+	release := make(chan struct{})
 	f := newFake(func(_ int, in io.Reader, out io.Writer) {
-		var reqs []map[string]any
-		readRequests(in, func(req map[string]any) bool {
-			reqs = append(reqs, req)
-			if len(reqs) < n {
-				return true
+		reqs := make(chan map[string]any, n)
+		go readRequests(in, func(req map[string]any) bool {
+			now := inside.Add(1)
+			for {
+				seen := most.Load()
+				if now <= seen || most.CompareAndSwap(seen, now) {
+					break
+				}
 			}
-			for i := len(reqs) - 1; i >= 0; i-- {
-				writeLine(out, map[string]any{"id": reqs[i]["id"], "ok": true, "x": reqs[i]["x"]})
-			}
-			return false
+			reqs <- req
+			return true
 		})
+		for req := range reqs {
+			mu.Lock()
+			order = append(order, req["x"].(float64))
+			first := len(order) == 1
+			mu.Unlock()
+			if first {
+				<-release
+			}
+			time.Sleep(2 * time.Millisecond)
+			inside.Add(-1)
+			writeLine(out, map[string]any{"id": req["id"], "ok": true, "x": req["x"]})
+		}
 	})
 	h := New(f.launcher(), nil)
 	defer h.Close()
@@ -130,14 +165,277 @@ func TestConcurrentCallsMatchedByID(t *testing.T) {
 				return
 			}
 			if got["x"] != float64(i) {
-				errs <- "wrong reply for call " + string(rune('A'+i))
+				errs <- "a call received the reply of another call"
 			}
 		}(i)
+		if i == 0 {
+			for h.busyNow() != "echo" {
+				time.Sleep(time.Millisecond)
+			}
+		} else {
+			waitQueued(t, h, i)
+		}
 	}
+	close(release)
 	wg.Wait()
 	close(errs)
 	for e := range errs {
 		t.Error(e)
+	}
+	if got := most.Load(); got != 1 {
+		t.Errorf("%d requests were inside the helper at once", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != n {
+		t.Fatalf("the helper received %d requests", len(order))
+	}
+	for i, x := range order {
+		if x != float64(i) {
+			t.Fatalf("the helper received the calls in the order %v", order)
+		}
+	}
+}
+
+func TestTimeoutOfAQueuedCallStartsWhenTheHelperReceivesIt(t *testing.T) {
+	f := newFake(func(_ int, in io.Reader, out io.Writer) {
+		readRequests(in, func(req map[string]any) bool {
+			if req["op"] == "slow" {
+				time.Sleep(400 * time.Millisecond)
+			}
+			writeLine(out, map[string]any{"id": req["id"], "ok": true, "op": req["op"]})
+			return true
+		})
+	})
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	slow := make(chan error, 1)
+	go func() {
+		_, err := h.Call("slow", nil, longWait)
+		slow <- err
+	}()
+	for h.busyNow() != "slow" {
+		time.Sleep(time.Millisecond)
+	}
+	got, err := h.Call("fast", nil, 200*time.Millisecond)
+	if err != nil || got["op"] != "fast" {
+		t.Fatalf("queued call: %v %v", got, err)
+	}
+	if err := <-slow; err != nil {
+		t.Fatal(err)
+	}
+	if got := f.launches.Load(); got != 1 {
+		t.Fatalf("launches %d", got)
+	}
+}
+
+// busyNow returns the op of the call that holds the helper, or "".
+func (h *Helper) busyNow() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.busyOp
+}
+
+func TestQueuedCallAnswersBusyAfterTheQueueWaitAndTheHelperKeepsRunning(t *testing.T) {
+	release := make(chan struct{})
+	f := newFake(func(_ int, in io.Reader, out io.Writer) {
+		readRequests(in, func(req map[string]any) bool {
+			if req["op"] == "ui.tree" {
+				<-release
+			}
+			writeLine(out, map[string]any{"id": req["id"], "ok": true, "op": req["op"]})
+			return true
+		})
+	})
+	h := New(f.launcher(), nil)
+	h.queueWait = 100 * time.Millisecond
+	defer h.Close()
+	long := make(chan error, 1)
+	go func() {
+		_, err := h.Call("ui.tree", nil, longWait)
+		long <- err
+	}()
+	for h.busyNow() != "ui.tree" {
+		time.Sleep(time.Millisecond)
+	}
+	_, err := h.Call("win.list", nil, longWait)
+	if err == nil || err.Error() != "the UI helper is busy with 'ui.tree'; retry" {
+		t.Fatalf("err %v", err)
+	}
+	waitQueued(t, h, 0)
+	select {
+	case <-f.killed[0]:
+		t.Fatal("the helper was killed")
+	default:
+	}
+	close(release)
+	if err := <-long; err != nil {
+		t.Fatalf("the call that held the helper: %v", err)
+	}
+	if got, err := h.Call("win.list", nil, longWait); err != nil || got["op"] != "win.list" {
+		t.Fatalf("call after the busy answer: %v %v", got, err)
+	}
+	if got := f.launches.Load(); got != 1 {
+		t.Fatalf("launches %d", got)
+	}
+}
+
+func TestCallQueuedBehindATimedOutCallRunsInTheNextHelper(t *testing.T) {
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		readRequests(in, func(req map[string]any) bool {
+			if n > 0 {
+				writeLine(out, map[string]any{"id": req["id"], "ok": true, "op": req["op"], "launch": n})
+			}
+			return true
+		})
+	})
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	stuck := make(chan error, 1)
+	go func() {
+		_, err := h.Call("ui.tree", nil, 150*time.Millisecond)
+		stuck <- err
+	}()
+	for h.busyNow() != "ui.tree" {
+		time.Sleep(time.Millisecond)
+	}
+	type reply struct {
+		fields map[string]any
+		err    error
+	}
+	queued := make(chan reply, 2)
+	for _, op := range []string{"win.list", "ui.find"} {
+		op := op
+		go func() {
+			got, err := h.Call(op, nil, longWait)
+			queued <- reply{got, err}
+		}()
+		for !h.queuedOp(op) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if err := <-stuck; err == nil || err.Error() != "UI helper did not answer 'ui.tree' within 0.15 s; it was restarted" {
+		t.Fatalf("err %v", err)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		r := <-queued
+		if r.err != nil {
+			t.Fatalf("queued call: %v", r.err)
+		}
+		if r.fields["launch"] != float64(1) {
+			t.Fatalf("queued call answered by %v", r.fields)
+		}
+		seen[r.fields["op"].(string)] = true
+	}
+	if !seen["win.list"] || !seen["ui.find"] {
+		t.Fatalf("answered ops %v", seen)
+	}
+	if got := f.launches.Load(); got != 2 {
+		t.Fatalf("launches %d", got)
+	}
+}
+
+// queuedOp reports whether a call of op waits for its turn.
+func (h *Helper) queuedOp(op string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, w := range h.waiters {
+		if w.op == op {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCallQueuedBehindACallWhoseHelperExitedRunsInTheNextHelper(t *testing.T) {
+	die := make(chan struct{})
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		if n == 0 {
+			<-die
+			out.(io.Closer).Close()
+			return
+		}
+		echoPlay(n, in, out)
+	})
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	first := make(chan error, 1)
+	go func() {
+		_, err := h.Call("ui.tree", nil, longWait)
+		first <- err
+	}()
+	for h.busyNow() != "ui.tree" {
+		time.Sleep(time.Millisecond)
+	}
+	second := make(chan error, 1)
+	go func() {
+		_, err := h.Call("win.list", map[string]any{"x": 1}, longWait)
+		second <- err
+	}()
+	waitQueued(t, h, 1)
+	close(die)
+	if err := <-first; err == nil || err.Error() != "UI helper exited; retry" {
+		t.Fatalf("call inside the helper that exited: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("queued call: %v", err)
+	}
+	if got := f.launches.Load(); got != 2 {
+		t.Fatalf("launches %d", got)
+	}
+}
+
+func TestCallTimesOutWhenTheHelperDoesNotReadItsInput(t *testing.T) {
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		if n > 0 {
+			echoPlay(n, in, out)
+		}
+	})
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	_, err := h.Call("ui.tree", nil, 100*time.Millisecond)
+	if err == nil || err.Error() != "UI helper did not answer 'ui.tree' within 0.1 s; it was restarted" {
+		t.Fatalf("err %v", err)
+	}
+	select {
+	case <-f.killed[0]:
+	case <-time.After(longWait):
+		t.Fatal("child not killed")
+	}
+	if _, err := h.Call("ping", map[string]any{"x": 1}, longWait); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseFailsCallsThatWaitForTheirTurn(t *testing.T) {
+	f := newFake(func(_ int, in io.Reader, out io.Writer) {
+		readRequests(in, func(map[string]any) bool { return true })
+	})
+	h := New(f.launcher(), nil)
+	errs := make(chan error, 2)
+	go func() {
+		_, err := h.Call("ui.tree", nil, longWait)
+		errs <- err
+	}()
+	for h.busyNow() != "ui.tree" {
+		time.Sleep(time.Millisecond)
+	}
+	go func() {
+		_, err := h.Call("win.list", nil, longWait)
+		errs <- err
+	}()
+	waitQueued(t, h, 1)
+	h.Close()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if err == nil || err.Error() != "UI helper is closed" {
+				t.Fatalf("err %v", err)
+			}
+		case <-time.After(longWait):
+			t.Fatal("a call did not return after Close")
+		}
 	}
 }
 
@@ -276,10 +574,9 @@ func TestHelperRestartsAfterExit(t *testing.T) {
 }
 
 func TestHelperTimeoutKillsAndRestarts(t *testing.T) {
-	got := make(chan struct{}, 4)
 	f := newFake(func(n int, in io.Reader, out io.Writer) {
 		if n == 0 {
-			readRequests(in, func(map[string]any) bool { got <- struct{}{}; return true })
+			readRequests(in, func(map[string]any) bool { return true })
 			return
 		}
 		echoPlay(n, in, out)
@@ -287,12 +584,6 @@ func TestHelperTimeoutKillsAndRestarts(t *testing.T) {
 	h := New(f.launcher(), nil)
 	defer h.Close()
 
-	other := make(chan error, 1)
-	go func() {
-		_, err := h.Call("win.list", nil, longWait)
-		other <- err
-	}()
-	<-got
 	_, err := h.Call("ui.tree", nil, 100*time.Millisecond)
 	if err == nil || err.Error() != "UI helper did not answer 'ui.tree' within 0.1 s; it was restarted" {
 		t.Fatalf("err %v", err)
@@ -301,14 +592,6 @@ func TestHelperTimeoutKillsAndRestarts(t *testing.T) {
 	case <-f.killed[0]:
 	case <-time.After(longWait):
 		t.Fatal("child not killed")
-	}
-	select {
-	case err := <-other:
-		if err == nil || err.Error() != "UI helper exited; retry" {
-			t.Fatalf("other pending call: %v", err)
-		}
-	case <-time.After(longWait):
-		t.Fatal("other pending call not failed")
 	}
 	if _, err := h.Call("ping", map[string]any{"x": 1}, longWait); err != nil {
 		t.Fatal(err)

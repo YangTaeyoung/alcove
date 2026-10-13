@@ -21,6 +21,11 @@ const (
 	errClosed = "UI helper is closed"
 )
 
+const (
+	defaultStartTimeout = 120 * time.Second
+	defaultQueueWait    = 60 * time.Second
+)
+
 // Launcher starts the helper child and returns its pipes.
 type Launcher func() (stdin io.WriteCloser, stdout io.ReadCloser, kill func(), err error)
 
@@ -35,8 +40,6 @@ type child struct {
 	stdout io.ReadCloser
 	kill   func()
 
-	wmu sync.Mutex // serializes request lines on stdin
-
 	// guarded by Helper.mu
 	pending    map[int64]chan result
 	dead       bool
@@ -49,28 +52,41 @@ type child struct {
 	readerDone chan struct{}
 }
 
-const defaultStartTimeout = 120 * time.Second
+// waiter is a call that waits for its turn in the helper.
+type waiter struct {
+	op   string
+	turn chan struct{} // closed when the call may proceed or the Helper was closed
+
+	// guarded by Helper.mu
+	granted bool
+}
 
 // Helper manages the helper child: it starts lazily, serves one child at a
-// time and starts a new one after the child exits or times out.
+// time and starts a new one after the child exits or times out. Calls go to
+// the child one at a time, in the order they arrived.
 type Helper struct {
 	launch  Launcher
 	onEvent func(name string, fields map[string]any)
 
 	startTimeout time.Duration
+	queueWait    time.Duration
 	logPath      string
 
-	mu     sync.Mutex
-	logger *log.Logger
-	cur    *child
-	nextID int64
-	closed bool
+	mu      sync.Mutex
+	logger  *log.Logger
+	cur     *child
+	nextID  int64
+	closed  bool
+	busy    bool   // a call holds the helper
+	busyOp  string // the op of that call
+	waiters []*waiter
 }
 
 // New returns a Helper that starts the child through launch on the first Call.
 // onEvent receives helper events with the "ev" key removed; it may be nil.
 func New(launch Launcher, onEvent func(name string, fields map[string]any)) *Helper {
-	return &Helper{launch: launch, onEvent: onEvent, logger: log.Default(), startTimeout: defaultStartTimeout}
+	return &Helper{launch: launch, onEvent: onEvent, logger: log.Default(),
+		startTimeout: defaultStartTimeout, queueWait: defaultQueueWait}
 }
 
 // SetLogPath sets the helper log file named in start-timeout errors.
@@ -87,9 +103,72 @@ func (h *Helper) SetLogger(l *log.Logger) {
 	h.mu.Unlock()
 }
 
+// acquire waits until no other call is inside the helper. A call that waits
+// longer than the queue wait gives up and names the op that holds the helper.
+func (h *Helper) acquire(op string) error {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return errors.New(errClosed)
+	}
+	if !h.busy {
+		h.busy, h.busyOp = true, op
+		h.mu.Unlock()
+		return nil
+	}
+	w := &waiter{op: op, turn: make(chan struct{})}
+	h.waiters = append(h.waiters, w)
+	wait := h.queueWait
+	h.mu.Unlock()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-w.turn:
+	case <-timer.C:
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if w.granted {
+		return nil
+	}
+	if h.closed {
+		return errors.New(errClosed)
+	}
+	for i, other := range h.waiters {
+		if other == w {
+			h.waiters = append(h.waiters[:i], h.waiters[i+1:]...)
+			break
+		}
+	}
+	return fmt.Errorf("the UI helper is busy with '%s'; retry", h.busyOp)
+}
+
+// release hands the helper to the call that has waited longest, if any.
+func (h *Helper) release() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.waiters) == 0 {
+		h.busy, h.busyOp = false, ""
+		return
+	}
+	w := h.waiters[0]
+	h.waiters = h.waiters[1:]
+	w.granted = true
+	h.busyOp = w.op
+	close(w.turn)
+}
+
 // Call sends one request and waits for its reply; it starts or restarts the
-// child as needed. The returned fields exclude "id" and "ok".
+// child as needed. The returned fields exclude "id" and "ok". The call waits
+// for its turn first; timeout counts from the moment the request is handed to
+// the child, and a child that does not answer within it is killed.
 func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (map[string]any, error) {
+	if err := h.acquire(op); err != nil {
+		return nil, err
+	}
+	defer h.release()
+
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -145,17 +224,14 @@ func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (
 		return nil, fmt.Errorf("UI request '%s' cannot be encoded: %v", op, err)
 	}
 	line = append(line, '\n')
-	c.wmu.Lock()
-	_, err = c.stdin.Write(line)
-	c.wmu.Unlock()
-	if err != nil {
-		h.terminate(c, errors.New(errExited))
-		r := <-ch
-		return r.fields, r.err
-	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	go func() {
+		if _, err := c.stdin.Write(line); err != nil {
+			h.terminate(c, errors.New(errExited))
+		}
+	}()
 	select {
 	case r := <-ch:
 		return r.fields, r.err
@@ -172,11 +248,15 @@ func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (
 		strconv.FormatFloat(timeout.Seconds(), 'f', -1, 64))
 }
 
-// Close kills the child and fails pending calls; later calls fail.
+// Close kills the child and fails pending and waiting calls; later calls fail.
 func (h *Helper) Close() {
 	h.mu.Lock()
 	h.closed = true
 	c := h.cur
+	for _, w := range h.waiters {
+		close(w.turn)
+	}
+	h.waiters = nil
 	h.mu.Unlock()
 	if c != nil {
 		h.terminate(c, errors.New(errClosed))
