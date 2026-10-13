@@ -36,7 +36,10 @@ public actor AgentClient {
         case end(String)
     }
 
+    /// The events of the connection. The stream keeps the newest `eventBacklog` events a reader has not taken and
+    /// ends when the client is released; `.disconnected` is the last event of a connection.
     public nonisolated let events: AsyncStream<Event>
+    public static let eventBacklog = 1000
     private let eventContinuation: AsyncStream<Event>.Continuation
     private var transport: TCPLineTransport?
     /// Handles the transport's lines and its end one at a time in the order they arrived.
@@ -50,12 +53,13 @@ public actor AgentClient {
 
     public init() {
         var c: AsyncStream<Event>.Continuation!
-        events = AsyncStream(bufferingPolicy: .unbounded) { c = $0 }
+        events = AsyncStream(bufferingPolicy: .bufferingNewest(AgentClient.eventBacklog)) { c = $0 }
         eventContinuation = c
     }
 
     deinit {
         readerTask?.cancel()
+        eventContinuation.finish()
     }
 
     /// Connect to `127.0.0.1:port`, wait for `hello`, check the token (when

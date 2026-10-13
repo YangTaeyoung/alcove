@@ -170,13 +170,13 @@ final class ObservationTests: XCTestCase {
         let click: [ToQEMU] = [.abs(con: 0, x: 0, y: 0), .btn(con: 0, button: .left, down: true), .sync,
                                .btn(con: 0, button: .left, down: false), .sync]
         let absent = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 0, "y": 0, "hold": 1])
-        XCTAssertEqual(absent, [:])
+        XCTAssertEqual(absent, ["eventSeq": 0])
         let none = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 0, "y": 0, "hold": 1, "observe": "none"])
-        XCTAssertEqual(none, [:])
+        XCTAssertEqual(none, ["eventSeq": 0])
         let sent = await t.sent
         XCTAssertEqual(sent, click + click)
         let key = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "a", "observe": "none"])
-        XCTAssertEqual(key, [:])
+        XCTAssertEqual(key, ["eventSeq": 0])
         let frameCalls = await t.frameCalls
         XCTAssertEqual(frameCalls, 1)
     }
@@ -186,7 +186,7 @@ final class ObservationTests: XCTestCase {
         let (h, t) = await setup(frames: [base, paint(base, tileX: 2, tileY: 1)])
         let r = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 0, "y": 0, "hold": 1, "observe": "summary",
                                                                   "settleMs": 60, "settleTimeoutMs": 1000])
-        XCTAssertEqual(r.objectValue?.keys.sorted(), ["observation"])
+        XCTAssertEqual(r.objectValue?.keys.sorted(), ["eventSeq", "observation"])
         let o = try XCTUnwrap(r["observation"])
         XCTAssertEqual(o["settled"]?.boolValue, true)
         XCTAssertEqual(o["changed"], ["x": 64, "y": 32, "w": 32, "h": 32])
@@ -276,14 +276,14 @@ final class ObservationTests: XCTestCase {
         let (h, t) = await setup(frames: [base, paint(base, tileX: 2, tileY: 1)])
         await t.setFailingFrameCalls([1])
         let r = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 0, "y": 0, "hold": 1, "observe": "summary", "settleMs": 60])
-        XCTAssertEqual(r, ["observationError": "the screen could not be read after vm.mouse.click: no surface is mapped; call vm.screenshot to see the result"])
+        XCTAssertEqual(r, ["observationError": "the screen could not be read after vm.mouse.click: no surface is mapped; call vm.screenshot to see the result", "eventSeq": 0])
         let sent = await t.sent
         XCTAssertEqual(sent, [.abs(con: 0, x: 0, y: 0), .btn(con: 0, button: .left, down: true), .sync,
                               .btn(con: 0, button: .left, down: false), .sync])
 
         await t.setFailingFrameCalls([4])
         let later = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift", "observe": "image", "settleMs": 200])
-        XCTAssertEqual(later.objectValue?.keys.sorted(), ["observationError"])
+        XCTAssertEqual(later.objectValue?.keys.sorted(), ["eventSeq", "observationError"])
         let after = await t.sent
         XCTAssertEqual(after.last, .key(mac: ObservationTests.shift, q: nil, down: true))
     }
@@ -296,7 +296,7 @@ final class ObservationTests: XCTestCase {
         await t.setFailingFrameCalls([1])
         let steps: JSON = [["op": "vm.key.down", "key": "shift"], ["op": "vm.key.press", "keys": "hyper+x"], ["op": "vm.key.up", "key": "shift"]]
         let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": steps, "observe": "summary", "settleMs": 60])
-        XCTAssertEqual(r.objectValue?.keys.sorted(), ["completed", "error", "failedStep", "observationError", "results"])
+        XCTAssertEqual(r.objectValue?.keys.sorted(), ["completed", "error", "eventSeq", "failedStep", "observationError", "results"])
         XCTAssertEqual(r["completed"]?.intValue, 1)
         XCTAssertEqual(r["results"], [[:]])
         XCTAssertEqual(r["failedStep"]?.intValue, 1)
@@ -307,7 +307,7 @@ final class ObservationTests: XCTestCase {
 
         await t.setFailingFrameCalls([3])
         let finished = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.up", "key": "shift"]], "observe": "diff", "settleMs": 60])
-        XCTAssertEqual(finished, ["completed": 1, "results": [[:]], "observationError": .string(observationError)])
+        XCTAssertEqual(finished, ["completed": 1, "results": [[:]], "observationError": .string(observationError), "eventSeq": 0])
         sent = await t.sent
         XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
     }
@@ -336,7 +336,7 @@ final class ObservationTests: XCTestCase {
         var sent = await t.sent
         XCTAssertEqual(sent, [])
         let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [down, ["op": "vm.key.up", "key": "shift", "name": "Win"]]])
-        XCTAssertEqual(r, ["completed": 2, "results": [[:], [:]]])
+        XCTAssertEqual(r, ["completed": 2, "results": [[:], [:]], "eventSeq": 0])
         sent = await t.sent
         XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
         let noName = await failure(h, "vm.batch", ["steps": [["op": "vm.key.down", "key": "shift", "name": "Win"]]])
@@ -346,11 +346,11 @@ final class ObservationTests: XCTestCase {
     func testMouseDownUpSendButtons() async throws {
         let (h, t) = await setup(frames: [solid(320, 192, 40)])
         let down = try await h.handle(op: "vm.mouse.down", params: ["name": "Win", "x": 319, "y": 191, "button": "right"])
-        XCTAssertEqual(down, [:])
+        XCTAssertEqual(down, ["eventSeq": 0])
         var sent = await t.sent
         XCTAssertEqual(sent, [.abs(con: 0, x: 32767, y: 32767), .btn(con: 0, button: .right, down: true), .sync])
         let up = try await h.handle(op: "vm.mouse.up", params: ["name": "Win", "button": "right"])
-        XCTAssertEqual(up, [:])
+        XCTAssertEqual(up, ["eventSeq": 0])
         sent = await t.sent
         XCTAssertEqual(Array(sent.dropFirst(3)), [.btn(con: 0, button: .right, down: false), .sync])
 
@@ -395,7 +395,7 @@ final class ObservationTests: XCTestCase {
             ["op": "vm.wait_idle", "seconds": 0, "timeout": 5],
         ]
         let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": steps, "observe": "summary", "settleMs": 60])
-        XCTAssertEqual(r.objectValue?.keys.sorted(), ["completed", "observation", "results"])
+        XCTAssertEqual(r.objectValue?.keys.sorted(), ["completed", "eventSeq", "observation", "results"])
         XCTAssertEqual(r["completed"]?.intValue, 7)
         XCTAssertEqual(r["results"], [[:], [:], [:], [:], [:], [:], ["idle": true]])
         XCTAssertEqual(r["observation"]?["settled"]?.boolValue, true)
@@ -411,7 +411,7 @@ final class ObservationTests: XCTestCase {
         ])
 
         let plain = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.down", "key": "shift"]]])
-        XCTAssertEqual(plain, ["completed": 1, "results": [[:]]])
+        XCTAssertEqual(plain, ["completed": 1, "results": [[:]], "eventSeq": 0])
     }
 
     func testBatchStopsAtFirstFailure() async throws {
@@ -420,7 +420,7 @@ final class ObservationTests: XCTestCase {
         let shift = ObservationTests.shift
         let steps: JSON = [["op": "vm.key.down", "key": "shift"], ["op": "vm.key.press", "keys": "hyper+x"], ["op": "vm.key.up", "key": "shift"]]
         let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": steps])
-        XCTAssertEqual(r.objectValue?.keys.sorted(), ["completed", "error", "failedStep", "results"])
+        XCTAssertEqual(r.objectValue?.keys.sorted(), ["completed", "error", "eventSeq", "failedStep", "results"])
         XCTAssertEqual(r["completed"]?.intValue, 1)
         XCTAssertEqual(r["results"], [[:]])
         XCTAssertEqual(r["failedStep"]?.intValue, 1)
@@ -433,11 +433,11 @@ final class ObservationTests: XCTestCase {
         XCTAssertEqual(observed["observation"]?["changed"], ["x": 64, "y": 32, "w": 32, "h": 32])
 
         let missing = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.mouse.click", "x": 1]]])
-        XCTAssertEqual(missing, ["completed": 0, "results": [], "failedStep": 0, "error": "missing or invalid parameter 'y'"])
+        XCTAssertEqual(missing, ["completed": 0, "results": [], "failedStep": 0, "error": "missing or invalid parameter 'y'", "eventSeq": 0])
 
         sent = await t.sent
         let waitFor = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.wait_for", "text": "Ready"], ["op": "vm.key.press", "keys": "a"]]])
-        XCTAssertEqual(waitFor, ["completed": 0, "results": [], "failedStep": 0, "error": "missing or invalid parameter 'conditions'"])
+        XCTAssertEqual(waitFor, ["completed": 0, "results": [], "failedStep": 0, "error": "missing or invalid parameter 'conditions'", "eventSeq": 0])
         let after = await t.sent
         XCTAssertEqual(after, sent)
     }

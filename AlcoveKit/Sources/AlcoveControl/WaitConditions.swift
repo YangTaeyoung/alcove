@@ -52,8 +52,9 @@ enum WaitCondition: Sendable {
     case windowTitle(contains: String?, pattern: NSRegularExpression?)
     /// The text of an element stayed the same for `quietMs`.
     case uiTextStable(element: [String: JSON], quietMs: Int)
-    /// A guest event named `name` arrived, with a window title containing `titleContains` when given.
-    case event(name: String, titleContains: String?)
+    /// A guest event named `name` arrived, with a window title containing `titleContains` when given. With `since` the
+    /// events after that sequence number count; without it those after the VM's event baseline.
+    case event(name: String, titleContains: String?, since: Int?)
 
     static let typeNames = ["screen_idle", "region_changed", "text_visible", "text_gone", "process_started", "process_exited",
                             "file_exists", "port_listening", "log_matches", "job_output_matches",
@@ -244,7 +245,12 @@ enum WaitCondition: Sendable {
             guard (contains == nil) != (source == nil) else { throw fail("window_title needs exactly one of 'contains' and 'regex'") }
             return .windowTitle(contains: contains, pattern: try source.map { try compile($0, regexOptions: [], index: index) })
         case "event":
-            return .event(name: try text("event")!, titleContains: try text("titleContains", required: false))
+            var since: Int?
+            if let v = fields["since"], v != .null {
+                guard let seq = v.intValue, seq >= 0 else { throw fail("'since' must be an integer of 0 or more; pass the eventSeq of an earlier reply") }
+                since = seq
+            }
+            return .event(name: try text("event")!, titleContains: try text("titleContains", required: false), since: since)
         default:
             throw fail("unknown type '\(type)'; valid types: \(typeNames.joined(separator: ", "))")
         }

@@ -238,6 +238,50 @@ final class AgentClientTests: XCTestCase {
         XCTAssertEqual(payload["code"]?.intValue, 0)
     }
 
+    /// Polls `condition` every 10 ms for up to 20 s; returns whether it held.
+    private func soon(_ condition: @Sendable () async -> Bool) async -> Bool {
+        for _ in 0..<2000 {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
+    }
+
+    func testEventStreamEndsWhenTheClientIsReleased() async throws {
+        var client: AgentClient? = AgentClient()
+        let stream = try XCTUnwrap(client).events
+        client = nil
+        let ended = LockedBox(false)
+        Task {
+            for await _ in stream {}
+            ended.value = true
+        }
+        let finished = await soon { ended.value }
+        XCTAssertTrue(finished)
+    }
+
+    func testEventStreamKeepsTheNewestEventsAndTheDisconnect() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.handler = { m, _ in m["op"]?.stringValue == "ping" ? [["t": "res", "id": m["id"] ?? .null, "ok": true, "pong": true]] : [] }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let count = AgentClient.eventBacklog + 500
+        for i in 0..<count { agent.sendLine(["t": "ev", "name": "tick", "i": .int(Int64(i))]) }
+        let reply = try await client.call("ping", [:], timeout: .seconds(20))
+        XCTAssertEqual(reply["pong"], true)
+        agent.drop()
+        let ended = await soon { await !client.isConnected }
+        XCTAssertTrue(ended)
+
+        var kept: [AgentClient.Event] = []
+        var it = client.events.makeAsyncIterator()
+        while kept.last != .disconnected, kept.count <= count, let event = await it.next() { kept.append(event) }
+        XCTAssertEqual(kept.count, AgentClient.eventBacklog)
+        XCTAssertEqual(kept.last, .disconnected)
+        guard case .agent(_, let oldest)? = kept.first else { return XCTFail("\(String(describing: kept.first))") }
+        XCTAssertEqual(oldest["i"]?.intValue, count - (AgentClient.eventBacklog - 1))
+    }
+
     func testEventsArriveInWireOrder() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         let client = AgentClient()

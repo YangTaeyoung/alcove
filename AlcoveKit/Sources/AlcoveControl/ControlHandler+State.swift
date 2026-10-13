@@ -12,7 +12,7 @@ extension ControlHandler {
         guard let provisioning = registry as? VMProvisioning else {
             throw ControlError.failed("this control host cannot clone or delete VMs")
         }
-        guard await registry.target(named: name) != nil else { throw ControlError.noSuchVM(name) }
+        _ = try await target(params)
         do {
             if op == "vm.clone" {
                 let newName = try string(params, "newName").trimmingCharacters(in: .whitespacesAndNewlines)

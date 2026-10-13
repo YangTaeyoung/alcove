@@ -55,6 +55,18 @@ private let messageEdit = node("e4", "Edit", "Message", depth: 1, x: 150, y: 60,
 
 private let noUISentence = "UI Automation is only available on Windows guests with current guest tools; update alcove-agent in 'Win'"
 
+/// A registry of one VM that counts its lookups.
+private actor CountingRegistry: VMRegistry {
+    private let only: FakeTarget
+    private(set) var lookups = 0
+    init(_ target: FakeTarget) { only = target }
+    func names() async -> [String] { [only.name] }
+    func target(named name: String) async -> VMTarget? {
+        lookups += 1
+        return name == only.name ? only : nil
+    }
+}
+
 /// A registry of one VM whose target can be replaced.
 private actor SwapRegistry: VMRegistry {
     private var current: FakeTarget
@@ -184,7 +196,7 @@ final class ControlUITests: XCTestCase {
 
         let move = try await h.handle(op: "vm.window.action", params: ["name": "Win", "window": "Alcove", "action": "move", "x": 40, "y": 30,
                                                                          "width": 9, "height": 9])
-        XCTAssertEqual(move, ["window": moved])
+        XCTAssertEqual(move, ["window": moved, "eventSeq": 0])
         XCTAssertEqual(fields(agentRequests(agent, "win.action").last), ["window": "Alcove", "action": "move", "x": 40, "y": 30])
 
         _ = try await h.handle(op: "vm.window.action", params: ["name": "Win", "window": "0x2a", "action": "resize", "width": 640, "height": 480, "x": 1])
@@ -331,7 +343,7 @@ final class ControlUITests: XCTestCase {
     func testUIClickUsesRectCentre() async throws {
         let (h, t, agent) = try await rig(["ui.rect": { _, _ in .ok(["node": sendButton, "cx": 190, "cy": 112, "clickable": true]) }])
         let r = try await h.handle(op: "vm.ui.click", params: ["name": "Win", "selector": ["role": "Button", "name": "Send"]])
-        XCTAssertEqual(r, ["x": 190, "y": 112, "node": sendButton])
+        XCTAssertEqual(r, ["x": 190, "y": 112, "node": sendButton, "eventSeq": 0])
         XCTAssertEqual(fields(agentRequests(agent, "ui.rect").last), ["role": "Button", "name": "Send", "scroll": true])
         var sent = await t.sent
         XCTAssertEqual(sent, [absolute(190, 112), .btn(con: 0, button: .left, down: true), .sync, .btn(con: 0, button: .left, down: false), .sync])
@@ -384,7 +396,7 @@ final class ControlUITests: XCTestCase {
         let (h, t, agent) = try await rig(["ui.rect": { _, _ in .ok(["node": messageEdit, "cx": 250, "cy": 72, "clickable": true]) }])
         let r = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "selector": ["role": "Edit", "name": "Message"],
                                                                 "text": "Hi 1", "clear": true, "submit": true])
-        XCTAssertEqual(r, ["node": messageEdit])
+        XCTAssertEqual(r, ["node": messageEdit, "eventSeq": 0])
         XCTAssertEqual(fields(agentRequests(agent, "ui.rect").last), ["role": "Edit", "name": "Message", "scroll": true])
         var sent = await t.sent
         XCTAssertEqual(Array(sent.prefix(5)), [absolute(250, 72), .btn(con: 0, button: .left, down: true), .sync,
@@ -423,7 +435,7 @@ final class ControlUITests: XCTestCase {
         let (h, t, agent) = try await rig(["ui.act": { _, _ in .ok(["node": after]) }])
         let r = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "selector": ["role": "Edit", "name": "Message"],
                                                                   "action": "set_value", "value": "새 값 \"x\""])
-        XCTAssertEqual(r, ["node": after])
+        XCTAssertEqual(r, ["node": after, "eventSeq": 0])
         XCTAssertEqual(fields(agentRequests(agent, "ui.act").last), ["role": "Edit", "name": "Message", "action": "set_value", "value": "새 값 \"x\""])
 
         let invoked = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e5", "action": "invoke", "observe": "summary", "settleMs": 20])
@@ -452,7 +464,52 @@ final class ControlUITests: XCTestCase {
         await t.setFailingFrameCalls([1])
         let r = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e5", "action": "invoke", "observe": "summary", "settleMs": 20])
         XCTAssertEqual(r, ["node": sendButton,
-                           "observationError": "the screen could not be read after vm.ui.action: no surface is mapped; call vm.screenshot to see the result"])
+                           "observationError": "the screen could not be read after vm.ui.action: no surface is mapped; call vm.screenshot to see the result", "eventSeq": 0])
+    }
+
+    func testWindowAndElementActionsPassTheAgentsFlagsAndSentences() async throws {
+        let disabled = "the element is disabled; wait until it is enabled"
+        let unsupported = "the element does not support toggle; it supports invoke, focus; click it through the display for anything else"
+        let hung = "window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait for it or end its process with proc.kill"
+        let (h, _, _) = try await rig([
+            "win.action": { m, _ in
+                switch (m["action"]?.stringValue, m["window"]?.stringValue) {
+                case ("close", "0x50"): return .ok(["closed": true, "window": .null])
+                case ("close", _): return .ok(["closed": false, "window": fixtureWindow])
+                case ("minimize", "0x400b8"): return .fail(hung)
+                default: return .ok(["window": fixtureWindow])
+                }
+            },
+            "ui.act": { m, _ in
+                switch m["ref"]?.stringValue {
+                case "e1": return .ok(["node": sendButton, "unresponsive": true])
+                case "e2": return .ok(["node": sendButton, "gone": true])
+                case "e3": return .fail(disabled)
+                case "e4": return .fail(unsupported)
+                default: return .fail(hung)
+                }
+            },
+        ])
+        let closed = try await h.handle(op: "vm.window.action", params: ["name": "Win", "window": "0x50", "action": "close"])
+        XCTAssertEqual(closed, ["window": .null, "closed": true, "eventSeq": 0])
+        let kept = try await h.handle(op: "vm.window.action", params: ["name": "Win", "window": "0x2a", "action": "close"])
+        XCTAssertEqual(kept, ["window": fixtureWindow, "closed": false, "eventSeq": 0])
+        let focused = try await h.handle(op: "vm.window.action", params: ["name": "Win", "window": "0x2a", "action": "focus"])
+        XCTAssertEqual(focused, ["window": fixtureWindow, "eventSeq": 0])
+        let notMinimized = await failure(h, "vm.window.action", ["name": "Win", "window": "0x400b8", "action": "minimize"])
+        XCTAssertEqual(notMinimized, hung)
+
+        let unresponsive = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e1", "action": "invoke"])
+        XCTAssertEqual(unresponsive, ["node": sendButton, "unresponsive": true, "eventSeq": 0])
+        let gone = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e2", "action": "invoke", "observe": "summary", "settleMs": 20])
+        XCTAssertEqual(gone["node"], sendButton)
+        XCTAssertEqual(gone["gone"], true)
+        XCTAssertNil(gone["unresponsive"])
+        XCTAssertEqual(gone["observation"]?["settled"]?.boolValue, true)
+        for (ref, sentence) in [("e3", disabled), ("e4", unsupported), ("e7", hung)] {
+            let text = await failure(h, "vm.ui.action", ["name": "Win", "ref": .string(ref), "action": "toggle"])
+            XCTAssertEqual(text, sentence)
+        }
     }
 
     // MARK: - launch
@@ -466,14 +523,14 @@ final class ControlUITests: XCTestCase {
             "name": "Win", "path": "C:\\앱 폴더\\app.exe", "args": ["--log", "C:\\logs\\x y.log"], "cwd": "C:\\앱 폴더",
             "env": ["MODE": "test"], "waitWindow": 2.5,
         ])
-        XCTAssertEqual(r, ["pid": 77, "window": fixtureWindow])
+        XCTAssertEqual(r, ["pid": 77, "window": fixtureWindow, "eventSeq": 0])
         XCTAssertEqual(fields(agentRequests(agent, "app.launch").last), [
             "path": "C:\\앱 폴더\\app.exe", "args": ["--log", "C:\\logs\\x y.log"], "cwd": "C:\\앱 폴더", "env": ["MODE": "test"],
             "wait_window_ms": 2500,
         ])
 
         let plain = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "notepad.exe"])
-        XCTAssertEqual(plain, ["pid": 78, "windowTimedOut": true])
+        XCTAssertEqual(plain, ["pid": 78, "windowTimedOut": true, "eventSeq": 0])
         XCTAssertEqual(fields(agentRequests(agent, "app.launch").last), ["path": "notepad.exe", "wait_window_ms": 15000])
 
         _ = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "notepad.exe", "waitWindow": 0])
@@ -544,7 +601,7 @@ final class ControlUITests: XCTestCase {
         let launch: JSON = ["exe": "app.exe", "args": ["--log", "C:\\logs\\x y.log"], "env": ["MODE": "test"]]
         let r = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "launch": launch])
         XCTAssertEqual(r, ["guestDir": .string(guestDir), "sent": ["app.exe", "data/설정.json"], "skipped": 0, "bytes": 9,
-                           "pid": 77, "window": fixtureWindow])
+                           "pid": 77, "window": fixtureWindow, "eventSeq": 0])
         XCTAssertEqual(fs[guestDir + "\\app.exe"], Data("new exe".utf8))
         XCTAssertEqual(fs[guestDir + "\\data\\설정.json"], Data("{}".utf8))
         XCTAssertNil(fs[guestDir + "\\old.dll"])
@@ -566,7 +623,7 @@ final class ControlUITests: XCTestCase {
 
         let again = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "launch": launch, "waitWindow": 0,
                                                                    "killRunning": false])
-        XCTAssertEqual(again, ["guestDir": .string(guestDir), "sent": [], "skipped": 2, "bytes": 0, "pid": 78, "window": fixtureWindow])
+        XCTAssertEqual(again, ["guestDir": .string(guestDir), "sent": [], "skipped": 2, "bytes": 0, "pid": 78, "window": fixtureWindow, "eventSeq": 0])
         XCTAssertEqual(agentRequests(agent, "app.launch").last?["wait_window_ms"]?.intValue, 0)
         XCTAssertEqual(agentRequests(agent, "proc.kill").count, 1)
     }
@@ -586,12 +643,12 @@ final class ControlUITests: XCTestCase {
             "name": "Win", "path": .string(file.path), "guestDir": "D:\\apps\\",
             "launch": ["exe": "C:\\Windows\\notepad.exe", "cwd": "C:\\Users"], "waitWindow": 3,
         ])
-        XCTAssertEqual(r, ["guestDir": "D:\\apps", "sent": ["tool one.exe"], "skipped": 0, "bytes": 6, "pid": 5, "windowTimedOut": true])
+        XCTAssertEqual(r, ["guestDir": "D:\\apps", "sent": ["tool one.exe"], "skipped": 0, "bytes": 6, "pid": 5, "windowTimedOut": true, "eventSeq": 0])
         XCTAssertEqual(fs["D:\\apps\\tool one.exe"], Data("binary".utf8))
         XCTAssertEqual(fields(agentRequests(agent, "app.launch").last), ["path": "C:\\Windows\\notepad.exe", "cwd": "C:\\Users", "wait_window_ms": 3000])
 
         let plain = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(file.path)])
-        XCTAssertEqual(plain, ["guestDir": "C:\\alcove-apps\\tool one", "sent": ["tool one.exe"], "skipped": 0, "bytes": 6])
+        XCTAssertEqual(plain, ["guestDir": "C:\\alcove-apps\\tool one", "sent": ["tool one.exe"], "skipped": 0, "bytes": 6, "eventSeq": 0])
         XCTAssertEqual(fs["C:\\alcove-apps\\tool one\\tool one.exe"], Data("binary".utf8))
         XCTAssertEqual(agentRequests(agent, "app.launch").count, 1)
 
@@ -695,7 +752,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(text, "pass guestDir; the default C:\\alcove-apps\\tool only fits Windows guests")
 
         let r = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "guestDir": "/opt/tool"])
-        XCTAssertEqual(r, ["guestDir": "/opt/tool", "sent": ["run.sh"], "skipped": 0, "bytes": 1])
+        XCTAssertEqual(r, ["guestDir": "/opt/tool", "sent": ["run.sh"], "skipped": 0, "bytes": 1, "eventSeq": 0])
         XCTAssertEqual(fs["/opt/tool/run.sh"], Data("x".utf8))
         XCTAssertNotNil(fs["/opt/tool/.alcove-deploy"])
         XCTAssertTrue(agentRequests(agent, "proc.kill").isEmpty)
@@ -846,7 +903,7 @@ final class ControlUITests: XCTestCase {
         fs["D:\\tools\\mine\\.alcove-deploy"] = Data("earlier".utf8)
         let (h, _) = try await deployRig(fs: fs, ["proc.list": { _, _ in .ok(["procs": []]) }])
         let r = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "guestDir": "D:\\tools\\mine"])
-        XCTAssertEqual(r, ["guestDir": "D:\\tools\\mine", "sent": ["app.exe"], "skipped": 0, "bytes": 3])
+        XCTAssertEqual(r, ["guestDir": "D:\\tools\\mine", "sent": ["app.exe"], "skipped": 0, "bytes": 3, "eventSeq": 0])
         XCTAssertEqual(fs.paths(), ["D:\\tools\\mine\\.alcove-deploy", "D:\\tools\\mine\\app.exe"])
         XCTAssertNotEqual(fs["D:\\tools\\mine\\.alcove-deploy"], Data("not sent".utf8))
 
@@ -854,7 +911,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(fresh["sent"], ["app.exe"])
         XCTAssertNotNil(fs["D:\\tools\\new one\\.alcove-deploy"])
         let again = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "guestDir": "D:\\tools\\new one"])
-        XCTAssertEqual(again, ["guestDir": "D:\\tools\\new one", "sent": [], "skipped": 1, "bytes": 0])
+        XCTAssertEqual(again, ["guestDir": "D:\\tools\\new one", "sent": [], "skipped": 1, "bytes": 0, "eventSeq": 0])
     }
 
     func testDeployNeverStopsTheAgentOrItsParents() async throws {
@@ -950,11 +1007,11 @@ final class ControlUITests: XCTestCase {
             },
         ])
         let none = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "app.exe", "waitWindow": 1])
-        XCTAssertEqual(none, ["pid": 7, "windowTimedOut": true])
+        XCTAssertEqual(none, ["pid": 7, "windowTimedOut": true, "eventSeq": 0])
         let unwaited = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "app.exe", "waitWindow": 0])
-        XCTAssertEqual(unwaited, ["pid": 7])
+        XCTAssertEqual(unwaited, ["pid": 7, "eventSeq": 0])
         let shown = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "app.exe", "args": ["window"]])
-        XCTAssertEqual(shown, ["pid": 7, "window": fixtureWindow])
+        XCTAssertEqual(shown, ["pid": 7, "window": fixtureWindow, "eventSeq": 0])
 
         let deployed = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "launch": ["exe": "app.exe"]])
         XCTAssertEqual(deployed["windowTimedOut"], true)
@@ -977,7 +1034,7 @@ final class ControlUITests: XCTestCase {
     func testEventsOp() async throws {
         let (h, t, agent) = try await rig()
         let empty = try await h.handle(op: "vm.events", params: ["name": "Win"])
-        XCTAssertEqual(empty, ["events": [], "next": 0])
+        XCTAssertEqual(empty, ["events": [], "next": 0, "first": 0])
 
         agent.sendLine(["t": "ev", "name": "window.opened", "window": fixtureWindow])
         agent.sendLine(["t": "ev", "name": "process.exited", "pid": 44, "code": 3, "path": "C:\\x.exe"])
@@ -1001,8 +1058,12 @@ final class ControlUITests: XCTestCase {
         let tail = try await h.handle(op: "vm.events", params: ["name": "Win", "since": 1])
         XCTAssertEqual(tail["events"]?.arrayValue?.map { $0["seq"]?.intValue }, [2])
         XCTAssertEqual(tail["next"]?.intValue, 2)
+        XCTAssertEqual(tail["first"]?.intValue, 1)
         let none = try await h.handle(op: "vm.events", params: ["name": "Win", "since": 2])
-        XCTAssertEqual(none, ["events": [], "next": 2])
+        XCTAssertEqual(none, ["events": [], "next": 2, "first": 1])
+        let fromAnEarlierServer = try await h.handle(op: "vm.events", params: ["name": "Win", "since": 3])
+        XCTAssertEqual(fromAnEarlierServer["events"]?.arrayValue?.map { $0["seq"]?.intValue }, [1, 2])
+        XCTAssertEqual(fromAnEarlierServer["next"]?.intValue, 2)
 
         for since: JSON in [-1, "2", 1.5] {
             let text = await failure(h, "vm.events", ["name": "Win", "since": since])
@@ -1012,6 +1073,44 @@ final class ControlUITests: XCTestCase {
         await t.setState(.stopped)
         let stopped = try await h.handle(op: "vm.events", params: ["name": "Win", "since": 1])
         XCTAssertEqual(stopped["events"]?.arrayValue?.count, 1)
+    }
+
+    func testEventsOpNamesTheOldestEventItStillHolds() async throws {
+        let (h, t, agent) = try await rig()
+        let count = EventBuffer.capacity + 40
+        for i in 1...count { agent.sendLine(["t": "ev", "name": "job.exited", "job": .string("j\(i)"), "code": 0]) }
+        let arrived = await eventually { await t.events(since: 0).next == count }
+        XCTAssertTrue(arrived)
+        let r = try await h.handle(op: "vm.events", params: ["name": "Win", "since": 10])
+        XCTAssertEqual(r["first"]?.intValue, 41)
+        XCTAssertEqual(r["next"]?.intValue, count)
+        XCTAssertEqual(r["events"]?[0]?["seq"]?.intValue, 41)
+        XCTAssertEqual(r["events"]?.arrayValue?.count, EventBuffer.capacity)
+    }
+
+    func testRepliesOfChangingOpsCarryTheEventSequence() async throws {
+        let (h, t, agent) = try await rig([
+            "win.list": { _, _ in .ok(["windows": []]) },
+            "fs.write": { _, _ in .ok(["size": 2]) },
+            "fs.read": { _, _ in .ok(["data": "", "size": 0, "eof": true]) },
+        ])
+        let first = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift"])
+        XCTAssertEqual(first, ["eventSeq": 0])
+        agent.sendLine(["t": "ev", "name": "window.opened", "window": fixtureWindow])
+        agent.sendLine(["t": "ev", "name": "window.foreground", "window": fixtureWindow])
+        let arrived = await eventually { await t.events(since: 0).next == 2 }
+        XCTAssertTrue(arrived)
+        let input = try await h.handle(op: "vm.key.up", params: ["name": "Win", "key": "shift"])
+        XCTAssertEqual(input, ["eventSeq": 2])
+        let written = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "C:\\x.txt", "text": "hi"])
+        XCTAssertEqual(written["eventSeq"]?.intValue, 2)
+        let batch = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.press", "keys": "a"]]])
+        XCTAssertEqual(batch, ["completed": 1, "results": [[:]], "eventSeq": 2])
+        for (op, params) in [("vm.window.list", ["name": "Win"] as JSON), ("vm.events", ["name": "Win"]), ("vm.screenshot", ["name": "Win"]),
+                             ("vm.status", ["name": "Win"]), ("vm.wait_for", ["name": "Win", "timeout": 1, "conditions": [["type": "screen_idle", "seconds": 0]]])] {
+            let r = try await h.handle(op: op, params: params)
+            XCTAssertNil(r["eventSeq"], op)
+        }
     }
 
     // MARK: - observation
@@ -1031,14 +1130,17 @@ final class ControlUITests: XCTestCase {
         XCTAssertNil(first["observation"]?["uiError"])
 
         agent.sendLine(["t": "ev", "name": "window.opened", "window": fixtureWindow])
-        agent.sendLine(["t": "ev", "name": "dialog.opened", "title": "Fixture \"Dialog\""])
+        agent.sendLine(["t": "ev", "name": "dialog.opened", "window": window("0x50", "Fixture \"Dialog\"", x: 0, y: 0, w: 10, h: 10)])
+        agent.sendLine(["t": "ev", "name": "window.foreground", "window": window("0x100ce", "", x: 0, y: 752, w: 1280, h: 48)])
         agent.sendLine(["t": "ev", "name": "process.exited", "pid": 44, "code": 3, "path": "C:\\apps\\crash me.exe"])
-        let arrived = await eventually { await t.events(since: 0).next == 3 }
+        agent.sendLine(["t": "ev", "name": "job.exited", "job": "j7", "code": 0])
+        let arrived = await eventually { await t.events(since: 0).next == 5 }
         XCTAssertTrue(arrived)
 
         let second = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "a", "observe": "summary", "settleMs": 20])
         XCTAssertEqual(second["observation"]?["events"],
-                       ["window.opened \"Alcove Fixture\"", "dialog.opened \"Fixture \\\"Dialog\\\"\"", "process.exited crash me.exe code 3"])
+                       ["window.opened \"Alcove Fixture\"", "dialog.opened \"Fixture \\\"Dialog\\\"\"", "window.foreground alcove-fixture.exe",
+                        "process.exited crash me.exe code 3", "job.exited j7 code 0"])
         let third = try await h.handle(op: "vm.mouse.click", params: click)
         XCTAssertEqual(third["observation"]?["events"], [])
 
@@ -1054,7 +1156,7 @@ final class ControlUITests: XCTestCase {
         let (h, t, agent) = try await rig(["ui.focused": { _, _ in .ok(["node": messageEdit, "window": fixtureWindow]) }])
         let click: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20]
         _ = try await h.handle(op: "vm.mouse.click", params: click)
-        for i in 1...25 { agent.sendLine(["t": "ev", "name": "window.title", "title": .string("t\(i)")]) }
+        for i in 1...25 { agent.sendLine(["t": "ev", "name": "window.title", "window": window("0x3b", "t\(i)", x: 0, y: 0, w: 10, h: 10)]) }
         let arrived = await eventually { await t.events(since: 0).next == 25 }
         XCTAssertTrue(arrived)
         let r = try await h.handle(op: "vm.mouse.click", params: click)
@@ -1073,6 +1175,48 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(asked["observation"]?.objectValue?.keys.sorted(), ["changedFraction", "height", "settled", "uiError", "width"])
         XCTAssertEqual(asked["observation"]?["uiError"]?.stringValue, noUISentence)
         XCTAssertTrue(agent.received.filter { $0["t"]?.stringValue == "req" }.isEmpty)
+    }
+
+    func testObservationOfAVMWhoseToolsAreNotConnectedYet() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        var calls = await t.agentCalls
+        XCTAssertTrue(calls.isEmpty)
+
+        let summary = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20])
+        XCTAssertEqual(summary["observation"]?.objectValue?.keys.sorted(), ["changedFraction", "height", "settled", "width"])
+        calls = await t.agentCalls
+        let sentByTheFirstClick = 5
+        XCTAssertEqual(calls.first?.timeout, .zero)
+        XCTAssertEqual(calls.first?.sent, sentByTheFirstClick)
+        XCTAssertTrue(calls.allSatisfy { $0.timeout == .zero })
+
+        let asked = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "ui", "settleMs": 20])
+        XCTAssertEqual(asked["observation"]?["uiError"]?.stringValue, "the guest tools are not connected yet; the next observation will carry the UI facts")
+
+        let before = await (t.agentCalls.count, t.sent.count)
+        _ = try await h.handle(op: "vm.batch", params: ["name": "Win", "observe": "summary", "settleMs": 20, "steps": [["op": "vm.key.press", "keys": "a"]]])
+        calls = await t.agentCalls
+        XCTAssertEqual(calls[before.0].sent, before.1)
+        XCTAssertEqual(calls[before.0].timeout, .zero)
+    }
+
+    func testAnOpLooksItsVMUpOnce() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
+        let registry = CountingRegistry(t)
+        let h = ControlHandler(registry: registry, hostKind: "test")
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        var lookups = await registry.lookups
+        XCTAssertEqual(lookups, 1)
+        _ = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.press", "keys": "a"], ["op": "vm.mouse.move", "x": 1, "y": 1]]])
+        lookups = await registry.lookups
+        XCTAssertEqual(lookups, 2)
+        _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
+        lookups = await registry.lookups
+        XCTAssertEqual(lookups, 3)
+        let missing = await failure(h, "vm.mouse.click", ["name": "Other", "x": 5, "y": 5])
+        XCTAssertEqual(missing, "no VM named 'Other'; call vm.list")
     }
 
     func testObservationWhoseHelperFailsKeepsTheScreenFacts() async throws {
@@ -1305,23 +1449,30 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "ui.text").count, 5)
     }
 
+    private func titled(_ title: String, id: String = "0x60") -> JSON {
+        window(id, title, x: 0, y: 0, w: 10, h: 10)
+    }
+
     func testWaitEvent() async throws {
         let (h, t, agent) = try await rig()
         _ = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift"])
-        agent.sendLine(["t": "ev", "name": "dialog.opened", "window": window("0x50", "Fixture Dialog", x: 0, y: 0, w: 10, h: 10)])
-        agent.sendLine(["t": "ev", "name": "dialog.opened", "title": "다른 이름으로 저장"])
+        agent.sendLine(["t": "ev", "name": "dialog.opened", "window": titled("Fixture Dialog", id: "0x50")])
+        agent.sendLine(["t": "ev", "name": "dialog.opened", "window": titled("다른 이름으로 저장")])
         let arrived = await eventually { await t.events(since: 0).next == 2 }
         XCTAssertTrue(arrived)
 
-        let titled = try await waitFor(h, [["type": "event", "event": "dialog.opened", "titleContains": "저장"]])
-        XCTAssertEqual(titled["matched"]?.intValue, 0)
-        XCTAssertEqual(titled["type"]?.stringValue, "event")
-        XCTAssertEqual(titled["detail"]?["seq"]?.intValue, 2)
-        XCTAssertEqual(titled["detail"]?["name"]?.stringValue, "dialog.opened")
-        XCTAssertEqual(titled["detail"]?["title"]?.stringValue, "다른 이름으로 저장")
+        let saveAs = try await waitFor(h, [["type": "event", "event": "dialog.opened", "titleContains": "저장"]])
+        XCTAssertEqual(saveAs["matched"]?.intValue, 0)
+        XCTAssertEqual(saveAs["type"]?.stringValue, "event")
+        XCTAssertEqual(saveAs["detail"]?["seq"]?.intValue, 2)
+        XCTAssertEqual(saveAs["detail"]?["name"]?.stringValue, "dialog.opened")
+        XCTAssertEqual(saveAs["detail"]?["window"], titled("다른 이름으로 저장"))
 
-        let consumed = try await waitFor(h, [["type": "event", "event": "dialog.opened"]], timeout: 1)
-        XCTAssertEqual(consumed["matched"]?.intValue, -1)
+        let earlier = try await waitFor(h, [["type": "event", "event": "dialog.opened"]])
+        XCTAssertEqual(earlier["matched"]?.intValue, 0)
+        XCTAssertEqual(earlier["detail"]?["seq"]?.intValue, 1)
+        let flat = try await waitFor(h, [["type": "event", "event": "dialog.opened", "titleContains": "none of them"]], timeout: 1)
+        XCTAssertEqual(flat["matched"]?.intValue, -1)
 
         let pending = Task {
             try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 30, "conditions": [
@@ -1329,7 +1480,7 @@ final class ControlUITests: XCTestCase {
             ]])
         }
         try await Task.sleep(for: .milliseconds(100))
-        agent.sendLine(["t": "ev", "name": "window.closed", "title": "x"])
+        agent.sendLine(["t": "ev", "name": "window.closed", "window": titled("x")])
         agent.sendLine(["t": "ev", "name": "process.exited", "pid": 44, "code": -1, "path": "C:\\x.exe"])
         let exited = try await pending.value
         XCTAssertEqual(exited["matched"]?.intValue, 1)
@@ -1339,7 +1490,7 @@ final class ControlUITests: XCTestCase {
 
     func testWaitEventSeesEventsSinceTheLatestChangingOp() async throws {
         let (h, t, agent) = try await rig()
-        agent.sendLine(["t": "ev", "name": "window.opened", "title": "old"])
+        agent.sendLine(["t": "ev", "name": "window.opened", "window": titled("old")])
         let first = await eventually { await t.events(since: 0).next == 1 }
         XCTAssertTrue(first)
         _ = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift"])
@@ -1347,12 +1498,108 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(stale["matched"]?.intValue, -1)
 
         _ = try await h.handle(op: "vm.key.up", params: ["name": "Win", "key": "shift"])
-        agent.sendLine(["t": "ev", "name": "window.opened", "title": "new"])
+        agent.sendLine(["t": "ev", "name": "window.opened", "window": titled("new")])
         let second = await eventually { await t.events(since: 0).next == 2 }
         XCTAssertTrue(second)
         let fresh = try await waitFor(h, [["type": "event", "event": "window.opened"]])
         XCTAssertEqual(fresh["matched"]?.intValue, 0)
-        XCTAssertEqual(fresh["detail"]?["title"]?.stringValue, "new")
+        XCTAssertEqual(fresh["detail"]?["window"]?["title"]?.stringValue, "new")
+    }
+
+    func testWaitEventStillMatchesAfterAnOpThatCausesNoEvents() async throws {
+        let (h, t, agent) = try await rig([
+            "fs.write": { _, _ in .ok(["size": 2]) },
+            "win.list": { _, _ in .ok(["windows": []]) },
+        ])
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        agent.sendLine(["t": "ev", "name": "dialog.opened", "window": titled("Fixture Dialog")])
+        let arrived = await eventually { await t.events(since: 0).next == 1 }
+        XCTAssertTrue(arrived)
+        _ = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "C:\\notes.txt", "text": "hi"])
+        _ = try await h.handle(op: "vm.window.list", params: ["name": "Win"])
+        _ = try await h.handle(op: "vm.set_resolution", params: ["name": "Win", "width": 1024, "height": 768])
+        let r = try await waitFor(h, [["type": "event", "event": "dialog.opened"]])
+        XCTAssertEqual(r["matched"]?.intValue, 0)
+        XCTAssertEqual(r["detail"]?["seq"]?.intValue, 1)
+    }
+
+    func testWaitEventMatchesAnEarlierEventAfterALaterOneMatched() async throws {
+        let (h, t, agent) = try await rig(["app.launch": { _, _ in .ok(["pid": 7]) }])
+        _ = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "app.exe", "waitWindow": 0])
+        agent.sendLine(["t": "ev", "name": "window.opened", "window": titled("Splash", id: "0x61")])
+        agent.sendLine(["t": "ev", "name": "window.opened", "window": titled("Fixture Main", id: "0x62")])
+        agent.sendLine(["t": "ev", "name": "window.foreground", "window": titled("Fixture Main", id: "0x62")])
+        let arrived = await eventually { await t.events(since: 0).next == 3 }
+        XCTAssertTrue(arrived)
+        let foreground = try await waitFor(h, [["type": "event", "event": "window.foreground"]])
+        XCTAssertEqual(foreground["detail"]?["seq"]?.intValue, 3)
+        let opened = try await waitFor(h, [["type": "event", "event": "window.opened", "titleContains": "Main"]])
+        XCTAssertEqual(opened["matched"]?.intValue, 0)
+        XCTAssertEqual(opened["detail"]?["seq"]?.intValue, 2)
+        let again = try await waitFor(h, [["type": "event", "event": "window.foreground"]])
+        XCTAssertEqual(again["detail"]?["seq"]?.intValue, 3)
+    }
+
+    func testWaitEventSinceKeepsTwoClientsApart() async throws {
+        let (h, t, agent) = try await rig()
+        let a = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift"])
+        let aSeq = try XCTUnwrap(a["eventSeq"]?.intValue)
+        agent.sendLine(["t": "ev", "name": "dialog.opened", "window": titled("A's dialog", id: "0x71")])
+        let first = await eventually { await t.events(since: 0).next == 1 }
+        XCTAssertTrue(first)
+        let b = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        let bSeq = try XCTUnwrap(b["eventSeq"]?.intValue)
+        XCTAssertEqual([aSeq, bSeq], [0, 1])
+        agent.sendLine(["t": "ev", "name": "window.opened", "window": titled("B's window", id: "0x72")])
+        let second = await eventually { await t.events(since: 0).next == 2 }
+        XCTAssertTrue(second)
+
+        let hidden = try await waitFor(h, [["type": "event", "event": "dialog.opened"]], timeout: 1)
+        XCTAssertEqual(hidden["matched"]?.intValue, -1)
+        let forA = try await waitFor(h, [["type": "event", "event": "dialog.opened", "since": .int(Int64(aSeq))]])
+        XCTAssertEqual(forA["matched"]?.intValue, 0)
+        XCTAssertEqual(forA["detail"]?["seq"]?.intValue, 1)
+        let forB = try await waitFor(h, [["type": "event", "event": "window.opened", "since": .int(Int64(bSeq))]])
+        XCTAssertEqual(forB["detail"]?["seq"]?.intValue, 2)
+        XCTAssertEqual(forB["detail"]?["window"]?["title"]?.stringValue, "B's window")
+
+        let next = try XCTUnwrap(forA["detail"]?["seq"]?.intValue)
+        let noMore = try await waitFor(h, [["type": "event", "event": "dialog.opened", "since": .int(Int64(next))]], timeout: 1)
+        XCTAssertEqual(noMore["matched"]?.intValue, -1)
+        let stillHidden = try await waitFor(h, [["type": "event", "event": "dialog.opened"]], timeout: 1)
+        XCTAssertEqual(stillHidden["matched"]?.intValue, -1)
+        let stillThere = try await waitFor(h, [["type": "event", "event": "window.opened"]])
+        XCTAssertEqual(stillThere["detail"]?["seq"]?.intValue, 2)
+
+        let fromAnEarlierServer = try await waitFor(h, [["type": "event", "event": "dialog.opened", "since": 500]])
+        XCTAssertEqual(fromAnEarlierServer["detail"]?["seq"]?.intValue, 1)
+        for since: JSON in [-1, "2", 1.5] {
+            do { _ = try await waitFor(h, [["type": "event", "event": "dialog.opened", "since": since]]); XCTFail("\(since) was accepted") }
+            catch { XCTAssertEqual("\(error)", "condition 0: 'since' must be an integer of 0 or more; pass the eventSeq of an earlier reply") }
+        }
+    }
+
+    func testEachInputStepOfABatchMovesTheEventBaseline() async throws {
+        let (h, _, agent) = try await rig()
+        agent.handler = { m, _ in
+            guard m["t"]?.stringValue == "clipboard.set" else { return [] }
+            return [["t": "ev", "name": "window.opened", "window": window("0x81", "Typed", x: 0, y: 0, w: 10, h: 10)],
+                    ["t": "ev", "name": "window.title", "window": window("0x81", "Typed more", x: 0, y: 0, w: 10, h: 10)]]
+        }
+        let batch = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [
+            ["op": "vm.key.press", "keys": "a"],
+            ["op": "vm.type", "text": "한글"],
+            ["op": "vm.wait_for", "timeout": 30, "conditions": [["type": "event", "event": "window.title"]]],
+            ["op": "vm.wait_for", "timeout": 30, "conditions": [["type": "event", "event": "window.opened"]]],
+            ["op": "vm.key.press", "keys": "b"],
+        ]])
+        XCTAssertEqual(batch["completed"]?.intValue, 5)
+        XCTAssertEqual(batch["results"]?[2]?["detail"]?["seq"]?.intValue, 2)
+        XCTAssertEqual(batch["results"]?[3]?["detail"]?["seq"]?.intValue, 1)
+        let after = try await waitFor(h, [["type": "event", "event": "window.opened"]], timeout: 1)
+        XCTAssertEqual(after["matched"]?.intValue, -1)
+        let bySeq = try await waitFor(h, [["type": "event", "event": "window.opened", "since": 0]])
+        XCTAssertEqual(bySeq["detail"]?["seq"]?.intValue, 1)
     }
 
     func testWaitEventFailsWhenTheAgentDisconnects() async throws {
@@ -1391,21 +1638,21 @@ final class ControlUITests: XCTestCase {
         let (old, oldAgent) = try await target(emitting: ["t": "ev", "name": "unused"])
         let registry = SwapRegistry(old)
         let h = ControlHandler(registry: registry, hostKind: "test")
-        for i in 1...3 { oldAgent.sendLine(["t": "ev", "name": "window.opened", "title": .string("old \(i)")]) }
+        for i in 1...3 { oldAgent.sendLine(["t": "ev", "name": "window.opened", "window": titled("old \(i)")]) }
         let arrived = await eventually { await old.events(since: 0).next == 3 }
         XCTAssertTrue(arrived)
         let click: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20]
         _ = try await h.handle(op: "vm.mouse.click", params: click)
         _ = try await h.handle(op: "vm.mouse.click", params: click)
 
-        let (fresh, _) = try await target(emitting: ["t": "ev", "name": "window.opened", "title": "fresh"])
+        let (fresh, _) = try await target(emitting: ["t": "ev", "name": "window.opened", "window": titled("fresh")])
         await registry.swap(fresh)
         let waited = try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 30, "observe": "summary", "settleMs": 20, "conditions": [
             ["type": "ui_exists", "name": "Nothing"], ["type": "event", "event": "window.opened"],
         ]])
         XCTAssertEqual(waited["matched"]?.intValue, 1)
         XCTAssertEqual(waited["detail"]?["seq"]?.intValue, 1)
-        XCTAssertEqual(waited["detail"]?["title"]?.stringValue, "fresh")
+        XCTAssertEqual(waited["detail"]?["window"]?["title"]?.stringValue, "fresh")
         XCTAssertEqual(waited["observation"]?["events"]?[0], "window.opened \"fresh\"")
     }
 
@@ -1868,7 +2115,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(sent, [])
 
         let events = try await h.handle(op: "vm.events", params: ["name": "Win"])
-        XCTAssertEqual(events, ["events": [], "next": 0])
+        XCTAssertEqual(events, ["events": [], "next": 0, "first": 0])
     }
 
     func testUIOpsOnAnAgentWithoutRequests() async throws {
@@ -1903,7 +2150,15 @@ final class ControlUITests: XCTestCase {
             XCTAssertEqual(ControlHandler.isReadOnly(op: op), readOnly.contains(op), op)
             XCTAssertEqual(ControlHandler.isConcurrent(op: op), concurrent.contains(op), op)
             XCTAssertEqual(ControlHandler.isInput(op: op), input.contains(op), op)
-            XCTAssertEqual(ControlHandler.capturesFrames(op: op), input.contains(op) || op.hasPrefix("vm.ui."), op)
+            XCTAssertEqual(ControlHandler.capturesFrames(op: op), input.contains(op) || op == "vm.app.launch" || op == "vm.deploy", op)
+            XCTAssertEqual(ControlHandler.movesEventBaseline(op: op), !readOnly.contains(op), op)
+        }
+        for op in ["vm.mouse.click", "vm.key.press", "vm.type", "vm.batch", "vm.exec", "vm.exec.start", "vm.exec.write", "vm.exec.kill", "vm.process.kill"] {
+            XCTAssertTrue(ControlHandler.movesEventBaseline(op: op), op)
+        }
+        for op in ["vm.exec.read", "vm.exec.list", "vm.process.list", "vm.fs.write", "vm.fs.delete", "vm.push_file", "vm.sync_dir", "vm.clipboard.set",
+                   "vm.set_resolution", "vm.snapshot.create", "vm.wait_for", "vm.screenshot", "vm.start", "vm.stop", "script.run"] {
+            XCTAssertFalse(ControlHandler.movesEventBaseline(op: op), op)
         }
     }
 
@@ -1934,19 +2189,33 @@ final class ControlUITests: XCTestCase {
     }
 
     func testARecordingTracesUIOpsAndEventPolls() async throws {
-        let (h, _, _) = try await rig(["ui.act": { _, _ in .ok(["node": sendButton]) }])
+        let (h, _, _) = try await rig([
+            "ui.act": { _, _ in .ok(["node": sendButton]) },
+            "ui.tree": { _, _ in .ok(["window": fixtureWindow, "nodes": [], "truncated": false]) },
+            "ui.find": { _, _ in .ok(["nodes": []]) },
+            "ui.text": { _, _ in .ok(["text": "", "total": 0, "source": "value"]) },
+            "win.list": { _, _ in .ok(["windows": []]) },
+            "app.launch": { _, _ in .ok(["pid": 7]) },
+        ])
         let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("control-ui-trace-" + UUID().uuidString)
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         _ = try await h.handle(op: "vm.record.start", params: ["name": "Win", "dir": .string(dir.path), "video": false])
         _ = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e5", "action": "invoke"])
         _ = try await h.handle(op: "vm.events", params: ["name": "Win"])
+        _ = try await h.handle(op: "vm.ui.tree", params: ["name": "Win"])
+        _ = try await h.handle(op: "vm.ui.find", params: ["name": "Win", "selector": ["name": "x"]])
+        _ = try await h.handle(op: "vm.ui.text", params: ["name": "Win", "ref": "e4"])
+        _ = try await h.handle(op: "vm.window.list", params: ["name": "Win"])
+        _ = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "app.exe", "waitWindow": 0])
         _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
         let lines = try String(contentsOf: dir.appendingPathComponent("trace.jsonl"), encoding: .utf8).split(separator: "\n")
             .map { try JSON.parse(Data($0.utf8)) }
-        XCTAssertEqual(lines.map { $0["op"]?.stringValue }, ["vm.ui.action", "vm.events"])
-        XCTAssertNotNil(lines[0]["before"]); XCTAssertNotNil(lines[0]["after"])
-        XCTAssertNil(lines[1]["before"]); XCTAssertNil(lines[1]["after"])
-        XCTAssertEqual(lines[1]["result"], ["events": [], "next": 0])
+        XCTAssertEqual(lines.map { $0["op"]?.stringValue },
+                       ["vm.ui.action", "vm.events", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.window.list", "vm.app.launch"])
+        XCTAssertEqual(lines.map { $0["before"] != nil && $0["after"] != nil }, [true, false, false, false, false, false, true])
+        XCTAssertEqual(lines.map { $0["before"] != nil || $0["after"] != nil }, [true, false, false, false, false, false, true])
+        XCTAssertEqual(lines[1]["result"], ["events": [], "next": 0, "first": 0])
+        XCTAssertEqual(lines[0]["result"]?["eventSeq"], 0)
     }
 }
 

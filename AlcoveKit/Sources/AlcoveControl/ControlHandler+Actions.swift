@@ -57,6 +57,7 @@ extension ControlHandler {
             try await send(op, to: t, params)
             return [:]
         }
+        _ = await t.agent(timeout: .zero)
         let before = try await frame(of: t, before: op)
         try await send(op, to: t, params)
         var out: [String: JSON] = [:]
@@ -69,13 +70,14 @@ extension ControlHandler {
         let options = try observeOptions(params)
         let steps = try batchSteps(params, vm: try string(params, "name"))
         let t = try await running(params)
+        if options.level != .none { _ = await t.agent(timeout: .zero) }
         let before = options.level == .none ? nil : try await frame(of: t, before: "vm.batch")
         var results: [JSON] = []
         var failure: (step: Int, message: String)?
         for (index, step) in steps.enumerated() {
             try Task.checkCancellation()
             do {
-                results.append(try await run(step, vm: t.name))
+                results.append(try await run(step, on: t))
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -125,14 +127,16 @@ extension ControlHandler {
         return steps
     }
 
-    /// Runs one batch step against `vm` with its `observe` set to `none`; `sleep` waits for its `ms`.
-    private func run(_ step: BatchStep, vm: String) async throws -> JSON {
+    /// Runs one batch step against `t` with its `observe` set to `none`; `sleep` waits for its `ms`.
+    /// A step that sends input moves the VM's event baseline to the newest event before it runs.
+    private func run(_ step: BatchStep, on t: VMTarget) async throws -> JSON {
         if step.op == "sleep" {
             try await Task.sleep(for: .milliseconds(step.params["ms"]?.intValue ?? 0))
             return [:]
         }
+        if ControlHandler.movesEventBaseline(op: step.op) { advanceEventBaseline(of: t, to: await t.events(since: .max).next) }
         var params = step.params
-        params["name"] = .string(vm)
+        params["name"] = .string(t.name)
         params["observe"] = .string(ObserveLevel.none.rawValue)
         return try await perform(op: step.op, params: .object(params))
     }
@@ -153,7 +157,7 @@ extension ControlHandler {
 
     /// Waits for the screen to settle after `op` and sets `observation` in `out`, or `observationError`
     /// when a frame cannot be read. The observation carries the UI facts of a guest whose connected agent
-    /// has the `ui` capability. Cancellation is thrown.
+    /// has the `ui` capability; the ops that observe ask for that connection before they send input. Cancellation is thrown.
     func addObservation(to out: inout [String: JSON], _ t: VMTarget, after op: String, before: Frame,
                                 _ options: ObserveOptions) async throws {
         do {

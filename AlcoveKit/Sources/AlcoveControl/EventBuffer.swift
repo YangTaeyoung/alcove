@@ -28,9 +28,9 @@ public struct GuestEvent: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// The title of the event's window: `window.title`, or `title` when the fields are flat.
+    /// The title of the window a window event carries.
     var windowTitle: String? {
-        payload["window"]?["title"]?.stringValue ?? payload["title"]?.stringValue
+        payload["window"]?["title"]?.stringValue
     }
 }
 
@@ -49,9 +49,10 @@ public actor EventBuffer {
         if events.count > EventBuffer.capacity { events.removeFirst(events.count - EventBuffer.capacity) }
     }
 
-    /// The kept events with a sequence number above `seq`, oldest first, and the sequence number of the newest event ever appended (0 when none).
-    public func since(_ seq: Int) -> (events: [GuestEvent], next: Int) {
-        (events.filter { $0.seq > seq }, last)
+    /// The kept events with a sequence number above `seq`, oldest first; `next`, the sequence number of the newest event
+    /// ever appended (0 when none); and `first`, that of the oldest event still kept (0 when none).
+    public func since(_ seq: Int) -> (events: [GuestEvent], next: Int, first: Int) {
+        (events.filter { $0.seq > seq }, last, events.first?.seq ?? 0)
     }
 
     /// Appends the agent events of `client`, without their `t` and `name` fields, until the client disconnects or the returned task is cancelled.

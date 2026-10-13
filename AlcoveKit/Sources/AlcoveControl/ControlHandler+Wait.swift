@@ -79,9 +79,13 @@ extension ControlHandler {
                 }
                 state.script = script
             }
-            if case .event = condition {
+            if case .event(_, _, let since) = condition {
                 let newest = await t.events(since: .max).next
-                state.eventCursor = min(eventBaseline[t.name] ?? newest, newest)
+                if let since {
+                    state.eventCursor = since > newest ? 0 : since
+                } else {
+                    state.eventCursor = min(position(in: eventBaseline, of: t) ?? newest, newest)
+                }
             }
             states.append(state)
         }
@@ -214,7 +218,7 @@ extension ControlHandler {
                            "cx": .int(Int64(first.x + first.w / 2)), "cy": .int(Int64(first.y + first.h / 2))])
         case .textGone(let text):
             return try await recognize(text, index: index, tick: &tick, vm: t, clock: clock, deadline: deadline).isEmpty ? .holds(nil) : .pending
-        case .event(let name, let titleContains):
+        case .event(let name, let titleContains, _):
             guard let agent else { throw ControlError.noTools(t.name) }
             let batch = await t.events(since: state.eventCursor)
             state.eventCursor = max(state.eventCursor, batch.next)
@@ -227,7 +231,6 @@ extension ControlHandler {
                 guard await agent.isConnected else { throw AgentClient.AgentError.disconnected }
                 return .pending
             }
-            eventBaseline[t.name] = max(eventBaseline[t.name] ?? 0, found.seq)
             return .holds(found.json)
         case .uiExists, .uiGone, .uiEnabled, .windowTitle, .uiTextStable:
             guard let agent else { throw ControlError.noTools(t.name) }

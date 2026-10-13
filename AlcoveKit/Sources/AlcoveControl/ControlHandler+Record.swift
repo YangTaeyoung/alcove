@@ -32,9 +32,9 @@ struct RecordingSeams: Sendable {
 extension ControlHandler {
     static let defaultRecordingSeconds = 900
 
-    /// Whether the trace holds a frame before and after `op`.
+    /// Whether the trace holds a frame before and after `op`: the input ops, `vm.app.launch` and `vm.deploy`.
     static func capturesFrames(op: String) -> Bool {
-        isInput(op: op) || op.hasPrefix("vm.ui.")
+        isInput(op: op) || op == "vm.app.launch" || op == "vm.deploy"
     }
 
     /// Runs `run` and adds the op, its outcome and its frames to the VM's recording; without one it only runs `run`.

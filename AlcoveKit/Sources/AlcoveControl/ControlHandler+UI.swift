@@ -354,7 +354,9 @@ extension ControlHandler {
         let fields = request
         return try await observed(t, op: op, options) {
             let r = try await self.uiCall(agent, "win.action", fields, vm: t.name, op: op)
-            return ["window": r["window"] ?? .null]
+            var out: [String: JSON] = ["window": r["window"] ?? .null]
+            if let closed = r["closed"] { out["closed"] = closed }
+            return out
         }
     }
 
@@ -485,7 +487,9 @@ extension ControlHandler {
         let fields = request
         return try await observed(t, op: op, options) {
             let r = try await self.uiCall(agent, "ui.act", fields, vm: t.name, op: op)
-            return ["node": r["node"] ?? .null]
+            var out: [String: JSON] = ["node": r["node"] ?? .null]
+            for key in ["unresponsive", "gone"] { if let flag = r[key] { out[key] = flag } }
+            return out
         }
     }
 
@@ -541,8 +545,9 @@ extension ControlHandler {
         }
         let t = try await target(params)
         _ = await t.agent(timeout: .zero)
-        let batch = await t.events(since: since)
-        return ["events": .array(batch.events.map(\.json)), "next": .int(Int64(batch.next))]
+        var batch = await t.events(since: since)
+        if since > batch.next { batch = await t.events(since: 0) }
+        return ["events": .array(batch.events.map(\.json)), "next": .int(Int64(batch.next)), "first": .int(Int64(batch.first))]
     }
 
     /// The observation lines of `events`: the newest `maxObservedEvents`, preceded by a count of the ones left out.
@@ -553,11 +558,13 @@ extension ControlHandler {
         return lines
     }
 
-    /// The event name followed by its window title in quotes, or by the file name of its `path` or its `job`, and by `code <n>` when it has a code.
+    /// The event name followed by its window title in quotes (the window's process when the title is empty), or by the
+    /// file name of its `path` or its `job`, and by `code <n>` when it has a code.
     static func eventLine(_ event: GuestEvent) -> String {
         var line = event.name
         if let title = event.windowTitle {
-            line += " " + UITreeText.quoted(title)
+            let process = title.isEmpty ? event.payload["window"]?["process"]?.stringValue : nil
+            line += " " + (process ?? UITreeText.quoted(title))
         } else if let path = event.payload["path"]?.stringValue, let file = path.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last {
             line += " " + file
         } else if let job = event.payload["job"]?.stringValue {
@@ -593,14 +600,19 @@ extension ControlHandler {
         }
     }
 
+    static let agentNotConnectedYet = "the guest tools are not connected yet; the next observation will carry the UI facts"
+
     /// Adds the foreground window title, the focused element, the events since the VM's previous observation and,
     /// at level `ui`, the tree of the foreground window. Needs a connected agent with the `ui` capability; without one
-    /// only level `ui` says so in `uiError`. The helper calls share one budget counted from the start: `UITiming.factBudget`,
+    /// only level `ui` says so in `uiError`: the agent is not connected yet, or it has no UI Automation. The helper calls share one budget counted from the start: `UITiming.factBudget`,
     /// or `UITiming.treeFactBudget` at level `ui`; what did not arrive within it is left out and `uiError` says the helper is busy.
     func addUIFacts(to observation: inout ScreenObservation, _ t: VMTarget, level: ObserveLevel) async {
         let end = ContinuousClock.now + (level == .ui ? UITiming.treeFactBudget : UITiming.factBudget)
-        guard let agent = await t.agent(timeout: .zero), let hello = await agent.hello, hello.rpcVersion >= 2,
-              hello.capabilities.contains("ui") else {
+        guard let agent = await t.agent(timeout: .zero) else {
+            if level == .ui { observation.uiError = ControlHandler.agentNotConnectedYet }
+            return
+        }
+        guard let hello = await agent.hello, hello.rpcVersion >= 2, hello.capabilities.contains("ui") else {
             if level == .ui { observation.uiError = ControlError.noUI(t.name).description }
             return
         }
@@ -629,10 +641,10 @@ extension ControlHandler {
                 observation.uiError = "the UI tree could not be read: \(reason)"
             }
         }
-        let cursor = observedEvents[t.name] ?? eventBaseline[t.name] ?? .max
-        var batch = await t.events(since: cursor)
-        if cursor != .max, batch.next < cursor { batch = await t.events(since: 0) }
-        observedEvents[t.name] = batch.next
+        let known = observedEvents[t.name] != nil || eventBaseline[t.name] != nil
+        let cursor = position(in: observedEvents, of: t) ?? position(in: eventBaseline, of: t) ?? (known ? 0 : .max)
+        let batch = await t.events(since: cursor)
+        observedEvents[t.name] = advanced(observedEvents, of: t, to: batch.next)
         observation.events = ControlHandler.eventLines(batch.events)
     }
 

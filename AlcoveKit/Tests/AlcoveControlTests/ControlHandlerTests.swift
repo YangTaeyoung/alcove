@@ -24,6 +24,8 @@ actor FakeTarget: VMTarget {
     var agentWait: Duration = .zero
     var agentWaits = 0, cancelledAgentWaits = 0
     var agentTimeouts: [Duration] = []
+    /// One entry per `agent(timeout:)` call: its timeout and how many display messages had been sent before it.
+    var agentCalls: [(timeout: Duration, sent: Int)] = []
     var snapshotList: [VMController.SnapshotInfo] = []
     var snapshotCalls: [String] = []
     var monitorReplies: [String] = []
@@ -74,6 +76,7 @@ actor FakeTarget: VMTarget {
     @discardableResult func sendDisplay(_ message: ToQEMU) async -> Bool { sent.append(message); return true }
     func agent(timeout: Duration) async -> AgentClient? {
         agentTimeouts.append(timeout)
+        agentCalls.append((timeout, sent.count))
         if agentWait > .zero {
             agentWaits += 1
             try? await Task.sleep(for: agentWait)
@@ -130,7 +133,7 @@ actor FakeTarget: VMTarget {
         eventFeed?.cancel()
         eventFeed = a.map { guestEvents.follow($0) }
     }
-    func events(since seq: Int) async -> (events: [GuestEvent], next: Int) { await guestEvents.since(seq) }
+    func events(since seq: Int) async -> (events: [GuestEvent], next: Int, first: Int) { await guestEvents.since(seq) }
     func setAgentWait(_ d: Duration) { agentWait = d }
     func setPNG(_ d: Data) { png = d }
     func setFrames(_ f: [Frame]) { frames = f }

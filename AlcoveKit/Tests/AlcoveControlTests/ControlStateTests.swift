@@ -35,7 +35,7 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(restored["snapshot"]?.stringValue, "clean")
         XCTAssertEqual(restored["tools"]?.boolValue, false)
         let deleted = try await h.handle(op: "vm.snapshot.delete", params: ["name": "Win", "snapshot": "clean"])
-        XCTAssertEqual(deleted, [:])
+        XCTAssertEqual(deleted, ["eventSeq": 0])
         let calls = await t.snapshotCalls
         XCTAssertEqual(calls, ["create:fresh", "restore:clean", "delete:clean"])
     }
@@ -271,7 +271,7 @@ final class ControlStateTests: XCTestCase {
         let (h, t) = setup()
         _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
         let removed = try await h.handle(op: "vm.forward.remove", params: ["name": "Win", "hostPort": 13389])
-        XCTAssertEqual(removed, [:])
+        XCTAssertEqual(removed, ["eventSeq": 0])
         let lines = await t.monitorLines
         XCTAssertEqual(lines.last, "hostfwd_remove net0 tcp:127.0.0.1:13389")
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
@@ -283,7 +283,7 @@ final class ControlStateTests: XCTestCase {
         _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
         await t.setMonitorReplies(["host forwarding rule for tcp:127.0.0.1:13389 removed\r\n"])
         let removed = try await h.handle(op: "vm.forward.remove", params: ["name": "Win", "hostPort": 13389])
-        XCTAssertEqual(removed, [:])
+        XCTAssertEqual(removed, ["eventSeq": 0])
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
         XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
     }
@@ -293,7 +293,7 @@ final class ControlStateTests: XCTestCase {
         _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
         await t.setMonitorReplies(["host forwarding rule for tcp:127.0.0.1:13389 not found\r\n"])
         let removed = try await h.handle(op: "vm.forward.remove", params: ["name": "Win", "hostPort": 13389])
-        XCTAssertEqual(removed, [:])
+        XCTAssertEqual(removed, ["eventSeq": 0])
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
         XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
     }
@@ -415,7 +415,7 @@ final class ControlStateTests: XCTestCase {
         let h = ControlHandler(registry: registry, hostKind: "test")
 
         let cloned = try await h.handle(op: "vm.clone", params: ["name": "Win", "newName": "  Copy "])
-        XCTAssertEqual(cloned, ["name": "Copy"])
+        XCTAssertEqual(cloned, ["name": "Copy", "eventSeq": 0])
         let missingName = await failure(h, "vm.clone", ["name": "Win"])
         XCTAssertEqual(missingName, "missing or invalid parameter 'newName'")
         let unknown = await failure(h, "vm.clone", ["name": "Nope", "newName": "Copy"])
@@ -433,7 +433,7 @@ final class ControlStateTests: XCTestCase {
         XCTAssertTrue(leasedClone.hasPrefix("VM 'Win' is leased by agent-a"), leasedClone)
 
         let deleted = try await h.handle(op: "vm.delete", params: ["name": "Win", "lease": .string(token)])
-        XCTAssertEqual(deleted, [:])
+        XCTAssertEqual(deleted, ["eventSeq": 0])
         let calls = await registry.calls
         XCTAssertEqual(calls, ["clone:Win->Copy", "delete:Win"])
 
@@ -516,7 +516,7 @@ final class ControlStateTests: XCTestCase {
         let (h, vms) = try headless()
         let template = try writeBundle(VMConfig.defaults(name: "Base", guestOS: .linux), in: vms)
         let cloned = try await h.handle(op: "vm.clone", params: ["name": "Base", "newName": "Copy"])
-        XCTAssertEqual(cloned, ["name": "Copy"])
+        XCTAssertEqual(cloned, ["name": "Copy", "eventSeq": 0])
         let copy = VMBundle(url: vms.appendingPathComponent("Copy.alcovevm"))
         XCTAssertEqual(try copy.loadConfig().cloneOf, "Base")
         XCTAssertEqual(template.liveClones().map(\.lastPathComponent), ["Copy.alcovevm"])
@@ -535,7 +535,7 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(start, "start failed: 'Base' is a template with clones (Copy); delete the clones first or start a clone")
 
         let deleted = try await h.handle(op: "vm.delete", params: ["name": "Copy"])
-        XCTAssertEqual(deleted, [:])
+        XCTAssertEqual(deleted, ["eventSeq": 0])
         XCTAssertFalse(FileManager.default.fileExists(atPath: copy.url.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
         let gone = await failure(h, "vm.status", ["name": "Copy"])
@@ -545,7 +545,7 @@ final class ControlStateTests: XCTestCase {
     func testStartDiscardChangesReportsEphemeral() async throws {
         let (h, t) = setup(state: .stopped)
         let started = try await h.handle(op: "vm.start", params: ["name": "Win", "discardChanges": true])
-        XCTAssertEqual(started, ["state": "running", "ephemeral": true])
+        XCTAssertEqual(started, ["state": "running", "ephemeral": true, "eventSeq": 0])
         var discards = await t.startDiscard
         XCTAssertEqual(discards, [true])
         let status = try await h.handle(op: "vm.status", params: ["name": "Win"])
@@ -557,14 +557,14 @@ final class ControlStateTests: XCTestCase {
         let again = await failure(h, "vm.start", ["name": "Win", "discardChanges": true])
         XCTAssertEqual(again, "VM 'Win' is already running; stop it first to start a session that discards changes")
         let plain = try await h.handle(op: "vm.start", params: ["name": "Win"])
-        XCTAssertEqual(plain, ["state": "running", "ephemeral": true])
+        XCTAssertEqual(plain, ["state": "running", "ephemeral": true, "eventSeq": 0])
         discards = await t.startDiscard
         XCTAssertEqual(discards, [true])
 
         _ = try await h.handle(op: "vm.stop", params: ["name": "Win"])
         await t.setCloneOf("Base")
         let kept = try await h.handle(op: "vm.start", params: ["name": "Win", "discardChanges": false])
-        XCTAssertEqual(kept, ["state": "running", "ephemeral": false])
+        XCTAssertEqual(kept, ["state": "running", "ephemeral": false, "eventSeq": 0])
         discards = await t.startDiscard
         XCTAssertEqual(discards, [true, false])
         let after = try await h.handle(op: "vm.status", params: ["name": "Win"])

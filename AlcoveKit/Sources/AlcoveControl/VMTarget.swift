@@ -31,9 +31,10 @@ public protocol VMTarget: Sendable {
     /// or the agent is not reachable within `timeout`. A zero `timeout` returns
     /// the agent only when it is already connected.
     func agent(timeout: Duration) async -> AgentClient?
-    /// The guest events with a sequence number above `seq`, oldest first, and the
-    /// sequence number of the newest event. The events outlive the agent connection.
-    func events(since seq: Int) async -> (events: [GuestEvent], next: Int)
+    /// The guest events with a sequence number above `seq`, oldest first, the sequence
+    /// number of the newest event and that of the oldest one still kept. The events
+    /// outlive the agent connection.
+    func events(since seq: Int) async -> (events: [GuestEvent], next: Int, first: Int)
     func snapshots() async throws -> [VMController.SnapshotInfo]
     func createSnapshot(named name: String) async throws
     func restoreSnapshot(named name: String) async throws
@@ -69,23 +70,132 @@ public protocol VMProvisioning: Sendable {
     func deleteVM(named name: String) async throws
 }
 
+/// The one agent connection of a VM: connects on demand, replaces a connection that ended, and makes the adopted
+/// connection the source of the VM's guest events.
+actor AgentLink {
+    private let isRunning: @Sendable () async -> Bool
+    private let endpoint: @Sendable () async -> (port: Int, token: String?)
+    private let events: EventBuffer
+    private let retryDelay: Duration
+    private var client: AgentClient?
+    /// Counts the times the client was dropped; a connection begun under an older count is not adopted.
+    private var generation = 0
+    /// Feeds the events of `client` into `events`.
+    private var feed: Task<Void, Never>?
+    /// The connection attempt started by a zero-timeout `agent` call.
+    private var warmUp: Task<Void, Never>?
+    /// How many such attempts were started.
+    private(set) var warmUpCount = 0
+    /// The `ui.ping` sent after the latest adoption of a client with the `ui` capability.
+    private(set) var helperStart: Task<Void, Never>?
+
+    /// `isRunning` says whether the VM runs; `endpoint` gives the forwarded agent port and the token the agent must present.
+    init(events: EventBuffer, retryDelay: Duration = .seconds(1), isRunning: @escaping @Sendable () async -> Bool,
+         endpoint: @escaping @Sendable () async -> (port: Int, token: String?)) {
+        self.events = events
+        self.retryDelay = retryDelay
+        self.isRunning = isRunning
+        self.endpoint = endpoint
+    }
+
+    /// The connected agent client; nil when the VM is not running or the agent is not reachable within `timeout`.
+    /// A zero `timeout` returns the client only when it is already connected and starts one connection attempt in the background.
+    func agent(timeout: Duration) async -> AgentClient? {
+        guard await isRunning() else {
+            await drop()
+            return nil
+        }
+        if let current = await connected() { return current }
+        guard timeout > .zero else {
+            startWarmUp()
+            return nil
+        }
+        let deadline = ContinuousClock.now + timeout
+        repeat {
+            let begun = generation
+            let target = await endpoint()
+            let candidate = AgentClient()
+            do {
+                try await candidate.connect(port: target.port, expectedToken: target.token, timeout: .seconds(5))
+            } catch {
+                try? await Task.sleep(for: retryDelay)
+                continue
+            }
+            let hasUI = await candidate.hello?.capabilities.contains("ui") ?? false
+            if let current = await connected() {
+                await candidate.disconnect()
+                return current
+            }
+            guard begun == generation else {
+                await candidate.disconnect()
+                continue
+            }
+            adopt(candidate, startsHelper: hasUI)
+            return candidate
+        } while ContinuousClock.now < deadline
+        return nil
+    }
+
+    /// Forgets the client and ends its event feed, then disconnects it.
+    func drop() async {
+        let dropped = client
+        client = nil
+        generation += 1
+        feed?.cancel()
+        feed = nil
+        await dropped?.disconnect()
+    }
+
+    /// The cached client when it is connected. A cached client found disconnected is forgotten, unless another
+    /// caller replaced it while it was asked.
+    private func connected() async -> AgentClient? {
+        while let cached = client {
+            if await cached.isConnected { return cached }
+            guard client === cached else { continue }
+            client = nil
+            feed?.cancel()
+            feed = nil
+        }
+        return nil
+    }
+
+    /// Makes `candidate` the cached client and the one source of guest events. With `startsHelper` it gets one `ui.ping`
+    /// that nobody waits for, which starts the agent's UI helper.
+    private func adopt(_ candidate: AgentClient, startsHelper: Bool) {
+        feed?.cancel()
+        feed = events.follow(candidate)
+        client = candidate
+        helperStart = startsHelper ? Task { _ = try? await candidate.call("ui.ping", [:], timeout: UITiming.callTimeout) } : nil
+    }
+
+    private func startWarmUp() {
+        guard warmUp == nil else { return }
+        warmUpCount += 1
+        warmUp = Task {
+            _ = await self.agent(timeout: .milliseconds(1))
+            self.warmUp = nil
+        }
+    }
+}
+
 /// Adapts a `VMController` (plus a lazily connected agent) to `VMTarget`.
 public actor ControllerTarget: VMTarget {
     public nonisolated let name: String
     public let controller: VMController
-    private var agentClient: AgentClient?
-    /// Counts the times the agent client was dropped; a connection begun under an older count is not adopted.
-    private var agentGeneration = 0
     private let frameSource = FrameSource()
     private let guestEvents = EventBuffer()
-    /// Feeds the events of `agentClient` into `guestEvents`.
-    private var eventFeed: Task<Void, Never>?
-    /// The connection attempt started by a zero-timeout `agent` call.
-    private var warmUp: Task<Void, Never>?
+    private let link: AgentLink
 
     public init(name: String, controller: VMController) {
         self.name = name
         self.controller = controller
+        link = AgentLink(events: guestEvents, isRunning: {
+            let state = await controller.state
+            return state == .running || state == .paused
+        }, endpoint: {
+            let config = await controller.config
+            return (config.agentHostPort, config.agentToken)
+        })
     }
 
     public func guestOS() async -> VMConfig.GuestOS { await controller.config.guestOS }
@@ -96,10 +206,10 @@ public actor ControllerTarget: VMTarget {
     public func isEphemeral() async -> Bool { await controller.isEphemeral }
     public func cloneOf() async -> String? { await controller.config.cloneOf }
     public func stop(force: Bool) async throws {
-        await dropAgentClient()
+        await link.drop()
         try await controller.shutdown(force: force)
     }
-    public func events(since seq: Int) async -> (events: [GuestEvent], next: Int) { await guestEvents.since(seq) }
+    public func events(since seq: Int) async -> (events: [GuestEvent], next: Int, first: Int) { await guestEvents.since(seq) }
     public func pause() async throws { try await controller.pause() }
     public func resume() async throws { try await controller.resume() }
 
@@ -128,36 +238,11 @@ public actor ControllerTarget: VMTarget {
     public func snapshots() async throws -> [VMController.SnapshotInfo] { try await controller.snapshots() }
     public func createSnapshot(named name: String) async throws { try await controller.createSnapshot(named: name) }
     public func restoreSnapshot(named name: String) async throws {
-        await dropAgentClient()
-        do { try await controller.restoreSnapshot(named: name) } catch { await dropAgentClient(); throw error }
-        await dropAgentClient()
+        await link.drop()
+        do { try await controller.restoreSnapshot(named: name) } catch { await link.drop(); throw error }
+        await link.drop()
     }
 
-    /// Forgets the cached agent client and ends its event feed synchronously, then disconnects it.
-    private func dropAgentClient() async {
-        let client = agentClient
-        agentClient = nil
-        agentGeneration += 1
-        eventFeed?.cancel()
-        eventFeed = nil
-        await client?.disconnect()
-    }
-
-    /// Makes `client` the cached agent client and the one source of guest events.
-    private func adopt(_ client: AgentClient) {
-        eventFeed?.cancel()
-        eventFeed = guestEvents.follow(client)
-        agentClient = client
-    }
-
-    /// Starts one connection attempt that nobody waits for, unless one is running.
-    private func startWarmUp() {
-        guard warmUp == nil else { return }
-        warmUp = Task {
-            _ = await self.agent(timeout: .milliseconds(1))
-            self.warmUp = nil
-        }
-    }
     public func engineInstance() async -> Int { await controller.engineInstance }
     public func agentHostPort() async -> Int { await controller.config.agentHostPort }
     public func deleteSnapshot(named name: String) async throws { try await controller.deleteSnapshot(named: name) }
@@ -168,38 +253,5 @@ public actor ControllerTarget: VMTarget {
         return forwards.filter { $0.proto == .tcp }
     }
 
-    public func agent(timeout: Duration) async -> AgentClient? {
-        let st = await controller.state
-        guard st == .running || st == .paused else {
-            await dropAgentClient()
-            return nil
-        }
-        if let a = agentClient, await a.isConnected { return a }
-        guard timeout > .zero else {
-            startWarmUp()
-            return nil
-        }
-        let config = await controller.config
-        let deadline = ContinuousClock.now + timeout
-        repeat {
-            let generation = agentGeneration
-            let client = AgentClient()
-            do {
-                try await client.connect(port: config.agentHostPort, expectedToken: config.agentToken, timeout: .seconds(5))
-                if let current = agentClient, await current.isConnected {
-                    await client.disconnect()
-                    return current
-                }
-                guard generation == agentGeneration else {
-                    await client.disconnect()
-                    continue
-                }
-                adopt(client)
-                return client
-            } catch {
-                try? await Task.sleep(for: .seconds(1))
-            }
-        } while ContinuousClock.now < deadline
-        return nil
-    }
+    public func agent(timeout: Duration) async -> AgentClient? { await link.agent(timeout: timeout) }
 }

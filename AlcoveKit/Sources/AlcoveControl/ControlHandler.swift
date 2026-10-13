@@ -71,11 +71,18 @@ public actor ControlHandler {
     let recordingsDirectory: URL?
     var recordings = RecordingTable()
     var recordingSeams = RecordingSeams()
-    /// Per VM: the newest event sequence number when its latest op outside the read-only set began, or
-    /// that of the event its latest `event` wait matched, whichever is higher.
-    var eventBaseline: [String: Int] = [:]
+    /// A position in the event sequence of one target object.
+    struct EventMark {
+        let source: AnyObject
+        var seq: Int
+    }
+
+    /// Per VM: the newest event sequence number when the latest op that can cause window or process events began.
+    var eventBaseline: [String: EventMark] = [:]
     /// Per VM: the newest event sequence number its latest observation reported.
-    var observedEvents: [String: Int] = [:]
+    var observedEvents: [String: EventMark] = [:]
+    /// The target `handle` looked up for the op running in the current task.
+    @TaskLocal static var resolvedTarget: (name: String, target: any VMTarget)?
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
@@ -140,6 +147,12 @@ public actor ControlHandler {
             || op == "vm.ui.click" || op == "vm.ui.type" || op == "vm.ui.action" || op == "vm.window.action"
     }
 
+    /// Whether `op` can cause window or process events in the guest: input, launches, deploys, commands and kills.
+    static func movesEventBaseline(op: String) -> Bool {
+        guard !isReadOnly(op: op) else { return false }
+        return isInput(op: op) || op == "vm.app.launch" || op == "vm.deploy" || op.hasPrefix("vm.exec") || op == "vm.process.kill"
+    }
+
     /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
     public func handle(op: String, params: JSON) async throws -> JSON {
         if !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
@@ -149,10 +162,7 @@ public actor ControlHandler {
         let traced = !op.hasPrefix("script.")
         let run: @Sendable () async throws -> JSON = {
             guard traced else { return try await self.perform(op: op, params: params) }
-            return try await self.recorded(op: op, params: params) {
-                await self.noteEventBaseline(op: op, params: params)
-                return try await self.perform(op: op, params: params)
-            }
+            return try await self.recorded(op: op, params: params) { try await self.performNotingEvents(op: op, params: params) }
         }
         if ControlHandler.isInput(op: op), let vm = params["name"]?.stringValue {
             return try await inputGate.withLock(vm, run)
@@ -294,8 +304,10 @@ public actor ControlHandler {
 
     // MARK: - helpers
 
+    /// The VM `params` names: the target `handle` looked up for the running op, or the registry's.
     func target(_ params: JSON) async throws -> VMTarget {
         guard let name = params["name"]?.stringValue else { throw ControlError.missing("name") }
+        if let resolved = ControlHandler.resolvedTarget, resolved.name == name { return resolved.target }
         guard let t = await registry.target(named: name) else { throw ControlError.noSuchVM(name) }
         return t
     }
@@ -310,11 +322,33 @@ public actor ControlHandler {
         observedEvents[vm] = nil
     }
 
-    /// Before an op outside the read-only set runs: remembers the newest event sequence number of its VM.
-    private func noteEventBaseline(op: String, params: JSON) async {
+    /// Runs `op`. For an op outside the read-only set the VM is looked up once, here: its newest event sequence number
+    /// at this moment becomes `eventSeq` of the result and, for an op that can cause events, the VM's event baseline.
+    private func performNotingEvents(op: String, params: JSON) async throws -> JSON {
         guard !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
-              let t = await registry.target(named: vm) else { return }
-        eventBaseline[vm] = await t.events(since: .max).next
+              let t = await registry.target(named: vm) else { return try await perform(op: op, params: params) }
+        let seq = await t.events(since: .max).next
+        if ControlHandler.movesEventBaseline(op: op) { advanceEventBaseline(of: t, to: seq) }
+        let result = try await ControlHandler.$resolvedTarget.withValue((vm, t)) { try await perform(op: op, params: params) }
+        guard var fields = result.objectValue else { return result }
+        fields["eventSeq"] = .int(Int64(seq))
+        return .object(fields)
+    }
+
+    /// The position `marks` holds for the target object `t`; nil when it holds none for this object.
+    func position(in marks: [String: EventMark], of t: VMTarget) -> Int? {
+        guard let mark = marks[t.name], mark.source === (t as AnyObject) else { return nil }
+        return mark.seq
+    }
+
+    /// `seq` and the position `marks` holds for `t`, whichever is higher, as the position of `t`.
+    func advanced(_ marks: [String: EventMark], of t: VMTarget, to seq: Int) -> EventMark {
+        EventMark(source: t as AnyObject, seq: max(seq, position(in: marks, of: t) ?? 0))
+    }
+
+    /// Moves the event baseline of `t` forward to `seq`; it never moves backwards within one target's sequence.
+    func advanceEventBaseline(of t: VMTarget, to seq: Int) {
+        eventBaseline[t.name] = advanced(eventBaseline, of: t, to: seq)
     }
 
     func running(_ params: JSON) async throws -> VMTarget {

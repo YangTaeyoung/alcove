@@ -73,7 +73,7 @@ final class ControlShellFilesTests: XCTestCase {
         let r = try await h.handle(op: "vm.exec", params: [
             "name": "Win", "command": "dir", "timeout": 7, "cwd": "C:\\x", "env": ["A": "1"], "stdin": "in", "shell": "cmd",
         ])
-        XCTAssertEqual(r, ["code": 3, "output": "out\nerr\n", "stdout": "out\n", "stderr": "err\n", "timedOut": true, "truncated": true])
+        XCTAssertEqual(r, ["code": 3, "output": "out\nerr\n", "stdout": "out\n", "stderr": "err\n", "timedOut": true, "truncated": true, "eventSeq": 0])
         let req = agentRequests(agent, "exec.run").first
         XCTAssertEqual(req?["cmd"]?.stringValue, "dir")
         XCTAssertEqual(req?["cwd"]?.stringValue, "C:\\x")
@@ -130,7 +130,7 @@ final class ControlShellFilesTests: XCTestCase {
             m["t"]?.stringValue == "exec" ? [["t": "exec.result", "code": 5, "out": .string("ran: " + (m["cmd"]?.stringValue ?? ""))]] : []
         }
         let r = try await h.handle(op: "vm.exec", params: ["name": "Win", "command": "hostname", "timeout": 5])
-        XCTAssertEqual(r, ["code": 5, "output": "ran: hostname"])
+        XCTAssertEqual(r, ["code": 5, "output": "ran: hostname", "eventSeq": 0])
 
         for extra in ["cwd", "stdin", "shell"] {
             let text = await failure(h, "vm.exec", .object(["name": "Win", "command": "hostname", extra: "x"]))
@@ -167,7 +167,7 @@ final class ControlShellFilesTests: XCTestCase {
             }
         }
         let started = try await h.handle(op: "vm.exec.start", params: ["name": "Win", "command": "ping -t host", "cwd": "C:\\x", "env": ["A": "1"], "shell": "cmd"])
-        XCTAssertEqual(started, ["job": "j1", "pid": 42])
+        XCTAssertEqual(started, ["job": "j1", "pid": 42, "eventSeq": 0])
         let start = agentRequests(agent, "exec.start").first
         XCTAssertEqual(start?["cmd"]?.stringValue, "ping -t host")
         XCTAssertEqual(start?["cwd"]?.stringValue, "C:\\x")
@@ -185,14 +185,14 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertNil(readReq?["outOffset"]); XCTAssertNil(readReq?["errOffset"])
 
         let written = try await h.handle(op: "vm.exec.write", params: ["name": "Win", "job": "j1", "data": "x\n", "eof": true])
-        XCTAssertEqual(written, [:])
+        XCTAssertEqual(written, ["eventSeq": 0])
         let writeReq = agentRequests(agent, "exec.write").first
         XCTAssertEqual(writeReq?["job"]?.stringValue, "j1")
         XCTAssertEqual(writeReq?["data"]?.stringValue, "x\n")
         XCTAssertEqual(writeReq?["eof"]?.boolValue, true)
 
         let killed = try await h.handle(op: "vm.exec.kill", params: ["name": "Win", "job": "j1"])
-        XCTAssertEqual(killed, ["state": "exited"])
+        XCTAssertEqual(killed, ["state": "exited", "eventSeq": 0])
         XCTAssertEqual(agentRequests(agent, "exec.kill").first?["job"]?.stringValue, "j1")
 
         let list = try await h.handle(op: "vm.exec.list", params: ["name": "Win"])
@@ -230,7 +230,7 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertTrue(agentRequests(agent, "proc.kill").isEmpty)
 
         let byName = try await h.handle(op: "vm.process.kill", params: ["name": "Win", "processName": "notepad", "tree": true])
-        XCTAssertEqual(byName, ["killed": 2])
+        XCTAssertEqual(byName, ["killed": 2, "eventSeq": 0])
         let nameReq = agentRequests(agent, "proc.kill").last
         XCTAssertEqual(nameReq?["name"]?.stringValue, "notepad")
         XCTAssertEqual(nameReq?["tree"]?.boolValue, true)
@@ -252,7 +252,7 @@ final class ControlShellFilesTests: XCTestCase {
         try payload.write(to: local)
 
         let r = try await h.handle(op: "vm.push_file", params: ["name": "Win", "path": .string(local.path), "guestPath": "/data/in/blob.bin"])
-        XCTAssertEqual(r, ["guestPath": "/data/in/blob.bin", "bytes": 300_000, "sha256": .string(sha256(payload))])
+        XCTAssertEqual(r, ["guestPath": "/data/in/blob.bin", "bytes": 300_000, "sha256": .string(sha256(payload)), "eventSeq": 0])
         XCTAssertEqual(fs["/data/in/blob.bin"], payload)
 
         let refused = await failure(h, "vm.push_file", ["name": "Win", "path": .string(local.path), "guestPath": "/data/in/blob.bin"])
@@ -275,7 +275,7 @@ final class ControlShellFilesTests: XCTestCase {
         let local = try tempDir().appendingPathComponent("note.txt")
         try Data("note".utf8).write(to: local)
         let r = try await h.handle(op: "vm.push_file", params: ["name": "Win", "path": .string(local.path), "dest": "downloads"])
-        XCTAssertEqual(r, ["guestPath": "C:\\Users\\alcove\\Downloads\\note.txt"])
+        XCTAssertEqual(r, ["guestPath": "C:\\Users\\alcove\\Downloads\\note.txt", "eventSeq": 0])
         let begin = agent.received.first { $0["t"]?.stringValue == "file.begin" }
         XCTAssertEqual(begin?["dest"]?.stringValue, "downloads")
         XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "req" })
@@ -310,12 +310,12 @@ final class ControlShellFilesTests: XCTestCase {
         let (h, _) = try await setup(fs: fs)
 
         let kept = try await h.handle(op: "vm.sync_dir", params: ["name": "Win", "path": .string(root.path), "guestPath": "/g/in"])
-        XCTAssertEqual(kept, ["sent": ["sub/b.bin"], "skipped": 1, "deleted": [], "bytes": .int(Int64(b.count))])
+        XCTAssertEqual(kept, ["sent": ["sub/b.bin"], "skipped": 1, "deleted": [], "bytes": .int(Int64(b.count)), "eventSeq": 0])
         XCTAssertEqual(fs["/g/in/sub/b.bin"], b)
         XCTAssertNotNil(fs["/g/in/old.txt"])
 
         let pruned = try await h.handle(op: "vm.sync_dir", params: ["name": "Win", "path": .string(root.path), "guestPath": "/g/in", "delete": true])
-        XCTAssertEqual(pruned, ["sent": [], "skipped": 2, "deleted": ["old.txt"], "bytes": 0])
+        XCTAssertEqual(pruned, ["sent": [], "skipped": 2, "deleted": ["old.txt"], "bytes": 0, "eventSeq": 0])
         XCTAssertNil(fs["/g/in/old.txt"])
 
         let notDir = await failure(h, "vm.sync_dir", ["name": "Win", "path": .string(root.appendingPathComponent("a.txt").path), "guestPath": "/g/in"])
@@ -405,7 +405,7 @@ final class ControlShellFilesTests: XCTestCase {
             return [agentReply(m, ["size": .int(Int64(file.value.count))])]
         }
         let created = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "~/note.txt", "text": "héllo"])
-        XCTAssertEqual(created, ["size": 6])
+        XCTAssertEqual(created, ["size": 6, "eventSeq": 0])
         let create = agentRequests(agent, "fs.write").last
         XCTAssertEqual(create?["path"]?.stringValue, "~/note.txt")
         XCTAssertEqual(create?["data"]?.stringValue, Data("héllo".utf8).base64EncodedString())
@@ -414,7 +414,7 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertNil(create?["append"]); XCTAssertNil(create?["text"])
 
         let appended = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "~/note.txt", "text": " more", "append": true])
-        XCTAssertEqual(appended, ["size": 11])
+        XCTAssertEqual(appended, ["size": 11, "eventSeq": 0])
         let append = agentRequests(agent, "fs.write").last
         XCTAssertEqual(append?["append"]?.boolValue, true)
         XCTAssertEqual(append?["mkdirs"]?.boolValue, true)
@@ -423,7 +423,7 @@ final class ControlShellFilesTests: XCTestCase {
 
         let long = String(repeating: "0123456789", count: 30_000)
         let replaced = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "~/note.txt", "text": .string(long)])
-        XCTAssertEqual(replaced, ["size": 300_000])
+        XCTAssertEqual(replaced, ["size": 300_000, "eventSeq": 0])
         XCTAssertEqual(file.value, Data(long.utf8))
         let pieces = agentRequests(agent, "fs.write").suffix(2)
         XCTAssertEqual(agentRequests(agent, "fs.write").count, 4)
@@ -443,13 +443,13 @@ final class ControlShellFilesTests: XCTestCase {
         fs["/g/a.txt"] = Data("abc".utf8)
         let (h, agent) = try await setup(fs: fs)
         let r = try await h.handle(op: "vm.fs.delete", params: ["name": "Win", "path": "/g/a.txt", "recursive": true])
-        XCTAssertEqual(r, ["deleted": true])
+        XCTAssertEqual(r, ["deleted": true, "eventSeq": 0])
         XCTAssertNil(fs["/g/a.txt"])
         let req = agentRequests(agent, "fs.delete").first
         XCTAssertEqual(req?["path"]?.stringValue, "/g/a.txt")
         XCTAssertEqual(req?["recursive"]?.boolValue, true)
         let again = try await h.handle(op: "vm.fs.delete", params: ["name": "Win", "path": "/g/a.txt"])
-        XCTAssertEqual(again, ["deleted": false])
+        XCTAssertEqual(again, ["deleted": false, "eventSeq": 0])
     }
 
     // MARK: - parameter types
@@ -492,7 +492,7 @@ final class ControlShellFilesTests: XCTestCase {
         fs["/g/a.txt"] = Data("abc".utf8)
         let (h, _) = try await setup(fs: fs)
         let r = try await h.handle(op: "vm.fs.write", params: ["name": "Win", "path": "/g/a.txt", "text": "z", "append": .null])
-        XCTAssertEqual(r, ["size": 1])
+        XCTAssertEqual(r, ["size": 1, "eventSeq": 0])
         XCTAssertEqual(fs["/g/a.txt"], Data("z".utf8))
         let read = try await h.handle(op: "vm.fs.read", params: ["name": "Win", "path": "/g/a.txt", "offset": .null, "length": .null])
         XCTAssertEqual(read["text"]?.stringValue, "z")
