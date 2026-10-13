@@ -9,6 +9,8 @@ enum WaitTiming {
     nonisolated(unsafe) static var agentPeriod = Duration.milliseconds(500)
     /// Longest an agent call of one evaluation may take.
     nonisolated(unsafe) static var agentCallTimeout = Duration.seconds(5)
+    /// Shortest time a text recognition gets to finish, also when the wait's timeout passes sooner.
+    nonisolated(unsafe) static var recognitionGrace = Duration.seconds(1)
     /// Output bytes one job condition reads per tick.
     nonisolated(unsafe) static var jobByteBudget = 4 * 1024 * 1024
     /// Text recognition on a frame.

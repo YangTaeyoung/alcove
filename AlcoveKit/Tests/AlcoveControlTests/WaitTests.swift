@@ -30,6 +30,7 @@ final class WaitTests: XCTestCase {
         WaitTiming.ocrPeriod = .milliseconds(60)
         WaitTiming.agentPeriod = .milliseconds(40)
         WaitTiming.agentCallTimeout = .seconds(3)
+        WaitTiming.recognitionGrace = .milliseconds(300)
     }
 
     override func tearDown() {
@@ -38,6 +39,7 @@ final class WaitTests: XCTestCase {
         WaitTiming.ocrPeriod = .milliseconds(700)
         WaitTiming.agentPeriod = .milliseconds(500)
         WaitTiming.agentCallTimeout = .seconds(5)
+        WaitTiming.recognitionGrace = .seconds(1)
         WaitTiming.jobByteBudget = 4 * 1024 * 1024
         WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) }
     }
@@ -471,6 +473,40 @@ final class WaitTests: XCTestCase {
         let r = try await waitFor(h, [["type": "text_visible", "text": "install complete"]], timeout: 10)
         XCTAssertEqual(r["matched"]?.intValue, 0)
         XCTAssertGreaterThan(calls.value, 3)
+    }
+
+    func testARecognitionThatOutlastsTheTimeoutDoesNotHoldTheWait() async throws {
+        WaitTiming.recognizer = { _, _ in
+            Thread.sleep(forTimeInterval: 2.5)
+            return []
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let start = ContinuousClock.now
+        let r = try await waitFor(h, [["type": "text_visible", "text": "ready"]], timeout: 1)
+        XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(1800))
+        XCTAssertEqual(r["matched"]?.intValue, -1)
+        XCTAssertLessThan(r["waited"]?.doubleValue ?? 9, 1.8)
+        let problems = try XCTUnwrap(r["problems"]?.arrayValue, "\(r)")
+        XCTAssertEqual(problems.count, 1)
+        XCTAssertEqual(problems[0]["type"]?.stringValue, "text_visible")
+        XCTAssertEqual(problems[0]["error"]?.stringValue,
+                       "text recognition did not finish within the timeout; call vm.wait_for again with a longer timeout")
+    }
+
+    func testARecognitionThatStraddlesTheTimeoutStillCounts() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.ocrPeriod = .milliseconds(20)
+        WaitTiming.recognitionGrace = .seconds(1)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            Thread.sleep(forTimeInterval: 0.3)
+            return calls.value == 4 ? [TextMatch(text: "ready", rect: Frame.Rect(x: 1, y: 2, w: 30, h: 10), confidence: 1)] : []
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let r = try await waitFor(h, [["type": "text_visible", "text": "ready"]], timeout: 1)
+        XCTAssertEqual(r["matched"]?.intValue, 0, "\(r)")
+        XCTAssertGreaterThan(r["waited"]?.doubleValue ?? 0, 1.0)
+        XCTAssertNil(r["problems"])
     }
 
     func testFrameReadFailuresAreRetried() async throws {

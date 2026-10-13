@@ -163,13 +163,13 @@ extension ControlHandler {
             guard let area = frame.clamp(rect), area == rect else { return .holds(nil) }
             return FrameDiff.between(reference, frame.crop(area)).changedTiles > 0 ? .holds(nil) : .pending
         case .textVisible(let text):
-            let matches = try await recognize(text, index: index, tick: &tick, vm: t)
+            let matches = try await recognize(text, index: index, tick: &tick, vm: t, clock: clock, deadline: deadline)
             guard let first = matches.first else { return .pending }
             return .holds(["text": .string(first.text), "x": .int(Int64(first.x)), "y": .int(Int64(first.y)),
                            "w": .int(Int64(first.w)), "h": .int(Int64(first.h)),
                            "cx": .int(Int64(first.x + first.w / 2)), "cy": .int(Int64(first.y + first.h / 2))])
         case .textGone(let text):
-            return try await recognize(text, index: index, tick: &tick, vm: t).isEmpty ? .holds(nil) : .pending
+            return try await recognize(text, index: index, tick: &tick, vm: t, clock: clock, deadline: deadline).isEmpty ? .holds(nil) : .pending
         default:
             guard let agent else { throw ControlError.noTools(t.name) }
             return try await evaluateAgent(condition, index: index, state: &state, vm: t.name, agent: agent, clock: clock, deadline: deadline)
@@ -189,8 +189,9 @@ extension ControlHandler {
         }
     }
 
-    /// The lines of this tick's frame that contain `text`, in frame coordinates.
-    private func recognize(_ text: WaitText, index: Int, tick: inout Tick, vm t: VMTarget) async throws -> [(text: String, x: Int, y: Int, w: Int, h: Int)] {
+    /// The lines of this tick's frame that contain `text`, in frame coordinates. Throws when the recognition outlasts `deadline`.
+    private func recognize(_ text: WaitText, index: Int, tick: inout Tick, vm t: VMTarget, clock: ContinuousClock,
+                           deadline: ContinuousClock.Instant) async throws -> [(text: String, x: Int, y: Int, w: Int, h: Int)] {
         let frame = try await tickFrame(&tick, t)
         let key = text.recognitionKey
         let found: (lines: [TextMatch], area: Frame.Rect)
@@ -205,10 +206,13 @@ extension ControlHandler {
                 area = clamped
             }
             let cropped = area == frame.bounds ? frame : frame.crop(area)
-            let languages = text.languages, recognizer = WaitTiming.recognizer
             let lines: [TextMatch]
-            do { lines = try await Task.detached { try recognizer(cropped, languages) }.value }
-            catch {
+            do {
+                guard let done = try await recognition(of: cropped, languages: text.languages, clock: clock, deadline: deadline) else {
+                    throw ControlError.failed("text recognition did not finish within the timeout; call vm.wait_for again with a longer timeout")
+                }
+                lines = done
+            } catch {
                 tick.recognitionErrors[key] = error
                 throw error
             }
@@ -220,6 +224,27 @@ extension ControlHandler {
             return line.text.range(of: text.query, options: .caseInsensitive) != nil
         }
         return matches.map { ($0.text, $0.rect.x + found.area.x, $0.rect.y + found.area.y, $0.rect.w, $0.rect.h) }
+    }
+
+    /// The recognized lines of `frame`, or nil when the recognition is still running at `deadline` and
+    /// `WaitTiming.recognitionGrace` after its start; the recognition then ends unobserved.
+    private func recognition(of frame: Frame, languages: [String], clock: ContinuousClock,
+                             deadline: ContinuousClock.Instant) async throws -> [TextMatch]? {
+        let recognizer = WaitTiming.recognizer
+        let limit = max(deadline, clock.now + WaitTiming.recognitionGrace)
+        let (outcomes, outcome) = AsyncStream<Result<[TextMatch], Error>?>.makeStream()
+        Task.detached {
+            outcome.yield(Result { try recognizer(frame, languages) })
+            outcome.finish()
+        }
+        let timer = Task {
+            try? await Task.sleep(until: limit, clock: clock)
+            outcome.yield(nil)
+            outcome.finish()
+        }
+        defer { timer.cancel() }
+        for await first in outcomes { return try first?.get() }
+        return nil
     }
 
     // MARK: - agent conditions
