@@ -29,6 +29,7 @@ extension ControlHandler {
             throw ControlError.failed("\(what) failed: \(ControlHandler.failureReason(error, fallback: "the operation could not finish; check vm.list"))")
         }
         forget(vm: name)
+        if op == "vm.delete" { recordings.latest[name] = nil }
         return [:]
     }
 

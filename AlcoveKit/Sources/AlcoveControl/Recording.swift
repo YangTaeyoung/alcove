@@ -63,6 +63,8 @@ actor Recording {
         let droppedFrames: Int?
         /// The wall-clock time at which the recording began to end.
         let ended: Date
+        /// The sentence describing why the video could not be written; nil when it could.
+        let videoError: String?
 
         var json: JSON {
             var obj: [String: JSON] = ["dir": .string(dir), "trace": .string(trace), "frames": .int(Int64(frames)),
@@ -193,6 +195,8 @@ actor Recording {
     var opCount: Int { lineCount }
     var writeErrorCount: Int { writeErrors }
     var latestWriteError: String? { lastWriteError }
+    /// The sentence describing why the video could not be written, as soon as the writer failed; nil while it can.
+    nonisolated var videoError: String? { sink.errorMessage }
     var elapsedSeconds: Double { Recording.seconds(startedInstant.duration(to: clock())) }
 
     /// Appends one trace line and its frames; nothing happens after the recording ended.
@@ -267,7 +271,7 @@ actor Recording {
                        seconds: (seconds * 10).rounded() / 10, ops: lineCount,
                        writeErrors: writeErrors, lastWriteError: lastWriteError,
                        videoSeconds: hasVideo ? (sink.appendedSeconds * 10).rounded() / 10 : nil,
-                       droppedFrames: hasVideo ? sink.droppedFrames : nil, ended: ended)
+                       droppedFrames: hasVideo ? sink.droppedFrames : nil, ended: ended, videoError: sink.errorMessage)
     }
 
     private static func requestParams(_ params: JSON) -> JSON {

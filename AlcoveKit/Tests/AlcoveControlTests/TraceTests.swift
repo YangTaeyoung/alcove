@@ -690,6 +690,71 @@ final class TraceTests: XCTestCase {
         XCTAssertFalse(recording)
     }
 
+    func testStatusReportsTheVideoErrorAsSoonAsTheWriterFailed() async throws {
+        let (h, _, _) = setup()
+        let sink = MessageSink()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in sink }))
+        _ = try await start(h, ["video": true])
+        let before = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertNil(before["videoError"])
+        sink.message = "the video could not be written: test"
+        let during = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(during["recording"]?.boolValue, true)
+        XCTAssertEqual(during["videoError"]?.stringValue, "the video could not be written: test")
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+    }
+
+    func testNothingRetainsARecordingThatEnded() async throws {
+        let (h, _, _) = setup()
+        _ = try await start(h)
+        weak var weakRecording: Recording?
+        do {
+            let active = await h.activeRecording("Win")
+            weakRecording = active
+            XCTAssertNotNil(weakRecording)
+        }
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertNil(weakRecording)
+        let last = await h.lastRecording("Win")
+        XCTAssertNotNil(last)
+    }
+
+    func testNothingRetainsARecordingThatEndedByItself() async throws {
+        let (h, _, clock) = setup()
+        _ = try await start(h, ["maxSeconds": 10])
+        weak var weakRecording: Recording?
+        do { weakRecording = await h.activeRecording("Win") }
+        clock.advance(.seconds(11))
+        _ = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertNil(weakRecording)
+        let last = await h.lastRecording("Win")
+        XCTAssertNotNil(last)
+    }
+
+    func testLastRecordingIsReplacedWhenANewerOneEnds() async throws {
+        let (h, _, _) = setup()
+        let first = try await start(h)
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let second = try await start(h, ["dir": .string(base.appendingPathComponent("second").path)])
+        let during = await h.lastRecording("Win")
+        XCTAssertEqual(during?.directory.path, first.path)
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let after = await h.lastRecording("Win")
+        XCTAssertEqual(after?.directory.path, second.path)
+    }
+
+    func testDeletingTheVMDropsItsLastRecording() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        let h = ControlHandler(registry: FakeProvisioningRegistry(targets: ["Win": t]), hostKind: "test", recordingsDirectory: base)
+        _ = try await start(h)
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let before = await h.lastRecording("Win")
+        XCTAssertNotNil(before)
+        _ = try await h.handle(op: "vm.delete", params: ["name": "Win"])
+        let after = await h.lastRecording("Win")
+        XCTAssertNil(after)
+    }
+
     func testVideoSinkIsFinishedOnStop() async throws {
         let dir = base.appendingPathComponent("sink")
         let sink = CountingSink()
@@ -713,6 +778,20 @@ extension ControlHandler {
         recordings.ended[vm] = nil
     }
     func plantVMGone(_ vm: String, _ recording: Recording) { recordings.vmGone[vm] = recording }
+    func activeRecording(_ vm: String) -> Recording? { recordings.active[vm] }
+    func lastRecording(_ vm: String) -> LastRecording? { recordings.latest[vm] }
+}
+
+private final class MessageSink: VideoSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: String?
+    var message: String? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+    var errorMessage: String? { message }
+    func append(frame: Frame, at time: Duration) {}
+    func finish() async {}
 }
 
 private final class CountingSink: VideoSink, @unchecked Sendable {

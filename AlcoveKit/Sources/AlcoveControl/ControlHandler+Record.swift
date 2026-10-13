@@ -14,14 +14,30 @@ struct RecordingTable {
     var starting: [String: URL] = [:]
     /// Recordings that are ending; `vm.record.stop` waits for them.
     var retiring: [String: Recording] = [:]
-    /// The recording of each VM that ended last, with its summary.
-    var latest: [String: EndedRecording] = [:]
+    /// What the diagnostics collector needs of the recording of each VM that ended last.
+    var latest: [String: LastRecording] = [:]
 }
 
 /// A recording that ended and whose summary is waiting for `vm.record.stop`.
 struct EndedRecording {
-    let recording: Recording
+    let delivery: SummaryDelivery
     let summary: Recording.Summary
+}
+
+/// The directory, the end time and the video error of a recording that ended; the recording itself is not kept.
+struct LastRecording: Sendable {
+    let directory: URL
+    let ended: Date
+    /// Whether the recording was made with a video.
+    let video: Bool
+    let videoError: String?
+
+    init(_ recording: Recording, summary: Recording.Summary) {
+        directory = URL(fileURLWithPath: summary.dir)
+        ended = summary.ended
+        video = recording.video
+        videoError = summary.videoError
+    }
 }
 
 /// Replaceable parts of a new recording.
@@ -86,8 +102,8 @@ extension ControlHandler {
         guard recordings.retiring[vm] === recording else { return }
         recordings.retiring[vm] = nil
         recordings.lastDirectory[vm] = summary.dir
-        recordings.latest[vm] = EndedRecording(recording: recording, summary: summary)
-        if !recording.delivery.isTaken { recordings.ended[vm] = EndedRecording(recording: recording, summary: summary) }
+        recordings.latest[vm] = LastRecording(recording, summary: summary)
+        if !recording.delivery.isTaken { recordings.ended[vm] = EndedRecording(delivery: recording.delivery, summary: summary) }
     }
 
     /// Waits until no recording of the VM is being retired.
@@ -125,7 +141,7 @@ extension ControlHandler {
             }
             if let retiring = recordings.retiring[vm] { return try await collect(retiring, vm: vm) }
             if recordings.starting[vm] != nil { throw ControlError.failed("'\(vm)' is still starting its recording; call vm.record.stop again in a moment") }
-            guard let ended = recordings.ended.removeValue(forKey: vm), ended.recording.delivery.take() else {
+            guard let ended = recordings.ended.removeValue(forKey: vm), ended.delivery.take() else {
                 throw ControlError.failed("'\(vm)' is not recording")
             }
             return ended.summary.json
@@ -139,6 +155,7 @@ extension ControlHandler {
                                               "seconds": .double(await current.elapsedSeconds), "ops": .int(Int64(await current.opCount)),
                                               "writeErrors": .int(Int64(await current.writeErrorCount))]
                 if let last = await current.latestWriteError { status["lastWriteError"] = .string(last) }
+                if let videoError = current.videoError { status["videoError"] = .string(videoError) }
                 return .object(status)
             }
             guard let dir = recordings.lastDirectory[vm] else { return ["recording": false] }
@@ -153,9 +170,9 @@ extension ControlHandler {
         if recordings.retiring[vm] === recording {
             recordings.retiring[vm] = nil
             recordings.lastDirectory[vm] = summary.dir
-            recordings.latest[vm] = EndedRecording(recording: recording, summary: summary)
+            recordings.latest[vm] = LastRecording(recording, summary: summary)
         }
-        if recordings.ended[vm]?.recording === recording { recordings.ended[vm] = nil }
+        if recordings.ended[vm]?.delivery === recording.delivery { recordings.ended[vm] = nil }
         guard recording.delivery.take() else { throw ControlError.failed("'\(vm)' is not recording") }
         return summary.json
     }
