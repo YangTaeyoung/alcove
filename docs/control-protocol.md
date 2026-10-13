@@ -225,8 +225,14 @@ run; steps before it keep their effect.
   the Latin recognizer. Two lines count as the same line when their rectangles
   intersect horizontally and overlap vertically by at least half the height of
   the less tall one. A line only the Korean recognizer found is kept; a line
-  only the Latin recognizer found is left out. In a line that mixes both
-  scripts the Latin letters are the Korean recognizer's reading.
+  only the Latin recognizer found is left out. A line of the Latin recognizer
+  that lies on more than one line of the Korean recognizer is left out too,
+  and each of those lines keeps the Korean recognizer's text and rectangle, so
+  no rectangle spans two lines. In a line that mixes both scripts the Latin
+  letters are the Korean recognizer's reading. A symbol outside ASCII can come
+  back as a similar ASCII character: in a line without Hangul, `✓ Done` was
+  read as `v Done` and `±0.5 µm` as `+0.5 um` (system font at 15 and 20
+  pixels).
 - With `languages` the area is recognized once with exactly that list. Pass
   `["en-US"]` when the screen has no Hangul you need: it is one recognition
   instead of two, and it reads the Latin part of a line that also holds Hangul
@@ -249,12 +255,20 @@ run; steps before it keep their effect.
   request for the frame and `languages` of a recognition that is running or
   waiting shares it. A request that is cancelled or, in a wait, runs out of
   time before its turn is taken out of the line and never recognized.
+- `vm.find_text` waits for its turn for at most 60 s. Then it leaves the line
+  and answers `the text recognition is busy (another reading has been running
+  for <n> s); retry in a few seconds`, `<n>` being the time the recognition
+  that is running has taken so far. A `vm.find_text` whose own recognition has
+  begun is answered when that recognition ends.
 - When the server starts it reads a small image with both recognizers in the
-  background, which loads them. Loading takes a fraction of a second, and tens
-  of seconds the first time a server binary runs from a path where it has not
-  read text before. A `vm.find_text` that arrives meanwhile waits behind it; a
-  text condition of `vm.wait_for` waits until its timeout and is then listed
-  in `problems` (see [Waiting for conditions](#waiting-for-conditions)).
+  background, which loads them; a recognizer that fails to read the image does
+  not keep the other from being loaded. Loading takes a fraction of a second,
+  and tens of seconds the first time a server binary runs from a path where it
+  has not read text before. It runs at utility priority, and at the priority
+  of a request for as long as a request waits behind it. A `vm.find_text` that
+  arrives meanwhile waits behind it; a text condition of `vm.wait_for` waits
+  behind it too, and is listed in `problems` when the loading outlasts its
+  timeout (see [Waiting for conditions](#waiting-for-conditions)).
 - When the Vision request itself fails (`text recognition failed: <reason>`),
   the op waits 150 ms and tries once more on the same frame; a second failure
   answers `text recognition failed twice; call vm.find_text again or use
@@ -293,8 +307,14 @@ screen take the screen at the start of the wait as their reference
 Conditions are evaluated in a loop with a 250 ms tick; each condition has its
 own period: 250 ms for `screen_idle` and `region_changed`, 700 ms for
 `text_visible` and `text_gone`, 500 ms for the conditions that call the guest
-tools. Conditions that read the screen share one frame per tick, and equal
-text searches share one recognition. A condition that needs guest tools
+tools. Conditions that read the screen share one frame per tick. A text
+condition does not hold the other conditions: its recognition runs beside the
+loop and is looked at on every tick, like a guest call, and the other
+conditions are judged on every tick meanwhile. Text conditions with the same
+`region` and `languages` share one recognition, and no new one is asked for
+while it runs. While the pixels of a text condition's area do not change, the
+area is not recognized again: the lines of its last recognition are used. A
+condition that needs guest tools
 (`process_*`, `file_exists`, `port_listening`, `log_matches`,
 `job_output_matches`) answers `guest tools are not connected in '<vm>'; ...`
 when they are not connected after a wait of up to 25 s. If several conditions hold on the same tick, the
@@ -305,8 +325,9 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
 - `matched` is the index of the condition that held, or `-1`. `waited` is the
   elapsed time in seconds with one decimal. `type` is its `type`; `detail` is
   as in the table. Running out of time is a success with `matched: -1`.
-  `waited` can exceed `timeout` by up to one second when a text recognition is
-  finishing.
+  `waited` can exceed `timeout` by up to one second plus one tick: at the
+  timeout the wait gives the text recognitions that have not finished one
+  second, all of them together, whatever their number.
 - `job exited`: when a `job_output_matches` condition sees the job exited and
   all its output read without a match, it can no longer become true and the wait
   ends at once with `matched: -1`, `type: "job_output_matches"` and
@@ -316,15 +337,19 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   `problems` appears only when `matched` is `-1` and lists
   `{condition, type, error, failures}` for each condition whose latest
   evaluations failed, `failures` being the number in a row. A text recognition
-  that has not finished at the timeout and one second after the wait asked for
-  it is given up: the wait ends, leaves the line of recognitions, and the
-  condition is listed with `text recognition did not finish within the
-  timeout; call vm.wait_for again with a longer timeout`. A port check whose
-  guest command fails or prints nothing on stdout is listed with `the port
-  check failed: the guest command exited with code <n>: <line>; run vm.doctor
-  to check the guest shell`, `<line>` being the first line of what the command
-  wrote to stderr, or to stdout when stderr is empty, cut at 200 characters;
-  when both are empty the sentence is `the port check failed: the guest
+  that has not finished one second after the timeout is given up: the wait
+  ends, leaves the line of recognitions, and each condition that waited for it
+  is listed, without `failures`, with `the text recognition did not finish
+  within the timeout; call vm.wait_for again` when the recognition was
+  running, or with `the text recognition was waiting behind other recognitions
+  and did not start; call vm.wait_for again` when its turn had not come. A
+  recognition that finishes within that second is still judged. A port check
+  whose guest command fails or prints nothing on stdout is listed with `the
+  port check failed: the guest command exited with code <n>: <line>`, `<line>`
+  being the first line of what the command wrote to stderr, or to stdout when
+  stderr is empty, cut at 200 characters; on a Linux guest without `ss` that
+  line is `ss is not installed in the guest; install the iproute2 package`.
+  When both are empty the sentence is `the port check failed: the guest
   command exited with code <n> and printed nothing; run vm.doctor to check the
   guest shell`. Errors that make the
   condition meaningless end the wait with an error instead: a guest-tools
