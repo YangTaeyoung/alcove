@@ -297,8 +297,9 @@ the guest tools) and `agentCaps` when they are connected.
 
 ## Starting
 
-`vm.start` on a VM that is already starting, running or paused answers its
-state without doing anything, except with `discardChanges: true`, which then
+`vm.start` on a VM in any state except `stopped` and `failed` (`starting`,
+`running`, `paused`, `suspending`, `stopping`) answers its state without doing
+anything, except with `discardChanges: true`, which then
 answers `VM '<vm>' is already running; stop it first to start a session that
 discards changes`. `ephemeral` in the result says whether the running session
 discards its changes.
@@ -414,7 +415,7 @@ image for later writes, and the image file keeps its size.
   answer `no snapshot '<s>' in '<vm>'; call vm.snapshot.list`.
 - A failure of the engine answers `snapshot create failed: <message>`,
   `snapshot restore failed: <message>` or `snapshot delete failed: <message>`
-  with the engine's message, or `the engine closed its control connection;
+  with the engine's message, or `the engine closed the connection (<reason>);
   check vm.status` when the engine went away.
 
 ## Port forwards
@@ -452,7 +453,8 @@ shows three kinds:
 
 `vm.set_network` with `up: false` takes the link of the guest's network
 adapter down (the guest sees an unplugged cable); `up: true` brings it back.
-`up` must be a boolean. The guest tools connect through the same adapter:
+`up` must be a boolean; without it, or with another type, the op answers
+`missing or invalid parameter 'up'`. The guest tools connect through the same adapter:
 
 - While the link is down, an op that needs the guest tools waits for its
   reply and then answers `guest tools in '<vm>' did not answer <op> in time;
@@ -506,7 +508,7 @@ to `width` x `height` (320 to 7680 by 200 to 4320, otherwise `width must be
 320...7680 and height 200...4320`). It then reads the frame every 500 ms for
 up to 8 s, until its size changes or equals the request, and answers the size
 of the last frame read. A guest that does not offer the mode leaves the size
-as it was, and the result says so. The op needs a running VM with connected
+as it was, and the result then shows the unchanged size. The op needs a running VM with connected
 guest tools.
 
 ## Guest environment

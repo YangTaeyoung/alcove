@@ -23,8 +23,10 @@ modifies `hw/nvme/ctrl.c`. `scripts/build-qemu.sh` applies both to QEMU
 `v11.1.1` (`QEMU_TAG`).
 
 `ui/alcove.c` declares `SPDX-License-Identifier: GPL-2.0-or-later` in its own
-header (patch line 136). None of the five modified files carries a per-file
-licence header, and QEMU's `LICENSE` clause 2 says source files with no
+header (patch line 136). None of the five files modified by patch 0001 carries
+a per-file licence header; `hw/nvme/ctrl.c` (patch 0002) carries its own, which
+reads "This code is licensed under the GNU GPL v2 or later." For the files
+without a header, QEMU's `LICENSE` clause 2 says source files with no
 licensing information are GPL "version 2 or (at your option) any later
 version" — so the whole series is GPL-2.0-or-later.
 
