@@ -217,7 +217,7 @@ final class GuestEvidenceTests: XCTestCase {
     func testEnableDumpsWritesKeysForExe() async throws {
         let (h, agent) = try await setup(stdout: "{\"folder\":\"C:\\\\alcove-dumps\"}")
         let r = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "My App.exe"])
-        XCTAssertEqual(r, ["folder": "C:\\alcove-dumps"])
+        XCTAssertEqual(r, ["folder": "C:\\alcove-dumps", "eventSeq": 0])
         let script = try XCTUnwrap(commands(agent).first)
         XCTAssertTrue(script.contains("Windows Error Reporting\\LocalDumps\\' + 'My App.exe'"), script)
         XCTAssertTrue(script.contains("C:\\alcove-dumps"), script)
@@ -233,7 +233,7 @@ final class GuestEvidenceTests: XCTestCase {
     func testDisableDumpsRemovesOnlyThatImage() async throws {
         let (h, agent) = try await setup()
         let r = try await h.handle(op: "vm.crash_dumps.disable", params: ["name": "Win", "exe": "MyApp.exe"])
-        XCTAssertEqual(r, [:])
+        XCTAssertEqual(r, ["eventSeq": 0])
         let script = try XCTUnwrap(commands(agent).first)
         XCTAssertTrue(script.contains("LocalDumps\\' + 'MyApp.exe'"), script)
         XCTAssertTrue(script.contains("DeleteSubKeyTree"), script)
