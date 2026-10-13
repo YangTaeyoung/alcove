@@ -155,6 +155,94 @@ func TestFsStat(t *testing.T) {
 	}
 }
 
+func TestIsLink(t *testing.T) {
+	links := []os.FileMode{os.ModeSymlink | 0o777, os.ModeSymlink | 0o666, os.ModeIrregular | 0o666}
+	for _, m := range links {
+		if !isLink(m) {
+			t.Errorf("%v is not reported as a link", m)
+		}
+	}
+	plain := []os.FileMode{0o644, os.ModeDir | 0o755, os.ModeDir | os.ModeIrregular | 0o777, os.ModeNamedPipe, os.ModeSocket, os.ModeDevice | os.ModeCharDevice}
+	for _, m := range plain {
+		if isLink(m) {
+			t.Errorf("%v is reported as a link", m)
+		}
+	}
+}
+
+// symlink creates a symbolic link or skips the test where the system does not allow one.
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symbolic links cannot be created here: %v", err)
+	}
+}
+
+func TestFsStatReportsLinks(t *testing.T) {
+	c, home := fsHome(t)
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "f.txt"), []byte("abc"), 0o644)
+	os.Mkdir(filepath.Join(home, "real"), 0o755)
+	os.WriteFile(filepath.Join(home, "real.txt"), []byte("x"), 0o644)
+	symlink(t, outside, filepath.Join(home, "to-dir"))
+	symlink(t, filepath.Join(outside, "f.txt"), filepath.Join(home, "to-file"))
+	symlink(t, filepath.Join(outside, "gone"), filepath.Join(home, "dangling"))
+
+	res := c.ok("fs.stat", proto.Message{"path": "to-dir"})
+	if res["exists"] != true || res["dir"] != true || res["link"] != true || res.String("path") != filepath.Join(home, "to-dir") {
+		t.Fatalf("link to a directory %v", res)
+	}
+	res = c.ok("fs.stat", proto.Message{"path": "to-file", "sha256": true})
+	sum := sha256.Sum256([]byte("abc"))
+	if res["exists"] != true || res["dir"] != false || res["link"] != true || res.Int("size") != 3 || res.String("sha256") != hex.EncodeToString(sum[:]) {
+		t.Fatalf("link to a file %v", res)
+	}
+	res = c.ok("fs.stat", proto.Message{"path": "dangling"})
+	if res["exists"] != false || res["link"] != true {
+		t.Fatalf("link to nothing %v", res)
+	}
+	for _, name := range []string{"real", "real.txt", "missing", "to-dir/f.txt"} {
+		if res := c.ok("fs.stat", proto.Message{"path": name}); res.Has("link") {
+			t.Fatalf("%s: %v", name, res)
+		}
+	}
+}
+
+func TestFsListMarksLinksAndDoesNotEnterThem(t *testing.T) {
+	c, home := fsHome(t)
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("s"), 0o644)
+	os.MkdirAll(filepath.Join(home, "t", "sub"), 0o755)
+	os.WriteFile(filepath.Join(home, "t", "a.txt"), []byte("a"), 0o644)
+	symlink(t, outside, filepath.Join(home, "t", "sub", "out"))
+	symlink(t, filepath.Join(outside, "secret.txt"), filepath.Join(home, "t", "note"))
+
+	res := c.ok("fs.list", proto.Message{"path": "t", "recursive": true, "sha256": true})
+	em := entryMap(res)
+	if len(em) != 4 {
+		t.Fatalf("entries %v", em)
+	}
+	for _, name := range []string{"sub/out", "note"} {
+		e := em[name]
+		if e == nil || e["link"] != true || e["dir"] != false {
+			t.Fatalf("%s: %v", name, e)
+		}
+		if _, has := e["sha256"]; has {
+			t.Fatalf("%s has a digest: %v", name, e)
+		}
+	}
+	for _, name := range []string{"sub", "a.txt"} {
+		if _, has := em[name]["link"]; has {
+			t.Fatalf("%s: %v", name, em[name])
+		}
+	}
+
+	res = c.ok("fs.list", proto.Message{"path": "t/sub/out", "recursive": true})
+	if list, _ := res["entries"].([]any); len(list) != 0 {
+		t.Fatalf("entries below a link %v", list)
+	}
+}
+
 func entryMap(res proto.Message) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	list, _ := res["entries"].([]any)

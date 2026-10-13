@@ -94,8 +94,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `exec.list` | — | `jobs`: [{`job`, `pid`, `state`, `code` (when exited), `cmd`, `started` (RFC 3339)}] |
 | `proc.list` | `name` (case-insensitive substring of the process name) | `procs`: [{`pid`, `ppid`, `name`, `path`, `cmd`, `mem_kb`}] |
 | `proc.kill` | `pid`, or `name` (exact process name); `tree` (bool) | `killed` (int) |
-| `fs.stat` | `path`; `sha256` (bool) | `exists`, `path` (absolute); for an existing entry also `dir`, `size`, `mtime` (RFC 3339, UTC), and `sha256` when asked for a file |
-| `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`}], `truncated` (more than 5000 entries) |
+| `fs.stat` | `path`; `sha256` (bool) | `exists`, `path` (absolute); for an existing entry also `dir`, `size`, `mtime` (RFC 3339, UTC), and `sha256` when asked for a file; `link: true` when the entry at `path` is a link |
+| `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`}], `truncated` (more than 5000 entries) |
 | `fs.read` | `path`, `offset` (default 0), `length` (default and cap 262144) | `data` (base64), `size` (of the file), `eof`, `encoding` |
 | `fs.tail` | `path`, `lines` (default 200) | `data` (base64 of the last lines, taken from at most the last 262144 bytes), `size`, `encoding` |
 | `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool) | `size` (of the file afterwards) |
@@ -536,6 +536,12 @@ agent sends one event per difference, each with the window object:
 - `fs.stat` of a missing path answers `exists: false` without an error.
   `fs.list`, `fs.read` and `fs.tail` of a missing path are errors that name
   the path.
+- `fs.stat` describes what the path leads to and adds `link: true` when the
+  entry at the path is a symbolic link or, on Windows, a junction or another
+  reparse point that is not a plain directory; a link to nothing answers
+  `exists: false` with `link: true`. `fs.list` marks such entries with
+  `link: true`, lists them with `dir: false` and does not list what is below
+  them.
 - `fs.list` lists the direct children, or with `recursive` the whole tree, in
   lexical order, at most 5000 entries. `sha256` (lower-case hex) is present
   only when asked for, and only for regular files the agent could read: a

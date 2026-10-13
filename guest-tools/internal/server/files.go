@@ -76,14 +76,31 @@ func (s *Server) registerFiles() {
 	s.register("fs.delete", true, s.fsDelete)
 }
 
+// isLink reports whether mode, read without following links, is that of a
+// symbolic link or of another entry that stands for something else and is not
+// a directory, such as a Windows junction.
+func isLink(mode os.FileMode) bool {
+	return mode&os.ModeSymlink != 0 || mode&os.ModeIrregular != 0 && !mode.IsDir()
+}
+
+// fsStat describes what path leads to. "link" is set when the entry at path
+// itself is a link, also when what it points to does not exist.
 func (s *Server) fsStat(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
 	}
+	link := false
+	if li, err := os.Lstat(path); err == nil {
+		link = isLink(li.Mode())
+	}
 	fi, err := os.Stat(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return proto.Message{"exists": false, "path": path}, nil
+		out := proto.Message{"exists": false, "path": path}
+		if link {
+			out["link"] = true
+		}
+		return out, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot stat '%s': %v", path, err)
@@ -94,6 +111,9 @@ func (s *Server) fsStat(_ context.Context, req proto.Message) (proto.Message, er
 		"size":   0,
 		"mtime":  mtimeString(fi),
 		"path":   path,
+	}
+	if link {
+		out["link"] = true
 	}
 	if !fi.IsDir() {
 		out["size"] = fi.Size()
@@ -158,6 +178,9 @@ func (s *Server) fsList(_ context.Context, req proto.Message) (proto.Message, er
 			"dir":   d.IsDir(),
 			"size":  int64(0),
 			"mtime": mtimeString(info),
+		}
+		if isLink(info.Mode()) {
+			e["link"] = true
 		}
 		if !d.IsDir() {
 			e["size"] = info.Size()
