@@ -417,10 +417,13 @@ public actor VMController {
         }
     }
 
+    /// Whether `name` can name a snapshot: 1 to 128 characters without a line break.
+    public static func isValidSnapshotName(_ name: String) -> Bool {
+        !name.isEmpty && name.count <= 128 && !name.contains(where: { $0.isNewline })
+    }
+
     private func checkSnapshotName(_ name: String) throws {
-        guard !name.isEmpty, name.count <= 128, !name.contains(where: { $0.isNewline }) else {
-            throw ControllerError.invalidSnapshotName(name)
-        }
+        guard Self.isValidSnapshotName(name) else { throw ControllerError.invalidSnapshotName(name) }
     }
 
     public func createSnapshot(named name: String) async throws {

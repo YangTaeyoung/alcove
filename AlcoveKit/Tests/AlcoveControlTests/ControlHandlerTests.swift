@@ -69,12 +69,22 @@ actor FakeTarget: VMTarget {
         return agentClient
     }
     func snapshots() async throws -> [VMController.SnapshotInfo] { snapshotList }
-    func createSnapshot(named name: String) async throws { snapshotCalls.append("create:\(name)") }
+    func createSnapshot(named name: String) async throws {
+        snapshotCalls.append("create:\(name)")
+        if let snapshotError { throw snapshotError }
+    }
     func restoreSnapshot(named name: String) async throws {
         snapshotCalls.append("restore:\(name)")
+        if let snapshotError { throw snapshotError }
         await restoreHook?(self)
     }
-    func deleteSnapshot(named name: String) async throws { snapshotCalls.append("delete:\(name)") }
+    func deleteSnapshot(named name: String) async throws {
+        snapshotCalls.append("delete:\(name)")
+        if let snapshotError { throw snapshotError }
+    }
+    /// What `createSnapshot`, `restoreSnapshot` and `deleteSnapshot` throw when set.
+    var snapshotError: Error?
+    func setSnapshotError(_ e: Error?) { snapshotError = e }
     func monitorCommand(_ line: String) async throws -> String {
         monitorLines.append(line)
         return monitorReplies.isEmpty ? "" : monitorReplies.removeFirst()

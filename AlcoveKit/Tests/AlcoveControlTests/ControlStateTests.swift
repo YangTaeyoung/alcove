@@ -29,15 +29,49 @@ final class ControlStateTests: XCTestCase {
     func testSnapshotCreateRestoreDelete() async throws {
         let (h, t) = setup()
         await t.setSnapshotList([snapshot])
-        let created = try await h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "clean"])
-        XCTAssertEqual(created["snapshot"]?.stringValue, "clean")
+        let created = try await h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "fresh"])
+        XCTAssertEqual(created["snapshot"]?.stringValue, "fresh")
         let restored = try await h.handle(op: "vm.snapshot.restore", params: ["name": "Win", "snapshot": "clean", "waitTools": 0])
         XCTAssertEqual(restored["snapshot"]?.stringValue, "clean")
         XCTAssertEqual(restored["tools"]?.boolValue, false)
         let deleted = try await h.handle(op: "vm.snapshot.delete", params: ["name": "Win", "snapshot": "clean"])
         XCTAssertEqual(deleted, [:])
         let calls = await t.snapshotCalls
-        XCTAssertEqual(calls, ["create:clean", "restore:clean", "delete:clean"])
+        XCTAssertEqual(calls, ["create:fresh", "restore:clean", "delete:clean"])
+    }
+
+    func testSnapshotCreateRefusesAnInvalidName() async throws {
+        let (h, t) = setup()
+        for name in ["", "a\nb", String(repeating: "x", count: 129)] {
+            let message = await failure(h, "vm.snapshot.create", ["name": "Win", "snapshot": .string(name)])
+            XCTAssertEqual(message, "snapshot name must be 1 to 128 characters without a line break; choose another name")
+        }
+        _ = try await h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": .string(String(repeating: "x", count: 128))])
+        let calls = await t.snapshotCalls
+        XCTAssertEqual(calls, ["create:" + String(repeating: "x", count: 128)])
+    }
+
+    func testSnapshotCreateRefusesAnExistingName() async throws {
+        let (h, t) = setup()
+        await t.setSnapshotList([snapshot])
+        let message = await failure(h, "vm.snapshot.create", ["name": "Win", "snapshot": "clean"])
+        XCTAssertEqual(message, "a snapshot named 'clean' already exists in 'Win'; call vm.snapshot.delete first or choose another name")
+        let calls = await t.snapshotCalls
+        XCTAssertEqual(calls, [])
+    }
+
+    func testSnapshotFailuresCarryTheEngineMessage() async throws {
+        let (h, t) = setup()
+        await t.setSnapshotList([snapshot])
+        await t.setSnapshotError(QMPClient.QMPError.job(id: "alcove-snapshot-save-1", error: "Error while writing VM state: No space left on device"))
+        let create = await failure(h, "vm.snapshot.create", ["name": "Win", "snapshot": "fresh"])
+        XCTAssertEqual(create, "snapshot create failed: Error while writing VM state: No space left on device")
+        await t.setSnapshotError(QMPClient.QMPError.command(name: "snapshot-delete", class: "GenericError", desc: "Device 'disk0' is not writable"))
+        let delete = await failure(h, "vm.snapshot.delete", ["name": "Win", "snapshot": "clean"])
+        XCTAssertEqual(delete, "snapshot delete failed: Device 'disk0' is not writable")
+        await t.setSnapshotError(QMPClient.QMPError.disconnected("peer closed"))
+        let restore = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
+        XCTAssertEqual(restore, "snapshot restore failed: the engine closed its control connection; check vm.status")
     }
 
     func testRestoreUnknownSnapshot() async throws {
@@ -122,6 +156,39 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(lines.last, "hostfwd_remove net0 tcp:127.0.0.1:13389")
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
         XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+    }
+
+    func testForwardRemoveAcceptsTheEngineConfirmation() async throws {
+        let (h, t) = setup()
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
+        await t.setMonitorReplies(["host forwarding rule for tcp:127.0.0.1:13389 removed\r\n"])
+        let removed = try await h.handle(op: "vm.forward.remove", params: ["name": "Win", "hostPort": 13389])
+        XCTAssertEqual(removed, [:])
+        let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+    }
+
+    func testForwardRemoveDropsAForwardTheEngineDoesNotHave() async throws {
+        let (h, t) = setup()
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
+        await t.setMonitorReplies(["host forwarding rule for tcp:127.0.0.1:13389 not found\r\n"])
+        let removed = try await h.handle(op: "vm.forward.remove", params: ["name": "Win", "hostPort": 13389])
+        XCTAssertEqual(removed, [:])
+        let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+    }
+
+    func testForwardRemoveReportsAnotherEngineReply() async throws {
+        let (h, t) = setup()
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
+        await t.setMonitorReplies(["invalid format\r\n"])
+        let message = await failure(h, "vm.forward.remove", ["name": "Win", "hostPort": 13389])
+        XCTAssertEqual(message, "port forward failed: invalid format")
+        let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(list["forwards"], [
+            ["hostPort": 40000, "guestPort": 7645, "kind": "agent"],
+            ["hostPort": 13389, "guestPort": 3389, "kind": "runtime"],
+        ])
     }
 
     func testForwardsForgottenWhenStopped() async throws {

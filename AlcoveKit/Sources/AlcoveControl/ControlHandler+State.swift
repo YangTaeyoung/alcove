@@ -79,13 +79,19 @@ extension ControlHandler {
             return ["snapshots": .array(rows)]
         case "vm.snapshot.create":
             let snapshot = try string(params, "snapshot")
-            do { try await t.createSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot create failed: \(error)") }
+            guard VMController.isValidSnapshotName(snapshot) else {
+                throw ControlError.failed("snapshot name must be 1 to 128 characters without a line break; choose another name")
+            }
+            guard try await !snapshotList(t).contains(where: { $0.name == snapshot }) else {
+                throw ControlError.failed("a snapshot named '\(snapshot)' already exists in '\(t.name)'; call vm.snapshot.delete first or choose another name")
+            }
+            do { try await t.createSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot create failed: \(engineReason(error))") }
             return ["snapshot": .string(snapshot)]
         case "vm.snapshot.restore":
             let snapshot = try string(params, "snapshot")
             let wait = params["waitTools"]?.intValue ?? 30
             try await requireSnapshot(snapshot, in: t)
-            do { try await t.restoreSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot restore failed: \(error)") }
+            do { try await t.restoreSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot restore failed: \(engineReason(error))") }
             let agent = await t.agent(timeout: .seconds(max(0, wait)))
             var clockSynced = false
             if let agent { clockSynced = await syncGuestClock(t, agent: agent) }
@@ -93,7 +99,7 @@ extension ControlHandler {
         case "vm.snapshot.delete":
             let snapshot = try string(params, "snapshot")
             try await requireSnapshot(snapshot, in: t)
-            do { try await t.deleteSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot delete failed: \(error)") }
+            do { try await t.deleteSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot delete failed: \(engineReason(error))") }
             return [:]
         case "vm.forward.add":
             let guestPort = try portParameter(params, "guestPort")
@@ -109,7 +115,11 @@ extension ControlHandler {
             } else if try await isReserved(hostPort, in: t) {
                 throw ControlError.failed("host port \(hostPort) is taken; pass hostPort: 0 to let Alcove choose")
             }
-            try await forwardLine(t, "hostfwd_add \(VMController.netdevID) tcp:127.0.0.1:\(hostPort)-:\(guestPort)", hostPort: hostPort)
+            let added = try await forwardLine(t, "hostfwd_add \(VMController.netdevID) tcp:127.0.0.1:\(hostPort)-:\(guestPort)")
+            if added.contains("Could not set up host forwarding rule") {
+                throw ControlError.failed("host port \(hostPort) is taken; pass hostPort: 0 to let Alcove choose")
+            }
+            guard added.isEmpty else { throw ControlError.failed("port forward failed: \(added)") }
             forwardInstances[t.name] = await t.engineInstance()
             runtimeForwards[t.name, default: []].append(Forward(hostPort: hostPort, guestPort: guestPort))
             return ["hostPort": .int(Int64(hostPort)), "guestPort": .int(Int64(guestPort))]
@@ -119,7 +129,10 @@ extension ControlHandler {
             guard runtimeForwards[t.name]?.contains(where: { $0.hostPort == hostPort }) == true else {
                 throw ControlError.failed("no runtime forward on host port \(hostPort) in '\(t.name)'; call vm.forward.list (forwards from the VM configuration cannot be removed while it runs)")
             }
-            try await forwardLine(t, "hostfwd_remove \(VMController.netdevID) tcp:127.0.0.1:\(hostPort)", hostPort: hostPort)
+            let removed = try await forwardLine(t, "hostfwd_remove \(VMController.netdevID) tcp:127.0.0.1:\(hostPort)")
+            guard removed.isEmpty || removed.hasSuffix(" removed") || removed.hasSuffix(" not found") else {
+                throw ControlError.failed("port forward failed: \(removed)")
+            }
             runtimeForwards[t.name]?.removeAll { $0.hostPort == hostPort }
             return [:]
         case "vm.forward.list":
@@ -174,16 +187,27 @@ extension ControlHandler {
         }
     }
 
-    /// Sends a forward line to the monitor; any reply text is an error.
-    private func forwardLine(_ t: VMTarget, _ line: String, hostPort: Int) async throws {
-        let reply: String
-        do { reply = try await t.monitorCommand(line) } catch { throw ControlError.failed("port forward failed: \(error)") }
-        let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        if text.contains("Could not set up host forwarding rule") {
-            throw ControlError.failed("host port \(hostPort) is taken; pass hostPort: 0 to let Alcove choose")
+    /// Sends a forward line to the monitor and returns its reply without surrounding whitespace.
+    /// `hostfwd_add` answers nothing on success; `hostfwd_remove` answers
+    /// `host forwarding rule for <address> removed` or `... not found`.
+    private func forwardLine(_ t: VMTarget, _ line: String) async throws -> String {
+        do {
+            return try await t.monitorCommand(line).trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            throw ControlError.failed("port forward failed: \(engineReason(error))")
         }
-        throw ControlError.failed("port forward failed: \(text)")
+    }
+
+    /// The engine's own message for a QMP error; the error's description otherwise.
+    nonisolated func engineReason(_ error: Error) -> String {
+        switch error {
+        case QMPClient.QMPError.job(_, let message): return message
+        case QMPClient.QMPError.command(_, _, let message): return message
+        case QMPClient.QMPError.disconnected: return "the engine closed its control connection; check vm.status"
+        case QMPClient.QMPError.timeout(let what): return "the engine did not answer \(what) in time; check vm.status"
+        case VMController.ControllerError.notRunning: return "the VM is not running; check vm.status"
+        default: return "\(error)"
+        }
     }
 
     /// A TCP port on 127.0.0.1 that was free at the time of the call.
