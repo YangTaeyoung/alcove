@@ -532,6 +532,7 @@ def _(a, run):
     expect(run.fixture, "check 8 did not start the fixture")
     r = act(a, run, "set_value", role="Edit", name="Message", value=MESSAGE)
     expect(r["node"].get("value") == MESSAGE, f"after set_value the node is {r['node']!r}")
+    labelled = a.call("ui.find", window=run.fixture["id"], role="Edit", name="Message")["nodes"]
     r = act(a, run, "invoke", role="Button", name="Send")
     expect(r["node"]["name"] == "Send", f"ui.act invoke returned {r['node']!r}")
     t0 = time.time()
@@ -555,7 +556,8 @@ def _(a, run):
     wrong = a.ask("ui.act", window=run.fixture["id"], role="Button", name="Send", action="toggle")
     expect(wrong.get("ok") is False and "does not support toggle" in wrong.get("error", "") and "invoke" in wrong["error"],
            f"ui.act toggle on a button answered {wrong!r}")
-    return f"{len(text)} characters, {len(words)} reply words, read at {len(set(lengths))} lengths in {time.time() - t0:.1f} s"
+    return (f"{len(text)} characters, {len(words)} reply words, read at {len(set(lengths))} lengths in {time.time() - t0:.1f} s; "
+            f"after set_value the edit is named {'Message' if labelled else 'by its own text'}")
 
 
 @check("the Dialog button raises dialog.opened and win.action close raises window.closed")
@@ -621,7 +623,7 @@ def _(a, run):
     w = do("focus")
     expect(w["foreground"] is True, f"after focus: {w!r}")
     expect(same_window(a, wid)["foreground"] is True, "win.list does not show the fixture in the foreground after focus")
-    r = act(a, run, "focus", role="Edit", name="Message")
+    r = act(a, run, "focus", role="Edit", automationId="101")
     expect("focused" in r["node"]["flags"], f"after ui.act focus the node is {r['node']!r}")
     f = a.call("ui.focused")
     expect(f["node"]["ref"] == r["node"]["ref"] and f["window"]["id"] == wid, f"ui.focused reports {f['node']!r} in {f['window']['title']!r}")
@@ -689,19 +691,22 @@ def _(a, run):
     expect(all(SECRET not in l for l in log), "the fixture log carries the secret text")
     replies = {}
     for mode in ("auto", "pattern", "descendants"):
-        replies[f"ui.text {mode}"] = a.ask("ui.text", window=wid, role="Edit", name="Secret", mode=mode)
+        replies[f"ui.text {mode}"] = a.ask("ui.text", window=wid, role="Edit", automationId="102", mode=mode)
         expect(replies[f"ui.text {mode}"].get("error") == "the element is a password field; its text is not read; it cannot be read through UI Automation",
                f"ui.text mode {mode} of the password field answered {replies[f'ui.text {mode}']!r}")
     replies["ui.text by ref"] = a.ask("ui.text", ref=r["node"]["ref"])
+    replies["ui.tree of the field"] = a.call("ui.tree", root=r["node"]["ref"], filter="all")
+    expect([n["ref"] for n in replies["ui.tree of the field"]["nodes"]] == [r["node"]["ref"]],
+           f"ui.tree with the password field as root lists {replies['ui.tree of the field']['nodes']!r}")
     replies["ui.text of the window"] = a.call("ui.text", window=wid, role="Window", mode="descendants")
     replies["ui.tree"] = a.call("ui.tree", window=wid, filter="all", max=2000)
     replies["ui.tree interactive"] = a.call("ui.tree", window=wid)
     replies["ui.find"] = a.call("ui.find", window=wid, name="Secret")
-    replies["ui.rect"] = a.call("ui.rect", window=wid, role="Edit", name="Secret")
+    replies["ui.rect"] = a.call("ui.rect", window=wid, role="Edit", automationId="102")
     replies["ui.focused"] = a.call("ui.focused")
     for what, reply in replies.items():
         expect(SECRET not in json.dumps(reply, ensure_ascii=False), f"{what} returned the typed secret")
-    field = [n for n in replies["ui.tree interactive"]["nodes"] if n["role"] == "Edit" and n["name"] == "Secret"]
+    field = [n for n in replies["ui.tree interactive"]["nodes"] if n["ref"] == r["node"]["ref"]]
     expect(len(field) == 1 and "password" in field[0]["flags"] and "value" not in field[0], f"ui.tree lists the field as {field!r}")
     shown = replies["ui.text of the window"]["text"].split("\n")
     expect("Message" in shown and "한글 라벨" in shown, f"the text below the window is {shown!r}")
