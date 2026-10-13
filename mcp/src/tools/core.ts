@@ -1,6 +1,7 @@
 // The core toolset: VM lifecycle, screen, pointer, keyboard, clipboard, exec and file push.
 import { z } from "zod";
 import type { ControlClient } from "../control.js";
+import { actionResult, actionTimeout, observeParams, observePayload, type ObserveArgs } from "../observation.js";
 import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, type Registrar } from "../toolkit.js";
 
 export function register(r: Registrar, client: ControlClient): void {
@@ -101,20 +102,34 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Screenshot",
       description:
-        "Capture the VM screen as a PNG image. Coordinates for click/move/drag tools are guest pixels in the full-resolution frame (width/height in the text part), even when max_width downsamples the returned image.",
+        "Capture the VM screen as a PNG or JPEG image. Coordinates for click/move/drag tools are guest pixels in the full-resolution frame. The text part gives the guest frame size and where the returned image sits: guest = origin + image_pixel / scale. Use region to capture one rectangle, scale or max_width to shrink the image.",
       inputSchema: {
         name: vmName,
+        region: z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() }).optional().describe("Capture only this guest-pixel rectangle {x, y, w, h}"),
+        scale: z.number().min(0.1).max(1).optional().describe("Scale the captured area by this factor (0.1 to 1)"),
         max_width: z.number().int().min(64).max(4096).optional().describe("Downscale the returned image to this width (default 1280) to save tokens; coordinates stay in full guest pixels"),
+        format: z.enum(["png", "jpeg"]).optional().describe("Image format (default png); jpeg is smaller"),
+        quality: z.number().min(0.1).max(1).optional().describe("JPEG quality (default 0.8)"),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ name, max_width }) => {
+    async ({ name, region, scale, max_width, format, quality }) => {
       try {
-        const r = await client.call("vm.screenshot", { name, maxWidth: max_width ?? 1280 }, 60000);
+        const r = await client.call("vm.screenshot", {
+          name,
+          maxWidth: max_width ?? 1280,
+          ...(region ? { region } : {}),
+          ...(scale !== undefined ? { scale } : {}),
+          ...(format ? { format } : {}),
+          ...(quality !== undefined ? { quality } : {}),
+        }, 60000);
+        const jpeg = typeof r.jpeg === "string";
+        const origin = `(${r.x ?? 0}, ${r.y ?? 0})`;
+        const imgScale = Math.round(Number(r.scale ?? 1) * 1000) / 1000;
         return {
           content: [
-            { type: "text", text: `${name}: ${r.width}x${r.height} guest pixels (image sent at ${r.sentWidth}x${r.sentHeight})` },
-            { type: "image", data: r.png as string, mimeType: "image/png" },
+            { type: "text", text: `${name}: guest frame ${r.width}x${r.height}; image ${r.sentWidth}x${r.sentHeight} with origin ${origin} and scale ${imgScale}; guest = origin + image_pixel / scale` },
+            jpeg ? { type: "image", data: r.jpeg as string, mimeType: "image/jpeg" } : { type: "image", data: r.png as string, mimeType: "image/png" },
           ],
         };
       } catch (e) {
@@ -130,13 +145,13 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Click",
       description: "Move the pointer to guest pixel (x, y) and click. Use count=2 for a double-click, button=\"right\" for a context menu.",
-      inputSchema: { name: vmName, ...point, button: z.enum(["left", "right", "middle"]).optional(), count: z.number().int().min(1).max(3).optional() },
+      inputSchema: { name: vmName, ...point, button: z.enum(["left", "right", "middle"]).optional(), count: z.number().int().min(1).max(3).optional(), ...observeParams },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ name, x, y, button, count }) => {
+    async ({ name, x, y, button, count, ...obs }) => {
       try {
-        await client.call("vm.mouse.click", { name, x, y, button: button ?? "left", count: count ?? 1 });
-        return text(`clicked ${button ?? "left"}${count && count > 1 ? ` x${count}` : ""} at (${x}, ${y})`);
+        const r = await client.call("vm.mouse.click", { name, x, y, button: button ?? "left", count: count ?? 1, ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs));
+        return actionResult(`clicked ${button ?? "left"}${count && count > 1 ? ` x${count}` : ""} at (${x}, ${y})`, r, obs.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }
@@ -148,13 +163,13 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Move mouse",
       description: "Move the pointer to guest pixel (x, y) without clicking (hover).",
-      inputSchema: { name: vmName, ...point },
+      inputSchema: { name: vmName, ...point, ...observeParams },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ name, x, y }) => {
+    async ({ name, x, y, ...obs }) => {
       try {
-        await client.call("vm.mouse.move", { name, x, y });
-        return text(`moved to (${x}, ${y})`);
+        const r = await client.call("vm.mouse.move", { name, x, y, ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs));
+        return actionResult(`moved to (${x}, ${y})`, r, obs.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }
@@ -170,13 +185,14 @@ export function register(r: Registrar, client: ControlClient): void {
         name: vmName,
         from_x: z.number().int(), from_y: z.number().int(), to_x: z.number().int(), to_y: z.number().int(),
         button: z.enum(["left", "right", "middle"]).optional(),
+        ...observeParams,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ name, from_x, from_y, to_x, to_y, button }) => {
+    async ({ name, from_x, from_y, to_x, to_y, button, ...obs }) => {
       try {
-        await client.call("vm.mouse.drag", { name, fromX: from_x, fromY: from_y, toX: to_x, toY: to_y, button: button ?? "left" });
-        return text(`dragged (${from_x}, ${from_y}) -> (${to_x}, ${to_y})`);
+        const r = await client.call("vm.mouse.drag", { name, fromX: from_x, fromY: from_y, toX: to_x, toY: to_y, button: button ?? "left", ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs));
+        return actionResult(`dragged (${from_x}, ${from_y}) -> (${to_x}, ${to_y})`, r, obs.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }
@@ -188,13 +204,13 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Scroll",
       description: "Scroll the mouse wheel at guest pixel (x, y). dy > 0 scrolls down, dy < 0 up; dx for horizontal. Units are wheel notches.",
-      inputSchema: { name: vmName, ...point, dy: z.number().int().optional(), dx: z.number().int().optional() },
+      inputSchema: { name: vmName, ...point, dy: z.number().int().optional(), dx: z.number().int().optional(), ...observeParams },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ name, x, y, dy, dx }) => {
+    async ({ name, x, y, dy, dx, ...obs }) => {
       try {
-        await client.call("vm.mouse.scroll", { name, x, y, dy: dy ?? 0, dx: dx ?? 0 });
-        return text(`scrolled dy=${dy ?? 0} dx=${dx ?? 0} at (${x}, ${y})`);
+        const r = await client.call("vm.mouse.scroll", { name, x, y, dy: dy ?? 0, dx: dx ?? 0, ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs));
+        return actionResult(`scrolled dy=${dy ?? 0} dx=${dx ?? 0} at (${x}, ${y})`, r, obs.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }
@@ -207,13 +223,13 @@ export function register(r: Registrar, client: ControlClient): void {
       title: "Type text",
       description:
         "Type text into the guest through the virtual keyboard (US layout). Newlines press Enter. For text outside the US layout the guest tools paste through the clipboard when connected.",
-      inputSchema: { name: vmName, text: z.string().min(1).max(20000), delay_ms: z.number().int().min(0).max(500).optional().describe("Delay between keys (default 12 ms)") },
+      inputSchema: { name: vmName, text: z.string().min(1).max(20000), delay_ms: z.number().int().min(0).max(500).optional().describe("Delay between keys (default 12 ms)"), ...observeParams },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ name, text: t, delay_ms }) => {
+    async ({ name, text: t, delay_ms, ...obs }) => {
       try {
-        await client.call("vm.type", { name, text: t, delay: delay_ms ?? 12 }, 600000);
-        return text(`typed ${t.length} characters`);
+        const r = await client.call("vm.type", { name, text: t, delay: delay_ms ?? 12, ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs, 600000));
+        return actionResult(`typed ${t.length} characters`, r, obs.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }
@@ -226,13 +242,13 @@ export function register(r: Registrar, client: ControlClient): void {
       title: "Press keys",
       description:
         "Press a key or combination and release it, e.g. \"enter\", \"ctrl+c\", \"win+r\", \"alt+f4\", \"ctrl+alt+delete\", \"f5\". Modifiers: ctrl, alt, shift, win (=cmd/meta). Keys: letters, digits, punctuation, enter, tab, esc, backspace, delete, space, up/down/left/right, home, end, pageup, pagedown, f1-f20.",
-      inputSchema: { name: vmName, keys: z.string().min(1), hold_ms: z.number().int().min(0).max(5000).optional().describe("Hold the final key this long before releasing") },
+      inputSchema: { name: vmName, keys: z.string().min(1), hold_ms: z.number().int().min(0).max(5000).optional().describe("Hold the final key this long before releasing"), ...observeParams },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ name, keys, hold_ms }) => {
+    async ({ name, keys, hold_ms, ...obs }) => {
       try {
-        await client.call("vm.key.press", { name, keys, hold: hold_ms ?? 0 });
-        return text(`pressed ${keys}`);
+        const r = await client.call("vm.key.press", { name, keys, hold: hold_ms ?? 0, ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs));
+        return actionResult(`pressed ${keys}`, r, obs.settle_timeout_ms);
       } catch (e) {
         return fail(e);
       }

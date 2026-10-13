@@ -25,6 +25,7 @@ def main():
         "alcove_list_vms", "alcove_vm_status", "alcove_start_vm", "alcove_stop_vm", "alcove_screenshot", "alcove_click",
         "alcove_move_mouse", "alcove_drag", "alcove_scroll", "alcove_type", "alcove_press_keys", "alcove_exec",
         "alcove_get_clipboard", "alcove_set_clipboard", "alcove_push_file", "alcove_wait_idle",
+        "alcove_find_text", "alcove_wait_for", "alcove_batch", "alcove_mouse_down", "alcove_mouse_up", "alcove_key_down", "alcove_key_up",
     }
     shell = {
         "alcove_exec_start", "alcove_exec_read", "alcove_exec_write", "alcove_exec_kill", "alcove_exec_list",
