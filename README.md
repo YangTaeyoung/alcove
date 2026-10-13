@@ -9,7 +9,7 @@
   <a href="#quick-start"><img alt="platform" src="https://img.shields.io/badge/platform-macOS%2015%2B%20·%20Apple%20silicon-0B84FF?style=flat-square"></a>
   <a href="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-MIT%20·%20GPL--2.0%20patches-6E7681?style=flat-square"></a>
-  <a href="#automate-it-from-claude-code"><img alt="MCP" src="https://img.shields.io/badge/MCP-29%20tools-E8952E?style=flat-square"></a>
+  <a href="#automate-it-from-claude-code"><img alt="MCP" src="https://img.shields.io/badge/MCP-46%20tools-E8952E?style=flat-square"></a>
 </p>
 
 <p><b>A virtual machine app for the Mac, written from scratch on top of QEMU and Apple's Hypervisor framework —<br>and the first one your coding agent can drive by itself.</b></p>
@@ -101,7 +101,7 @@ headless engine when it is not.
 ```
 
 <details>
-<summary><b>All 29 tools</b></summary>
+<summary><b>All 46 tools</b></summary>
 
 | Toolset | Tool | What it does |
 |---|---|---|
@@ -122,11 +122,21 @@ headless engine when it is not.
 | `files` | `alcove_pull_file` | Copy a file from the guest to the Mac |
 | `files` | `alcove_sync_dir` | Send the changed files of a Mac folder into a guest folder |
 | `files` | `alcove_fs_list` / `alcove_fs_read` / `alcove_fs_write` / `alcove_fs_delete` | List a guest folder; read a text file by range or its last lines; write text; delete |
+| `state` | `alcove_pause_vm` / `alcove_resume_vm` | Freeze a running VM in memory; continue it |
+| `state` | `alcove_snapshot_list` / `alcove_snapshot_create` / `alcove_snapshot_restore` / `alcove_snapshot_delete` | Named disk and memory snapshots; restoring waits for the guest tools and syncs the guest clock |
+| `state` | `alcove_clone_vm` / `alcove_delete_vm` | A linked clone of a stopped VM; permanently delete a VM |
+| `state` | `alcove_lease_acquire` / `alcove_lease_release` | Keep other agents' state-changing calls off a VM until the lease ends |
+| `state` | `alcove_port_forward_add` / `alcove_port_forward_remove` / `alcove_port_forward_list` | Forward a host port on 127.0.0.1 to a guest port |
+| `state` | `alcove_set_network` / `alcove_set_resolution` / `alcove_set_environment` | Guest network link, screen resolution; theme, time zone, clock, locale, keyboard layouts and display scale |
+| `state` | `alcove_doctor` | Check why a VM may not be automatable, line by line with the next step |
 
 </details>
 
-The server lists every toolset by default. `ALCOVE_MCP_TOOLSETS` selects some,
-for example `core` for the 16 screen and input tools only:
+The server lists every toolset by default. `ALCOVE_MCP_TOOLSETS` selects some
+of `core`, `shell`, `files` and `state` (the names `ui`, `evidence`, `replay` and
+`http` are accepted and hold no tools yet). `core` has 16 tools: VM lifecycle,
+screenshot, pointer, keyboard, `alcove_exec`, the clipboard, `alcove_push_file`
+and `alcove_wait_idle`. For example, `core` and `files`:
 
 ```bash
 claude mcp add alcove -e ALCOVE_MCP_TOOLSETS=core,files -- node "$PWD/dist/index.js"

@@ -40,8 +40,8 @@ Capabilities:
 | both | `ping` / `pong` | — | keepalive every 10 s |
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
 | host → agent | `clipboard.get` | — | ask for the current text; answered with `clipboard.text` |
-| agent → host | `clipboard.text` | `text` | reply to `clipboard.get` |
-| agent → host | `clipboard.changed` | `text` | the guest clipboard changed (text only in v1; polled via the clipboard sequence number on Windows, `wl-paste --watch`/`xclip` polling on Linux) |
+| agent → host | `clipboard.text` | `text` | reply to `clipboard.get`; text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
+| agent → host | `clipboard.changed` | `text` | the guest clipboard changed (text only in v1; polled via the clipboard sequence number on Windows, `wl-paste --watch`/`xclip` polling on Linux); text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
 | host → agent | `resolution.set` | `w`, `h` | ask the guest to switch its primary display mode |
 | agent → host | `resolution` | `w`, `h` | current primary display mode (sent after hello and on change) |
 | host → agent | `file.begin` | `id`, `name`, `size`, `dest` ("desktop"/"downloads") | start a file push |
@@ -50,7 +50,7 @@ Capabilities:
 | agent → host | `file.done` | `id`, `path` or `error` | result |
 | host → agent | `shutdown` | — | graceful OS shutdown (`shutdown /s /t 0` or `systemctl poweroff`) |
 | host → agent | `exec` | `cmd` (string) | run a command with the default shell and no time limit; answered with `exec.result` (`code` -1 and `out` "exec disabled" unless the agent was started with `--allow-exec`) |
-| agent → host | `exec.result` | `code`, `out` | exit code and combined stdout and stderr of `exec` |
+| agent → host | `exec.result` | `code`, `out` | exit code and combined stdout and stderr of `exec`; `out` keeps the last 200000 bytes, starting on a character boundary (there is no `truncated` field) |
 
 Unknown `t` values are ignored. Strings are UTF-8; the guest clipboard is
 converted from/to UTF-16 on Windows by the agent.
@@ -145,8 +145,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   answers the state; for an exited job it answers `exited` at once.
 - The table holds 64 jobs. Starting one more forgets the oldest exited job;
   with 64 running jobs `exec.start` fails and names `exec.kill`.
-- `exec.list` reports each job's full `cmd` text (for `argv`, the elements
-  joined by spaces) and `started` in the guest's local time with its offset.
+- `exec.list` reports each job's `cmd` text (for `argv`, the elements joined
+  by spaces) cut to 4096 characters with a trailing `…` when longer, and `started` in the guest's local time with its offset.
 - When a job's process exits the agent sends
   `{"t":"ev","name":"job.exited","job":"<id>","code":<int>}` to every open
   connection.
@@ -155,7 +155,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 
 - Windows lists `Win32_Process` (`mem_kb` is the working set); elsewhere
   `ps axo pid=,ppid=,rss=,args=` (`name` is the base name of the first
-  argument, `path` is set when that argument is absolute).
+  argument, `path` is set when that argument is absolute). Each `cmd` is cut to
+  8192 characters with a trailing `…` when longer.
 - `proc.kill` with `pid` answers `killed: 1` or an error. With `name` it kills
   every process of that exact name: on Windows through
   `taskkill /F [/T] /IM <name>` (`.exe` is added to a name without an
@@ -202,15 +203,32 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | One message read by the agent (a line with its newline) | 1 MiB (`proto.MaxLine`); a longer line closes the connection |
 | Binary payload of one `fs.read` / `fs.write` / `file.chunk` | 256 KiB (262144 bytes) before base64 |
 | `exec.run` output | last 200000 bytes per stream |
+| `exec` (v1) output | last 200000 bytes of the combined output |
+| `exec.list` `cmd` | 4096 characters per job, then `…` |
+| `proc.list` `cmd` | 8192 characters per process, then `…` |
+| `clipboard.text` / `clipboard.changed` text | 700000 bytes of UTF-8, cut on a character boundary |
 | Job output | last 1 MiB per stream; `exec.read` returns at most 262144 bytes per stream |
 | Jobs | 64 |
 | `fs.list` | 5000 entries |
 | `fs.tail` | last 262144 bytes of the file |
 
-Messages written by the agent are bounded by these payload limits, not by
-1 MiB: JSON escaping can expand command output (a NUL byte becomes six
-characters), so a reply can be several megabytes long. The host reads lines of
-up to 8 MiB and does not send a `req` longer than 1 MiB.
+The host reads lines of up to 8 MiB and does not send a `req` longer than
+1 MiB. JSON escaping can expand text (a NUL byte becomes six characters), so a
+reply can be several megabytes long. What bounds each reply the agent writes:
+
+- `exec.run`, `exec.read`, `fs.read` and `fs.tail` carry at most the payload
+  limits in the table.
+- `exec.list` is bounded by 64 jobs of at most 4096 characters of `cmd`.
+- `proc.list` has one entry per process on the machine, each `cmd` at most
+  8192 characters.
+- `exec.result` carries at most 200000 bytes of `out`.
+- `clipboard.text` and `clipboard.changed` carry at most 700000 bytes of
+  text.
+- `fs.list` is bounded by 5000 entries, not by bytes. A name is at most 255
+  characters on the supported file systems, which keeps a listing of one
+  folder under 8 MiB unless the names consist mostly of control characters. With `recursive` a name is a relative path and a tree of
+  5000 entries with very long paths can pass 8 MiB; the host then closes the
+  connection.
 
 ### Known limitations
 

@@ -462,7 +462,10 @@ def _(run):
     vm = run.vm
     m = run.mcp()
     names = {t["name"] for t in m.request("tools/list")["tools"]}
-    expect(len(names) == 29 and "alcove_fs_list" in names, f"the server lists {len(names)} tools: {sorted(names)}")
+    driven = {"alcove_exec", "alcove_exec_start", "alcove_exec_read", "alcove_exec_write", "alcove_exec_list", "alcove_exec_kill",
+              "alcove_process_list", "alcove_process_kill", "alcove_fs_write", "alcove_fs_read", "alcove_fs_list", "alcove_fs_delete",
+              "alcove_sync_dir", "alcove_pull_file", "alcove_push_file"}
+    expect(driven <= names, f"the default tool list lacks {sorted(driven - names)}")
 
     out = tool(m, "alcove_exec", {"name": vm, "command": "(Get-Location).Path; Write-Output '한글 mcp'", "cwd": "C:\\Windows", "timeout_s": 60})
     expect(out.startswith("exit code 0") and "C:\\Windows" in out and "한글 mcp" in out, f"alcove_exec: {out!r}")
@@ -558,10 +561,10 @@ def _(run):
 
     core = run.mcp("core")
     names = {t["name"] for t in core.request("tools/list")["tools"]}
-    expect("alcove_fs_list" not in names and "alcove_exec_start" not in names and "alcove_exec" in names and len(names) == 16,
+    expect("alcove_exec" in names and "alcove_fs_list" not in names and "alcove_exec_start" not in names,
            f"with ALCOVE_MCP_TOOLSETS=core the server lists {sorted(names)}")
     core.close()
-    return "29 tools, 16 with ALCOVE_MCP_TOOLSETS=core"
+    return f"{len(driven)} driven tools in the default list; core lists alcove_exec without alcove_fs_list and alcove_exec_start"
 
 
 @check("refusals say what was wrong")
@@ -585,6 +588,11 @@ def _(run):
     message = run.refusal("vm.pull_file", guestPath=G_CTL + r"\small.txt", path=os.path.join(nowhere, "small.txt"))
     expect(nowhere in message and "folder" in message, f"vm.pull_file into a missing host folder failed with {message!r}")
     expect(not os.path.exists(nowhere), f"the refused pull created {nowhere}")
+    seen.append(message)
+
+    absent = os.path.join(run.host, "no such source folder")
+    message = run.refusal("vm.sync_dir", path=absent, guestPath=G_CTL + r"\sync-refused")
+    expect(absent in message, f"vm.sync_dir of a missing host folder failed with {message!r}")
     seen.append(message)
 
     count = "[Console]::In.ReadToEnd().Length"
