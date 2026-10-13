@@ -77,7 +77,7 @@ final class LeaseTests: XCTestCase {
         XCTAssertEqual(renewed["expiresIn"]?.intValue, 120)
         clock.advance(.seconds(100))
         let text = await failure(h, "vm.mouse.click", ["name": "Win", "x": 1, "y": 1])
-        XCTAssertTrue(text.contains("for another 70 s;"), text)
+        XCTAssertTrue(text.contains("for another 20 s;"), text)
     }
 
     func testReleaseNeedsToken() async throws {
