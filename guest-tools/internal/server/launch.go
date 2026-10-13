@@ -35,10 +35,12 @@ var (
 )
 
 // claimSet holds the ids of the windows launches have taken, in the order
-// they were taken, at most maxClaims of them.
+// they were taken, at most maxClaims of them, and which of them belong to a
+// launch that has not answered yet.
 type claimSet struct {
 	ids   map[string]bool
 	order []string
+	held  map[string]bool
 }
 
 // add records id; when that makes more than maxClaims ids, the oldest leave.
@@ -53,8 +55,25 @@ func (c *claimSet) add(id string) {
 	c.order = append(c.order, id)
 	for len(c.order) > maxClaims {
 		delete(c.ids, c.order[0])
+		delete(c.held, c.order[0])
 		c.order = c.order[1:]
 	}
+}
+
+// hold marks a claimed id as belonging to a launch that has not answered yet.
+func (c *claimSet) hold(id string) {
+	if !c.ids[id] {
+		return
+	}
+	if c.held == nil {
+		c.held = map[string]bool{}
+	}
+	c.held[id] = true
+}
+
+// release ends the mark hold set; the id stays claimed.
+func (c *claimSet) release(id string) {
+	delete(c.held, id)
 }
 
 func (c *claimSet) remove(id string) {
@@ -62,6 +81,7 @@ func (c *claimSet) remove(id string) {
 		return
 	}
 	delete(c.ids, id)
+	delete(c.held, id)
 	for i, other := range c.order {
 		if other == id {
 			c.order = append(c.order[:i], c.order[i+1:]...)
@@ -70,8 +90,17 @@ func (c *claimSet) remove(id string) {
 	}
 }
 
-func (c *claimSet) clear() {
-	c.ids, c.order = nil, nil
+// clearReleased forgets every id that is not held.
+func (c *claimSet) clearReleased() {
+	var order []string
+	for _, id := range c.order {
+		if c.held[id] {
+			order = append(order, id)
+		} else {
+			delete(c.ids, id)
+		}
+	}
+	c.order = order
 }
 
 func (s *Server) registerLaunch() {
@@ -155,16 +184,28 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 }
 
 // claimWindow picks a window not listed before the launch and not already
-// claimed by another launch, and claims it. The launch's own current claim,
-// named by own, stays eligible so a later listing can reselect it.
+// claimed by another launch, claims it and holds the claim for the launch
+// until releaseClaim. The launch's own current claim, named by own, stays
+// eligible in a later listing.
 func (s *Server) claimWindow(windows []map[string]any, before map[string]bool, tree map[int]bool, foreign bool, own string) map[string]any {
 	s.launchMu.Lock()
 	defer s.launchMu.Unlock()
 	w := pickLaunchWindow(windows, before, tree, foreign, s.claimed.ids, own)
 	if w != nil {
 		s.claimed.add(windowID(w))
+		s.claimed.hold(windowID(w))
 	}
 	return w
+}
+
+// releaseClaim records that the launch holding the claim on id has answered.
+func (s *Server) releaseClaim(id string) {
+	if id == "" {
+		return
+	}
+	s.launchMu.Lock()
+	s.claimed.release(id)
+	s.launchMu.Unlock()
 }
 
 func (s *Server) unclaimWindow(id string) {
@@ -216,6 +257,8 @@ func (s *Server) waitLaunchWindow(ctx context.Context, pid int, before map[strin
 	start := time.Now()
 	deadline := start.Add(wait)
 	tree := map[int]bool{pid: true}
+	held := ""
+	defer func() { s.releaseClaim(held) }()
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -231,6 +274,7 @@ func (s *Server) waitLaunchWindow(ctx context.Context, pid int, before map[strin
 		if err == nil {
 			foreign := done || time.Since(start) >= launchForeignGrace
 			if w := s.claimWindow(windows, before, tree, foreign, ""); w != nil {
+				held = windowID(w)
 				time.Sleep(launchPoll)
 				growTree(tree, processParents())
 				again, againErr := s.listWindows(ctx)
@@ -239,10 +283,12 @@ func (s *Server) waitLaunchWindow(ctx context.Context, pid int, before map[strin
 						if windowID(later) != windowID(w) {
 							s.unclaimWindow(windowID(w))
 							w = later
+							held = windowID(w)
 						}
 					} else if !listedWindow(again, windowID(w)) {
 						// The chosen window is gone and nothing replaced it: keep looking.
 						s.unclaimWindow(windowID(w))
+						held = ""
 						if !time.Now().Before(deadline) {
 							return nil
 						}

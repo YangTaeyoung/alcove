@@ -27,11 +27,11 @@ func (s *Server) HandleUIEvent(name string, fields map[string]any) {
 	s.emit(name, fields)
 }
 
-// HandleUIStart forgets the windows launches have taken; it runs when a UI
-// helper process has started.
+// HandleUIStart forgets the windows taken by launches that have answered; it
+// runs when a UI helper process has started.
 func (s *Server) HandleUIStart() {
 	s.launchMu.Lock()
-	s.claimed.clear()
+	s.claimed.clearReleased()
 	s.launchMu.Unlock()
 }
 

@@ -350,17 +350,54 @@ func TestClaimSetForgetsTheOldestIdsBeyondItsLimit(t *testing.T) {
 	if c.ids["0x4"] || len(c.ids) != maxClaims-1 || len(c.order) != maxClaims-1 {
 		t.Fatalf("after removing 0x4 the set holds %d ids in an order of %d", len(c.ids), len(c.order))
 	}
-	c.clear()
+	c.clearReleased()
 	if len(c.ids) != 0 || len(c.order) != 0 {
-		t.Fatalf("after clear the set holds %d ids", len(c.ids))
+		t.Fatalf("after clearReleased the set holds %d ids", len(c.ids))
 	}
 	c.add("0x1")
 	if !c.ids["0x1"] || len(c.order) != 1 {
-		t.Fatal("an id claimed after clear is missing")
+		t.Fatal("an id claimed after clearReleased is missing")
 	}
 }
 
-func TestAHelperStartReleasesTheClaimedWindows(t *testing.T) {
+func TestClaimSetKeepsHeldIdsWhenItForgetsTheReleasedOnes(t *testing.T) {
+	var c claimSet
+	for _, id := range []string{"0x1", "0x2", "0x3", "0x4"} {
+		c.add(id)
+	}
+	c.hold("0x2")
+	c.hold("0x4")
+	c.hold("0xnone")
+	if c.ids["0xnone"] || c.held["0xnone"] {
+		t.Fatal("holding an id that is not claimed claimed it")
+	}
+	c.clearReleased()
+	if len(c.ids) != 2 || !c.ids["0x2"] || !c.ids["0x4"] || fmt.Sprint(c.order) != "[0x2 0x4]" {
+		t.Fatalf("after clearReleased the set holds %v in the order %v", c.ids, c.order)
+	}
+	c.release("0x2")
+	if !c.ids["0x2"] {
+		t.Fatal("a released id is no longer claimed")
+	}
+	c.remove("0x4")
+	if c.held["0x4"] {
+		t.Fatal("a removed id is still held")
+	}
+	c.clearReleased()
+	if len(c.ids) != 0 || len(c.order) != 0 {
+		t.Fatalf("after the second clearReleased the set holds %v", c.ids)
+	}
+	for i := 0; i < maxClaims+1; i++ {
+		id := fmt.Sprintf("0x%x", 100+i)
+		c.add(id)
+		c.hold(id)
+	}
+	if c.ids["0x64"] || c.held["0x64"] || len(c.held) != maxClaims {
+		t.Fatalf("the oldest held id stayed beyond the limit; %d ids are held", len(c.held))
+	}
+}
+
+func TestAHelperStartReleasesTheClaimsOfLaunchesThatAnswered(t *testing.T) {
 	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: &fakeUI{}})
 	before := map[string]bool{}
 	tree := map[int]bool{77: true}
@@ -372,12 +409,57 @@ func TestAHelperStartReleasesTheClaimedWindows(t *testing.T) {
 		t.Fatalf("a claimed window was claimed again: %v", w)
 	}
 	s.HandleUIStart()
+	if w := s.claimWindow(windows, before, tree, false, ""); w != nil {
+		t.Fatalf("a helper start released the claim of a launch that has not answered: %v", w)
+	}
+	s.releaseClaim("0x20")
+	if w := s.claimWindow(windows, before, tree, false, ""); w != nil {
+		t.Fatalf("the claim of a launch that answered was released without a helper start: %v", w)
+	}
+	s.HandleUIStart()
 	if w := s.claimWindow(windows, before, tree, false, ""); w == nil || windowID(w) != "0x20" {
 		t.Fatalf("claim after a helper start: %v", w)
 	}
 	s.HandleUIEvent("window.closed", map[string]any{"window": map[string]any{"id": "0x20"}})
 	if w := s.claimWindow(windows, before, tree, false, ""); w == nil || windowID(w) != "0x20" {
 		t.Fatalf("claim after window.closed: %v", w)
+	}
+}
+
+func TestAHelperStartDuringALaunchKeepsItsClaimAndTheAnswerReleasesTheHold(t *testing.T) {
+	old := window("0x10", "Program Manager", 4)
+	var s *Server
+	var heldAtStart, claimedAfterStart bool
+	ui := &windowsUI{list: func(n int) ([]any, error) {
+		if n == 0 {
+			return []any{old}, nil
+		}
+		if n == 2 {
+			// The listing after the first choice: a helper starts while the launch runs.
+			s.launchMu.Lock()
+			heldAtStart = s.claimed.held["0x20"]
+			s.launchMu.Unlock()
+			s.HandleUIStart()
+			s.launchMu.Lock()
+			claimedAfterStart = s.claimed.ids["0x20"]
+			s.launchMu.Unlock()
+		}
+		return []any{window("0x20", "Fixture", 77), old}, nil
+	}}
+	var c *rpcClient
+	c, s = newRPCClient(t, Options{UI: ui})
+	res := c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}})
+	if w, _ := res["window"].(map[string]any); w["id"] != "0x20" {
+		t.Fatalf("res %v", res)
+	}
+	if !heldAtStart || !claimedAfterStart {
+		t.Fatalf("held before the helper start: %v, claimed after it: %v", heldAtStart, claimedAfterStart)
+	}
+	s.launchMu.Lock()
+	held, claimed := len(s.claimed.held), s.claimed.ids["0x20"]
+	s.launchMu.Unlock()
+	if held != 0 || !claimed {
+		t.Fatalf("after the answer %d claims are held and 0x20 claimed is %v", held, claimed)
 	}
 }
 
