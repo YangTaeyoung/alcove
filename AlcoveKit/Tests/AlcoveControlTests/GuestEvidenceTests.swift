@@ -7,16 +7,23 @@ import AlcoveQMP
 import AlcoveTestSupport
 
 final class GuestEvidenceTests: XCTestCase {
-    private func setup(os: VMConfig.GuestOS = .windows, fs: FakeFS? = nil, stdout: String = "", code: Int = 0, stderr: String = "")
+    private func setup(os: VMConfig.GuestOS = .windows, fs: FakeFS? = nil, stdout: String = "", code: Int = 0, stderr: String = "",
+                       truncated: Bool = false, timedOut: Bool = false, staleDigest: Bool = false)
         async throws -> (ControlHandler, FakeAgent) {
         let agent = FakeAgent()
         fs?.install(on: agent)
         let files = agent.handler
         agent.handler = { m, a in
             if m["t"]?.stringValue == "req", m["op"]?.stringValue == "exec.run" {
-                return [agentReply(m, ["code": .int(Int64(code)), "stdout": .string(stdout), "stderr": .string(stderr), "timed_out": false])]
+                return [agentReply(m, ["code": .int(Int64(code)), "stdout": .string(stdout), "stderr": .string(stderr), "timed_out": .bool(timedOut), "truncated": .bool(truncated)])]
             }
-            return files?(m, a) ?? []
+            let replies = files?(m, a) ?? []
+            guard staleDigest, m["op"]?.stringValue == "fs.stat" else { return replies }
+            return replies.map { reply in
+                guard case .object(var o) = reply else { return reply }
+                o["sha256"] = .string(String(repeating: "0", count: 64))
+                return .object(o)
+            }
         }
         let (h, t) = try await handlerWithAgent(agent, in: self)
         await t.setOS(os)
@@ -50,6 +57,8 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertTrue(script.contains("AddMinutes(-60)"), script)
         XCTAssertTrue(script.contains("-First 50"), script)
         XCTAssertFalse(script.contains("$filter.Level"), script)
+        XCTAssertTrue(script.contains("-gt 150000"), script)
+        XCTAssertTrue(script.contains("ConvertTo-Json -Compress -Depth 3"), script)
     }
 
     func testEventLogAcceptsAPlainArray() async throws {
@@ -138,20 +147,22 @@ final class GuestEvidenceTests: XCTestCase {
 
     func testEventLogOnLinuxReadsTheJournal() async throws {
         let line = "{\"__REALTIME_TIMESTAMP\":\"1800000000123456\",\"PRIORITY\":\"3\",\"SYSLOG_IDENTIFIER\":\"myapp\",\"_PID\":\"412\",\"MESSAGE\":\"segfault at 0\"}"
-        let noise = "{\"__REALTIME_TIMESTAMP\":\"1800000001000000\",\"PRIORITY\":\"6\",\"_COMM\":\"cron\",\"MESSAGE\":[104,105]}"
-        let (h, agent) = try await setup(os: .linux, stdout: line + "\n" + noise + "\npartial{")
+        let newer = "{\"__REALTIME_TIMESTAMP\":\"1800000001000000\",\"PRIORITY\":\"6\",\"_COMM\":\"cron\",\"MESSAGE\":[104,105]}"
+        let (h, agent) = try await setup(os: .linux, stdout: "{\"__REALTIME_TIMESTAMP\":\"17999\npartial\n" + line + "\n" + newer + "\n")
         let r = try await h.handle(op: "vm.event_log", params: ["name": "Win", "level": "error", "provider": "myapp", "sinceMinutes": 10, "contains": "a.b", "max": 20])
         XCTAssertEqual(r["entries"]?.arrayValue?.count, 2)
-        XCTAssertEqual(r["entries"]?[0]?["time"]?.stringValue, "2027-01-15T08:00:00.123Z")
-        XCTAssertEqual(r["entries"]?[0]?["level"]?.stringValue, "error")
-        XCTAssertEqual(r["entries"]?[0]?["provider"]?.stringValue, "myapp")
-        XCTAssertEqual(r["entries"]?[0]?["id"]?.intValue, 412)
-        XCTAssertEqual(r["entries"]?[0]?["message"]?.stringValue, "segfault at 0")
-        XCTAssertEqual(r["entries"]?[1]?["level"]?.stringValue, "info")
-        XCTAssertEqual(r["entries"]?[1]?["provider"]?.stringValue, "cron")
-        XCTAssertEqual(r["entries"]?[1]?["message"]?.stringValue, "hi")
+        XCTAssertEqual(r["entries"]?[0]?["level"]?.stringValue, "info")
+        XCTAssertEqual(r["entries"]?[0]?["provider"]?.stringValue, "cron")
+        XCTAssertEqual(r["entries"]?[0]?["message"]?.stringValue, "hi")
+        XCTAssertEqual(r["entries"]?[1]?["time"]?.stringValue, "2027-01-15T08:00:00.123Z")
+        XCTAssertEqual(r["entries"]?[1]?["level"]?.stringValue, "error")
+        XCTAssertEqual(r["entries"]?[1]?["provider"]?.stringValue, "myapp")
+        XCTAssertEqual(r["entries"]?[1]?["id"]?.intValue, 412)
+        XCTAssertEqual(r["entries"]?[1]?["message"]?.stringValue, "segfault at 0")
+        XCTAssertNil(r["truncated"])
         let script = try XCTUnwrap(commands(agent).first)
         XCTAssertTrue(script.contains("journalctl -o json"), script)
+        XCTAssertFalse(script.contains(" -r "), script)
         XCTAssertTrue(script.contains("-p 3"), script)
         XCTAssertTrue(script.contains("-t 'myapp'"), script)
         XCTAssertTrue(script.contains("--since=-10min"), script)
@@ -159,12 +170,45 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertTrue(script.contains("-n 20"), script)
     }
 
-    func testEventLogFailureNamesTheNextStep() async throws {
-        let (h, _) = try await setup(stdout: "", code: 1, stderr: "the guest has no event log named 'Nope'; list logs with Get-WinEvent -ListLog *")
+    func testEventLogOnLinuxKeepsTheNewestEntriesWhenOutputIsCut() async throws {
+        func row(_ micros: Int, _ text: String) -> String {
+            "{\"__REALTIME_TIMESTAMP\":\"\(micros)\",\"PRIORITY\":\"3\",\"MESSAGE\":\"\(text)\"}"
+        }
+        let (h, _) = try await setup(os: .linux, stdout: "ncated tail\"}\n" + row(1_800_000_001_000_000, "b") + "\n" + row(1_800_000_002_000_000, "c") + "\n", truncated: true)
+        let r = try await h.handle(op: "vm.event_log", params: ["name": "Win", "max": 2])
+        XCTAssertEqual(r["entries"]?.arrayValue?.compactMap { $0["message"]?.stringValue }, ["c", "b"])
+        XCTAssertEqual(r["truncated"]?.boolValue, true)
+    }
+
+    func testEventLogCutByTheAgentNamesTheNextStep() async throws {
+        let (h, _) = try await setup(stdout: "ries\":[{\"time\":\"t\"}],\"truncated\":false}", truncated: true)
+        let text = await failure(h, "vm.event_log", ["name": "Win"])
+        XCTAssertEqual(text, "the guest output was cut before the host read it; pass a smaller max or a narrower sinceMinutes")
+    }
+
+    func testEventLogTimeoutNamesTheNextStep() async throws {
+        let (h, _) = try await setup(stdout: "", code: -1, timedOut: true)
+        let text = await failure(h, "vm.event_log", ["name": "Win"])
+        XCTAssertEqual(text, "the guest took more than 60 s to read the event log; narrow it with level, provider, contains or a smaller sinceMinutes")
+    }
+
+    func testEventLogOnAnOldJournalctlNamesTheNextStep() async throws {
+        let (h, _) = try await setup(os: .linux, stdout: "", code: 1, stderr: "journalctl: unrecognized option '--output-fields=PRIORITY'")
+        let text = await failure(h, "vm.event_log", ["name": "Win"])
+        XCTAssertEqual(text, "journalctl in the guest is too old for these filters; read the logs with vm.exec instead")
+    }
+
+    func testUnknownLogSentenceComesFromTheScript() async throws {
+        let (h, agent) = try await setup(stdout: "", code: 2, stderr: "the guest has no event log named 'Nope'; list the logs with Get-WinEvent -ListLog *\r\n")
         let text = await failure(h, "vm.event_log", ["name": "Win", "log": "Nope"])
-        XCTAssertEqual(text, "the guest has no event log named 'Nope'; list logs with Get-WinEvent -ListLog *")
-        let (h2, _) = try await setup(stdout: "not json")
-        let bad = await failure(h2, "vm.event_log", ["name": "Win"])
+        XCTAssertEqual(text, "the guest has no event log named 'Nope'; list the logs with Get-WinEvent -ListLog *")
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("[Console]::Error.WriteLine(\"the guest has no event log named '$log'; list the logs with Get-WinEvent -ListLog *\"); exit 2"), script)
+    }
+
+    func testEventLogOutputThatIsNoJSONIsAnError() async throws {
+        let (h, _) = try await setup(stdout: "not json")
+        let bad = await failure(h, "vm.event_log", ["name": "Win"])
         XCTAssertEqual(bad, "the guest printed no event log JSON; run vm.doctor to check the guest shell")
     }
 
@@ -224,11 +268,36 @@ final class GuestEvidenceTests: XCTestCase {
     }
 
     func testDumpListWithoutFolder() async throws {
-        for output in ["", "[]"] {
+        let (h, _) = try await setup(stdout: "[]")
+        let r = try await h.handle(op: "vm.crash_dumps.list", params: ["name": "Win"])
+        XCTAssertEqual(r, ["dumps": []])
+    }
+
+    func testDumpListOutputThatIsNoJSONIsAnError() async throws {
+        for output in ["", "Warning: profile", "[{\"file\""] {
             let (h, _) = try await setup(stdout: output)
-            let r = try await h.handle(op: "vm.crash_dumps.list", params: ["name": "Win"])
-            XCTAssertEqual(r, ["dumps": []], output)
+            let text = await failure(h, "vm.crash_dumps.list", ["name": "Win"])
+            XCTAssertEqual(text, "the guest printed no crash dump list; run vm.doctor to check the guest shell", output)
         }
+    }
+
+    func testDumpListKeepsOnlyDmpExtensions() async throws {
+        let (h, agent) = try await setup(stdout: "[]")
+        _ = try await h.handle(op: "vm.crash_dumps.list", params: ["name": "Win"])
+        XCTAssertTrue(try XCTUnwrap(commands(agent).first).contains("$_.Extension -ieq '.dmp'"))
+    }
+
+    func testEnableAndDisableReportGuestFailuresAsSentences() async throws {
+        let (h, agent) = try await setup()
+        _ = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "a.exe"])
+        let enable = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(enable.contains("$LASTEXITCODE -ne 0"), enable)
+        XCTAssertTrue(enable.contains("[Console]::Error.WriteLine('could not make C:\\alcove-dumps writable for the Users group; check the folder permissions'); exit 2"), enable)
+        XCTAssertTrue(enable.contains("catch {"), enable)
+        XCTAssertTrue(enable.contains("check that alcove-agent runs elevated"), enable)
+        _ = try await h.handle(op: "vm.crash_dumps.disable", params: ["name": "Win", "exe": "a.exe"])
+        let disable = commands(agent)[1]
+        XCTAssertTrue(disable.contains("check that alcove-agent runs elevated"), disable)
     }
 
     func testDumpPullUsesFileOps() async throws {
@@ -256,11 +325,19 @@ final class GuestEvidenceTests: XCTestCase {
     func testDumpPullRefusesOtherFiles() async throws {
         let (h, agent) = try await setup(fs: FakeFS())
         let message = "file must be the name of a .dmp file listed by vm.crash_dumps.list, without a folder"
-        for file in ["..\\Windows\\win.ini", "../x.dmp", "C:\\alcove-dumps\\a.dmp", "sub/a.dmp", "..", "a.dmp:stream", "a.txt", ".dmp", "a\\..\\b.dmp", ""] {
+        for file in ["..\\Windows\\win.ini", "../x.dmp", "C:\\alcove-dumps\\a.dmp", "sub/a.dmp", "..", "a.dmp:stream", "a.txt", ".dmp", "a\\..\\b.dmp", "", "CON.dmp", "nul.dmp", "Com1.dmp", "LPT9.dmp", "aux.x.dmp"] {
             let text = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": .string(file), "path": "/tmp/x.dmp"])
             XCTAssertEqual(text, message, file)
         }
         XCTAssertEqual(agentRequests(agent, "fs.stat").count, 0)
+    }
+
+    func testDumpPullOfAChangedDumpNamesTheNextStep() async throws {
+        let fs = FakeFS()
+        fs["C:\\alcove-dumps\\a.exe.1.dmp"] = Data("dump".utf8)
+        let (h, _) = try await setup(fs: fs, staleDigest: true)
+        let text = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": "a.exe.1.dmp", "path": "/tmp/alcove-test-never-written.dmp"])
+        XCTAssertEqual(text, "the dump changed while it was pulled; retry in a few seconds")
     }
 
     func testDumpsOnLinux() async throws {

@@ -36,7 +36,12 @@ extension ControlHandler {
                 guard ControlHandler.isWindowsFileName(file, suffix: ".dmp") else {
                     throw ControlError.failed("file must be the name of a .dmp file listed by vm.crash_dumps.list, without a folder")
                 }
-                return try await pull(t, guestPath: GuestRecipes.dumpFolder + "\\" + file, to: try string(params, "path"))
+                let path = try string(params, "path")
+                do {
+                    return try await pull(t, guestPath: GuestRecipes.dumpFolder + "\\" + file, to: path)
+                } catch AgentClient.AgentError.remote("digest mismatch after download") {
+                    throw ControlError.failed("the dump changed while it was pulled; retry in a few seconds")
+                }
             case "vm.sync_dir":
                 let path = try string(params, "path")
                 let guestPath = try string(params, "guestPath")

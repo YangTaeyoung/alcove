@@ -146,21 +146,36 @@ extension ControlHandler {
         return agent
     }
 
+    /// The outcome of a recipe: `truncated` is the agent's flag that it kept only the tail of an output stream.
+    struct RecipeOutput {
+        var ok: Bool
+        var detail: String
+        var stdout: String
+        var timedOut = false
+        var truncated = false
+    }
+
     /// Runs `script` in the guest. `ok` means exit code 0 without a timeout; `detail` is trimmed stderr on failure, trimmed stdout otherwise.
     func runRecipe(_ agent: AgentClient, _ script: String, vm: String, op: String) async -> (ok: Bool, detail: String, stdout: String) {
+        let r = await runRecipeOutput(agent, script, vm: vm, op: op)
+        return (r.ok, r.detail, r.stdout)
+    }
+
+    func runRecipeOutput(_ agent: AgentClient, _ script: String, vm: String, op: String) async -> RecipeOutput {
         do {
             let r = try await agent.call("exec.run", ["cmd": .string(script), "timeout_ms": .int(Int64(ControlHandler.recipeTimeoutMilliseconds))],
                                          timeout: .seconds(ControlHandler.recipeTimeoutMilliseconds / 1000 + 15))
             let code = r["code"]?.intValue ?? -1
             let timedOut = r["timed_out"]?.boolValue ?? false
+            let truncated = r["truncated"]?.boolValue ?? false
             let out = (r["stdout"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let err = (r["stderr"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let ok = code == 0 && !timedOut
-            if ok { return (true, out, out) }
+            if ok { return RecipeOutput(ok: true, detail: out, stdout: out, truncated: truncated) }
             let detail = !err.isEmpty ? err : timedOut ? "timed out after \(ControlHandler.recipeTimeoutMilliseconds / 1000) s" : out.isEmpty ? "exit code \(code)" : out
-            return (false, detail, out)
+            return RecipeOutput(ok: false, detail: detail, stdout: out, timedOut: timedOut, truncated: truncated)
         } catch {
-            return (false, agentFailure(error, vm: vm, op: op).description, "")
+            return RecipeOutput(ok: false, detail: agentFailure(error, vm: vm, op: op).description, stdout: "")
         }
     }
 
@@ -304,16 +319,32 @@ extension ControlHandler {
             throw ControlError.failed("the event log is not supported on this guest OS")
         }
         let agent = try await execAgent(t, op: "vm.event_log")
-        let result = await runRecipe(agent, script, vm: t.name, op: "vm.event_log")
-        guard result.ok else { throw ControlError.failed(result.detail) }
+        let result = await runRecipeOutput(agent, script, vm: t.name, op: "vm.event_log")
+        guard result.ok else {
+            if result.timedOut {
+                throw ControlError.failed("the guest took more than \(ControlHandler.recipeTimeoutMilliseconds / 1000) s to read the event log; narrow it with level, provider, contains or a smaller sinceMinutes")
+            }
+            if os == .linux, result.detail.contains("unrecognized option") || result.detail.contains("invalid option") {
+                throw ControlError.failed("journalctl in the guest is too old for these filters; read the logs with vm.exec instead")
+            }
+            throw ControlError.failed(result.detail)
+        }
+        var entries: [JSON]
+        var truncated = result.truncated
         if os == .linux {
-            return ["entries": .array(Array(Self.journalEntries(result.stdout).prefix(max)))]
+            entries = Array(Self.journalEntries(result.stdout).prefix(max))
+        } else {
+            guard let parsed = Self.eventEntries(result.stdout) else {
+                if result.truncated {
+                    throw ControlError.failed("the guest output was cut before the host read it; pass a smaller max or a narrower sinceMinutes")
+                }
+                throw ControlError.failed("the guest printed no event log JSON; run vm.doctor to check the guest shell")
+            }
+            entries = parsed.entries
+            truncated = truncated || parsed.truncated
         }
-        guard let parsed = Self.eventEntries(result.stdout) else {
-            throw ControlError.failed("the guest printed no event log JSON; run vm.doctor to check the guest shell")
-        }
-        var reply: [String: JSON] = ["entries": .array(parsed.entries)]
-        if parsed.truncated { reply["truncated"] = true }
+        var reply: [String: JSON] = ["entries": .array(entries)]
+        if truncated { reply["truncated"] = true }
         return .object(reply)
     }
 
@@ -351,7 +382,7 @@ extension ControlHandler {
         return (entries, truncated)
     }
 
-    /// The entries of `journalctl -o json` output, one JSON object per line; lines that are no JSON object are skipped.
+    /// The entries of `journalctl -o json` output, one JSON object per line in time order, newest first in the result; lines that are no JSON object are skipped.
     private static func journalEntries(_ output: String) -> [JSON] {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -360,19 +391,19 @@ extension ControlHandler {
             if let bytes = value?.arrayValue { return String(decoding: bytes.compactMap { $0.intValue.map { UInt8(truncatingIfNeeded: $0) } }, as: UTF8.self) }
             return nil
         }
-        var entries: [JSON] = []
+        var entries: [(micros: Double, entry: JSON)] = []
         for line in output.split(whereSeparator: \.isNewline) where line.hasPrefix("{") {
             guard let json = try? JSON.parse(Data(line.utf8)), json.objectValue != nil else { continue }
             let micros = Double(text(json["__REALTIME_TIMESTAMP"]) ?? "") ?? 0
             let priority = Int(text(json["PRIORITY"]) ?? "") ?? 6
             let level = priority <= 2 ? "critical" : priority == 3 ? "error" : priority == 4 ? "warning" : "info"
             let pid = Int(text(json["_PID"]) ?? "") ?? Int(text(json["SYSLOG_PID"]) ?? "") ?? 0
-            entries.append(["time": .string(formatter.string(from: Date(timeIntervalSince1970: micros / 1_000_000))),
-                            "id": .int(Int64(pid)), "level": .string(level),
-                            "provider": .string(text(json["SYSLOG_IDENTIFIER"]) ?? text(json["_COMM"]) ?? ""),
-                            "message": .string(cutMessage(text(json["MESSAGE"]) ?? ""))])
+            entries.append((micros, ["time": .string(formatter.string(from: Date(timeIntervalSince1970: micros / 1_000_000))),
+                                     "id": .int(Int64(pid)), "level": .string(level),
+                                     "provider": .string(text(json["SYSLOG_IDENTIFIER"]) ?? text(json["_COMM"]) ?? ""),
+                                     "message": .string(cutMessage(text(json["MESSAGE"]) ?? ""))]))
         }
-        return entries
+        return entries.enumerated().sorted { ($0.element.micros, $1.offset) > ($1.element.micros, $0.offset) }.map(\.element.entry)
     }
 
     // MARK: - vm.crash_dumps.enable, disable, list
@@ -406,7 +437,10 @@ extension ControlHandler {
         case "vm.crash_dumps.disable":
             return [:]
         default:
-            return ["dumps": .array(Self.dumpItems(result.stdout).map { item -> JSON in
+            guard let rows = Self.dumpItems(result.stdout) else {
+                throw ControlError.failed("the guest printed no crash dump list; run vm.doctor to check the guest shell")
+            }
+            return ["dumps": .array(rows.map { item -> JSON in
                 ["file": .string(item["file"]?.stringValue ?? ""), "exe": .string(item["exe"]?.stringValue ?? ""),
                  "bytes": .int(Int64(item["bytes"]?.intValue ?? 0)), "time": .string(item["time"]?.stringValue ?? "")]
             })]
@@ -414,12 +448,16 @@ extension ControlHandler {
     }
 
     /// Whether `s` is a bare Windows file name ending in `suffix` (any case) with a non-empty stem and no character
-    /// a Windows file name cannot hold.
+    /// a Windows file name cannot hold, whose part before the first dot is no reserved device name.
     static func isWindowsFileName(_ s: String, suffix: String) -> Bool {
         let invalid = Set("<>:\"/\\|?*".unicodeScalars)
         guard s.lowercased().hasSuffix(suffix), s.count > suffix.count, s.utf16.count <= 255 else { return false }
-        return s.unicodeScalars.allSatisfy { $0.value >= 0x20 && !invalid.contains($0) }
+        guard s.unicodeScalars.allSatisfy({ $0.value >= 0x20 && !invalid.contains($0) }) else { return false }
+        return !reservedDeviceNames.contains(s.prefix { $0 != "." }.uppercased())
     }
+
+    private static let reservedDeviceNames: Set<String> =
+        Set(["CON", "PRN", "AUX", "NUL"] + (1...9).flatMap { ["COM\($0)", "LPT\($0)"] })
 
     private static func lastJSONObject(_ output: String) -> JSON? {
         for line in output.split(whereSeparator: \.isNewline).reversed() where line.hasPrefix("{") {
@@ -428,11 +466,11 @@ extension ControlHandler {
         return nil
     }
 
-    /// The dump rows of the recipe output: a JSON array or one row object; empty output is no rows.
-    private static func dumpItems(_ output: String) -> [JSON] {
+    /// The dump rows of the recipe output: a JSON array or one row object; nil for any other text.
+    private static func dumpItems(_ output: String) -> [JSON]? {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let json = try? JSON.parse(Data(trimmed.utf8)) else { return [] }
+        guard let json = try? JSON.parse(Data(trimmed.utf8)) else { return nil }
         if let array = json.arrayValue { return array.filter { $0.objectValue != nil } }
-        return json.objectValue != nil ? [json] : []
+        return json.objectValue != nil ? [json] : nil
     }
 }

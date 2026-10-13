@@ -226,6 +226,8 @@ enum GuestRecipes {
 
     /// The folder Windows Error Reporting writes crash dumps into.
     static let dumpFolder = "C:\\alcove-dumps"
+    /// The most bytes of serialised entries the Windows event log recipe prints.
+    static let eventOutputBudget = 150_000
     /// The most characters of one event message the host returns.
     static let eventMessageLimit = 2000
     /// The Windows event levels of `level` and everything more severe.
@@ -256,14 +258,14 @@ enum GuestRecipes {
 
     /// Windows: prints one JSON object `{entries, truncated}` with `entries` newest first, each `{time, id, level, provider,
     /// message}`; `time` is ISO 8601 UTC and `message` is cut at `eventMessageLimit` characters; `truncated` is true when
-    /// the output budget ended the list before `max` entries. Linux: prints the journal as one JSON object per line.
+    /// the next entry did not fit `eventOutputBudget` bytes of serialised output. Linux: prints the journal as one JSON object per line in time order, so a cut output loses the oldest lines.
     /// `level` is `critical`, `error`, `warning` or `info`.
     static func eventLog(log: String, level: String?, provider: String?, sinceMinutes: Int, contains: String?, max: Int,
                          os: VMConfig.GuestOS) -> String? {
         switch os {
         case .windows:
             var script = windowsPrelude + "$log = \(quote(log, os: os))\n"
-            script += "if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue)) { throw \"the guest has no event log named '$log'; list the logs with Get-WinEvent -ListLog *\" }\n"
+            script += "if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine(\"the guest has no event log named '$log'; list the logs with Get-WinEvent -ListLog *\"); exit 2 }\n"
             script += "$filter = @{ LogName = $log; StartTime = (Get-Date).AddMinutes(-\(sinceMinutes)) }\n"
             if let level, let levels = windowsLevels(level) {
                 script += "$filter.Level = @(\(levels.map(String.init).joined(separator: ",")))\n"
@@ -277,30 +279,31 @@ enum GuestRecipes {
             script += "$events = @(\(pipeline) | Select-Object -First \(max))\n"
             script += """
             $levels = @{ 1 = 'critical'; 2 = 'error'; 3 = 'warning'; 4 = 'info' }
-            $out = New-Object System.Collections.ArrayList
+            $parts = New-Object System.Collections.ArrayList
             $bytes = 0
             $truncated = $false
             foreach ($e in $events) {
               $m = [string]$e.Message
               if ($m.Length -gt \(eventMessageLimit)) { $m = $m.Substring(0, \(eventMessageLimit)) }
-              $size = [Text.Encoding]::UTF8.GetByteCount($m) + 300
-              if ($out.Count -gt 0 -and $bytes + $size -gt 70000) { $truncated = $true; break }
-              $bytes += $size
               $level = $levels[[int]$e.Level]
               if (-not $level) { $level = 'info' }
-              [void]$out.Add([pscustomobject][ordered]@{
+              $json = [pscustomobject][ordered]@{
                 time = $e.TimeCreated.ToUniversalTime().ToString('o')
                 id = [int]$e.Id
                 level = $level
                 provider = [string]$e.ProviderName
                 message = $m
-              })
+              } | ConvertTo-Json -Compress -Depth 3
+              $size = [Text.Encoding]::UTF8.GetByteCount($json) + 1
+              if ($bytes + $size -gt \(eventOutputBudget)) { $truncated = $true; break }
+              $bytes += $size
+              [void]$parts.Add($json)
             }
-            [pscustomobject][ordered]@{ entries = @($out); truncated = $truncated } | ConvertTo-Json -Compress -Depth 4
+            '{"entries":[' + ($parts -join ',') + '],"truncated":' + $(if ($truncated) { 'true' } else { 'false' }) + '}'
             """
             return script
         case .linux:
-            var command = "journalctl -o json --no-pager -r -n \(max) --since=-\(sinceMinutes)min"
+            var command = "journalctl -o json --no-pager -n \(max) --since=-\(sinceMinutes)min"
             command += " --output-fields=PRIORITY,SYSLOG_IDENTIFIER,_COMM,_PID,SYSLOG_PID,MESSAGE"
             if let level, let priority = journalPriority(level) { command += " -p \(priority)" }
             if let provider { command += " -t \(quote(provider, os: os))" }
@@ -323,13 +326,19 @@ enum GuestRecipes {
         guard os == .windows else { return nil }
         return windowsPrelude + localDumpsKey(exe) + """
         $folder = '\(dumpFolder)'
-        [void](New-Item -ItemType Directory -Force -Path $folder)
-        [void](& icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M')
-        $key = $hklm.CreateSubKey($sub)
-        $key.SetValue('DumpFolder', $folder, [Microsoft.Win32.RegistryValueKind]::ExpandString)
-        $key.SetValue('DumpCount', 5, [Microsoft.Win32.RegistryValueKind]::DWord)
-        $key.SetValue('DumpType', \(full ? 2 : 1), [Microsoft.Win32.RegistryValueKind]::DWord)
-        $key.Close()
+        try {
+          [void](New-Item -ItemType Directory -Force -Path $folder)
+          $null = & icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M'
+          if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('could not make \(dumpFolder) writable for the Users group; check the folder permissions'); exit 2 }
+          $key = $hklm.CreateSubKey($sub)
+          $key.SetValue('DumpFolder', $folder, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+          $key.SetValue('DumpCount', 5, [Microsoft.Win32.RegistryValueKind]::DWord)
+          $key.SetValue('DumpType', \(full ? 2 : 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+          $key.Close()
+        } catch {
+          [Console]::Error.WriteLine('could not set up crash dumps: ' + $_.Exception.Message + '; check that alcove-agent runs elevated')
+          exit 2
+        }
         [pscustomobject]@{ folder = $folder } | ConvertTo-Json -Compress
         """
     }
@@ -337,7 +346,13 @@ enum GuestRecipes {
     /// Windows only: removes the local dump key of `exe`; other images keep theirs.
     static func disableDumps(exe: String, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
-        return windowsPrelude + localDumpsKey(exe) + "$hklm.DeleteSubKeyTree($sub, $false)\n'ok'"
+        return windowsPrelude + localDumpsKey(exe) + """
+        try { $hklm.DeleteSubKeyTree($sub, $false) } catch {
+          [Console]::Error.WriteLine('could not remove the crash dump setting: ' + $_.Exception.Message + '; check that alcove-agent runs elevated')
+          exit 2
+        }
+        'ok'
+        """
     }
 
     /// Windows only: prints a JSON array of the `.dmp` files in `dumpFolder`, newest first, each `{file, exe, bytes, time}`.
@@ -348,7 +363,7 @@ enum GuestRecipes {
         $folder = '\(dumpFolder)'
         $items = @()
         if (Test-Path -LiteralPath $folder) {
-          $items = @(Get-ChildItem -LiteralPath $folder -File -Filter *.dmp | Sort-Object LastWriteTimeUtc -Descending | ForEach-Object {
+          $items = @(Get-ChildItem -LiteralPath $folder -File -Filter *.dmp | Where-Object { $_.Extension -ieq '.dmp' } | Sort-Object LastWriteTimeUtc -Descending | ForEach-Object {
             $exe = ''
             if ($_.Name -match '^(.+\\.exe)\\.[0-9]+\\.dmp$') { $exe = $Matches[1] }
             [pscustomobject][ordered]@{ file = $_.Name; exe = $exe; bytes = [int64]$_.Length; time = $_.LastWriteTimeUtc.ToString('o') }
