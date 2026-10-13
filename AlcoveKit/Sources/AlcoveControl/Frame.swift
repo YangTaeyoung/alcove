@@ -94,15 +94,23 @@ public struct Frame: Sendable, Equatable {
         (230, 0, 92), (0, 122, 255), (0, 153, 68), (255, 128, 0), (153, 51, 204), (0, 163, 163),
     ]
 
+    /// The widths in pixels a mark's outline can have.
+    static let markLineWidth = 1.0...8.0
+    /// The sizes in pixels the text of a mark's tag can have.
+    static let markTextSize = 9.0...32.0
+
     /// The frame with each mark drawn as an outlined rectangle and its number in a filled tag: above the
     /// rectangle's top-left corner, or inside that corner when the tag does not fit above, and moved sideways
     /// into the frame when it would reach past an edge. A rectangle too thin for an outline is filled; one without
-    /// an area is not drawn. `scale` multiplies the outline width (2 pixels) and the tag's text size (13 pixels).
+    /// an area is not drawn. `scale` multiplies the outline width (2 pixels) and the tag's text size (13 pixels); the
+    /// outline stays between 1 and 8 pixels wide and the text between 9 and 32 pixels high, whatever `scale` is.
     /// Parts of a rectangle outside the frame are cut off.
     public func drawingMarks(_ marks: [Mark], scale: Double = 1) -> Frame {
         guard !marks.isEmpty else { return self }
-        let line = max(1, (2 * max(1, scale)).rounded())
-        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, CGFloat(13 * max(1, scale)), nil)
+        let factor = scale.isFinite ? scale : 1
+        let line = min(max((2 * factor).rounded(), Frame.markLineWidth.lowerBound), Frame.markLineWidth.upperBound)
+        let size = min(max(13 * factor, Frame.markTextSize.lowerBound), Frame.markTextSize.upperBound)
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, CGFloat(size), nil)
         let padding = CGFloat(line)
         let space = CGColorSpaceCreateDeviceRGB()
         guard let white = CGColor(colorSpace: space, components: [1, 1, 1, 1]) else { return self }

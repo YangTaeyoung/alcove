@@ -198,6 +198,11 @@ final class ControlUITests: XCTestCase {
         XCTAssertTrue(lines[1].hasPrefix("[e2] Text \"" + String(repeating: "x", count: 200) + "\" "), lines[1])
         XCTAssertNil(line.unicodeScalars.first { $0 != "\n" && ($0.value < 0x20 || (0x7F...0x9F).contains($0.value) || $0.value == 0x2028 || $0.value == 0x2029) })
         XCTAssertEqual(UITreeText.label(node("e3", "Button", long)), "Button \"" + String(repeating: "가", count: 200) + "…\"")
+
+        let cut = UITreeText.line(node("e4", "Edit", "Notes", value: String(repeating: "값", count: 199) + "\n" + String(repeating: "z", count: 300)))
+        XCTAssertEqual(cut, "[e4] Edit \"Notes\" (0,0 10x10) value=\"" + String(repeating: "값", count: 199) + "\\n…\"")
+        let whole = UITreeText.line(node("e5", "Edit", "Notes", value: String(repeating: "v", count: 200)))
+        XCTAssertEqual(whole, "[e5] Edit \"Notes\" (0,0 10x10) value=\"" + String(repeating: "v", count: 200) + "\"")
     }
 
     // MARK: - windows
@@ -2405,6 +2410,34 @@ final class ControlUITests: XCTestCase {
         for frame in [thin, left, top, right, hundred] {
             for i in stride(from: 3, to: frame.pixels.count, by: 4) where frame.pixels[i] != 255 { XCTFail("alpha at \(i)"); break }
         }
+    }
+
+    func testDrawingMarksKeepsTheOutlineAndTheTagWithinBoundsAtAnyScale() throws {
+        let base = try XCTUnwrap(Frame(png: makePNG(width: 400, height: 300)))
+        let mark = [Frame.Mark(number: 7, rect: Frame.Rect(x: 100, y: 150, w: 200, h: 100))]
+        let color = Frame.markColors[(7 - 1) % Frame.markColors.count]
+        let bgr: [UInt8] = [color.blue, color.green, color.red, 255]
+
+        for scale in [1000.0, 40.0, Double.infinity, 1e300] {
+            let big = base.drawingMarks(mark, scale: scale)
+            let expected = scale.isFinite ? 8 : 2
+            for inside in 0..<expected { XCTAssertEqual(big.pixel(x: 100 + inside, y: 200), bgr, "\(scale) \(inside)") }
+            XCTAssertEqual(big.pixel(x: 100 + expected, y: 200), base.pixel(x: 100 + expected, y: 200), "\(scale)")
+            XCTAssertEqual(big.pixel(x: 200, y: 200), base.pixel(x: 200, y: 200), "\(scale)")
+            XCTAssertEqual(big.pixel(x: 101, y: 148), bgr, "\(scale)")
+            XCTAssertEqual(big.pixel(x: 101, y: 80), base.pixel(x: 101, y: 80), "\(scale)")
+            XCTAssertEqual(big.pixel(x: 180, y: 140), base.pixel(x: 180, y: 140), "\(scale)")
+        }
+        for scale in [0.001, 0.0, -5.0, Double.nan] {
+            let small = base.drawingMarks(mark, scale: scale)
+            let expected = scale.isNaN ? 2 : 1
+            XCTAssertEqual(small.pixel(x: 100, y: 200), bgr, "\(scale)")
+            XCTAssertEqual(small.pixel(x: 100 + expected, y: 200), base.pixel(x: 100 + expected, y: 200), "\(scale)")
+            XCTAssertEqual(small.pixel(x: 101, y: 148), bgr, "\(scale)")
+            XCTAssertEqual(small.pixel(x: 101, y: 130), base.pixel(x: 101, y: 130), "\(scale)")
+        }
+        XCTAssertEqual(base.drawingMarks(mark, scale: 1), base.drawingMarks(mark))
+        XCTAssertEqual(base.drawingMarks(mark, scale: 4).pixel(x: 107, y: 200), bgr)
     }
 
     func testDrawingMarksOutlinesEachRectangle() throws {

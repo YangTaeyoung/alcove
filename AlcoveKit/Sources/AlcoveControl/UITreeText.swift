@@ -4,6 +4,7 @@ import AlcoveQMP
 /// Text form of UI Automation nodes (`{ref, depth, role, name, value?, x, y, w, h, flags}`).
 enum UITreeText {
     /// One line per node: indentation by depth, `[ref] Role "name" (x,y WxH) flags`, value as `value="..."`.
+    /// Names and values longer than `nameLimit` characters are cut.
     static func render(_ nodes: [JSON]) -> String {
         nodes.map(line).joined(separator: "\n")
     }
@@ -15,18 +16,21 @@ enum UITreeText {
             parts.append("(\(x),\(y) \(w)x\(h))")
         }
         parts += (node["flags"]?.arrayValue ?? []).compactMap(\.stringValue)
-        if let value = node["value"]?.stringValue { parts.append("value=\(quoted(value))") }
+        if let value = node["value"]?.stringValue { parts.append("value=\(quoted(cut(value)))") }
         return String(repeating: "  ", count: max(0, node["depth"]?.intValue ?? 0)) + parts.joined(separator: " ")
     }
 
-    /// The most characters of a name a line shows.
+    /// The most characters of a name or a value a line shows.
     static let nameLimit = 200
+
+    /// `text`, or its first `nameLimit` characters followed by `…` when it is longer.
+    static func cut(_ text: String) -> String {
+        text.count > nameLimit ? String(text.prefix(nameLimit)) + "…" : text
+    }
 
     /// `Role "name"` of a node; a name longer than `nameLimit` characters is cut there and ends with `…`.
     static func label(_ node: JSON) -> String {
-        var name = node["name"]?.stringValue ?? ""
-        if name.count > nameLimit { name = String(name.prefix(nameLimit)) + "…" }
-        return "\(node["role"]?.stringValue ?? "?") \(quoted(name))"
+        "\(node["role"]?.stringValue ?? "?") \(quoted(cut(node["name"]?.stringValue ?? "")))"
     }
 
     /// `text` in double quotes on one line: backslash, double quote, newline, carriage return and tab are backslash-escaped;
