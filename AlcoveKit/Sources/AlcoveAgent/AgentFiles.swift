@@ -23,6 +23,20 @@ public struct SyncObstacle: Error, Equatable, Sendable {
     public let isLink: Bool
 }
 
+/// A guest file that holds more bytes than a pull was allowed to take: `bytes` is the size the guest reported, or the
+/// bytes received when the limit was passed.
+public struct TransferTooLarge: Error, Equatable, Sendable {
+    public let guestPath: String
+    public let bytes: Int
+    public let limit: Int
+
+    public init(guestPath: String, bytes: Int, limit: Int) {
+        self.guestPath = guestPath
+        self.bytes = bytes
+        self.limit = limit
+    }
+}
+
 private let transferPiece = 256 * 1024
 
 private func hex(_ digest: SHA256.Digest) -> String {
@@ -136,11 +150,28 @@ extension AgentClient {
     }
 
     /// Download a guest file to `url` through `<url>.alcove-part`, verifying the SHA-256.
-    public func pullFile(guestPath: String, to url: URL, timeout: Duration = .seconds(1800)) async throws -> TransferResult {
-        let info = try await call("fs.stat", ["path": .string(guestPath), "sha256": .bool(true)], timeout: timeout)
+    ///
+    /// With `deadline`, each request waits `timeout` or the time left until `deadline`, whichever is shorter, and a request
+    /// due after `deadline` throws `AgentError.timeout` without being sent. With `maxBytes`, a file that holds more bytes
+    /// throws `TransferTooLarge`: before any piece is read when `fs.stat` reports the size, otherwise once more bytes
+    /// arrived. A task cancelled before the file is moved to `url` throws `CancellationError` and leaves no
+    /// `<url>.alcove-part`; a file already at `url` stays as it is.
+    public func pullFile(guestPath: String, to url: URL, timeout: Duration = .seconds(1800),
+                         deadline: ContinuousClock.Instant? = nil, maxBytes: Int? = nil) async throws -> TransferResult {
+        func wait(for op: String) throws -> Duration {
+            guard let deadline else { return timeout }
+            let left = ContinuousClock.now.duration(to: deadline)
+            guard left > .zero else { throw AgentError.timeout(op) }
+            return min(timeout, left)
+        }
+        let info = try await call("fs.stat", ["path": .string(guestPath), "sha256": .bool(true)], timeout: try wait(for: "fs.stat"))
         guard info["exists"]?.boolValue == true, info["dir"]?.boolValue != true else {
             throw AgentError.remote("'\(guestPath)' is not a file in the guest; check the path")
         }
+        if let maxBytes, let size = info["size"]?.intValue, size > maxBytes {
+            throw TransferTooLarge(guestPath: guestPath, bytes: size, limit: maxBytes)
+        }
+        try Task.checkCancellation()
         let expected = info["sha256"]?.stringValue?.lowercased() ?? ""
         let part = URL(fileURLWithPath: url.path + ".alcove-part")
         let fm = FileManager.default
@@ -156,14 +187,16 @@ extension AgentClient {
                 try Task.checkCancellation()
                 let r = try await call("fs.read", [
                     "path": .string(guestPath), "offset": .int(Int64(offset)), "length": .int(Int64(transferPiece)),
-                ], timeout: timeout)
+                ], timeout: try wait(for: "fs.read"))
                 let piece = Data(base64Encoded: r["data"]?.stringValue ?? "") ?? Data()
                 try handle.write(contentsOf: piece)
                 hasher.update(data: piece)
                 offset += piece.count
+                if let maxBytes, offset > maxBytes { throw TransferTooLarge(guestPath: guestPath, bytes: offset, limit: maxBytes) }
                 if r["eof"]?.boolValue == true || piece.isEmpty { break }
             }
             try handle.close()
+            try Task.checkCancellation()
         } catch {
             try? handle.close()
             try? fm.removeItem(at: part)
