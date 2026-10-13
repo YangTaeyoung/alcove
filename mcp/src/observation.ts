@@ -1,7 +1,7 @@
 // Rendering of the `observation` object that control action results carry, and
 // the parameters that ask for it.
 import { z } from "zod";
-import type { ToolResult } from "./toolkit.js";
+import { UI_FACTS_BUDGET_MS, type ToolResult } from "./toolkit.js";
 
 export interface TextContent { type: "text"; text: string }
 export interface ImageContent { type: "image"; data: string; mimeType: string }
@@ -86,6 +86,17 @@ export function eventSeqLine(reply: Record<string, unknown>): string | undefined
 }
 
 /**
+ * Tool result of a tool that changes the guest without observing it: `head`, the reply's `eventSeq` when it has one,
+ * then `body`; `structured` with that `eventSeq` as structured content, none when both are absent.
+ */
+export function changeResult(head: string, reply: Record<string, unknown>, structured?: Record<string, unknown>, body = ""): ToolResult {
+  const seq = eventSeqLine(reply);
+  const lines = [head, ...(seq ? [seq] : []), ...(body ? [body] : [])];
+  const content = seq ? { ...structured, eventSeq: reply.eventSeq } : structured;
+  return { content: [{ type: "text", text: lines.join("\n") }], ...(content ? { structuredContent: content } : {}) };
+}
+
+/**
  * Tool result: `line`, the reply's `eventSeq` when it has one (also as structured content), then the rendered
  * `observation` of the control reply, when it has one.
  */
@@ -153,4 +164,10 @@ export function observePayload(a: ObserveArgs, fallback: ObserveLevel): Record<s
 /** `client.call` timeout in ms for an action: `base` plus the settle timeout. */
 export function actionTimeout(a: ObserveArgs, base = 60000): number {
   return base + (a.settle_timeout_ms ?? DEFAULT_SETTLE_TIMEOUT_MS);
+}
+
+/** The time in ms an observation at the level `a` asks for can take: the settle timeout and the UI facts; 0 at level none or without a level. */
+export function observationTime(a: ObserveArgs): number {
+  if (a.observe === undefined || a.observe === "none") return 0;
+  return (a.settle_timeout_ms ?? DEFAULT_SETTLE_TIMEOUT_MS) + UI_FACTS_BUDGET_MS;
 }

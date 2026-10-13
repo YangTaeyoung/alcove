@@ -1,6 +1,7 @@
 // The shell toolset: background jobs and guest processes.
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
+import { changeResult } from "../observation.js";
 import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, type Registrar } from "../toolkit.js";
 
 const job = z.string().describe("Job id returned by alcove_exec_start");
@@ -19,7 +20,7 @@ export function register(r: Registrar, client: ControlClient): void {
     async ({ name, ...cmd }) => {
       try {
         const res = await client.call("vm.exec.start", { name, ...commandPayload(cmd) });
-        return text(`started job ${res.job} (pid ${res.pid})`, { job: res.job, pid: res.pid });
+        return changeResult(`started job ${res.job} (pid ${res.pid})`, res, { job: res.job, pid: res.pid });
       } catch (e) {
         return fail(e);
       }
@@ -74,8 +75,8 @@ export function register(r: Registrar, client: ControlClient): void {
     },
     async ({ name, job: id, data, eof }) => {
       try {
-        await client.call("vm.exec.write", { name, job: id, data, ...(eof !== undefined ? { eof } : {}) });
-        return text(`wrote ${data.length} characters${eof ? " and closed stdin" : ""}`);
+        const res = await client.call("vm.exec.write", { name, job: id, data, ...(eof !== undefined ? { eof } : {}) });
+        return changeResult(`wrote ${data.length} characters${eof ? " and closed stdin" : ""}`, res);
       } catch (e) {
         return fail(e);
       }
@@ -94,7 +95,7 @@ export function register(r: Registrar, client: ControlClient): void {
     async ({ name, job: id }) => {
       try {
         const res = await client.call("vm.exec.kill", { name, job: id });
-        return text(`job ${id}: ${res.state}`);
+        return changeResult(`job ${id}: ${res.state}`, res);
       } catch (e) {
         return fail(e);
       }
@@ -165,7 +166,7 @@ export function register(r: Registrar, client: ControlClient): void {
           ...(pid !== undefined ? { pid } : { processName: process_name }),
           ...(tree !== undefined ? { tree } : {}),
         });
-        return text(`killed ${res.killed} process(es)`, { killed: res.killed });
+        return changeResult(`killed ${res.killed} process(es)`, res, { killed: res.killed });
       } catch (e) {
         return fail(e);
       }

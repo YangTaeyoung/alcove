@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { register } from "./tools/ui.js";
+import { register as registerCore } from "./tools/core.js";
 import { marksLegend } from "./observation.js";
 import { rig, textOf } from "./test-rig.js";
+import { CALL_MARGIN_MS, HELPER_CALL_MS, HELPER_QUEUE_MS, UI_CALL_TIMEOUT_MS, UI_FACTS_BUDGET_MS, uiCallTimeout } from "./toolkit.js";
 
 test("alcove_list_windows prints one line per window with flags", async () => {
   const t = rig(register, { windows: [
@@ -140,19 +142,21 @@ test("alcove_events prints the title of window events, the code and path of exit
     { seq: 42, time: "T2", name: "window.foreground", window: { ...win, title: "" } },
     { seq: 43, time: "T3", name: "process.exited", pid: 7140, code: 3221227010, path: "C:\\apps\\crash me.exe" },
     { seq: 44, time: "T4", name: "job.exited", job: "j7", code: 0 },
+    { seq: 45, time: "T5", name: "events.dropped", count: 37 },
   ];
-  const gapped = rig(register, { events, next: 44, first: 41 });
+  const gapped = rig(register, { events, next: 45, first: 41 });
   const r = await gapped.run("alcove_events", { name: "vm", since: 10 });
   assert.equal(textOf(r), [
-    "4 events",
+    "5 events",
     "events 11 to 40 are no longer kept; the list starts at 41",
     '41 T1 dialog.opened "Fixture Dialog"',
     '42 T2 window.foreground ""',
     "43 T3 process.exited code 3221227010 C:\\apps\\crash me.exe",
     "44 T4 job.exited code 0 job j7",
-    "next: 44",
+    "45 T5 events.dropped count 37",
+    "next: 45",
   ].join("\n"));
-  assert.deepEqual(r.structuredContent, { events, next: 44, first: 41 });
+  assert.deepEqual(r.structuredContent, { events, next: 45, first: 41 });
   const whole = await rig(register, { events, next: 44, first: 41 }).run("alcove_events", { name: "vm", since: 40 });
   assert.doesNotMatch(textOf(whole), /no longer kept/);
   const fromTheStart = await rig(register, { events: [], next: 0, first: 0 }).run("alcove_events", { name: "vm" });
@@ -172,7 +176,24 @@ test("the ui tools wait longer than the control op can take", async () => {
   await t.run("alcove_ui_action", { name: "vm", ref: "e1", action: "invoke", settle_timeout_ms: 5000 });
   await t.run("alcove_window_action", { name: "vm", window: "T", action: "focus" });
   await t.run("alcove_deploy", { name: "vm", path: "/b" });
-  assert.deepEqual(t.timeouts, [250000, 250000, 250000, 250000, 252000, 252100, 255000, 252000, 5400000]);
+  assert.deepEqual(t.timeouts, [300000, 300000, 300000, 300000, 302000, 302100, 305000, 302000, 5400000]);
+});
+
+test("the ui call timeout is the helper queue, the helper call, the observation's UI facts and a margin", () => {
+  assert.deepEqual([HELPER_QUEUE_MS, HELPER_CALL_MS, UI_FACTS_BUDGET_MS, CALL_MARGIN_MS], [60000, 215000, 20000, 5000]);
+  assert.equal(UI_CALL_TIMEOUT_MS, 60000 + 215000 + 20000 + 5000);
+  assert.equal(uiCallTimeout(1), UI_CALL_TIMEOUT_MS);
+  assert.equal(uiCallTimeout(2), 2 * (60000 + 215000) + 20000 + 5000);
+});
+
+test("alcove_screenshot waits for every helper call its control op makes", async () => {
+  const t = rig(registerCore, { width: 100, height: 100, sentWidth: 100, sentHeight: 100, scale: 1, png: "QUJD" });
+  await t.run("alcove_screenshot", { name: "vm" });
+  await t.run("alcove_screenshot", { name: "vm", marks: false });
+  await t.run("alcove_screenshot", { name: "vm", marks: true });
+  await t.run("alcove_screenshot", { name: "vm", window: "Notepad" });
+  await t.run("alcove_screenshot", { name: "vm", window: "Notepad", marks: true });
+  assert.deepEqual(t.timeouts, [60000, 60000, 300000, 300000, 575000]);
 });
 
 test("alcove_window_action and alcove_ui_action tell what the action left behind", async () => {
@@ -186,6 +207,10 @@ test("alcove_window_action and alcove_ui_action tell what the action left behind
   assert.equal(textOf(gone), 'invoke e1 Button "Crash"\nthe element is gone after the action; the line above shows it as it was before');
   const hung = await rig(register, { node, unresponsive: true }).run("alcove_ui_action", { name: "vm", ref: "e1", action: "invoke" });
   assert.match(textOf(hung), /\nits window stopped responding during the action; /);
+  const pending = await rig(register, { node, pending: true, eventSeq: 4 }).run("alcove_ui_action", { name: "vm", ref: "e1", action: "invoke" });
+  assert.equal(textOf(pending), 'invoke e1 Button "Crash"\nthe action is still running in the app\neventSeq 4');
+  const done = await rig(register, { node }).run("alcove_ui_action", { name: "vm", ref: "e1", action: "invoke" });
+  assert.equal(textOf(done), 'invoke e1 Button "Crash"');
 });
 
 test("marksLegend lists marks and is empty without them", () => {

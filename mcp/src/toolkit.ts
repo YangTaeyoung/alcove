@@ -65,8 +65,26 @@ export function registrar(server: Pick<McpServer, "registerTool">, enabled: Set<
   };
 }
 
-/** `client.call` timeout in ms of a tool whose control op asks the guest's UI helper: the op's wait for the helper plus the helper's answer. */
-export const UI_CALL_TIMEOUT_MS = 250000;
+/** Longest a control op waits for its turn at the guest's UI helper, in ms. */
+export const HELPER_QUEUE_MS = 60000;
+/** Longest the control server waits for the answer to one call to the guest's UI helper, in ms. */
+export const HELPER_CALL_MS = 215000;
+/** Longest an observation spends on the UI facts of the guest, in ms. */
+export const UI_FACTS_BUDGET_MS = 20000;
+/** Allowance in ms for the way of a control reply back to this server. */
+export const CALL_MARGIN_MS = 5000;
+
+/**
+ * `client.call` timeout in ms of a tool whose control op makes `helperCalls` calls to the guest's UI helper one after
+ * another and may observe the screen afterwards: for each call the wait for the helper and its answer, then the UI
+ * facts of the observation and the margin. `actionTimeout` adds the time the screen takes to settle.
+ */
+export function uiCallTimeout(helperCalls = 1): number {
+  return helperCalls * (HELPER_QUEUE_MS + HELPER_CALL_MS) + UI_FACTS_BUDGET_MS + CALL_MARGIN_MS;
+}
+
+/** `uiCallTimeout` of a control op that makes one helper call. */
+export const UI_CALL_TIMEOUT_MS = uiCallTimeout(1);
 /** `client.call` timeout in ms of `alcove_deploy`: copy, installer, launch and window wait. */
 export const DEPLOY_TIMEOUT_MS = 5400000;
 

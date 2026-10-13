@@ -10,7 +10,7 @@ test("alcove_screenshot sends window and marks and lists the marked elements", a
   assert.equal(t.calls[0].params.window, "Notepad");
   assert.equal(t.calls[0].params.marks, true);
   assert.match((r.content[0] as { text: string }).text, /\n1: e4 Button "OK" \(1,2 3x4\)$/);
-  assert.equal(t.timeouts[0], 250000);
+  assert.equal(t.timeouts[0], 575000);
 });
 
 test("alcove_screenshot says when more elements exist than are marked", async () => {

@@ -26,7 +26,7 @@ function nodeLabel(n: Obj | undefined): string {
 
 const WAIT_WINDOW_DEFAULT_S = 20;
 
-/** One line per guest event: `seq time name` followed by the window title, or by the exit code and the program or job. */
+/** One line per guest event: `seq time name` followed by the window title, by the exit code and the program or job, or by the count of dropped events. */
 export function eventLine(e: Obj): string {
   const parts = [`${e.seq} ${e.time} ${e.name}`];
   const w = e.window as Obj | undefined;
@@ -34,6 +34,7 @@ export function eventLine(e: Obj): string {
   if (e.code !== undefined) parts.push(`code ${e.code}`);
   if (e.path !== undefined) parts.push(String(e.path));
   if (e.job !== undefined) parts.push(`job ${e.job}`);
+  if (e.count !== undefined) parts.push(`count ${e.count}`);
   return parts.join(" ");
 }
 
@@ -240,7 +241,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("ui", "alcove_ui_action", {
     title: "Run a UI pattern action",
-    description: "Act on a UI element of a Windows guest through UI Automation patterns instead of the mouse: invoke, toggle, expand, collapse, select, set_value (needs value), focus or scroll_into_view. Works on covered or off-screen elements where alcove_ui_click cannot. Returns the element after the action and what changed on screen.",
+    description: "Act on a UI element of a Windows guest through UI Automation patterns instead of the mouse: invoke, toggle, expand, collapse, select, set_value (needs value), focus or scroll_into_view. Works on covered or off-screen elements where alcove_ui_click cannot. Returns the element after the action and what changed on screen; the text says when the action is still running in the app, the element is gone or its window stopped responding.",
     inputSchema: {
       name: vmName,
       ...selectorParams,
@@ -265,7 +266,8 @@ export function register(r: Registrar, client: ControlClient): void {
       const flags = Array.isArray(node?.flags) && (node?.flags as unknown[]).length ? ` [${(node?.flags as string[]).join(", ")}]` : "";
       const val = node?.value !== undefined ? ` value="${node.value}"` : "";
       const after = reply.gone === true ? "\nthe element is gone after the action; the line above shows it as it was before"
-        : reply.unresponsive === true ? "\nits window stopped responding during the action; the line above shows the element as it was before" : "";
+        : reply.unresponsive === true ? "\nits window stopped responding during the action; the line above shows the element as it was before"
+        : reply.pending === true ? "\nthe action is still running in the app" : "";
       return actionResult(`${action} ${nodeLabel(node)}${flags}${val}${after}`, reply, settle_timeout_ms);
     } catch (e) {
       return fail(e);
@@ -359,7 +361,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("ui", "alcove_events", {
     title: "Read guest events",
-    description: "Read the window, dialog and process events of a Windows guest (window opened, closed, foreground, title changed, dialog opened, process or job exited with its code) in order, newest 500 kept. Pass the `next` value of the previous call as `since` to get only new events; a line says so when events between `since` and the oldest kept one were dropped. Use it to notice dialogs and crashes that appeared while you were not looking.",
+    description: "Read the window, dialog and process events of a Windows guest (window opened, closed, foreground, title changed, dialog opened, process or job exited with its code) in order, newest 500 kept. Pass the `next` value of the previous call as `since` to get only new events; a line says so when events between `since` and the oldest kept one were dropped, and an events.dropped event counts the events the guest could not deliver. Use it to notice dialogs and crashes that appeared while you were not looking.",
     inputSchema: {
       name: vmName,
       since: z.number().int().min(0).optional().describe("Return events after this sequence number (default: all kept)"),

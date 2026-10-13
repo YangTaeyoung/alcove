@@ -2,7 +2,7 @@
 // condition waits and batches.
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
-import { actionResult, actionTimeout, batchResult, observeParams, observePayload, waitForResult, type ObserveArgs } from "../observation.js";
+import { actionResult, actionTimeout, batchResult, observationTime, observeParams, observePayload, waitForResult, type ObserveArgs } from "../observation.js";
 import { fail, text, vmName, type Registrar } from "../toolkit.js";
 
 const buttonEnum = z.enum(["left", "right", "middle"]);
@@ -161,7 +161,7 @@ export function register(r: Registrar, client: ControlClient): void {
           conditions: (a.conditions as unknown[]).map(camelKeys),
           timeout,
           ...observePayload(a as ObserveArgs, "none"),
-        }, (timeout + 30) * 1000);
+        }, (timeout + 30) * 1000 + observationTime(a as ObserveArgs));
         return waitForResult(reply, timeout, a.settle_timeout_ms);
       } catch (e) {
         return fail(e);

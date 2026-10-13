@@ -1,8 +1,8 @@
 // The core toolset: VM lifecycle, screen, pointer, keyboard, clipboard, exec and file push.
 import { z } from "zod";
 import type { ControlClient } from "../control.js";
-import { actionResult, actionTimeout, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
-import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
+import { actionResult, actionTimeout, changeResult, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
+import { clip, commandParams, commandPayload, fail, streamSections, text, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
 
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("core",
@@ -131,6 +131,7 @@ export function register(r: Registrar, client: ControlClient): void {
     },
     async ({ name, region, scale, max_width, format, quality, window, marks }) => {
       try {
+        const helperCalls = (window !== undefined ? 1 : 0) + (marks ? 1 : 0);
         const r = await client.call("vm.screenshot", {
           name,
           maxWidth: max_width ?? 1280,
@@ -140,7 +141,7 @@ export function register(r: Registrar, client: ControlClient): void {
           ...(quality !== undefined ? { quality } : {}),
           ...(window !== undefined ? { window } : {}),
           ...(marks !== undefined ? { marks } : {}),
-        }, window !== undefined || marks ? UI_CALL_TIMEOUT_MS : 60000);
+        }, helperCalls > 0 ? uiCallTimeout(helperCalls) : 60000);
         const jpeg = typeof r.jpeg === "string";
         return {
           content: [
@@ -290,7 +291,7 @@ export function register(r: Registrar, client: ControlClient): void {
         const output = String(r.output ?? "");
         const head = `exit code ${r.code}${r.timedOut ? " (timed out)" : ""}${r.truncated ? " (output truncated)" : ""}`;
         const body = hasStreams ? streamSections(stdout, stderr) : output ? `output:\n${clip(output)}` : "";
-        return text(body ? `${head}\n${body}` : head, { code: r.code, stdout, stderr, output, timedOut: r.timedOut === true, truncated: r.truncated === true });
+        return changeResult(head, r, { code: r.code, stdout, stderr, output, timedOut: r.timedOut === true, truncated: r.truncated === true }, body);
       } catch (e) {
         return fail(e);
       }
