@@ -50,7 +50,7 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Start VM",
       description:
-        "Boot a VM (or resume it from suspend). By default waits until the guest tools connect (the OS has booted and a user is logged in), up to wait_timeout_s; when the guest has no tools it returns after the wait and you should use alcove_wait_idle / screenshots to judge readiness.",
+        "Boot a VM (or resume it from suspend). A resumed session is reported with whether the guest tools reconnected and the guest clock was synced. By default waits until the guest tools connect (the OS has booted and a user is logged in), up to wait_timeout_s; when the guest has no tools it returns after the wait and you should use alcove_wait_idle / screenshots to judge readiness.",
       inputSchema: {
         name: vmName,
         wait_for_tools: z.boolean().optional().describe("Wait for the guest tools to connect (default true)"),
@@ -61,8 +61,22 @@ export function register(r: Registrar, client: ControlClient): void {
     },
     async ({ name, wait_for_tools, wait_timeout_s, discard_changes }) => {
       try {
-        const r = await client.call("vm.start", { name, ...(discard_changes !== undefined ? { discardChanges: discard_changes } : {}) }, 300000);
         const wait = wait_for_tools ?? true;
+        const r = await client.call(
+          "vm.start",
+          { name, ...(discard_changes !== undefined ? { discardChanges: discard_changes } : {}), ...(wait ? {} : { waitTools: 0 }) },
+          300000,
+        );
+        if (r.resumed === true) {
+          const next = r.tools === true
+            ? "call alcove_set_environment with clock \"host\""
+            : "call alcove_vm_status until the tools are connected, then alcove_set_environment with clock \"host\"";
+          return text(
+            `${name}: ${r.state}; resumed a suspended session; ` +
+              (r.tools === true ? "guest tools reconnected; " : "guest tools did not reconnect in time; ") +
+              (r.clockSynced === true ? "guest clock synced" : `guest clock not synced; ${next}`),
+          );
+        }
         const deadline = Date.now() + (wait_timeout_s ?? 180) * 1000;
         let tools = false;
         if (wait) {

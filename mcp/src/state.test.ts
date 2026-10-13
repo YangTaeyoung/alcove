@@ -133,3 +133,13 @@ test("alcove_lease_release without a stored token names alcove_lease_acquire and
   assert.match(textOf(r), /holds no lease on 'Win'; call alcove_lease_acquire first/);
   assert.equal(calls.length, 0);
 });
+
+test("alcove_set_environment text names the offered display scale steps and the resolution limit", () => {
+  const configs = new Map<string, { description?: string; inputSchema?: Record<string, { description?: string }> }>();
+  const registrar: Registrar = { tool: (_set, name, config) => void configs.set(name, config as never) };
+  registerState(registrar, { leases: new LeaseBook(), call: async () => ({}) } as unknown as LeasedControlClient);
+  const cfg = configs.get("alcove_set_environment")!;
+  assert.match(cfg.description ?? "", /nearest offered step and reported as FAILED/);
+  assert.match(cfg.description ?? "", /alcove_set_resolution/);
+  assert.match(cfg.inputSchema?.dpi_scale?.description ?? "", /100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450 or 500/);
+});

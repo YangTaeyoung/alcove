@@ -341,7 +341,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     {
       title: "Set guest environment",
       description:
-        "Change guest settings for testing: theme, time zone, clock, locale, keyboard layouts and display scale. Each applied setting reports whether it took effect now or for programs started afterwards (app restart).",
+        "Change guest settings for testing: theme, time zone, clock, locale, keyboard layouts and display scale. Each applied setting reports whether it took effect now or for programs started afterwards (app restart). dpi_scale must be a step the guest offers at its current resolution; any other value is changed to the nearest offered step and reported as FAILED with the scale applied. A larger scale needs a larger resolution first (alcove_set_resolution).",
       inputSchema: {
         name: vmName,
         theme: z.enum(["dark", "light"]).optional(),
@@ -349,7 +349,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
         clock: z.string().min(1).optional().describe("ISO 8601 date-time, or \"host\" to copy the host clock"),
         locale: z.string().min(1).optional().describe("Locale tag, e.g. \"de-DE\""),
         keyboard_layouts: z.array(z.string().min(1)).min(1).optional().describe("Keyboard layout tags, e.g. [\"en-US\", \"de-DE\"]"),
-        dpi_scale: z.number().int().min(100).max(500).optional().describe("Display scale in percent (100-500)"),
+        dpi_scale: z.number().int().min(100).max(500).optional().describe("Display scale in percent: 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450 or 500, limited by the resolution"),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
