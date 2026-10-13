@@ -33,6 +33,8 @@ type Options struct {
 	// Shutdown runs an OS shutdown; nil uses the platform default.
 	Shutdown func() error
 	Logger   *log.Logger
+	// UI serves the ui and win ops; nil means the guest has no ui capability.
+	UI UI
 }
 
 // Server serves one connection at a time (the app reconnects as needed).
@@ -82,6 +84,9 @@ func (s *Server) caps() []string {
 	caps = append(caps, "rpc")
 	if s.opt.AllowExec {
 		caps = append(caps, "jobs", "proc", "fs")
+	}
+	if s.opt.UI != nil {
+		caps = append(caps, "ui")
 	}
 	return caps
 }

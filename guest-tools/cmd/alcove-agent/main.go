@@ -15,6 +15,7 @@ import (
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/server"
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/token"
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/uia"
 )
 
 func main() {
@@ -50,7 +51,15 @@ func main() {
 		logger.Fatalf("listen: %v", err)
 	}
 	logger.Printf("alcove-agent %s listening on %s (token %s, exec %v)", server.AgentVersion, l.Addr(), mask(*tok), *allowExec)
-	s := server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger})
+	var s *server.Server
+	var ui server.UI
+	if uia.Available() {
+		helper := uia.New(uia.DefaultLauncher(filepath.Join(os.Getenv("ProgramData"), "Alcove", "uia")),
+			func(name string, fields map[string]any) { s.HandleUIEvent(name, fields) })
+		helper.SetLogger(logger)
+		ui = helper
+	}
+	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui})
 	logger.Fatal(s.Serve(l))
 }
 
