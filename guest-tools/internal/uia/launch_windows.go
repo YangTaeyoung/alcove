@@ -3,7 +3,6 @@
 package uia
 
 import (
-	"bytes"
 	_ "embed"
 	"fmt"
 	"io"
@@ -11,8 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
+	"time"
 )
 
 //go:embed assets/bootstrap.ps1
@@ -23,99 +22,87 @@ var helperSource []byte
 
 const createNoWindow = 0x08000000
 
+// stderrDrainWait is how long after the helper process ended its remaining
+// stderr output is still copied to the log.
+const stderrDrainWait = 2 * time.Second
+
 // Available reports whether this build can start a helper.
 func Available() bool { return true }
 
-// DefaultLauncher locks dir and its parent to Administrators and SYSTEM, writes
-// the embedded files into it and starts Windows PowerShell from the system
-// directory without a console window. When the folders cannot be locked the
-// helper is not started. Each start passes the number of helpers this launcher
-// started before it as ALCOVE_UIA_START. The helper's environment drops the
-// variables that redirect the .NET runtime and PowerShell module loading, and
-// its temporary directory is a folder inside the locked directory, so that no
-// other process of the user can plant files that the elevated compile reads.
+// DefaultLauncher returns a launcher that waits for the PowerShell process of
+// its previous start to end, locks dir and its parent to Administrators and
+// SYSTEM, writes the embedded files into dir and starts Windows PowerShell
+// from the system directory without a console window. The helper is not
+// started when the previous process still runs after previousExitWait or when
+// the folders cannot be locked. Each start passes the number of helpers this
+// launcher started before it as ALCOVE_UIA_START. The helper's environment is
+// cleanHelperEnv of the agent's, with the tmp folder inside dir as its
+// temporary directory.
 func DefaultLauncher(dir string) Launcher {
 	starts := 0
+	var gate exitGate
 	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
 		system, err := systemDirectory()
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		if !gate.waitPrevious(previousExitWait) {
+			return nil, nil, nil, fmt.Errorf("the previous UI helper process has not ended after %d s; retry", int(previousExitWait.Seconds()))
+		}
 		if err := LockHelperFolders(filepath.Dir(dir), dir); err != nil {
 			return nil, nil, nil, fmt.Errorf("the UI helper folder %s could not be locked (%v); fix its owner and access list, then retry", dir, err)
 		}
-		if err := writeIfDifferent(filepath.Join(dir, "bootstrap.ps1"), bootstrapScript); err != nil {
-			return nil, nil, nil, err
+		if err := os.WriteFile(filepath.Join(dir, "bootstrap.ps1"), bootstrapScript, 0o644); err != nil {
+			return nil, nil, nil, notPrepared(dir, err)
 		}
-		if err := writeIfDifferent(filepath.Join(dir, "helper.cs"), helperSource); err != nil {
-			return nil, nil, nil, err
+		if err := os.WriteFile(filepath.Join(dir, "helper.cs"), helperSource, 0o644); err != nil {
+			return nil, nil, nil, notPrepared(dir, err)
 		}
 		tmp := filepath.Join(dir, "tmp")
-		if err := os.MkdirAll(tmp, 0o755); err != nil {
-			return nil, nil, nil, err
+		if err := os.Mkdir(tmp, 0o755); err != nil {
+			return nil, nil, nil, notPrepared(dir, err)
 		}
 		logFile, err := openCappedLog(filepath.Join(dir, "helper.log"), maxLogBytes)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, notPrepared(dir, err)
 		}
 		cmd := exec.Command(filepath.Join(system, "WindowsPowerShell", "v1.0", "powershell.exe"),
 			"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(dir, "bootstrap.ps1"))
 		cmd.Dir = dir
-		cmd.Env = append(cleanHelperEnv(tmp), "ALCOVE_UIA_START="+strconv.Itoa(starts))
-		starts++
+		cmd.Env = append(cleanHelperEnv(os.Environ(), tmp), "ALCOVE_UIA_START="+strconv.Itoa(starts))
 		cmd.Stderr = logFile
+		cmd.WaitDelay = stderrDrainWait
 		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-		stdin, err := cmd.StdinPipe()
+		childIn, stdin, err := os.Pipe()
 		if err != nil {
 			logFile.Close()
 			return nil, nil, nil, err
 		}
-		stdout, err := cmd.StdoutPipe()
+		stdout, childOut, err := os.Pipe()
 		if err != nil {
+			childIn.Close()
+			stdin.Close()
 			logFile.Close()
 			return nil, nil, nil, err
 		}
-		if err := cmd.Start(); err != nil {
+		cmd.Stdin, cmd.Stdout = childIn, childOut
+		err = cmd.Start()
+		childIn.Close()
+		childOut.Close()
+		if err != nil {
+			stdin.Close()
+			stdout.Close()
 			logFile.Close()
 			return nil, nil, nil, err
 		}
-		kill := func() {
-			_ = cmd.Process.Kill()
-			go func() {
-				_ = cmd.Wait()
-				logFile.Close()
-			}()
-		}
+		starts++
+		ended := gate.started()
+		go func() {
+			_ = cmd.Wait()
+			logFile.Close()
+			ended()
+		}()
+		kill := func() { _ = cmd.Process.Kill() }
 		return stdin, stdout, kill, nil
 	}
-}
-
-// cleanHelperEnv returns the agent's environment without the variables that
-// would redirect the .NET runtime (COR_*, COMPlus_*, DOTNET_*) or PowerShell
-// module loading (PSModulePath), with TEMP and TMP set to tmp.
-func cleanHelperEnv(tmp string) []string {
-	env := make([]string, 0, len(os.Environ())+2)
-	for _, kv := range os.Environ() {
-		eq := strings.IndexByte(kv, '=')
-		if eq < 0 {
-			continue
-		}
-		name := strings.ToUpper(kv[:eq])
-		if strings.HasPrefix(name, "COR_") || strings.HasPrefix(name, "COMPLUS_") ||
-			strings.HasPrefix(name, "DOTNET_") || name == "PSMODULEPATH" || name == "TEMP" || name == "TMP" {
-			continue
-		}
-		env = append(env, kv)
-	}
-	return append(env, "TEMP="+tmp, "TMP="+tmp)
-}
-
-func writeIfDifferent(path string, want []byte) error {
-	if have, err := os.ReadFile(path); err == nil && bytes.Equal(have, want) {
-		return nil
-	}
-	if err := os.WriteFile(path, want, 0o644); err != nil {
-		return fmt.Errorf("write %s: %v", path, err)
-	}
-	return nil
 }
