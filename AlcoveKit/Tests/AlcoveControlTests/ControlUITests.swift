@@ -1802,6 +1802,69 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(bySeq["detail"]?["seq"]?.intValue, 1)
     }
 
+    func testWaitEventDoesNotMatchEventsFromBeforeARestoreOrAnEarlierSession() async throws {
+        let (h, t, agent) = try await rig()
+        await t.setSnapshotList([VMController.SnapshotInfo(name: "clean", vmStateSize: 1, date: Date())])
+        let opened: JSON = ["type": "event", "event": "window.opened"]
+        func send(_ title: String, expecting count: Int) async {
+            agent.sendLine(["t": "ev", "name": "window.opened", "window": titled(title)])
+            let arrived = await eventually { await t.events(since: 0).next == count }
+            XCTAssertTrue(arrived)
+        }
+        _ = try await h.handle(op: "vm.key.down", params: ["name": "Win", "key": "shift"])
+        await send("before the restore", expecting: 1)
+        let visible = try await waitFor(h, [opened])
+        XCTAssertEqual(visible["detail"]?["seq"]?.intValue, 1)
+
+        await t.setRestoreHook { target in
+            agent.sendLine(["t": "ev", "name": "window.opened", "window": window("0x61", "while it is restored", x: 0, y: 0, w: 10, h: 10)])
+            _ = await eventually { await target.events(since: 0).next == 2 }
+        }
+        let restored = try await h.handle(op: "vm.snapshot.restore", params: ["name": "Win", "snapshot": "clean", "waitTools": 0])
+        XCTAssertEqual(restored["eventSeq"]?.intValue, 2)
+        let hidden = try await waitFor(h, [opened], timeout: 1)
+        XCTAssertEqual(hidden["matched"]?.intValue, -1)
+        await send("after the restore", expecting: 3)
+        let fresh = try await waitFor(h, [opened])
+        XCTAssertEqual(fresh["detail"]?["seq"]?.intValue, 3)
+
+        let stopped = try await h.handle(op: "vm.stop", params: ["name": "Win"])
+        XCTAssertEqual(stopped["eventSeq"]?.intValue, 3)
+        await send("while stopped", expecting: 4)
+        let started = try await h.handle(op: "vm.start", params: ["name": "Win"])
+        XCTAssertEqual(started["eventSeq"]?.intValue, 4)
+        let earlier = try await waitFor(h, [opened], timeout: 1)
+        XCTAssertEqual(earlier["matched"]?.intValue, -1)
+        let bySeq = try await waitFor(h, [["type": "event", "event": "window.opened", "since": 3]])
+        XCTAssertEqual(bySeq["detail"]?["seq"]?.intValue, 4)
+        await send("in the new session", expecting: 5)
+        let now = try await waitFor(h, [opened])
+        XCTAssertEqual(now["detail"]?["seq"]?.intValue, 5)
+
+        await t.setSnapshotError(NSError(domain: "test", code: 1))
+        _ = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
+        let afterAFailedRestore = try await waitFor(h, [opened], timeout: 1)
+        XCTAssertEqual(afterAFailedRestore["matched"]?.intValue, -1)
+    }
+
+    func testEventPositionsDoNotKeepAReplacedVMAlive() async throws {
+        final class Weak: @unchecked Sendable { weak var target: FakeTarget? }
+        let holder = Weak()
+        let fresh = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
+        let registry: SwapRegistry
+        do {
+            let old = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
+            holder.target = old
+            registry = SwapRegistry(old)
+        }
+        let h = ControlHandler(registry: registry, hostKind: "test")
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20])
+        XCTAssertNotNil(holder.target)
+        await registry.swap(fresh)
+        let released = await eventually { holder.target == nil }
+        XCTAssertTrue(released, "an event position keeps the replaced VM")
+    }
+
     func testWaitEventFailsWhenTheAgentDisconnects() async throws {
         let (h, _, agent) = try await rig()
         let pending = Task {
@@ -2523,11 +2586,13 @@ final class ControlUITests: XCTestCase {
             XCTAssertEqual(ControlHandler.capturesFrames(op: op), input.contains(op) || op == "vm.app.launch" || op == "vm.deploy", op)
             XCTAssertEqual(ControlHandler.movesEventBaseline(op: op), !readOnly.contains(op), op)
         }
-        for op in ["vm.mouse.click", "vm.key.press", "vm.type", "vm.batch", "vm.exec", "vm.exec.start", "vm.exec.write", "vm.exec.kill", "vm.process.kill"] {
+        for op in ["vm.mouse.click", "vm.key.press", "vm.type", "vm.batch", "vm.exec", "vm.exec.start", "vm.exec.write", "vm.exec.kill", "vm.process.kill",
+                   "vm.start", "vm.stop", "vm.snapshot.restore"] {
             XCTAssertTrue(ControlHandler.movesEventBaseline(op: op), op)
         }
         for op in ["vm.exec.read", "vm.exec.list", "vm.process.list", "vm.fs.write", "vm.fs.delete", "vm.push_file", "vm.sync_dir", "vm.clipboard.set",
-                   "vm.set_resolution", "vm.snapshot.create", "vm.wait_for", "vm.screenshot", "vm.start", "vm.stop", "script.run"] {
+                   "vm.set_resolution", "vm.snapshot.create", "vm.snapshot.delete", "vm.snapshot.list", "vm.pause", "vm.resume", "vm.wait_for",
+                   "vm.screenshot", "script.run"] {
             XCTAssertFalse(ControlHandler.movesEventBaseline(op: op), op)
         }
     }

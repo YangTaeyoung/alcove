@@ -71,9 +71,9 @@ public actor ControlHandler {
     let recordingsDirectory: URL?
     var recordings = RecordingTable()
     var recordingSeams = RecordingSeams()
-    /// A position in the event sequence of one target object.
+    /// A position in the event sequence of one target object, which the mark does not keep alive.
     struct EventMark {
-        let source: AnyObject
+        weak var source: AnyObject?
         var seq: Int
     }
 
@@ -147,10 +147,15 @@ public actor ControlHandler {
             || op == "vm.ui.click" || op == "vm.ui.type" || op == "vm.ui.action" || op == "vm.window.action"
     }
 
-    /// Whether `op` can cause window or process events in the guest: input, launches, deploys, commands and kills.
+    /// The ops that end the guest's session or replace its state: the events from before them belong to another session.
+    static let sessionOps: Set<String> = ["vm.start", "vm.stop", "vm.snapshot.restore"]
+
+    /// Whether `op` moves the VM's event baseline when it begins: an op that can cause window or process events in
+    /// the guest (input, launches, deploys, commands and kills) and an op of `sessionOps`.
     static func movesEventBaseline(op: String) -> Bool {
         guard !isReadOnly(op: op) else { return false }
         return isInput(op: op) || op == "vm.app.launch" || op == "vm.deploy" || op.hasPrefix("vm.exec") || op == "vm.process.kill"
+            || sessionOps.contains(op)
     }
 
     /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
@@ -225,7 +230,7 @@ public actor ControlHandler {
             }
             lastSize[t.name] = nil
             runtimeForwards[t.name] = nil
-            return ["state": .string(describe(await t.state()))]
+            return ["state": .string(describe(await t.state())), "eventSeq": .int(Int64(await passEvents(of: t)))]
         case "vm.pause":
             let t = try await running(params)
             if await t.state() == .running { try await t.pause() }
@@ -323,7 +328,8 @@ public actor ControlHandler {
     }
 
     /// Runs `op`. For an op outside the read-only set the VM is looked up once, here: its newest event sequence number
-    /// at this moment becomes `eventSeq` of the result and, for an op that can cause events, the VM's event baseline.
+    /// at this moment becomes the VM's event baseline when `movesEventBaseline` says so, and `eventSeq` of the result
+    /// unless the op set one itself.
     private func performNotingEvents(op: String, params: JSON) async throws -> JSON {
         guard !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
               let t = await registry.target(named: vm) else { return try await perform(op: op, params: params) }
@@ -331,8 +337,15 @@ public actor ControlHandler {
         if ControlHandler.movesEventBaseline(op: op) { advanceEventBaseline(of: t, to: seq) }
         let result = try await ControlHandler.$resolvedTarget.withValue((vm, t)) { try await perform(op: op, params: params) }
         guard var fields = result.objectValue else { return result }
-        fields["eventSeq"] = .int(Int64(seq))
+        if fields["eventSeq"] == nil { fields["eventSeq"] = .int(Int64(seq)) }
         return .object(fields)
+    }
+
+    /// Moves the event baseline of `t` past every event received so far and returns that position.
+    func passEvents(of t: VMTarget) async -> Int {
+        let seq = await t.events(since: .max).next
+        advanceEventBaseline(of: t, to: seq)
+        return seq
     }
 
     /// The position `marks` holds for the target object `t`; nil when it holds none for this object.
