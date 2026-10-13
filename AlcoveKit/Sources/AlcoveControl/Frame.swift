@@ -83,7 +83,7 @@ public struct Frame: Sendable, Equatable {
 
     private static let bitmapInfo = CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
 
-    private func cgImage() -> CGImage? {
+    func cgImage() -> CGImage? {
         guard let provider = CGDataProvider(data: pixels as CFData) else { return nil }
         return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
                        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: Frame.bitmapInfo),

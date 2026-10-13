@@ -74,7 +74,7 @@ public actor ControlHandler {
         "vm.snapshot.list", "vm.snapshot.create", "vm.snapshot.restore", "vm.snapshot.delete",
         "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network",
         "vm.lease.acquire", "vm.lease.release", "vm.set_resolution",
-        "vm.wait_idle", "vm.set_environment", "vm.doctor",
+        "vm.wait_idle", "vm.set_environment", "vm.doctor", "vm.find_text",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -85,13 +85,13 @@ public actor ControlHandler {
     private static let readOnlyOps: Set<String> = [
         "hello", "vm.list", "vm.status", "vm.screenshot", "vm.wait_idle", "vm.clipboard.get", "vm.exec.read",
         "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
-        "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor",
+        "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
     ]
 
     /// Whether `op` runs outside the per-connection request order.
     public static func isConcurrent(op: String) -> Bool {
         op.hasPrefix("vm.exec") || op.hasPrefix("vm.process.") || op.hasPrefix("vm.fs.")
-            || op == "vm.push_file" || op == "vm.pull_file" || op == "vm.sync_dir"
+            || op == "vm.push_file" || op == "vm.pull_file" || op == "vm.sync_dir" || op == "vm.find_text"
     }
 
     /// Whether `op` sends mouse or keyboard input to a guest.
@@ -151,6 +151,9 @@ public actor ControlHandler {
         case "vm.screenshot":
             let t = try await running(params)
             return try await screenshotResult(t, params)
+        case "vm.find_text":
+            let t = try await running(params)
+            return try await findText(t, params)
         case "vm.mouse.move":
             let t = try await running(params)
             try await move(t, x: try int(params, "x"), y: try int(params, "y"))
@@ -350,15 +353,53 @@ public actor ControlHandler {
         return frame
     }
 
-    private func screenshotResult(_ t: VMTarget, _ params: JSON) async throws -> JSON {
-        var region: Frame.Rect?
-        if let value = params["region"] {
-            guard let x = value["x"]?.intValue, let y = value["y"]?.intValue,
-                  let w = value["w"]?.intValue, let h = value["h"]?.intValue, w > 0, h > 0 else {
-                throw ControlError.failed("region needs integer x, y, w, h with w and h above 0")
-            }
-            region = Frame.Rect(x: x, y: y, w: w, h: h)
+    private func regionParam(_ params: JSON) throws -> Frame.Rect? {
+        guard let value = params["region"] else { return nil }
+        guard let x = value["x"]?.intValue, let y = value["y"]?.intValue,
+              let w = value["w"]?.intValue, let h = value["h"]?.intValue, w > 0, h > 0 else {
+            throw ControlError.failed("region needs integer x, y, w, h with w and h above 0")
         }
+        return Frame.Rect(x: x, y: y, w: w, h: h)
+    }
+
+    private func findText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
+        let region = try regionParam(params)
+        var languages = ScreenText.defaultLanguages
+        if let value = params["languages"] {
+            guard let items = value.arrayValue, !items.isEmpty else { throw ControlError.missing("languages") }
+            languages = try items.map { item in
+                guard let name = item.stringValue else { throw ControlError.missing("languages") }
+                return name
+            }
+        }
+        let regex = params["regex"]?.boolValue ?? false
+        let query = params["query"]?.stringValue ?? ""
+        if regex { _ = try ScreenText.filter([], query: query, regex: true) }
+
+        let frame = try await screenshot(t)
+        var area = frame.bounds
+        if let region {
+            guard let clamped = frame.clamp(region) else {
+                throw ControlError.failed("region is outside the \(frame.width)x\(frame.height) frame")
+            }
+            area = clamped
+        }
+        let cropped = area == frame.bounds ? frame : frame.crop(area)
+        let chosen = languages
+        let lines = try await Task.detached { try ScreenText.recognize(cropped, languages: chosen) }.value
+        let matches = try ScreenText.filter(lines, query: query, regex: regex)
+        let rows: [JSON] = matches.map { m in
+            let x = m.rect.x + area.x, y = m.rect.y + area.y
+            return ["text": .string(m.text), "x": .int(Int64(x)), "y": .int(Int64(y)),
+                    "w": .int(Int64(m.rect.w)), "h": .int(Int64(m.rect.h)),
+                    "cx": .int(Int64(x + m.rect.w / 2)), "cy": .int(Int64(y + m.rect.h / 2)),
+                    "confidence": .double((m.confidence * 100).rounded() / 100)]
+        }
+        return ["matches": .array(rows), "lines": .int(Int64(lines.count))]
+    }
+
+    private func screenshotResult(_ t: VMTarget, _ params: JSON) async throws -> JSON {
+        let region = try regionParam(params)
         var scale = 1.0
         if let value = params["scale"] {
             guard let s = value.doubleValue, (0.1...1).contains(s) else { throw ControlError.failed("scale must be between 0.1 and 1") }
