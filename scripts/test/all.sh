@@ -1,7 +1,8 @@
 #!/bin/bash
 # Full local verification: engine build, backend protocol test, library tests,
-# guest agent tests and cross-builds, app build. The Windows install and the
-# guest-agent VM tests are separate (scripts/test/install-windows.py, agent-*.py).
+# guest agent tests and cross-builds, MCP server build and tests, app build.
+# The Windows install and the VM runs are separate (scripts/test/install-windows.py,
+# install-agent.py, agent-*.py, at1-e2e.py).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -12,5 +13,7 @@ python3 scripts/test/install-windows.py --selftest
 ( cd guest-tools && go vet ./... && go test ./... \
     && GOOS=windows GOARCH=arm64 go build -ldflags "-H windowsgui" -o "$ROOT/build/alcove-agent-windows-arm64.exe" ./cmd/alcove-agent \
     && GOOS=linux GOARCH=arm64 go build -o "$ROOT/build/alcove-agent-linux-arm64" ./cmd/alcove-agent )
+( cd mcp && { [ -d node_modules ] || npm ci; } && npm run build && npm test )
+python3 scripts/test/mcp-smoke.py --list-only
 xcodegen generate >/dev/null
 xcodebuild -project Alcove.xcodeproj -scheme Alcove -configuration Debug -derivedDataPath build/DerivedData build 2>&1 | grep -E "BUILD SUCCEEDED|BUILD FAILED|error:"

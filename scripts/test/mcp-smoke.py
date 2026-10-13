@@ -4,56 +4,10 @@
   mcp-smoke.py --list-only        initialize + tools/list (no VM needed)
   mcp-smoke.py --vm "Windows 11"  also: list VMs, start, screenshot (image), exec, click, type, stop
 """
-import base64, json, os, subprocess, sys, time
+import base64, os, sys, time
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-SERVER = os.path.join(ROOT, "mcp", "dist", "index.js")
-
-
-class MCP:
-    def __init__(self, env):
-        self.p = subprocess.Popen(["node", SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
-        self.n = 0
-
-    def request(self, method, params=None, timeout=300):
-        self.n += 1
-        msg = {"jsonrpc": "2.0", "id": self.n, "method": method}
-        if params is not None:
-            msg["params"] = params
-        self.p.stdin.write(json.dumps(msg) + "\n"); self.p.stdin.flush()
-        end = time.time() + timeout
-        while time.time() < end:
-            line = self.p.stdout.readline()
-            if not line:
-                raise SystemExit("server closed stdout; stderr: " + self.p.stderr.read())
-            try:
-                reply = json.loads(line)
-            except json.JSONDecodeError:
-                raise SystemExit("non-JSON on stdout (protocol violation): " + line[:200])
-            if reply.get("id") == self.n:
-                if "error" in reply:
-                    raise SystemExit(f"{method}: {reply['error']}")
-                return reply["result"]
-        raise SystemExit(f"{method}: timeout")
-
-    def notify(self, method, params=None):
-        msg = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            msg["params"] = params
-        self.p.stdin.write(json.dumps(msg) + "\n"); self.p.stdin.flush()
-
-    def call(self, name, args, timeout=300):
-        r = self.request("tools/call", {"name": name, "arguments": args}, timeout)
-        texts = [c["text"] for c in r.get("content", []) if c["type"] == "text"]
-        images = [c for c in r.get("content", []) if c["type"] == "image"]
-        return r.get("isError", False), "\n".join(texts), images
-
-    def close(self):
-        self.p.stdin.close()
-        try:
-            self.p.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.p.kill()
+sys.dont_write_bytecode = True
+from mcp_stdio import MCP, MCPError, ROOT
 
 
 def main():
@@ -62,9 +16,8 @@ def main():
     if "--vm" in sys.argv:
         vm = sys.argv[sys.argv.index("--vm") + 1]
     m = MCP(env)
-    init = m.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "smoke", "version": "0"}})
+    init = m.initialize()
     print("server:", init["serverInfo"], "protocol:", init["protocolVersion"])
-    m.notify("notifications/initialized")
     tools = m.request("tools/list")["tools"]
     names = sorted(t["name"] for t in tools)
     print("tools:", ", ".join(names))
@@ -153,4 +106,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except MCPError as e:
+        raise SystemExit(str(e))

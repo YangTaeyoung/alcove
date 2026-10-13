@@ -18,7 +18,7 @@ Usage: install-agent.py [--vm NAME] [--ssh-port N] [--agent-port N]
 import argparse, hashlib, json, os, re, socket, subprocess, sys, time
 
 sys.dont_write_bytecode = True
-import ctl
+from alcove_ctl import Client, ControlError
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 AGENT = os.path.join(ROOT, "build", "alcove-agent-windows-arm64.exe")
@@ -94,20 +94,24 @@ def source_version():
     return m.group(1)
 
 
+def control(op, **params):
+    """One control operation on its own connection; a refusal ends the script."""
+    try:
+        with Client() as client:
+            return client.call(op, **params)
+    except ControlError as e:
+        fail(f"{op}: {e}")
+
+
 def vm_state(vm):
-    status = ctl.call(ctl.connect(), "vm.status", name=vm)
-    if not status.get("ok"):
-        fail(f"vm.status: {status.get('error')}")
-    return status.get("state")
+    return control("vm.status", name=vm).get("state")
 
 
 def ensure_running(vm, ssh_port):
     state = vm_state(vm)
     if state == "stopped":
         log(f"{vm} is stopped; starting it")
-        started = ctl.call(ctl.connect(), "vm.start", name=vm)
-        if not started.get("ok"):
-            fail(f"vm.start: {started.get('error')}")
+        control("vm.start", name=vm)
         state = vm_state(vm)
     end = time.time() + 300
     while state != "running":

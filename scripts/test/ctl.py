@@ -3,35 +3,10 @@
 Usage: ctl.py OP [key=value ...]   e.g. ctl.py vm.exec name="Windows 11" command=hostname
 Values that parse as JSON (numbers, true/false) are sent typed; others as strings.
 Starts `alcovectl serve` when nothing answers (needs ALCOVE_CTL or a dev build)."""
-import json, os, socket, subprocess, sys, time
+import json, sys
 
-SOCK = os.environ.get("ALCOVE_CONTROL_SOCKET", os.path.expanduser("~/Library/Application Support/Alcove/control.sock"))
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-
-def connect():
-    for attempt in range(40):
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(SOCK)
-            return s
-        except OSError:
-            if attempt == 0:
-                ctl = os.environ.get("ALCOVE_CTL") or os.path.join(ROOT, "AlcoveKit", ".build-ctl", "debug", "alcovectl")
-                subprocess.Popen([ctl, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            time.sleep(0.5)
-    raise SystemExit("cannot connect to " + SOCK)
-
-
-def call(s, op, **params):
-    s.sendall((json.dumps({"id": 1, "op": op, **params}) + "\n").encode())
-    buf = b""
-    while b"\n" not in buf:
-        chunk = s.recv(1 << 20)
-        if not chunk:
-            raise SystemExit("connection closed")
-        buf += chunk
-    return json.loads(buf.split(b"\n", 1)[0])
+sys.dont_write_bytecode = True
+from alcove_ctl import Client, ControlError
 
 
 def main():
@@ -44,7 +19,12 @@ def main():
             params[k] = json.loads(v)
         except ValueError:
             params[k] = v
-    r = call(connect(), op, **params)
+    try:
+        client = Client()
+        r = client.wait(client.send(op, **params), None)
+        client.close()
+    except ControlError as e:
+        raise SystemExit(str(e))
     if "png" in r:
         path = params.get("out", "/tmp/alcove-ctl-shot.png")
         import base64
