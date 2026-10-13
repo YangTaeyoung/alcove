@@ -268,20 +268,32 @@ final class ScreenTextTests: XCTestCase {
         XCTAssertEqual(ScreenText.merged(standard, latin: [touching]), standard)
     }
 
-    func testMergeReplacesOneStandardLineByEveryLatinLineOnItAndTwoByOne() {
+    func testMergeReplacesOneStandardLineByEveryLatinLineThatLiesOnItAlone() {
         let wide = line("Yes No Cance| App-y", 13, 657, 201, 17)
         let parts = [line("Yes", 13, 657, 27, 15), line("No Cancel", 57, 657, 95, 15), line("Apply", 153, 657, 61, 17)]
         XCTAssertEqual(ScreenText.merged([wide], latin: parts), parts)
-        let pieces = [line("Ln 37,", 19, 733, 50, 15), line("Col1", 75, 733, 30, 15)]
-        let whole = line("Ln 37, Col 1", 19, 733, 86, 15)
-        XCTAssertEqual(ScreenText.merged(pieces, latin: [whole]), [whole])
     }
 
-    func testMergeKeepsALatinLineThatLiesOnALineWithHangulAndOnOneWithout() {
+    func testMergeLeavesOutALatinLineThatLiesOnTwoStandardLinesAndKeepsBoth() {
+        let pieces = [line("Ln 37,", 19, 733, 50, 15), line("Col1", 75, 733, 30, 15)]
+        let whole = line("Ln 37, Col 1", 19, 733, 86, 15)
+        XCTAssertEqual(ScreenText.merged(pieces, latin: [whole]), pieces)
+
+        let retry = line("다시 시도", 10, 100, 100, 18)
+        let ok = line("OK", 130, 100, 20, 18)
+        XCTAssertEqual(ScreenText.merged([retry, ok], latin: [line("#|1 OK", 12, 100, 138, 18)]), [retry, ok])
+
         let hangul = line("취소", 10, 100, 40, 18)
         let plain = line("App-y", 60, 100, 50, 18)
-        let across = line("#1 Apply", 12, 100, 98, 18)
-        XCTAssertEqual(ScreenText.merged([hangul, plain], latin: [across]), [hangul, across])
+        XCTAssertEqual(ScreenText.merged([hangul, plain], latin: [line("#1 Apply", 12, 100, 98, 18)]), [hangul, plain])
+    }
+
+    func testMergeKeepsAStandardLineWhenOneOfTheLatinLinesOnItAlsoLiesOnAnother() {
+        let wide = line("Yes No Cance| App-y", 13, 657, 201, 17)
+        let next = line("0K", 250, 657, 30, 17)
+        let alone = line("Yes", 13, 657, 27, 15)
+        let across = line("No Cancel Apply OK", 57, 657, 223, 17)
+        XCTAssertEqual(ScreenText.merged([wide, next], latin: [alone, across]), [wide, next])
     }
 
     func testMergeReturnsReadingOrderAndOnlyRectanglesOfItsInputs() {

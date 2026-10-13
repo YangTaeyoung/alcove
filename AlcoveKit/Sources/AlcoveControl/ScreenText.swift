@@ -52,17 +52,22 @@ enum ScreenText {
 
     /// One reading of an area from two recognitions of it, in reading order. Two lines are partners when their
     /// rectangles intersect horizontally and overlap vertically by at least half the height of the less tall one.
-    /// A line of `standard` that holds Hangul or has no partner in `latin` stays; one without Hangul gives way to
-    /// its partners. A line of `latin` stays when one of its partners holds no Hangul.
+    /// A line of `latin` is a candidate when it has exactly one partner and that partner holds no Hangul. A line
+    /// of `standard` that has partners, all of them candidates, is replaced by them. Every other line of
+    /// `standard` stays with its own text and rectangle, and no other line of `latin` is in the result.
     static func merged(_ standard: [TextMatch], latin: [TextMatch]) -> [TextMatch] {
-        var replaced = Set<Int>()
-        var taken: [TextMatch] = []
-        for line in latin {
-            let plain = standard.indices.filter { arePartners(standard[$0].rect, line.rect) && !holdsHangul(standard[$0].text) }
-            guard !plain.isEmpty else { continue }
-            replaced.formUnion(plain)
-            taken.append(line)
+        let partners = latin.map { line in standard.indices.filter { arePartners(standard[$0].rect, line.rect) } }
+        var takers: [Int: [Int]] = [:]
+        var kept = Set<Int>()
+        for (index, own) in partners.enumerated() {
+            if own.count == 1, !holdsHangul(standard[own[0]].text) {
+                takers[own[0], default: []].append(index)
+            } else {
+                kept.formUnion(own)
+            }
         }
+        let replaced = Set(takers.keys).subtracting(kept)
+        let taken = replaced.flatMap { takers[$0] ?? [] }.map { latin[$0] }
         return readingOrder(standard.indices.filter { !replaced.contains($0) }.map { standard[$0] } + taken)
     }
 
