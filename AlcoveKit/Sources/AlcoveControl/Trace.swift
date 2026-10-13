@@ -98,15 +98,15 @@ enum TraceSanitizer {
 
     /// `value` with each string that equals a secret replaced by `mask`, and each occurrence of a secret of at least
     /// `minSubstringSecret` characters inside a longer string.
-    static func maskValues(_ value: JSON, secrets: [String]) -> JSON {
+    static func maskValues(_ value: JSON, secrets: [String], replacement: String = mask) -> JSON {
         let known = secrets.filter { !$0.isEmpty }.sorted { $0.count > $1.count }
         guard !known.isEmpty else { return value }
         func walk(_ item: JSON) -> JSON {
             switch item {
             case .string(let text):
-                if known.contains(text) { return .string(mask) }
+                if known.contains(text) { return .string(replacement) }
                 var out = text
-                for secret in known where secret.count >= minSubstringSecret { out = out.replacingOccurrences(of: secret, with: mask) }
+                for secret in known where secret.count >= minSubstringSecret { out = out.replacingOccurrences(of: secret, with: replacement) }
                 return .string(out)
             case .array(let items): return .array(items.map(walk))
             case .object(let fields): return .object(fields.mapValues(walk))

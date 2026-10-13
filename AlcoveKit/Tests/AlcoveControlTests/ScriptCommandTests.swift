@@ -129,14 +129,24 @@ final class ScriptCommandTests: XCTestCase {
             XCTAssertTrue(ScriptReport.isSecret(name), name)
         }
         for name in ["message", "user", "path"] { XCTAssertFalse(ScriptReport.isSecret(name), name) }
-        let variables = ["message": "hello", "password": "hunter2"]
+        let variables = ["message": "hello", "password": "hunter2-long"]
         XCTAssertEqual(ScriptReport.variablesLine(variables), "variables: message=hello, password=<hidden>")
         XCTAssertNil(ScriptReport.variablesLine([:]))
-        let reply: JSON = ["passed": false, "stepsRun": 1, "failedStep": 1, "seconds": 1.0, "error": "step 1 failed: typed hunter2",
-                           "steps": [step(1, label: "login hunter2", ok: false, error: "typed hunter2")]]
+        let reply: JSON = ["passed": false, "stepsRun": 1, "failedStep": 1, "seconds": 1.0, "error": "step 1 failed: typed hunter2-long",
+                           "steps": [step(1, label: "login hunter2-long", ok: false, error: "typed hunter2-long")]]
         let text = ScriptReport.lines(reply, variables: variables).joined(separator: "\n")
         XCTAssertFalse(text.contains("hunter2"))
         XCTAssertTrue(text.contains("typed <hidden>"))
+        XCTAssertEqual(ScriptReport.masked("could not use hunter2-long", variables: variables), "could not use <hidden>")
+    }
+
+    func testShortSecretHidesOnlyAWholeString() {
+        let variables = ["pin_key": "1"]
+        let reply: JSON = ["passed": false, "stepsRun": 1, "failedStep": 1, "seconds": 1.0, "error": "step 1 failed: typed 1",
+                           "steps": [step(1, label: "1", ok: false, error: "1")]]
+        XCTAssertEqual(ScriptReport.lines(reply, variables: variables), [
+            "FAIL 1 <hidden> 250 ms", "     <hidden>", "error: step 1 failed: typed 1", "FAILED: step 1 failed after 1.0 s",
+        ])
     }
 
     func testFailureImageIsWrittenNextToTheScriptAndRemovedWhenTheRunHasNone() throws {

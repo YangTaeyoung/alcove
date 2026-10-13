@@ -158,19 +158,27 @@ public enum ScriptReport {
         return "variables: " + variables.keys.sorted().map { "\($0)=\(isSecret($0) ? "<hidden>" : variables[$0]!)" }.joined(separator: ", ")
     }
 
-    /// `text` without the values of the secret variables.
+    /// The values of the secret variables.
+    static func secretValues(_ variables: [String: String]) -> [String] {
+        variables.filter { isSecret($0.key) }.map(\.value)
+    }
+
+    /// `value` with `<hidden>` in place of each string that equals the value of a secret variable and of each
+    /// occurrence of a value of 8 or more characters inside a longer string.
+    public static func masked(_ value: JSON, variables: [String: String]) -> JSON {
+        TraceSanitizer.maskValues(value, secrets: secretValues(variables), replacement: "<hidden>")
+    }
+
+    /// `text` with the same replacement as `masked(_: JSON, variables:)`.
     public static func masked(_ text: String, variables: [String: String]) -> String {
-        var out = text
-        for (name, value) in variables.sorted(by: { $0.value.count > $1.value.count }) where isSecret(name) && !value.isEmpty {
-            out = out.replacingOccurrences(of: value, with: "<hidden>")
-        }
-        return out
+        masked(.string(text), variables: variables).stringValue ?? text
     }
 
     /// The output lines for the reply of `script.run`: one per step (`ok` or `FAIL`, number, label or op,
     /// milliseconds, markers), the error of a failed step, the warning, then `PASSED` or `FAILED`; `INTERRUPTED` and
     /// no error line for a run a signal stopped.
-    public static func lines(_ reply: JSON, variables: [String: String], interrupted: Bool = false) -> [String] {
+    public static func lines(_ unmasked: JSON, variables: [String: String], interrupted: Bool = false) -> [String] {
+        let reply = masked(unmasked, variables: variables)
         var out: [String] = []
         for entry in reply["steps"]?.arrayValue ?? [] {
             let number = entry["step"]?.intValue ?? 0
@@ -187,7 +195,7 @@ public enum ScriptReport {
         }
         if !interrupted, let error = reply["error"]?.stringValue { out.append("error: \(error)") }
         if let warning = reply["warning"]?.stringValue { out.append("warning: \(warning)") }
-        if interrupted { return (out + ["INTERRUPTED"]).map { masked($0, variables: variables) } }
+        if interrupted { return out + ["INTERRUPTED"] }
         let seconds = String(format: "%.1f", reply["seconds"]?.doubleValue ?? 0)
         let count = reply["stepsRun"]?.intValue ?? 0
         if reply["passed"]?.boolValue == true {
@@ -196,7 +204,7 @@ public enum ScriptReport {
             let failed = reply["failedStep"]?.intValue.map { "step \($0) failed" } ?? "the run stopped"
             out.append("FAILED: \(failed) after \(seconds) s")
         }
-        return out.map { masked($0, variables: variables) }
+        return out
     }
 
     /// The PNG of the failure screenshot in the reply of `script.run`.
