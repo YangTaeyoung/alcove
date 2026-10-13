@@ -4,8 +4,8 @@ import AlcoveQMP
 /// The recordings of the handler's VMs.
 struct RecordingTable {
     var active: [String: Recording] = [:]
-    /// Summaries of recordings that ended by themselves and were not collected with `vm.record.stop`.
-    var ended: [String: Recording.Summary] = [:]
+    /// Recordings that ended by themselves and were not collected with `vm.record.stop`, with their summaries.
+    var ended: [String: EndedRecording] = [:]
     /// The directory of the latest recording per VM.
     var lastDirectory: [String: String] = [:]
     /// The recording each VM had when it was found not running.
@@ -14,6 +14,12 @@ struct RecordingTable {
     var starting: [String: URL] = [:]
     /// Recordings that are ending; `vm.record.stop` waits for them.
     var retiring: [String: Recording] = [:]
+}
+
+/// A recording that ended and whose summary is waiting for `vm.record.stop`.
+struct EndedRecording {
+    let recording: Recording
+    let summary: Recording.Summary
 }
 
 /// Replaceable parts of a new recording.
@@ -53,11 +59,13 @@ extension ControlHandler {
 
     /// The VM's recording while it is still active; one that reached its limit is retired first.
     func liveRecording(_ vm: String) async -> Recording? {
-        guard let recording = recordings.active[vm] else { return nil }
-        await recording.endIfDue()
-        if await recording.isActive { return recording }
-        await retireRecording(vm, recording)
-        if let newer = recordings.active[vm], newer !== recording { return await liveRecording(vm) }
+        while let recording = recordings.active[vm] {
+            await recording.endIfDue()
+            let live = await recording.isActive
+            if recordings.active[vm] !== recording { continue }
+            if live { return recording }
+            await retireRecording(vm, recording)
+        }
         return nil
     }
 
@@ -67,30 +75,23 @@ extension ControlHandler {
         recordings.active[vm] = nil
         recordings.retiring[vm] = recording
         let summary = await recording.stop()
-        settle(recording, vm: vm, summary: summary, collecting: false)
+        settle(recording, vm: vm, summary: summary)
     }
 
-    /// Records the end of `recording` once: the first to settle it clears the retirement; a retirement keeps the summary
-    /// for `vm.record.stop`, a collector takes it. Returns the summary when the caller is the one that delivers it.
-    @discardableResult
-    private func settle(_ recording: Recording, vm: String, summary: Recording.Summary, collecting: Bool) -> Recording.Summary? {
-        if recordings.retiring[vm] === recording {
-            recordings.retiring[vm] = nil
-            recordings.lastDirectory[vm] = summary.dir
-            if collecting { return summary }
-            recordings.ended[vm] = summary
-            return nil
-        }
-        guard collecting, recordings.ended[vm]?.dir == summary.dir else { return nil }
-        recordings.ended[vm] = nil
-        return summary
+    /// Ends the retirement of `recording`, the first time it is settled, and keeps its summary for `vm.record.stop`
+    /// unless a stop has delivered it already.
+    private func settle(_ recording: Recording, vm: String, summary: Recording.Summary) {
+        guard recordings.retiring[vm] === recording else { return }
+        recordings.retiring[vm] = nil
+        recordings.lastDirectory[vm] = summary.dir
+        if !recording.delivery.isTaken { recordings.ended[vm] = EndedRecording(recording: recording, summary: summary) }
     }
 
     /// Waits until no recording of the VM is being retired.
     private func settleRetirements(_ vm: String) async {
         while let retiring = recordings.retiring[vm] {
             let summary = await retiring.stop()
-            settle(retiring, vm: vm, summary: summary, collecting: false)
+            settle(retiring, vm: vm, summary: summary)
         }
     }
 
@@ -104,7 +105,6 @@ extension ControlHandler {
     func record(op: String, params: JSON) async throws -> JSON {
         let t = try await target(params)
         let vm = t.name
-        let current = op == "vm.record.start" ? nil : await liveRecording(vm)
         switch op {
         case "vm.record.start":
             repeat {
@@ -115,16 +115,21 @@ extension ControlHandler {
             if let reserved = recordings.starting[vm] { throw ControlError.failed("'\(vm)' is already recording to \(reserved.path); call vm.record.stop first") }
             return try await startRecording(t, params)
         case "vm.record.stop":
-            if let current {
-                recordings.active[vm] = nil
-                recordings.retiring[vm] = current
+            if let current = recordings.active[vm] {
+                if recordings.active[vm] === current {
+                    recordings.active[vm] = nil
+                    recordings.retiring[vm] = current
+                }
                 return try await collect(current, vm: vm)
             }
             if let retiring = recordings.retiring[vm] { return try await collect(retiring, vm: vm) }
             if recordings.starting[vm] != nil { throw ControlError.failed("'\(vm)' is still starting its recording; call vm.record.stop again in a moment") }
-            guard let summary = recordings.ended.removeValue(forKey: vm) else { throw ControlError.failed("'\(vm)' is not recording") }
-            return summary.json
+            guard let ended = recordings.ended.removeValue(forKey: vm), ended.recording.delivery.take() else {
+                throw ControlError.failed("'\(vm)' is not recording")
+            }
+            return ended.summary.json
         default:
+            let current = await liveRecording(vm)
             if let reserved = recordings.starting[vm] {
                 return ["recording": true, "dir": .string(reserved.path), "seconds": 0, "ops": 0, "writeErrors": 0]
             }
@@ -140,13 +145,17 @@ extension ControlHandler {
         }
     }
 
-    /// Waits for `recording` to end and returns its summary as the answer to `vm.record.stop`.
+    /// Waits for `recording` to end and returns its summary as the answer to `vm.record.stop`; of all the stops that wait for
+    /// the same recording, one gets the summary and the others fail.
     private func collect(_ recording: Recording, vm: String) async throws -> JSON {
         let summary = await recording.stop()
-        guard let delivered = settle(recording, vm: vm, summary: summary, collecting: true) else {
-            throw ControlError.failed("'\(vm)' is not recording")
+        if recordings.retiring[vm] === recording {
+            recordings.retiring[vm] = nil
+            recordings.lastDirectory[vm] = summary.dir
         }
-        return delivered.json
+        if recordings.ended[vm]?.recording === recording { recordings.ended[vm] = nil }
+        guard recording.delivery.take() else { throw ControlError.failed("'\(vm)' is not recording") }
+        return summary.json
     }
 
     private func startRecording(_ t: VMTarget, _ params: JSON) async throws -> JSON {

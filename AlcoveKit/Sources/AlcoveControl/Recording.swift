@@ -30,6 +30,22 @@ struct NoVideoSink: VideoSink {
     func finish() async {}
 }
 
+/// Hands the summary of one recording to a single caller.
+final class SummaryDelivery: @unchecked Sendable {
+    private let lock = NSLock()
+    private var taken = false
+
+    var isTaken: Bool { lock.withLock { taken } }
+
+    /// True for the first call only.
+    func take() -> Bool {
+        lock.withLock {
+            defer { taken = true }
+            return !taken
+        }
+    }
+}
+
 /// One recording of a VM's control ops: a trace file, the frames around input ops and an optional video.
 actor Recording {
     struct Summary: Sendable, Equatable {
@@ -57,6 +73,7 @@ actor Recording {
         }
     }
 
+    nonisolated let delivery = SummaryDelivery()
     let vm: String
     let directory: URL
     let fps: Int
