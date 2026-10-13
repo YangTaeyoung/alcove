@@ -19,8 +19,8 @@
 //   - "Hang": the window thread sleeps for 60 s;
 //   - "Fetch": an HTTPS GET of --url on another goroutine, which appends
 //     "Fetch: <status code or error>" to the transcript;
-//   - "Titles": changes the window title every 50 ms for 5 s, ending with
-//     "Alcove Fixture".
+//   - "Titles": changes the window title every 50 ms for 5 s, then shows
+//     "Alcove Fixture held" for 600 ms and ends with "Alcove Fixture".
 //
 // With --log every action appends one line "<RFC 3339 time> <action> [detail]"
 // to the file; a change of Secret is logged as "secret <length>", without the
@@ -42,6 +42,7 @@ import (
 
 const (
 	windowTitle = "Alcove Fixture"
+	heldTitle   = "Alcove Fixture held"
 	className   = "AlcoveFixtureWindow"
 
 	replyWords    = 30
@@ -114,6 +115,7 @@ const (
 	titlesTimer    = 2
 	titlesInterval = 50 // ms
 	titlesTicks    = 100
+	titlesHeld     = 12 // ticks
 )
 
 var (
@@ -432,11 +434,19 @@ func (a *app) onTitles() {
 	procSetTimer.Call(a.main, titlesTimer, titlesInterval, 0)
 }
 
-// onTitlesTimer changes the title once more, ending at the base title.
+// onTitlesTimer changes the title once more: to the next numbered title for
+// titlesTicks ticks, then to heldTitle for titlesHeld ticks, then to the base
+// title.
 func (a *app) onTitlesTimer() {
 	a.titlesTick++
-	if a.titlesTick < titlesTicks {
+	switch {
+	case a.titlesTick < titlesTicks:
 		setWindowText(a.main, fmt.Sprintf("Alcove Fixture %d", a.titlesTick))
+		return
+	case a.titlesTick == titlesTicks:
+		setWindowText(a.main, heldTitle)
+		return
+	case a.titlesTick < titlesTicks+titlesHeld:
 		return
 	}
 	procKillTimer.Call(a.main, titlesTimer)
