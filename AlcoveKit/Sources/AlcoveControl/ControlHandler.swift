@@ -466,7 +466,7 @@ public actor ControlHandler {
 
     private func findText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
         let region = try regionParam(params)
-        var languages = ScreenText.defaultLanguages
+        var languages: [String]?
         if let value = params["languages"] {
             guard let items = value.arrayValue, !items.isEmpty, items.allSatisfy({ $0.stringValue != nil }) else {
                 throw ControlError.failed("languages must be an array of language codes such as [\"en-US\",\"ko-KR\"]")
@@ -487,7 +487,7 @@ public actor ControlHandler {
         }
         let cropped = area == frame.bounds ? frame : frame.crop(area)
         let chosen = languages
-        try ScreenText.validate(languages: chosen)
+        try ScreenText.validate(languages: chosen ?? ScreenText.defaultLanguages + ScreenText.latinLanguages)
         let lines: [TextMatch]
         do {
             lines = try await queuedRecognition(of: cropped, languages: chosen)
@@ -511,7 +511,7 @@ public actor ControlHandler {
     }
 
     /// The lines the recognition queue reads in `frame`. A cancelled task leaves the queue and throws `CancellationError`.
-    private nonisolated func queuedRecognition(of frame: Frame, languages: [String]) async throws -> [TextMatch] {
+    private nonisolated func queuedRecognition(of frame: Frame, languages: [String]?) async throws -> [TextMatch] {
         guard let outcome = await RecognitionQueue.shared.recognize(frame, languages: languages) else { throw CancellationError() }
         return try outcome.get()
     }

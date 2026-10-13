@@ -12,7 +12,48 @@ struct TextMatch: Sendable, Equatable {
 
 /// Text recognition on guest frames with the Vision framework.
 enum ScreenText {
+    /// The languages of the first recognition of a reading without `languages`.
     static let defaultLanguages = ["ko-KR", "en-US"]
+    /// The languages of its second recognition.
+    static let latinLanguages = ["en-US"]
+
+    /// The lines of `frame` in reading order. With `languages`, what one recognition with that list returns.
+    /// Without, `merged` of a recognition with `defaultLanguages` and one with `latinLanguages`.
+    static func read(_ frame: Frame, languages: [String]?,
+                     with recognizer: @Sendable (Frame, [String]) throws -> [TextMatch]) throws -> [TextMatch] {
+        if let languages { return try recognizer(frame, languages) }
+        let standard = try recognizer(frame, defaultLanguages)
+        return merged(standard, latin: try recognizer(frame, latinLanguages))
+    }
+
+    /// One reading of an area from two recognitions of it, in reading order. Two lines are partners when their
+    /// rectangles intersect horizontally and overlap vertically by at least half the height of the less tall one.
+    /// A line of `standard` that holds Hangul or has no partner in `latin` stays; one without Hangul gives way to
+    /// its partners. A line of `latin` stays when one of its partners holds no Hangul.
+    static func merged(_ standard: [TextMatch], latin: [TextMatch]) -> [TextMatch] {
+        var replaced = Set<Int>()
+        var taken: [TextMatch] = []
+        for line in latin {
+            let plain = standard.indices.filter { arePartners(standard[$0].rect, line.rect) && !holdsHangul(standard[$0].text) }
+            guard !plain.isEmpty else { continue }
+            replaced.formUnion(plain)
+            taken.append(line)
+        }
+        return readingOrder(standard.indices.filter { !replaced.contains($0) }.map { standard[$0] } + taken)
+    }
+
+    private static func arePartners(_ a: Frame.Rect, _ b: Frame.Rect) -> Bool {
+        let vertical = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+        let horizontal = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+        return horizontal > 0 && vertical * 2 >= min(a.h, b.h)
+    }
+
+    /// Whether `text` has a Hangul syllable or a Hangul letter (jamo).
+    private static func holdsHangul(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            (0xAC00...0xD7A3).contains(scalar.value) || (0x1100...0x11FF).contains(scalar.value) || (0x3130...0x318F).contains(scalar.value)
+        }
+    }
 
     /// Frames narrower than this are enlarged before recognition.
     static let upscaleBelowWidth = 400

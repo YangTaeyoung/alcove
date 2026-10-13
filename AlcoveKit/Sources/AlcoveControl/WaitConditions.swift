@@ -53,12 +53,13 @@ struct WaitText: Sendable {
     let query: String
     let expression: NSRegularExpression?
     let region: Frame.Rect?
-    let languages: [String]
+    /// The recognition languages the condition names; nil for the reading without `languages`.
+    let languages: [String]?
 
-    /// Identifies the recognition this text needs; conditions with the same key share one.
+    /// Identifies the reading this text needs; conditions with the same key share one.
     var recognitionKey: String {
         let area = region.map { "\($0.x),\($0.y),\($0.w),\($0.h)" } ?? "frame"
-        return area + "|" + languages.joined(separator: ",")
+        return area + "|" + (languages?.joined(separator: ",") ?? "merged")
     }
 }
 
@@ -193,14 +194,14 @@ enum WaitCondition: Sendable {
                 guard let flag = v.boolValue else { throw fail("'regex' must be a boolean") }
                 if flag { expression = try compile(query, regexOptions: [.caseInsensitive], index: index) }
             }
-            var languages = ScreenText.defaultLanguages
+            var languages: [String]?
             if let v = fields["languages"], v != .null {
                 guard let items = v.arrayValue, !items.isEmpty, items.allSatisfy({ $0.stringValue != nil }) else {
                     throw fail("'languages' must be a non-empty array of strings")
                 }
                 languages = items.compactMap(\.stringValue)
             }
-            do { try ScreenText.validate(languages: languages) }
+            do { try ScreenText.validate(languages: languages ?? ScreenText.defaultLanguages + ScreenText.latinLanguages) }
             catch { throw fail(ControlHandler.failureReason(error, fallback: "the recognition languages cannot be checked")) }
             return WaitText(query: query, expression: expression, region: try region(), languages: languages)
         }

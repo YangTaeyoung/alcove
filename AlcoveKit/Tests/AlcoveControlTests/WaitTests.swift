@@ -222,6 +222,27 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(r["detail"], ["text": "Edge", "x": 899, "y": 549, "w": 1, "h": 1, "cx": 899, "cy": 549])
     }
 
+    func testTextConditionsWithoutLanguagesUseTheMergedReading() async throws {
+        let seen = LockedBox<[[String]]>([])
+        WaitTiming.recognizer = { _, languages in
+            seen.value.append(languages)
+            let text = languages == ["en-US"] ? "Alcove OCR check" : "Alcove OR check"
+            return [TextMatch(text: text, rect: Frame.Rect(x: 45, y: 117, w: 130, h: 15), confidence: 1)]
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let merged = try await waitFor(h, [["type": "text_gone", "text": "nothing"], ["type": "text_visible", "text": "OCR check"]], timeout: 10)
+        XCTAssertEqual(merged["matched"]?.intValue, 0)
+        XCTAssertEqual(seen.value, [["ko-KR", "en-US"], ["en-US"]])
+        let found = try await waitFor(h, [["type": "text_visible", "text": "OCR check"]], timeout: 10)
+        XCTAssertEqual(found["detail"]?["text"]?.stringValue, "Alcove OCR check")
+
+        seen.value = []
+        let single = try await waitFor(h, [["type": "text_visible", "text": "OCR check", "languages": ["ko-KR", "en-US"]]], timeout: 1)
+        XCTAssertEqual(single["matched"]?.intValue, -1)
+        XCTAssertFalse(seen.value.isEmpty)
+        XCTAssertTrue(seen.value.allSatisfy { $0 == ["ko-KR", "en-US"] }, "\(seen.value)")
+    }
+
     func testTextVisibleWithRegex() async throws {
         let drawn = drawText([("Build 42 done", 100, 120)])
         let (h, _) = await screenRig(frames: [drawn.frame])

@@ -1,11 +1,12 @@
 import Foundation
 import Synchronization
 
-/// Runs text recognitions one at a time on a thread of its own, in the order they were asked for.
+/// Runs the readings of text (`ScreenText.read`) one at a time on a thread of its own, in the order they were
+/// asked for, so that one recognizer call runs at a time.
 ///
-/// A caller that asks for a recognition equal to the one running or to one that waits joins it. A recognition that
-/// waits and has lost every caller is removed without being started; the running one ends and its result goes to
-/// the callers that still wait.
+/// A caller that asks for the frame and languages of the reading that runs or of one that waits joins it. A reading
+/// that waits and has lost every caller is removed without being started; the running one ends and its result
+/// goes to the callers that still wait.
 final class RecognitionQueue: Sendable {
     typealias Recognizer = @Sendable (Frame, [String]) throws -> [TextMatch]
     typealias Outcome = Result<[TextMatch], Error>
@@ -15,7 +16,7 @@ final class RecognitionQueue: Sendable {
 
     private struct Request {
         let frame: Frame
-        let languages: [String]
+        let languages: [String]?
         let recognizer: Recognizer
         var waiters: [Int: CheckedContinuation<Outcome?, Never>]
     }
@@ -37,15 +38,15 @@ final class RecognitionQueue: Sendable {
     private let state = Mutex(State())
     private let worker = DispatchQueue(label: "alcove.control.recognition", qos: .userInitiated)
 
-    /// The recognitions in the queue: whether one runs, how many callers wait for it and how many others wait
-    /// for their turn.
+    /// The readings in the queue: whether one runs, how many callers wait for it and how many others wait for
+    /// their turn.
     var load: (running: Bool, callers: Int, waiting: Int) {
         state.withLock { ($0.running != nil, $0.running?.waiters.count ?? 0, $0.waiting.count) }
     }
 
-    /// What `recognizer` reads in `frame` with `languages`, once the recognitions asked for earlier have ended.
+    /// `ScreenText.read` of `frame` and `languages` with `recognizer`, once the readings asked for earlier have ended.
     /// Nil when `limit` passed or the task was cancelled before the result arrived.
-    func recognize(_ frame: Frame, languages: [String], recognizer: @escaping Recognizer = WaitTiming.recognizer,
+    func recognize(_ frame: Frame, languages: [String]?, recognizer: @escaping Recognizer = WaitTiming.recognizer,
                    until limit: ContinuousClock.Instant? = nil) async -> Outcome? {
         let caller = state.withLock { state in
             state.lastCaller += 1
@@ -70,7 +71,7 @@ final class RecognitionQueue: Sendable {
 
     /// Adds `caller` to the request for the same frame and languages, or to a new one behind the others; the new
     /// one starts at once when none runs. A caller that has left gets nil.
-    private func join(_ caller: Int, frame: Frame, languages: [String], recognizer: @escaping Recognizer,
+    private func join(_ caller: Int, frame: Frame, languages: [String]?, recognizer: @escaping Recognizer,
                       _ continuation: CheckedContinuation<Outcome?, Never>) {
         let joined: Joined = state.withLock { state in
             guard state.arriving.remove(caller) != nil else { return .left }
@@ -115,7 +116,7 @@ final class RecognitionQueue: Sendable {
     /// Runs `request`, which is the running one, on the worker thread, answers its callers and starts the next.
     private func run(_ request: Request) {
         worker.async {
-            let outcome = Outcome { try request.recognizer(request.frame, request.languages) }
+            let outcome = Outcome { try ScreenText.read(request.frame, languages: request.languages, with: request.recognizer) }
             let (callers, next) = self.state.withLock { state in
                 let callers = state.running.map { Array($0.waiters.values) } ?? []
                 state.running = state.waiting.isEmpty ? nil : state.waiting.removeFirst()

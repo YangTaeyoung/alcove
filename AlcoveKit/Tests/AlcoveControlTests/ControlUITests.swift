@@ -2728,7 +2728,7 @@ final class ControlUITests: XCTestCase {
         let (h, _, agent) = try await rig(["ui.find": { _, _ in .silent }])
         let wait = Task {
             try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 1, "conditions": [
-                ["type": "ui_gone", "name": "Busy"], ["type": "text_visible", "text": "never shown"],
+                ["type": "ui_gone", "name": "Busy"], ["type": "text_visible", "text": "never shown", "languages": ["en-US"]],
             ]])
         }
         let reading = await eventually { entered.value == 1 && agentRequests(agent, "ui.find").count == 1 }

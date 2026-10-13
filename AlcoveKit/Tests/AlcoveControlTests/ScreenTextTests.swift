@@ -47,6 +47,10 @@ private func assertNear(_ rect: Frame.Rect, _ expected: Frame.Rect, tolerance: I
     XCTAssertLessThanOrEqual(abs(rect.h - expected.h), tolerance, "h \(rect) vs \(expected) \(message)", file: file, line: line)
 }
 
+private func line(_ text: String, _ x: Int, _ y: Int, _ w: Int, _ h: Int, confidence: Double = 1) -> TextMatch {
+    TextMatch(text: text, rect: Frame.Rect(x: x, y: y, w: w, h: h), confidence: confidence)
+}
+
 final class ScreenTextTests: XCTestCase {
     func testRecognizesEnglishAndKorean() throws {
         let supported = try VNRecognizeTextRequest(completionHandler: nil).supportedRecognitionLanguages()
@@ -222,9 +226,123 @@ final class ScreenTextTests: XCTestCase {
         }
         addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
         let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
-        let r = try await h.handle(op: "vm.find_text", params: ["name": "Win", "query": "send"])
+        let r = try await h.handle(op: "vm.find_text", params: ["name": "Win", "query": "send", "languages": ["en-US"]])
         XCTAssertEqual(calls.value, 2)
         XCTAssertEqual(r["matches"]?.arrayValue?.count, 1)
+    }
+
+    // MARK: - the reading without `languages`
+
+    func testMergeTakesTheLatinReadingOfALineWithoutHangul() {
+        let standard = [line("Enron 0x80070005: access denied", 11, 467, 253, 17)]
+        let latin = [line("Error 0x80070005: access denied", 12, 466, 251, 18, confidence: 0.5)]
+        XCTAssertEqual(ScreenText.merged(standard, latin: latin), latin)
+    }
+
+    func testMergeKeepsTheStandardReadingOfALineWithHangul() {
+        let hangul = line("결제 금액: 128,450원 (부가세 포함)", 11, 333, 265, 23)
+        let mixed = line("파일 report-2026.xlsx 저장", 11, 371, 220, 19)
+        let jamo = line("ㅇㅋ OK", 11, 409, 60, 19)
+        let latin = [line("2M 2O1: 128,450 (4714 TE)", 11, 334, 262, 21), line("Ite report-2026.xlsx MA", 12, 372, 218, 18), line("OK OK", 11, 410, 58, 17)]
+        XCTAssertEqual(ScreenText.merged([hangul, mixed, jamo], latin: latin), [hangul, mixed, jamo])
+    }
+
+    func testMergeKeepsAStandardLineWithoutAPartnerAndDropsALatinLineWithoutOne() {
+        let alone = line("Plain text", 307, 733, 58, 14)
+        let above = line("Voun tnial ends", 11, 100, 205, 11)
+        let beside = line("Apply", 500, 733, 61, 15)
+        XCTAssertEqual(ScreenText.merged([alone], latin: [above, beside]), [alone])
+        XCTAssertEqual(ScreenText.merged([], latin: [above, beside]), [])
+        XCTAssertEqual(ScreenText.merged([alone], latin: []), [alone])
+    }
+
+    func testMergePairsLinesThatOverlapByHalfTheHeightOfTheLessTallOne() {
+        let standard = [line("Youn trial", 10, 100, 200, 20)]
+        let half = line("Your trial", 10, 110, 200, 20)
+        XCTAssertEqual(ScreenText.merged(standard, latin: [half]), [half])
+        let less = line("Your trial", 10, 111, 200, 20)
+        XCTAssertEqual(ScreenText.merged(standard, latin: [less]), standard)
+        let short = line("Your trial", 10, 116, 200, 8)
+        XCTAssertEqual(ScreenText.merged(standard, latin: [short]), [short])
+        let touching = line("Your trial", 210, 100, 200, 20)
+        XCTAssertEqual(ScreenText.merged(standard, latin: [touching]), standard)
+    }
+
+    func testMergeReplacesOneStandardLineByEveryLatinLineOnItAndTwoByOne() {
+        let wide = line("Yes No Cance| App-y", 13, 657, 201, 17)
+        let parts = [line("Yes", 13, 657, 27, 15), line("No Cancel", 57, 657, 95, 15), line("Apply", 153, 657, 61, 17)]
+        XCTAssertEqual(ScreenText.merged([wide], latin: parts), parts)
+        let pieces = [line("Ln 37,", 19, 733, 50, 15), line("Col1", 75, 733, 30, 15)]
+        let whole = line("Ln 37, Col 1", 19, 733, 86, 15)
+        XCTAssertEqual(ScreenText.merged(pieces, latin: [whole]), [whole])
+    }
+
+    func testMergeKeepsALatinLineThatLiesOnALineWithHangulAndOnOneWithout() {
+        let hangul = line("취소", 10, 100, 40, 18)
+        let plain = line("App-y", 60, 100, 50, 18)
+        let across = line("#1 Apply", 12, 100, 98, 18)
+        XCTAssertEqual(ScreenText.merged([hangul, plain], latin: [across]), [hangul, across])
+    }
+
+    func testMergeReturnsReadingOrderAndOnlyRectanglesOfItsInputs() {
+        let standard = [line("Lowen row", 100, 400, 120, 20), line("위 오른쪽", 600, 100, 120, 20), line("Uppen left", 100, 104, 120, 20)]
+        let latin = [line("Upper left", 101, 103, 119, 21), line("9| 2E", 600, 101, 118, 19), line("Lower row", 100, 401, 121, 19)]
+        let merged = ScreenText.merged(standard, latin: latin)
+        XCTAssertEqual(merged.map(\.text), ["Upper left", "위 오른쪽", "Lower row"])
+        XCTAssertEqual(merged.map(\.rect), [latin[0].rect, standard[1].rect, latin[2].rect])
+    }
+
+    func testAReadingWithoutLanguagesRecognizesWithTheDefaultListThenTheLatinOneAndMerges() throws {
+        let seen = LockedBox<[[String]]>([])
+        let lines = try ScreenText.read(drawText([], width: 64, height: 64).frame, languages: nil) { _, languages in
+            seen.value.append(languages)
+            return languages == ["en-US"] ? [line("Alcove OCR check", 45, 117, 130, 15)] : [line("Alcove OR check", 45, 117, 128, 15), line("한글 인식 확인", 45, 136, 110, 21)]
+        }
+        XCTAssertEqual(seen.value, [["ko-KR", "en-US"], ["en-US"]])
+        XCTAssertEqual(lines.map(\.text), ["Alcove OCR check", "한글 인식 확인"])
+    }
+
+    func testAReadingWithLanguagesRecognizesOnceWithThatList() throws {
+        for languages in [["en-US"], ["ko-KR", "en-US"], ["ko-KR"]] {
+            let seen = LockedBox<[[String]]>([])
+            let lines = try ScreenText.read(drawText([], width: 64, height: 64).frame, languages: languages) { _, languages in
+                seen.value.append(languages)
+                return [line("Alcove OR check", 45, 117, 128, 15)]
+            }
+            XCTAssertEqual(seen.value, [languages])
+            XCTAssertEqual(lines.map(\.text), ["Alcove OR check"])
+        }
+    }
+
+    func testAReadingWithoutLanguagesFindsSmallLatinTextAndHangul() throws {
+        guard try ScreenText.supportedLanguages.get().contains("ko-KR") else { throw XCTSkip("ko-KR is not a supported recognition language on this host") }
+        let drawn = drawText([("Send message", 100, 120), ("메시지 보내기", 100, 300), ("저장 report.xlsx", 100, 480)])
+        let lines = try ScreenText.read(drawn.frame, languages: nil) { try ScreenText.recognize($0, languages: $1) }
+        XCTAssertEqual(lines.count, 3, "\(lines)")
+        XCTAssertTrue(lines[0].text.lowercased().contains("send message"), "\(lines)")
+        XCTAssertTrue(lines[1].text.replacingOccurrences(of: " ", with: "").contains("메시지보내기"), "\(lines)")
+        XCTAssertTrue(lines[2].text.contains("저장"), "\(lines)")
+        assertNear(lines[0].rect, drawn.rects[0], "latin")
+        assertNear(lines[1].rect, drawn.rects[1], "hangul")
+    }
+
+    func testFindTextWithoutLanguagesUsesTheMergedReading() async throws {
+        let seen = LockedBox<[[String]]>([])
+        WaitTiming.recognizer = { _, languages in
+            seen.value.append(languages)
+            return languages == ["en-US"] ? [line("batch works", 45, 117, 90, 15)] : [line("batch wonks!", 45, 117, 92, 15), line("한글 인식 확인", 45, 136, 110, 21)]
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 1280, height: 800).frame)
+        let all = try await h.handle(op: "vm.find_text", params: ["name": "Win"])
+        XCTAssertEqual(all["lines"]?.intValue, 2)
+        XCTAssertEqual(all["matches"]?.arrayValue?.compactMap { $0["text"]?.stringValue }, ["batch works", "한글 인식 확인"])
+        XCTAssertEqual(seen.value, [["ko-KR", "en-US"], ["en-US"]])
+
+        seen.value = []
+        let chosen = try await h.handle(op: "vm.find_text", params: ["name": "Win", "languages": ["ko-KR", "en-US"]])
+        XCTAssertEqual(chosen["matches"]?.arrayValue?.compactMap { $0["text"]?.stringValue }, ["batch wonks!", "한글 인식 확인"])
+        XCTAssertEqual(seen.value, [["ko-KR", "en-US"]])
     }
 
     func testFindTextFailsWithAnInstructionAfterTwoRecognitionFailures() async throws {

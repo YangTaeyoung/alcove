@@ -460,7 +460,7 @@ extension ControlHandler {
 
     /// The lines the recognition queue reads in `frame`, or nil when it has not answered at `deadline` and
     /// `WaitTiming.recognitionGrace` after this call, whichever comes later; the wait then leaves the queue.
-    private func recognition(of frame: Frame, languages: [String], clock: ContinuousClock,
+    private func recognition(of frame: Frame, languages: [String]?, clock: ContinuousClock,
                              deadline: ContinuousClock.Instant) async throws -> [TextMatch]? {
         let limit = max(deadline, clock.now + WaitTiming.recognitionGrace)
         return try await RecognitionQueue.shared.recognize(frame, languages: languages, until: limit)?.get()
