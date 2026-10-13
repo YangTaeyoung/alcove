@@ -600,8 +600,9 @@ extension ControlHandler {
                 let err = (r["stderr"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let printed = err.isEmpty ? out : err
                 let line = printed.split(whereSeparator: \.isNewline).first.map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
-                let what = line.isEmpty ? " and printed nothing" : ": \(line.prefix(ControlHandler.portOutputLimit))"
-                throw ControlError.failed("the port check failed: the guest command exited with code \(code)\(what); run vm.doctor to check the guest shell")
+                let what = line.isEmpty ? " and printed nothing; run vm.doctor to check the guest shell"
+                    : ": \(line.prefix(ControlHandler.portOutputLimit))"
+                throw ControlError.failed("the port check failed: the guest command exited with code \(code)\(what)")
             }
             return out == "1" ? .holds(nil) : .pending
         case .logMatches(let path, let pattern):

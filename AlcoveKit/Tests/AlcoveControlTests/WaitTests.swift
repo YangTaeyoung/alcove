@@ -367,7 +367,7 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(GuestRecipes.portListening(8080, os: .windows),
                        "if (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue) { '1' } else { '0' }")
         XCTAssertEqual(GuestRecipes.portListening(8080, os: .linux),
-                       "command -v ss >/dev/null 2>&1 || { echo \"ss is not installed in the guest\" >&2; exit 127; }\n"
+                       "command -v ss >/dev/null 2>&1 || { echo \"ss is not installed in the guest; install the iproute2 package\" >&2; exit 127; }\n"
                        + "ss -ltn \"sport = :8080\" | tail -n +2 | grep -q . && echo 1 || echo 0")
         XCTAssertNil(GuestRecipes.portListening(8080, os: .other))
     }
@@ -480,7 +480,7 @@ final class WaitTests: XCTestCase {
         agent.handler = { m, _ in
             guard m["op"]?.stringValue == "exec.run" else { return [] }
             calls.value += 1
-            if calls.value <= 2 { return [agentReply(m, ["code": 127, "stdout": "", "stderr": "ss is not installed in the guest\n"])] }
+            if calls.value <= 2 { return [agentReply(m, ["code": 127, "stdout": "", "stderr": "ss is not installed in the guest; install the iproute2 package\n"])] }
             return [agentReply(m, ["code": 0, "stdout": "1\n", "stderr": ""])]
         }
         let (h, _) = try await agentRig(agent)
@@ -490,13 +490,13 @@ final class WaitTests: XCTestCase {
         let failing = FakeAgent()
         failing.handler = { m, _ in
             guard m["op"]?.stringValue == "exec.run" else { return [] }
-            return [agentReply(m, ["code": 127, "stdout": "", "stderr": "ss is not installed in the guest\n"])]
+            return [agentReply(m, ["code": 127, "stdout": "", "stderr": "ss is not installed in the guest; install the iproute2 package\n"])]
         }
         let (h2, _) = try await agentRig(failing)
         let timedOut = try await waitFor(h2, [["type": "port_listening", "port": 22]], timeout: 1)
         XCTAssertEqual(timedOut["matched"]?.intValue, -1)
         XCTAssertEqual(timedOut["problems"]?[0]?["error"]?.stringValue,
-                       "the port check failed: the guest command exited with code 127: ss is not installed in the guest; run vm.doctor to check the guest shell")
+                       "the port check failed: the guest command exited with code 127: ss is not installed in the guest; install the iproute2 package")
     }
 
     func testAPortCheckThatFailsQuotesTheFirstLineOfItsOutput() async throws {
@@ -517,8 +517,7 @@ final class WaitTests: XCTestCase {
             let (h, _) = try await agentRig(agent)
             let r = try await waitFor(h, [["type": "port_listening", "port": 22]], timeout: 1)
             XCTAssertEqual(r["matched"]?.intValue, -1)
-            XCTAssertEqual(r["problems"]?[0]?["error"]?.stringValue,
-                           "the port check failed: \(reply.sentence); run vm.doctor to check the guest shell")
+            XCTAssertEqual(r["problems"]?[0]?["error"]?.stringValue, "the port check failed: \(reply.sentence)")
         }
     }
 
