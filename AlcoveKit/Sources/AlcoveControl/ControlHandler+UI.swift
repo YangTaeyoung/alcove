@@ -32,9 +32,10 @@ struct HelperBusy: Error {}
 /// Where work running in a task of its own stands, for a caller that does not wait for it.
 actor CallAnswer<Value: Sendable> {
     enum Phase: Sendable {
-        /// Not sent to the agent yet; a helper call is waiting for its turn at the helper.
+        /// Running and not marked as sent: a helper call is waiting for its turn at the helper; other work stays in
+        /// this phase until it ends.
         case queued
-        /// Sent to the agent at the given time.
+        /// A helper call that was sent to the agent at the given time.
         case sent(ContinuousClock.Instant)
         /// Ended at the given time with its result.
         case done(Value, ContinuousClock.Instant)
@@ -164,7 +165,7 @@ enum HelperSentence: Equatable {
     case staleRef(String)
     /// `no element matches <selector>; …`
     case noMatch
-    /// `no window has "…" in its title; …` or `window 0x… no longer exists; …`
+    /// `no window has "…" in its title; …` or `window 0x… no longer exists; …`, the `0x` in either case
     case windowGone
     /// `the element is a password field; …`
     case passwordField
@@ -172,8 +173,7 @@ enum HelperSentence: Equatable {
     case notResponding
     /// `the UI helper is shut down; …`
     case shutDown
-    /// `… the UI helper folder <dir> could not be locked (…); fix its owner and access list, then retry` or
-    /// `… <dir> is a reparse point; remove it`
+    /// `… the UI helper folder <dir> could not be locked (…); fix its owner and access list, then retry`
     case cannotStart
     /// `the request was cancelled`
     case cancelled
@@ -188,7 +188,7 @@ enum HelperSentence: Equatable {
             self = .noMatch
         } else if message.hasPrefix("no window has \"") {
             self = .windowGone
-        } else if words.count == 3, words[0] == "window", words[1].hasPrefix("0x"), words[2].hasPrefix("no longer exists") {
+        } else if words.count == 3, words[0] == "window", words[1].lowercased().hasPrefix("0x"), words[2].hasPrefix("no longer exists") {
             self = .windowGone
         } else if message.hasPrefix("the element is a password field") {
             self = .passwordField
@@ -200,8 +200,6 @@ enum HelperSentence: Equatable {
             self = .cancelled
         } else if message.contains("the UI helper folder "), message.contains(" could not be locked ("),
                   message.hasSuffix("; fix its owner and access list, then retry") {
-            self = .cannotStart
-        } else if message.hasSuffix(" is a reparse point; remove it") {
             self = .cannotStart
         } else {
             self = .other

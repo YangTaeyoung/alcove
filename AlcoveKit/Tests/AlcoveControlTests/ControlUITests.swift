@@ -538,7 +538,8 @@ final class ControlUITests: XCTestCase {
         let crowded = "9 earlier ui.act calls are still running in the app; wait for them or end its process with proc.kill"
         let unlocked = "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
             + "(SetNamedSecurityInfo(C:\\ProgramData\\Alcove\\uia): Access is denied.); fix its owner and access list, then retry"
-        let reparse = "C:\\ProgramData\\Alcove\\uia is a reparse point; remove it"
+        let reparse = "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
+            + "(C:\\ProgramData\\Alcove\\uia is a reparse point; remove it); fix its owner and access list, then retry"
         let shutDown = "the UI helper is shut down; restart alcove-agent"
         let (h, _, _) = try await rig([
             "ui.tree": { _, n in .fail([unlocked, reparse, shutDown][min(n, 2)]) },
@@ -597,6 +598,7 @@ final class ControlUITests: XCTestCase {
             ("no element matches {\"name\":\"x is a reparse point; remove it\"}; call ui.tree to see what exists", .noMatch),
             ("no window has \"Chat is not responding; \" in its title; call win.list to see the open windows", .windowGone),
             ("window 0x50 no longer exists; call win.list again", .windowGone),
+            ("window 0X2A0F1C no longer exists; call win.list again", .windowGone),
             ("the element is a password field; its text is not read; it cannot be read through UI Automation", .passwordField),
             ("the element is a password field; its text is not read", .passwordField),
             ("window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait and retry, or end its process with proc.kill "
@@ -606,7 +608,9 @@ final class ControlUITests: XCTestCase {
             ("could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
                 + "(SetNamedSecurityInfo(C:\\ProgramData\\Alcove\\uia): Access is denied.); fix its owner and access list, then retry", .cannotStart),
             ("the UI helper folder D:\\x could not be locked (denied); fix its owner and access list, then retry", .cannotStart),
-            ("C:\\ProgramData\\Alcove\\uia is a reparse point; remove it", .cannotStart),
+            ("could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
+                + "(C:\\ProgramData\\Alcove\\uia is a reparse point; remove it); fix its owner and access list, then retry", .cannotStart),
+            ("C:\\ProgramData\\Alcove\\uia is a reparse point; remove it", .other),
             ("the request was cancelled", .cancelled),
             ("UI helper is closed", .other),
             ("UI helper exited; retry", .other),
@@ -1599,12 +1603,13 @@ final class ControlUITests: XCTestCase {
         let hung = "window 0x9 \"File no longer exists\" is not responding; wait and retry, or end its process with proc.kill "
             + "when win.list still shows responding false after 10 s"
         let noTitle = "no window has \"Fixture Dialog\" in its title; call win.list to see the open windows"
-        let noHandle = "window 0x50 no longer exists; call win.list again"
         let (h, _, agent) = try await rig([
             "ui.find": { m, n in
                 switch m["name"]?.stringValue {
                 case "Busy": return n < searchErrors.count ? .fail(searchErrors[n]) : .ok(["nodes": []])
-                case "Closed": return .fail(m["window"]?.stringValue == "0x50" ? noHandle : noTitle)
+                case "Closed":
+                    let window = m["window"]?.stringValue ?? ""
+                    return .fail(window.lowercased().hasPrefix("0x") ? "window \(window) no longer exists; call win.list again" : noTitle)
                 case "Front": return .fail("no window is in the foreground; pass a window id from win.list")
                 case "Hung": return .fail(hung)
                 case "Cancelled": return .fail("the request was cancelled")
@@ -1633,7 +1638,7 @@ final class ControlUITests: XCTestCase {
         let cancelled = try await unmatched(["type": "ui_gone", "name": "Cancelled"])
         XCTAssertEqual(cancelled["problems"]?[0]?["error"]?.stringValue, "the request was cancelled")
 
-        for window in ["Fixture Dialog", "0x50"] {
+        for window in ["Fixture Dialog", "0x50", "0X2A0F1C"] {
             let before = agentRequests(agent, "ui.find").count
             let closed = try await waitFor(h, [["type": "ui_gone", "window": .string(window), "name": "Closed"]])
             XCTAssertEqual(closed["matched"]?.intValue, 0, window)
@@ -1658,7 +1663,8 @@ final class ControlUITests: XCTestCase {
         let sentences = [
             "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
                 + "(SetNamedSecurityInfo(C:\\ProgramData\\Alcove\\uia): Access is denied.); fix its owner and access list, then retry",
-            "C:\\ProgramData\\Alcove\\uia is a reparse point; remove it",
+            "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
+                + "(C:\\ProgramData\\Alcove\\uia is a reparse point; remove it); fix its owner and access list, then retry",
             "the UI helper is shut down; restart alcove-agent",
         ]
         let conditions: [JSON] = [
