@@ -18,18 +18,21 @@ put back; when that fails it stays and the script prints how to restore them.
 
 Usage: uia-helper-check.py [--agent-port N] [--only N[,N...]] [--kill-helper]
 
+The last check reads every message of the run, so with --only it covers the
+selected checks.
+
 --kill-helper ends the running UI helper process first, twice, and requires
 that a ref of the first replacement is unknown to the second; the checks then
 run against the helper the agent started for the next operation.
 """
-import argparse, base64, hashlib, json, ntpath, os, re, select, shutil, signal, socket, sys, tempfile, time
+import argparse, base64, hashlib, json, ntpath, os, re, select, shutil, signal, socket, statistics, sys, tempfile, time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FIXTURE_BUILD = os.path.join(ROOT, "build", "alcove-fixture-windows-arm64.exe")
 E2E = r"C:\alcove-e2e"
 FIXTURE = E2E + r"\alcove-fixture.exe"
 FIXTURE_TITLE = "Alcove Fixture"
-HELD_TITLE = "Alcove Fixture held"
+NUMBERED_TITLE = re.compile(r"Alcove Fixture \d+")
 MESSAGE = '안녕 "fixture"'
 SECRET = "hunter2-비밀-7Q"
 CHUNK = 262144
@@ -54,6 +57,10 @@ FIXTURE_LOG = BASE + r"\fixture.log"
 CRASH_CODE = 3221227010
 WER_DIRS = (r"C:\ProgramData\Microsoft\Windows\WER\ReportArchive", r"C:\ProgramData\Microsoft\Windows\WER\ReportQueue")
 HELPER_EXITED = "UI helper exited; retry"
+PASSWORD_SENTENCE = "the element is a password field; its text is not read; it cannot be read through UI Automation"
+MESSAGE_AID, SECRET_AID = "101", "102"
+AT_BUDGET_MS = 250
+AT_LIMIT_S = (AT_BUDGET_MS + 100) / 1000
 
 
 class Failure(Exception):
@@ -71,6 +78,8 @@ class Agent:
         self.buf = b""
         self.next_id = 0
         self.events = []
+        self.received = 0
+        self.leaks = []
         self.hello = self._next(10)
         expect(self.hello and self.hello.get("t") == "hello", f"expected hello, got {self.hello!r}")
         self.send({"t": "welcome", "v": 1})
@@ -90,7 +99,11 @@ class Agent:
                 raise Failure("the agent closed the connection")
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
-        return json.loads(line)
+        m = json.loads(line)
+        self.received += 1
+        if SECRET in json.dumps(m, ensure_ascii=False):
+            self.leaks.append(f"{m.get('t')} {m.get('name') or m.get('id')}")
+        return m
 
     def _file(self, m):
         """Answers a ping and keeps an event with its arrival time."""
@@ -182,6 +195,7 @@ class Run:
         self.fixture_pids = []
         self.fixture = None
         self.wer_since = None
+        self.titles = None
 
     def windows(self):
         return self.a.call("win.list")["windows"]
@@ -248,6 +262,7 @@ class Run:
         expect(self.a.call("proc.list", name="alcove-fixture")["procs"] == [],
                "alcove-fixture.exe runs already; end it in the guest before this check")
         self.push_fixture()
+        self.a.call("fs.mkdir", path=BASE)
         r = self.a.call("app.launch", path=FIXTURE, args=["--log", FIXTURE_LOG])
         expect(type(r.get("pid")) is int and r["pid"] > 0, f"app.launch returned pid {r.get('pid')!r}")
         self.fixture_pids.append(r["pid"])
@@ -255,6 +270,18 @@ class Run:
 
     def fixture_log(self):
         return self.read_file(FIXTURE_LOG).decode("utf-8", "replace").splitlines()
+
+    def end_fixtures(self):
+        """Ends the fixture processes this run started that still run."""
+        def own():
+            return {p["pid"] for p in self.a.call("proc.list", name="alcove-fixture")["procs"]} & set(self.fixture_pids)
+        for pid in own():
+            self.a.ask("proc.kill", pid=pid)
+        end = time.time() + 10
+        while own():
+            expect(time.time() < end, f"fixture processes {sorted(own())} still run 10 s after proc.kill")
+            time.sleep(0.3)
+        self.fixture = None
 
 
 def restore(a, root, copy, names):
@@ -679,7 +706,7 @@ def _(a, run):
     run.fixture = r["window"]
     wid = run.fixture["id"]
     r = act(a, run, "set_value", role="Edit", name="Secret", value=SECRET)
-    expect("password" in r["node"]["flags"] and "value" not in r["node"], f"after set_value the node is {r['node']!r}")
+    expect(is_password_node(r["node"]), f"after set_value the node is {r['node']!r}")
     end = time.time() + 5
     while True:
         log = run.fixture_log()
@@ -691,8 +718,8 @@ def _(a, run):
     expect(all(SECRET not in l for l in log), "the fixture log carries the secret text")
     replies = {}
     for mode in ("auto", "pattern", "descendants"):
-        replies[f"ui.text {mode}"] = a.ask("ui.text", window=wid, role="Edit", automationId="102", mode=mode)
-        expect(replies[f"ui.text {mode}"].get("error") == "the element is a password field; its text is not read; it cannot be read through UI Automation",
+        replies[f"ui.text {mode}"] = a.ask("ui.text", window=wid, role="Edit", automationId=SECRET_AID, mode=mode)
+        expect(replies[f"ui.text {mode}"].get("error") == PASSWORD_SENTENCE,
                f"ui.text mode {mode} of the password field answered {replies[f'ui.text {mode}']!r}")
     replies["ui.text by ref"] = a.ask("ui.text", ref=r["node"]["ref"])
     replies["ui.tree of the field"] = a.call("ui.tree", root=r["node"]["ref"], filter="all")
@@ -702,15 +729,36 @@ def _(a, run):
     replies["ui.tree"] = a.call("ui.tree", window=wid, filter="all", max=2000)
     replies["ui.tree interactive"] = a.call("ui.tree", window=wid)
     replies["ui.find"] = a.call("ui.find", window=wid, name="Secret")
-    replies["ui.rect"] = a.call("ui.rect", window=wid, role="Edit", automationId="102")
+    replies["ui.rect"] = a.call("ui.rect", window=wid, role="Edit", automationId=SECRET_AID)
     replies["ui.focused"] = a.call("ui.focused")
     for what, reply in replies.items():
         expect(SECRET not in json.dumps(reply, ensure_ascii=False), f"{what} returned the typed secret")
     field = [n for n in replies["ui.tree interactive"]["nodes"] if n["ref"] == r["node"]["ref"]]
-    expect(len(field) == 1 and "password" in field[0]["flags"] and "value" not in field[0], f"ui.tree lists the field as {field!r}")
+    expect(len(field) == 1 and is_password_node(field[0]), f"ui.tree lists the field as {field!r}")
     shown = replies["ui.text of the window"]["text"].split("\n")
     expect("Message" in shown and "한글 라벨" in shown, f"the text below the window is {shown!r}")
-    return f"{len(replies)} replies checked; the fixture logged a secret of {len(SECRET)} characters"
+    rounds, read = 10, 0
+    act(a, run, "focus", role="Edit", automationId=SECRET_AID)
+    for n in range(1, rounds + 1):
+        nodes = {"ui.act": [act(a, run, "set_value", role="Edit", automationId=SECRET_AID, value=SECRET)["node"]],
+                 "ui.find": a.call("ui.find", window=wid, automationId=SECRET_AID)["nodes"],
+                 "ui.tree": [m for m in a.call("ui.tree", window=wid)["nodes"] if m.get("aid") == SECRET_AID],
+                 "ui.tree all": [m for m in a.call("ui.tree", window=wid, filter="all", max=2000)["nodes"] if m.get("aid") == SECRET_AID],
+                 "ui.focused": [a.call("ui.focused")["node"]],
+                 "ui.rect": [a.call("ui.rect", window=wid, automationId=SECRET_AID)["node"]]}
+        for what, found in nodes.items():
+            expect(len(found) == 1 and found[0].get("aid") == SECRET_AID and found[0]["ref"] == r["node"]["ref"],
+                   f"round {n}: {what} returned {found!r} for the password field {r['node']['ref']}")
+            expect(is_password_node(found[0]), f"round {n}: {what} returned the password field as {found[0]!r}")
+            read += 1
+    expect(not a.leaks, f"the typed secret is in the messages {a.leaks!r}")
+    return (f"{len(replies)} replies checked; the fixture logged a secret of {len(SECRET)} characters; "
+            f"{read} nodes of the field after {rounds} more set_value calls have an empty name")
+
+
+def is_password_node(n):
+    """True for a node with the password flag, an empty name and no value."""
+    return "password" in n["flags"] and n["name"] == "" and "value" not in n
 
 
 def running_fixture(a, run):
@@ -722,33 +770,37 @@ def running_fixture(a, run):
     return run.fixture["id"]
 
 
-@check("the Titles button raises one window.title for the held title and one, a second later, for the base title")
+def titles_run(a, run):
+    """Presses the fixture's Titles button once per run of this script and returns
+    the window id, the window.title events of that window in the 9 s after the
+    press, and the window as win.list shows it afterwards."""
+    if run.titles is None:
+        wid = running_fixture(a, run)
+        a.pump(1.2)
+        seen = len(a.events)
+        a.call("ui.act", window=wid, role="Button", name="Titles", action="invoke")
+        # The title changes every 50 ms for 5 s and then is the base title.
+        a.pump(9)
+        titles = [e for e in a.events[seen:] if e.get("name") == "window.title" and e["window"]["id"] == wid]
+        run.titles = (wid, titles, same_window(a, wid))
+    return run.titles
+
+
+@check("the Titles button raises window.title events at least a second apart, the last one with the base title")
 def _(a, run):
-    wid = running_fixture(a, run)
-    seen = len(a.events)
-    a.call("ui.act", window=wid, role="Button", name="Titles", action="invoke")
-    # The title changes every 50 ms for 5 s, is HELD_TITLE for 600 ms and then the base title.
-    a.pump(9)
-    titles = [e for e in a.events[seen:] if e.get("name") == "window.title" and e["window"]["id"] == wid]
+    wid, titles, final = titles_run(a, run)
     shown = [e["window"]["title"] for e in titles]
-    expect(2 <= len(titles) <= 8 and shown[-2:] == [HELD_TITLE, FIXTURE_TITLE], f"the window.title events carry {shown!r}")
+    expect(len(titles) >= 2, f"{len(titles)} window.title events arrived for window {wid}: {shown!r}")
     gaps = [b["at"] - a_["at"] for a_, b in zip(titles, titles[1:])]
     expect(all(g >= 0.9 for g in gaps), f"window.title events arrived {[round(g, 2) for g in gaps]!r} s apart: {shown!r}")
-    final = same_window(a, wid)
+    expect(shown[-1] == FIXTURE_TITLE, f"the last window.title carries {shown[-1]!r}: {shown!r}")
     expect(final and final["title"] == FIXTURE_TITLE, f"the window title did not return to {FIXTURE_TITLE!r}: {final!r}")
-    return f"{len(titles)} window.title events {shown!r}, the last two {gaps[-1]:.2f} s apart"
+    return f"{len(titles)} window.title events {shown!r}, {min(gaps):.2f} to {max(gaps):.2f} s apart"
 
 
 @check("ui.act invoke on Crash ends the fixture with a crash code and a WER report")
 def _(a, run):
-    # End the fixture earlier checks left running.
-    running = {p["pid"] for p in a.call("proc.list", name="alcove-fixture")["procs"]}
-    for pid in running:
-        a.call("proc.kill", pid=pid)
-    end = time.time() + 10
-    while {p["pid"] for p in a.call("proc.list", name="alcove-fixture")["procs"]} and time.time() < end:
-        time.sleep(0.3)
-    run.fixture = None
+    run.end_fixtures()
     since = int(a.call("exec.run", cmd="[DateTime]::UtcNow.Ticks")["stdout"].strip())
     r = run.launch_fixture()
     expect(r.get("window"), f"app.launch returned no window: {r!r}")
@@ -826,6 +878,223 @@ def _(a, run):
     gaps = [b - a_ for a_, b in zip(own, own[1:])]
     expect(all(g >= 0.9 for g in gaps), f"window.foreground events for the fixture arrived {[round(g, 2) for g in gaps]!r} s apart")
     return f"window.foreground named {named!r}"
+
+
+@check("a title that changes every 50 ms for 5 s raises 3 to 6 window.title events")
+def _(a, run):
+    wid, titles, _final = titles_run(a, run)
+    shown = [e["window"]["title"] for e in titles]
+    numbered = [t for t in shown if NUMBERED_TITLE.fullmatch(t)]
+    expect(3 <= len(numbered) <= 6, f"{len(numbered)} window.title events carry a numbered title: {shown!r}")
+    expect(all(a_ != b for a_, b in zip(shown, shown[1:])), f"two window.title events in a row carry the same title: {shown!r}")
+    return f"{len(numbered)} events with a numbered title, {len(shown)} in all"
+
+
+@check("when the dialog in front closes, window.foreground for the fixture arrives with window.closed")
+def _(a, run):
+    wid = running_fixture(a, run)
+    a.call("win.action", window="Program Manager", action="focus")
+    a.pump(1.5)
+    seen = len(a.events)
+    a.call("win.action", window=wid, action="focus")
+    first = a.event("window.foreground", lambda e: e in a.events[seen:] and e["window"]["id"] == wid, f"for the fixture {wid}")
+    act(a, run, "invoke", role="Button", name="Dialog")
+    front = a.event("window.foreground", lambda e: e in a.events[seen:] and e["window"]["title"] == "Fixture Dialog", "for the dialog")
+    seen = len(a.events)
+    r = a.call("win.action", window=front["window"]["id"], action="close")
+    expect(r.get("closed") is True, f"win.action close answered {r!r}")
+    closed = a.event("window.closed", lambda e: e in a.events[seen:] and e["window"]["id"] == front["window"]["id"], "for the dialog")
+    back = a.event("window.foreground", lambda e: e in a.events[seen:] and e["window"]["id"] == wid, f"for the fixture {wid}", timeout=5)
+    expect(back["at"] - closed["at"] < 0.25,
+           f"window.foreground for the fixture arrived {back['at'] - closed['at']:.2f} s after window.closed of the dialog")
+    return (f"window.foreground {back['at'] - closed['at']:.3f} s after window.closed, "
+            f"{back['at'] - first['at']:.2f} s after the fixture's previous window.foreground")
+
+
+def at_node(reply, where, ref=None):
+    """Checks the node of a ui.at reply and returns it; ref is the ref it must carry, None for no ref."""
+    n = reply["node"]
+    expect(isinstance(n, dict) and n.get("ref") == ref and ("ref" in n) == (ref is not None), f"{where}: the node carries ref {n.get('ref')!r}: {n!r}")
+    check_node({**n, "ref": ref or "e1"}, where)
+    expect(n["depth"] == 0, f"{where}: depth is {n['depth']!r}")
+    w = reply["window"]
+    expect(isinstance(w, dict) and set(w) == {"id", "title"} and WINDOW_ID.fullmatch(w["id"]) and isinstance(w["title"], str),
+           f"{where}: the window is {w!r}")
+    expect(set(reply) <= {"t", "id", "ok", "node", "window", "byAutomationId", "byName"}, f"{where}: unknown fields in {sorted(reply)!r}")
+    return n
+
+
+def rect_of(n):
+    return (n["x"], n["y"], n["w"], n["h"])
+
+
+def fixture_in_front(a, run):
+    """Returns the id of the fixture window after bringing it to the foreground."""
+    wid = running_fixture(a, run)
+    w = a.call("win.action", window=wid, action="focus")["window"]
+    expect(w["foreground"] is True, f"the fixture did not come to the foreground: {w!r}")
+    return wid
+
+
+def send_button(a, wid):
+    """Returns the ui.rect reply of the fixture's Send button, which must be clickable."""
+    send = a.call("ui.rect", window=wid, role="Button", name="Send")
+    expect(send["clickable"] is True, f"the Send button is not clickable: {send.get('blocked')!r}")
+    return send
+
+
+@check("ui.at at the centre of Send returns the button, its window and selector counts that ui.rect resolves")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    send = send_button(a, wid)
+    r = a.call("ui.at", x=send["cx"], y=send["cy"])
+    n = at_node(r, "ui.at")
+    expect(n["role"] == "Button" and n["name"] == "Send" and rect_of(n) == rect_of(send["node"]), f"the node is {n!r}, ui.rect gave {send['node']!r}")
+    expect(r["window"] == {"id": wid, "title": FIXTURE_TITLE}, f"the window is {r['window']!r}")
+    one = {"matches": 1, "index": 0}
+    expect(r.get("byAutomationId") == one and r.get("byName") == one, f"byAutomationId {r.get('byAutomationId')!r}, byName {r.get('byName')!r}")
+    by_aid = a.call("ui.rect", window=wid, role=n["role"], automationId=n["aid"], index=r["byAutomationId"]["index"])
+    by_name = a.call("ui.rect", window=wid, role=n["role"], name=n["name"], index=r["byName"]["index"])
+    expect(rect_of(by_aid["node"]) == rect_of(n) and rect_of(by_name["node"]) == rect_of(n),
+           f"ui.rect by the selectors gave {rect_of(by_aid['node'])} and {rect_of(by_name['node'])}, ui.at {rect_of(n)}")
+    for bad in ({}, {"x": send["cx"]}, {"x": send["cx"], "y": send["cy"], "focused": True}, {"ref": send["node"]["ref"], "focused": True}):
+        res = a.ask("ui.at", **bad)
+        expect(res.get("ok") is False and res.get("error") == "pass x and y, ref, or focused: true", f"ui.at with {bad!r} answered {res!r}")
+    return f"{n['role']} {n['name']!r} aid {n['aid']} at {rect_of(n)} in {r['window']['id']}"
+
+
+@check("ui.at on two buttons with the same name returns matches 2 and the index ui.rect resolves to each")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    same = a.call("ui.find", window=wid, role="Button", name="Same")["nodes"]
+    expect(len(same) == 2 and rect_of(same[0]) != rect_of(same[1]), f"the fixture has {len(same)} buttons named Same: {same!r}")
+    seen = []
+    for i, button in enumerate(same):
+        r = a.call("ui.at", x=button["x"] + button["w"] // 2, y=button["y"] + button["h"] // 2)
+        n = at_node(r, f"ui.at on Same {i}")
+        expect(n["role"] == "Button" and n["name"] == "Same" and rect_of(n) == rect_of(button), f"the node is {n!r}, ui.find gave {button!r}")
+        expect(r.get("byName") == {"matches": 2, "index": i}, f"byName of the Same button listed as number {i} is {r.get('byName')!r}")
+        expect(r.get("byAutomationId") == {"matches": 1, "index": 0}, f"byAutomationId is {r.get('byAutomationId')!r}")
+        back = a.call("ui.rect", window=wid, role="Button", name="Same", index=r["byName"]["index"])
+        expect(rect_of(back["node"]) == rect_of(button) and back["node"]["ref"] == button["ref"],
+               f"ui.rect with index {r['byName']['index']} gave {back['node']!r}, expected {button!r}")
+        seen.append((n["aid"], r["byName"]["index"]))
+    return f"automation ids and indexes {seen!r}"
+
+
+@check("ui.at on the password edit returns the password flag, an empty name, no value and no byName")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    act(a, run, "set_value", role="Edit", automationId=SECRET_AID, value=SECRET)
+    field = a.call("ui.rect", window=wid, role="Edit", automationId=SECRET_AID)
+    expect(field["clickable"] is True, f"the Secret edit is not clickable: {field.get('blocked')!r}")
+    r = a.call("ui.at", x=field["cx"], y=field["cy"])
+    n = at_node(r, "ui.at")
+    expect(n["role"] == "Edit" and n.get("aid") == SECRET_AID and is_password_node(n), f"the node is {n!r}")
+    expect("byName" not in r and r.get("byAutomationId") == {"matches": 1, "index": 0}, f"the reply has {sorted(r)!r}, byAutomationId {r.get('byAutomationId')!r}")
+    return f"flags {n['flags']!r}, name {n['name']!r}"
+
+
+@check("ui.at with focused returns the Message edit after ui.act focus, and the password node after focusing Secret")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    focused = act(a, run, "focus", role="Edit", automationId=MESSAGE_AID)["node"]
+    r = a.call("ui.at", focused=True)
+    n = at_node(r, "ui.at focused")
+    expect(n["role"] == "Edit" and n.get("aid") == MESSAGE_AID and rect_of(n) == rect_of(focused) and "focused" in n["flags"],
+           f"the node is {n!r}, ui.act focus returned {focused!r}")
+    expect(r["window"] == {"id": wid, "title": FIXTURE_TITLE}, f"the window is {r['window']!r}")
+    act(a, run, "focus", role="Edit", automationId=SECRET_AID)
+    r = a.call("ui.at", focused=True)
+    secret = at_node(r, "ui.at focused")
+    expect(secret.get("aid") == SECRET_AID and is_password_node(secret) and "focused" in secret["flags"] and "byName" not in r,
+           f"with the Secret edit focused the reply is {r!r}")
+    return f"{n['role']} aid {n['aid']}, then {secret['role']} aid {secret['aid']} with flags {secret['flags']!r}"
+
+
+@check("ui.at with the ref of Send returns the node of the point request plus ref")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    send = send_button(a, wid)
+    ref = send["node"]["ref"]
+    by_point = a.call("ui.at", x=send["cx"], y=send["cy"])
+    by_ref = a.call("ui.at", ref=ref)
+    n = at_node(by_ref, "ui.at ref", ref=ref)
+    expect(n == {"ref": ref, **at_node(by_point, "ui.at")}, f"by ref the node is {n!r}, by point {by_point['node']!r}")
+    for key in ("window", "byAutomationId", "byName"):
+        expect(by_ref.get(key) == by_point.get(key), f"{key} is {by_ref.get(key)!r} by ref and {by_point.get(key)!r} by point")
+    gone = a.ask("ui.at", ref="e1999999999")
+    expect(gone.get("ok") is False and gone.get("error") == "element e1999999999 no longer exists; call ui.tree again", f"an unknown ref answered {gone!r}")
+    return f"{ref} is {n['role']} {n['name']!r}"
+
+
+@check("ui.at at a point outside every screen answers that no element is there")
+def _(a, run):
+    r = a.ask("ui.at", x=-5000, y=-5000)
+    want = "no element at (-5000, -5000); take a screenshot to see what is there"
+    expect(r.get("ok") is False and r.get("error") == want, f"ui.at answered {r!r}")
+    return want
+
+
+@check("50 ui.at calls by point register no ref and each answers within 350 ms")
+def _(a, run):
+    run.end_fixtures()
+    wid = fixture_in_front(a, run)
+    send = send_button(a, wid)
+    before = a.call("ui.find", window=wid, role="Button", name="Fetch")["nodes"][0]["ref"]
+    refs = a.call("ui.ping")["refs"]
+    times = []
+    for _ in range(50):
+        t0 = time.time()
+        r = a.call("ui.at", x=send["cx"], y=send["cy"])
+        times.append(time.time() - t0)
+        expect(r["node"]["name"] == "Send" and "ref" not in r["node"], f"ui.at answered {r['node']!r}")
+    after = a.call("ui.find", window=wid, role="Button", name="Titles")["nodes"][0]["ref"]
+    counted = a.call("ui.ping")["refs"]
+    expect(int(after[1:]) == int(before[1:]) + 1, f"the ref allocated before the calls is {before}, the next one after them {after}")
+    expect(counted == refs + 1, f"the helper held {refs} refs before the calls and {counted} after them and one ui.find")
+    slow = [round(t, 3) for t in times if t > AT_LIMIT_S]
+    expect(not slow, f"{len(slow)} of 50 calls took longer than {AT_LIMIT_S} s: {slow!r}")
+    return f"median {statistics.median(times) * 1000:.0f} ms, slowest {max(times) * 1000:.0f} ms; refs {before} then {after}"
+
+
+@check("ui.at on the hung fixture answers the timeout sentence within its budget and win.list answers at once")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    pid = run.fixture["pid"]
+    send = send_button(a, wid)
+    ref = send["node"]["ref"]
+    r = act(a, run, "invoke", role="Button", name="Hang")
+    expect(r.get("unresponsive") is True, f"ui.act invoke on Hang answered {r!r}")
+    took = {}
+
+    def timed(what, limit, op, **params):
+        t0 = time.time()
+        res = a.ask(op, **params)
+        took[what] = time.time() - t0
+        expect(took[what] <= limit, f"{what} answered after {took[what]:.3f} s, the limit is {limit} s: {res!r}")
+        return res
+
+    res = timed("ui.at by point", AT_LIMIT_S, "ui.at", x=send["cx"], y=send["cy"])
+    want = f"no element at ({send['cx']}, {send['cy']}): the app did not answer within {AT_BUDGET_MS} ms; retry"
+    expect(res.get("ok") is False and res.get("error") == want, f"ui.at by point on the hung window answered {res!r}")
+    listed = timed("win.list", 0.3, "win.list")
+    expect(listed.get("ok") is True and any(w["id"] == wid for w in listed["windows"]), f"win.list after the timeout answered {listed!r}")
+    res = timed("ui.at by ref", 0.2, "ui.at", ref=ref, budgetMs=100)
+    want = f"element {ref} was not read: the app did not answer within 100 ms; retry"
+    expect(res.get("ok") is False and res.get("error") == want, f"ui.at by ref on the hung window answered {res!r}")
+    timed("the second win.list", 0.3, "win.list")
+    seen = len(a.events)
+    expect(a.call("proc.kill", pid=pid)["killed"] == 1, "proc.kill did not report one killed process")
+    a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}")
+    run.fixture = None
+    return ", ".join(f"{what} after {t * 1000:.0f} ms" for what, t in took.items())
+
+
+@check("the secret typed into the password edit is in no message the agent sent during the run")
+def _(a, run):
+    expect(not a.leaks, f"the typed secret is in the messages {a.leaks!r}")
+    return f"{a.received} messages read"
 
 
 def find_wer(a, since_ticks):
