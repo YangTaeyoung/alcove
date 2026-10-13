@@ -24,7 +24,10 @@ namespace Alcove
     {
         const int MaxReplyBytes = 8 * 1024 * 1024 - 4096;
 
+        const int WorkerStackBytes = 64 * 1024 * 1024;
+
         static readonly object outputLock = new object();
+        static readonly object logLock = new object();
         static StreamWriter output;
         static StreamWriter log;
 
@@ -33,7 +36,7 @@ namespace Alcove
         {
             try { Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); }
             catch (EntryPointNotFoundException) { }
-            Thread worker = new Thread(Loop);
+            Thread worker = new Thread(Loop, WorkerStackBytes);
             worker.SetApartmentState(ApartmentState.MTA);
             worker.Start();
             worker.Join();
@@ -139,7 +142,7 @@ namespace Alcove
         // Writes one line to stderr, which the agent stores in helper.log.
         public static void Log(string text)
         {
-            lock (outputLock)
+            lock (logLock)
             {
                 try
                 {
@@ -492,6 +495,7 @@ namespace Alcove
         const int DefaultFindLimit = 20;
         const int TextCap = 200000;
         const int ValueCut = 200;
+        const int MaxWalkDepth = 256;
 
         readonly Dictionary<string, RefEntry> refsByKey = new Dictionary<string, RefEntry>();
         readonly Dictionary<int, RefEntry> refsByNumber = new Dictionary<int, RefEntry>();
@@ -692,7 +696,7 @@ namespace Alcove
             Native.GetWindowThreadProcessId(hwnd, out pid);
             if (cls == "ApplicationFrameWindow")
             {
-                // A packaged app draws inside a frame window of another process; report the app's process.
+                // The frame window of a packaged app reports the process of its core window.
                 IntPtr core = Native.FindWindowExW(hwnd, IntPtr.Zero, "Windows.UI.Core.CoreWindow", null);
                 uint corePid;
                 if (core != IntPtr.Zero && Native.GetWindowThreadProcessId(core, out corePid) != 0 && corePid != 0)
@@ -735,18 +739,24 @@ namespace Alcove
                 }
                 return foreground;
             }
+            if (window.Length == 0)
+            {
+                throw new HelperException("pass a window id, a title part, or foreground");
+            }
             if (window.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
             {
                 long value;
-                if (long.TryParse(window.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out value))
+                if (window.Length < 3 || window.Length > 18
+                    || !long.TryParse(window.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out value))
                 {
-                    IntPtr hwnd = new IntPtr(value);
-                    if (!Native.IsWindow(hwnd))
-                    {
-                        throw new HelperException("window " + window + " no longer exists; call win.list again");
-                    }
-                    return hwnd;
+                    throw new HelperException(Json.Write(window) + " is not a window id; ids look like 0x1a2b3c and come from win.list");
                 }
+                IntPtr hwnd = new IntPtr(value);
+                if (!Native.IsWindow(hwnd) || Native.GetAncestor(hwnd, Native.GA_ROOT) != hwnd)
+                {
+                    throw new HelperException("window " + window + " no longer exists; call win.list again");
+                }
+                return hwnd;
             }
             foreach (IntPtr hwnd in ListedWindows(foreground))
             {
@@ -935,14 +945,28 @@ namespace Alcove
             return text.Substring(0, end) + "…";
         }
 
+        // The cached value of a property, or null when the element does not have it or its
+        // provider failed to read it.
+        static object Cached(AutomationElement element, AutomationProperty property)
+        {
+            try
+            {
+                return element.GetCachedPropertyValue(property, true);
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+        }
+
         static string CachedValue(AutomationElement element)
         {
-            return element.GetCachedPropertyValue(ValuePattern.ValueProperty, true) as string;
+            return Cached(element, ValuePattern.ValueProperty) as string;
         }
 
         static bool CachedBool(AutomationElement element, AutomationProperty property)
         {
-            object v = element.GetCachedPropertyValue(property, true);
+            object v = Cached(element, property);
             return v is bool && (bool)v;
         }
 
@@ -955,8 +979,8 @@ namespace Alcove
             n["role"] = RoleName(element.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType);
             n["name"] = (element.GetCachedPropertyValue(AutomationElement.NameProperty) as string) ?? "";
             bool password = CachedBool(element, AutomationElement.IsPasswordProperty);
-            string value = CachedValue(element);
-            if (!string.IsNullOrEmpty(value) && !password)
+            string value = password ? null : CachedValue(element);
+            if (!string.IsNullOrEmpty(value))
             {
                 n["value"] = Cut(Newlines(value), ValueCut);
             }
@@ -989,9 +1013,9 @@ namespace Alcove
             if (enabled is bool && !(bool)enabled) { flags.Add("disabled"); }
             if (CachedBool(element, AutomationElement.IsOffscreenProperty)) { flags.Add("offscreen"); }
             if (CachedBool(element, SelectionItemPattern.IsSelectedProperty)) { flags.Add("selected"); }
-            object toggle = element.GetCachedPropertyValue(TogglePattern.ToggleStateProperty, true);
+            object toggle = Cached(element, TogglePattern.ToggleStateProperty);
             if (toggle is ToggleState && (ToggleState)toggle == ToggleState.On) { flags.Add("checked"); }
-            object expand = element.GetCachedPropertyValue(ExpandCollapsePattern.ExpandCollapseStateProperty, true);
+            object expand = Cached(element, ExpandCollapsePattern.ExpandCollapseStateProperty);
             if (expand is ExpandCollapseState)
             {
                 ExpandCollapseState state = (ExpandCollapseState)expand;
@@ -1050,6 +1074,10 @@ namespace Alcove
             {
                 throw new HelperException("depth must be 0 or more");
             }
+            if (walk.Depth > MaxWalkDepth)
+            {
+                throw new HelperException("depth must be " + MaxWalkDepth + " or less; read deeper parts with root");
+            }
             if (walk.Max < 1)
             {
                 throw new HelperException("max must be 1 or more");
@@ -1084,7 +1112,9 @@ namespace Alcove
         }
 
         // Adds the subtree below parent. level is the parent's distance from the root; nodes of the
-        // next level get nodeDepth, which counts only the ancestors that are in the answer.
+        // next level get nodeDepth, which counts only the ancestors that are in the answer. The walk
+        // is marked truncated when a listed element does not fit in max, when the time for the
+        // request is used up and when an element disappears under it.
         void WalkChildren(TreeWalk walk, AutomationElement parent, int level, int nodeDepth)
         {
             if (level >= walk.Depth)
@@ -1098,11 +1128,12 @@ namespace Alcove
             }
             catch (ElementNotAvailableException)
             {
+                walk.Truncated = true;
                 return;
             }
             while (child != null && !walk.Truncated)
             {
-                if (walk.Nodes.Count >= walk.Max || OutOfTime())
+                if (OutOfTime())
                 {
                     walk.Truncated = true;
                     return;
@@ -1110,6 +1141,11 @@ namespace Alcove
                 try
                 {
                     bool listed = walk.All || IsInteractive(child);
+                    if (listed && walk.Nodes.Count >= walk.Max)
+                    {
+                        walk.Truncated = true;
+                        return;
+                    }
                     if (listed)
                     {
                         walk.Nodes.Add(Node(child, nodeDepth));
@@ -1123,6 +1159,7 @@ namespace Alcove
                 }
                 catch (ElementNotAvailableException)
                 {
+                    walk.Truncated = true;
                     return;
                 }
             }
@@ -1151,13 +1188,16 @@ namespace Alcove
             return watch.ElapsedMilliseconds > budgetMs;
         }
 
+        // Why a walk ended before it had seen every element.
+        enum Stop { None, Time, Depth, Changed }
+
         sealed class Search
         {
             public Selector Selector;
             public ControlType Type;
             public int Need;
             public List<AutomationElement> Found = new List<AutomationElement>();
-            public bool TimedOut;
+            public Stop Stopped = Stop.None;
         }
 
         // Walks the control view of the selector's window in tree order and collects the matching
@@ -1184,7 +1224,7 @@ namespace Alcove
             }
             if (search.Found.Count < need)
             {
-                SearchChildren(search, root);
+                SearchChildren(search, root, 1);
             }
             return search;
         }
@@ -1219,7 +1259,8 @@ namespace Alcove
             return true;
         }
 
-        void SearchChildren(Search search, AutomationElement parent)
+        // Checks the children of parent, which are `level` levels below the window.
+        void SearchChildren(Search search, AutomationElement parent, int level)
         {
             AutomationElement child;
             try
@@ -1228,13 +1269,19 @@ namespace Alcove
             }
             catch (ElementNotAvailableException)
             {
+                search.Stopped = Stop.Changed;
+                return;
+            }
+            if (child != null && level > MaxWalkDepth)
+            {
+                search.Stopped = Stop.Depth;
                 return;
             }
             while (child != null)
             {
                 if (OutOfTime())
                 {
-                    search.TimedOut = true;
+                    search.Stopped = Stop.Time;
                     return;
                 }
                 try
@@ -1245,9 +1292,9 @@ namespace Alcove
                     }
                     if (search.Found.Count < search.Need)
                     {
-                        SearchChildren(search, child);
+                        SearchChildren(search, child, level + 1);
                     }
-                    if (search.TimedOut || search.Found.Count >= search.Need)
+                    if (search.Stopped != Stop.None || search.Found.Count >= search.Need)
                     {
                         return;
                     }
@@ -1255,15 +1302,25 @@ namespace Alcove
                 }
                 catch (ElementNotAvailableException)
                 {
+                    search.Stopped = Stop.Changed;
                     return;
                 }
             }
         }
 
-        string SearchTimedOut(Selector selector)
+        // The error for a search that ended before it found what was asked for.
+        string SearchStopped(Search search)
         {
-            return "the search for " + selector.ToJson() + " did not finish within " + (FindBudgetMs / 1000)
-                + " s; read the window in parts with ui.tree and root, then use a ref";
+            string what = "the search for " + search.Selector.ToJson();
+            switch (search.Stopped)
+            {
+                case Stop.Depth:
+                    return what + " stopped " + MaxWalkDepth + " levels below the window; read the deeper part with ui.tree and root, then use a ref";
+                case Stop.Changed:
+                    return what + " met an element that disappeared; call the operation again";
+                default:
+                    return what + " did not finish within " + (budgetMs / 1000) + " s; read the window in parts with ui.tree and root, then use a ref";
+            }
         }
 
         // Returns the element named by "ref" or by the selector fields, with fresh cached properties.
@@ -1279,9 +1336,9 @@ namespace Alcove
             Search search = Matches(selector, index + 1);
             if (index >= search.Found.Count)
             {
-                if (search.TimedOut)
+                if (search.Stopped != Stop.None)
                 {
-                    throw new HelperException(SearchTimedOut(selector));
+                    throw new HelperException(SearchStopped(search));
                 }
                 throw new HelperException("no element matches " + selector.ToJson() + "; call ui.tree to see what exists");
             }
@@ -1311,9 +1368,9 @@ namespace Alcove
             }
             int first = selector.Index < 0 ? 0 : selector.Index;
             Search search = Matches(selector, selector.Index < 0 ? limit : first + 1);
-            if (search.TimedOut && search.Found.Count <= first)
+            if (search.Stopped != Stop.None && search.Found.Count <= first)
             {
-                throw new HelperException(SearchTimedOut(selector));
+                throw new HelperException(SearchStopped(search));
             }
             List<object> nodes = new List<object>();
             for (int i = first; i < search.Found.Count; i++)
@@ -1326,7 +1383,7 @@ namespace Alcove
             }
             Dictionary<string, object> r = new Dictionary<string, object>();
             r["nodes"] = nodes;
-            if (search.TimedOut)
+            if (search.Stopped != Stop.None)
             {
                 r["truncated"] = true;
             }
@@ -1348,15 +1405,19 @@ namespace Alcove
             {
                 throw new HelperException("offset must be 0 or more");
             }
-            if (length < 1)
+            if (length < 0)
             {
-                throw new HelperException("length must be 1 or more");
+                throw new HelperException("length must be 0 or more");
             }
             if (length > TextCap)
             {
                 length = TextCap;
             }
             AutomationElement element = Target(req);
+            if (CachedBool(element, AutomationElement.IsPasswordProperty))
+            {
+                throw new HelperException("the element is a password field; its text is not read");
+            }
 
             string text = null;
             string source = null;
@@ -1375,7 +1436,7 @@ namespace Alcove
             }
             // An empty value counts as the text of an edit or a document only; other elements go on to their descendants.
             string value = null;
-            if (text == null && mode == "auto" && !CachedBool(element, AutomationElement.IsPasswordProperty))
+            if (text == null && mode == "auto")
             {
                 value = CachedValue(element);
                 ControlType type = element.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType;
@@ -1418,26 +1479,34 @@ namespace Alcove
                 end++;
             }
             Dictionary<string, object> r = new Dictionary<string, object>();
-            r["text"] = text.Substring(start, end - start);
+            r["text"] = length == 0 ? "" : text.Substring(start, end - start);
             r["total"] = total;
             r["source"] = source;
             return r;
         }
 
         // The text, list item, edit and document elements below the element, one per line: the value
-        // of an edit or document that has one, the name otherwise.
+        // of an edit or document that has one, the name otherwise. Password fields and everything
+        // below them are left out.
         string DescendantNames(AutomationElement element)
         {
             StringBuilder sb = new StringBuilder();
-            if (!CollectText(element, sb))
+            switch (CollectText(element, sb, 1))
             {
-                throw new HelperException("the text below the element was not read within " + (TextBudgetMs / 1000)
-                    + " s; read a smaller element: list its parts with ui.tree and root");
+                case Stop.Time:
+                    throw new HelperException("the text below the element was not read within " + (budgetMs / 1000)
+                        + " s; read a smaller element: list its parts with ui.tree and root");
+                case Stop.Depth:
+                    throw new HelperException("the text below the element lies more than " + MaxWalkDepth
+                        + " levels deep; read a smaller element: list its parts with ui.tree and root");
+                case Stop.Changed:
+                    throw new HelperException("an element disappeared while the text was read; call ui.text again");
             }
             return sb.ToString();
         }
 
-        bool CollectText(AutomationElement parent, StringBuilder sb)
+        // Appends the text of the children of parent, which are `level` levels below the element.
+        Stop CollectText(AutomationElement parent, StringBuilder sb, int level)
         {
             AutomationElement child;
             try
@@ -1446,49 +1515,57 @@ namespace Alcove
             }
             catch (ElementNotAvailableException)
             {
-                return true;
+                return Stop.Changed;
+            }
+            if (child != null && level > MaxWalkDepth)
+            {
+                return Stop.Depth;
             }
             while (child != null)
             {
                 if (OutOfTime())
                 {
-                    return false;
+                    return Stop.Time;
                 }
                 try
                 {
-                    ControlType type = child.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType;
-                    if (type == ControlType.Text || type == ControlType.ListItem || type == ControlType.Edit || type == ControlType.Document)
+                    if (!CachedBool(child, AutomationElement.IsPasswordProperty))
                     {
-                        string line = child.GetCachedPropertyValue(AutomationElement.NameProperty) as string;
-                        if (type == ControlType.Edit || type == ControlType.Document)
+                        ControlType type = child.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType;
+                        if (type == ControlType.Text || type == ControlType.ListItem || type == ControlType.Edit || type == ControlType.Document)
                         {
-                            string value = CachedValue(child);
-                            if (!string.IsNullOrEmpty(value) && !CachedBool(child, AutomationElement.IsPasswordProperty))
+                            string line = child.GetCachedPropertyValue(AutomationElement.NameProperty) as string;
+                            if (type == ControlType.Edit || type == ControlType.Document)
                             {
-                                line = value;
+                                string value = CachedValue(child);
+                                if (!string.IsNullOrEmpty(value))
+                                {
+                                    line = value;
+                                }
+                            }
+                            if (!string.IsNullOrEmpty(line))
+                            {
+                                if (sb.Length > 0)
+                                {
+                                    sb.Append('\n');
+                                }
+                                sb.Append(line);
                             }
                         }
-                        if (!string.IsNullOrEmpty(line))
+                        Stop stopped = CollectText(child, sb, level + 1);
+                        if (stopped != Stop.None)
                         {
-                            if (sb.Length > 0)
-                            {
-                                sb.Append('\n');
-                            }
-                            sb.Append(line);
+                            return stopped;
                         }
-                    }
-                    if (!CollectText(child, sb))
-                    {
-                        return false;
                     }
                     child = TreeWalker.ControlViewWalker.GetNextSibling(child, textCache);
                 }
                 catch (ElementNotAvailableException)
                 {
-                    return true;
+                    return Stop.Changed;
                 }
             }
-            return true;
+            return Stop.None;
         }
 
         // ---- ui.rect ----
