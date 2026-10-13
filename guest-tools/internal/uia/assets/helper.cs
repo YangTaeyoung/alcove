@@ -367,6 +367,7 @@ namespace Alcove
             public uint Private;
         }
 
+        public const int ERROR_ACCESS_DENIED = 5;
         public const uint GW_OWNER = 4;
         public const uint GA_ROOT = 2;
         public const int SW_MAXIMIZE = 3;
@@ -408,9 +409,9 @@ namespace Alcove
         [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
         [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessageW(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool PostMessageW(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PeekMessageW(out MSG message, IntPtr hwnd, uint min, uint max, uint remove);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
         [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
         [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
         [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
@@ -536,15 +537,32 @@ namespace Alcove
     sealed class WindowWatch
     {
         const int IntervalMs = 300;
+        const long EventCapMs = 1000;
+        const long FailureLogMs = 60000;
 
         Dictionary<IntPtr, Dictionary<string, object>> known = new Dictionary<IntPtr, Dictionary<string, object>>();
         IntPtr foreground;
+        // The last title compared and the last title emitted per window, with the time it was
+        // emitted, so at most one window.title per window per second reaches the connections.
+        readonly Dictionary<IntPtr, string> lastSeenTitle = new Dictionary<IntPtr, string>();
+        readonly Dictionary<IntPtr, string> lastTitleSent = new Dictionary<IntPtr, string>();
+        readonly Dictionary<IntPtr, long> titleSentAt = new Dictionary<IntPtr, long>();
+        readonly Dictionary<IntPtr, long> foregroundSentAt = new Dictionary<IntPtr, long>();
+        readonly Stopwatch clock = Stopwatch.StartNew();
+        long lastFailureLog = -FailureLogMs;
 
         public void Run()
         {
             try { Native.SetThreadDpiAwarenessContext(new IntPtr(-4)); }
             catch (EntryPointNotFoundException) { }
-            Compare(false);
+            try
+            {
+                Compare(false);
+            }
+            catch (Exception e)
+            {
+                UiaHelper.Log("the first window comparison failed: " + e);
+            }
             while (true)
             {
                 Thread.Sleep(IntervalMs);
@@ -554,22 +572,28 @@ namespace Alcove
                 }
                 catch (Exception e)
                 {
-                    UiaHelper.Log("the window comparison failed: " + e);
+                    long now = clock.ElapsedMilliseconds;
+                    if (now - lastFailureLog >= FailureLogMs)
+                    {
+                        lastFailureLog = now;
+                        UiaHelper.Log("the window comparison failed: " + e);
+                    }
                 }
             }
         }
 
         void Compare(bool report)
         {
+            long now = clock.ElapsedMilliseconds;
             IntPtr front = Native.ForegroundWindow();
-            Dictionary<IntPtr, Dictionary<string, object>> now = new Dictionary<IntPtr, Dictionary<string, object>>();
+            Dictionary<IntPtr, Dictionary<string, object>> windows = new Dictionary<IntPtr, Dictionary<string, object>>();
             List<IntPtr> order = new List<IntPtr>();
             foreach (IntPtr hwnd in Session.ListedWindows(front))
             {
                 Dictionary<string, object> window = Session.WindowObject(hwnd, front);
                 if (((string)window["title"]).Length > 0)
                 {
-                    now[hwnd] = window;
+                    windows[hwnd] = window;
                     order.Add(hwnd);
                 }
             }
@@ -577,15 +601,20 @@ namespace Alcove
             {
                 foreach (KeyValuePair<IntPtr, Dictionary<string, object>> old in known)
                 {
-                    if (!now.ContainsKey(old.Key))
+                    if (!windows.ContainsKey(old.Key))
                     {
                         old.Value["foreground"] = false;
                         Emit("window.closed", old.Value);
+                        lastSeenTitle.Remove(old.Key);
+                        lastTitleSent.Remove(old.Key);
+                        titleSentAt.Remove(old.Key);
+                        foregroundSentAt.Remove(old.Key);
                     }
                 }
                 foreach (IntPtr hwnd in order)
                 {
-                    Dictionary<string, object> window = now[hwnd];
+                    Dictionary<string, object> window = windows[hwnd];
+                    string title = (string)window["title"];
                     Dictionary<string, object> old;
                     if (!known.TryGetValue(hwnd, out old))
                     {
@@ -594,24 +623,54 @@ namespace Alcove
                         {
                             Emit("dialog.opened", window);
                         }
+                        lastTitleSent[hwnd] = title;
+                        titleSentAt[hwnd] = now;
                     }
-                    else if ((string)old["title"] != (string)window["title"])
+                    else
                     {
-                        Emit("window.title", window);
+                        MaybeEmitTitle(hwnd, title, window, now);
                     }
+                    lastSeenTitle[hwnd] = title;
                 }
                 if (front != foreground && front != IntPtr.Zero)
                 {
                     Dictionary<string, object> window;
-                    if (!now.TryGetValue(front, out window))
+                    if (!windows.TryGetValue(front, out window))
                     {
                         window = Session.WindowObject(front, front);
                     }
-                    Emit("window.foreground", window);
+                    long last;
+                    if (!foregroundSentAt.TryGetValue(front, out last) || now - last >= EventCapMs)
+                    {
+                        Emit("window.foreground", window);
+                        foregroundSentAt[front] = now;
+                    }
                 }
             }
-            known = now;
+            known = windows;
             foreground = front;
+        }
+
+        // Emits window.title at most once per window per second: a title emits once it has been
+        // quiet for one comparison or the second since the last emit has passed, and the latest
+        // title is the one emitted.
+        void MaybeEmitTitle(IntPtr hwnd, string title, Dictionary<string, object> window, long now)
+        {
+            string sent;
+            if (lastTitleSent.TryGetValue(hwnd, out sent) && sent == title)
+            {
+                return;
+            }
+            string seen;
+            bool quiet = lastSeenTitle.TryGetValue(hwnd, out seen) && seen == title;
+            long last;
+            bool secondPassed = !titleSentAt.TryGetValue(hwnd, out last) || now - last >= EventCapMs;
+            if (quiet || secondPassed)
+            {
+                Emit("window.title", window);
+                lastTitleSent[hwnd] = title;
+                titleSentAt[hwnd] = now;
+            }
         }
 
         static void Emit(string name, Dictionary<string, object> window)
@@ -662,6 +721,10 @@ namespace Alcove
         readonly Dictionary<string, ControlType> rolesByName = new Dictionary<string, ControlType>(StringComparer.OrdinalIgnoreCase);
         readonly HashSet<ControlType> interactiveTypes = new HashSet<ControlType>();
 
+        const int MaxActThreadsPerApp = 8;
+        static readonly object actLock = new object();
+        static readonly Dictionary<int, int> actThreads = new Dictionary<int, int>();
+
         public Session()
         {
             int start;
@@ -676,6 +739,7 @@ namespace Alcove
             matchCache.Add(AutomationElement.NameProperty);
             matchCache.Add(AutomationElement.ControlTypeProperty);
             matchCache.Add(AutomationElement.AutomationIdProperty);
+            matchCache.Add(AutomationElement.IsPasswordProperty);
             textCache = new CacheRequest();
             textCache.TreeFilter = Automation.ControlViewCondition;
             textCache.Add(AutomationElement.NameProperty);
@@ -962,11 +1026,16 @@ namespace Alcove
             return WindowObject(hwnd, Native.ForegroundWindow());
         }
 
-        // True when the window's thread handles a message within the given time.
+        // True when the window's thread handles a message within the given time. A window of a
+        // higher integrity level denies the message with access denied but is not hung.
         static bool Responds(IntPtr hwnd, int ms)
         {
             IntPtr result;
-            return Native.SendMessageTimeoutW(hwnd, Native.WM_NULL, IntPtr.Zero, IntPtr.Zero, Native.SMTO_ABORTIFHUNG, (uint)ms, out result) != IntPtr.Zero;
+            if (Native.SendMessageTimeoutW(hwnd, Native.WM_NULL, IntPtr.Zero, IntPtr.Zero, Native.SMTO_ABORTIFHUNG, (uint)ms, out result) != IntPtr.Zero)
+            {
+                return true;
+            }
+            return Marshal.GetLastWin32Error() == Native.ERROR_ACCESS_DENIED;
         }
 
         static void RequireResponding(IntPtr hwnd)
@@ -974,7 +1043,7 @@ namespace Alcove
             if (Native.IsHungAppWindow(hwnd) || (Native.IsWindow(hwnd) && !Responds(hwnd, RespondMs)))
             {
                 throw new HelperException("window " + HwndId(hwnd) + " " + Json.Write(WindowTitle(hwnd))
-                    + " is not responding; wait for it or end its process with proc.kill");
+                    + " is not responding; wait and retry, or end its process with proc.kill when win.list still shows responding false after 10 s");
             }
         }
 
@@ -1010,10 +1079,16 @@ namespace Alcove
             return true;
         }
 
-        static string NotResponding(IntPtr hwnd, string what)
+        // The sentence for a show-state change that did not take: the window is named as not
+        // responding only when it really is hung, otherwise the app is said to decline it.
+        static string NotChanged(IntPtr hwnd, string what)
         {
-            return "window " + HwndId(hwnd) + " " + Json.Write(WindowTitle(hwnd)) + " " + what + " within "
-                + (WindowStateMs / 1000) + " s; check responding in win.list, then retry or end its process with proc.kill";
+            string head = "window " + HwndId(hwnd) + " " + Json.Write(WindowTitle(hwnd)) + " " + what + " within " + (WindowStateMs / 1000) + " s; ";
+            if (Native.IsHungAppWindow(hwnd) || (Native.IsWindow(hwnd) && !Responds(hwnd, RespondMs)))
+            {
+                return head + "check responding in win.list, then retry or end its process with proc.kill";
+            }
+            return head + "the app may not allow it";
         }
 
         // Asks the window to change its show state and waits until it has.
@@ -1026,7 +1101,7 @@ namespace Alcove
             Native.ShowWindowAsync(hwnd, command);
             if (!WaitUntil(done, WindowStateMs))
             {
-                throw new HelperException(NotResponding(hwnd, what));
+                throw new HelperException(NotChanged(hwnd, what));
             }
         }
 
@@ -1125,9 +1200,19 @@ namespace Alcove
                     break;
                 }
                 case "close":
-                    Native.PostMessageW(hwnd, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                {
+                    string cls = WindowClass(hwnd);
+                    if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd")
+                    {
+                        throw new HelperException("window " + HwndId(hwnd) + " is part of the Windows shell and is not closed");
+                    }
+                    if (!Native.PostMessageW(hwnd, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero))
+                    {
+                        throw new HelperException("window " + HwndId(hwnd) + " belongs to a process the helper cannot send to");
+                    }
                     r["closed"] = WaitUntil(delegate { return !Native.IsWindow(hwnd) || !Native.IsWindowVisible(hwnd); }, CloseWaitMs);
                     break;
+                }
                 case "move":
                 case "resize":
                 {
@@ -1140,7 +1225,7 @@ namespace Alcove
                     int a = Params.Int(req, first, 0), b = Params.Int(req, second, 0);
                     if (!move && (a < 1 || b < 1))
                     {
-                        throw new HelperException("w and h must be 1 or more");
+                        throw new HelperException("pass w and h of at least 1");
                     }
                     ShowNormal(hwnd);
                     Native.RECT outer, visible;
@@ -1229,7 +1314,7 @@ namespace Alcove
                     ValuePattern valuePattern = (ValuePattern)PatternFor(element, ValuePattern.Pattern, action);
                     if (valuePattern.Current.IsReadOnly)
                     {
-                        throw new HelperException("the element is read-only; its value cannot be set");
+                        throw new HelperException("the element is read-only; its value cannot be set; type into another element or change it in the app");
                     }
                     valuePattern.SetValue(value);
                     break;
@@ -1239,6 +1324,41 @@ namespace Alcove
                 case "scroll_into_view":
                     ((ScrollItemPattern)PatternFor(element, ScrollItemPattern.Pattern, action)).ScrollIntoView();
                     break;
+            }
+        }
+
+        // TryEnterAct counts one more ui.act worker for the app, unless more than
+        // MaxActThreadsPerApp are already running in it.
+        static bool TryEnterAct(int pid, out int running)
+        {
+            lock (actLock)
+            {
+                actThreads.TryGetValue(pid, out running);
+                if (running >= MaxActThreadsPerApp)
+                {
+                    return false;
+                }
+                actThreads[pid] = running + 1;
+                return true;
+            }
+        }
+
+        static void LeaveAct(int pid)
+        {
+            lock (actLock)
+            {
+                int n;
+                if (actThreads.TryGetValue(pid, out n))
+                {
+                    if (n <= 1)
+                    {
+                        actThreads.Remove(pid);
+                    }
+                    else
+                    {
+                        actThreads[pid] = n - 1;
+                    }
+                }
             }
         }
 
@@ -1256,12 +1376,41 @@ namespace Alcove
             }
             AutomationElement element = Target(req);
             IntPtr hwnd = scopeWindow;
+            bool passwordLineage = HasPasswordAncestor(element);
             Dictionary<string, object> before = Node(element, 0);
+            if (passwordLineage)
+            {
+                MarkPassword(before);
+            }
+            if (((List<object>)before["flags"]).Contains("disabled"))
+            {
+                throw new HelperException("the element is disabled; wait until it is enabled");
+            }
             if (action == "focus" && hwnd != IntPtr.Zero && Native.IsWindow(hwnd))
             {
                 Focus(hwnd);
             }
 
+            int pid = 0;
+            if (hwnd != IntPtr.Zero)
+            {
+                uint p;
+                Native.GetWindowThreadProcessId(hwnd, out p);
+                pid = (int)p;
+            }
+            if (pid == 0)
+            {
+                try { pid = (int)element.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty); }
+                catch (Exception) { }
+            }
+            int running;
+            if (!TryEnterAct(pid, out running))
+            {
+                throw new HelperException(running + " earlier ui.act calls are still running in the app; wait for them or end its process with proc.kill");
+            }
+
+            bool known = hwnd != IntPtr.Zero && Native.IsWindow(hwnd);
+            bool wasEnabled = known && Native.IsWindowEnabled(hwnd);
             Exception failure = null;
             Thread worker = new Thread(delegate()
             {
@@ -1273,15 +1422,20 @@ namespace Alcove
                 {
                     failure = e;
                 }
+                finally
+                {
+                    LeaveAct(pid);
+                }
             });
             worker.IsBackground = true;
             worker.SetApartmentState(ApartmentState.MTA);
             worker.Start();
-            bool known = hwnd != IntPtr.Zero && Native.IsWindow(hwnd);
-            bool wasEnabled = known && Native.IsWindowEnabled(hwnd);
             // The action counts as done when it returned, or when the window stopped taking input for a window it opened.
-            bool returned = WaitUntil(delegate { return worker.Join(0) || (wasEnabled && !Native.IsWindowEnabled(hwnd)); }, ActWaitMs) && worker.Join(0);
-            if (returned && failure != null)
+            WaitUntil(delegate { return worker.Join(0) || (wasEnabled && !Native.IsWindowEnabled(hwnd)); }, ActWaitMs);
+            bool joined = worker.Join(0);
+            bool modalOpened = wasEnabled && known && Native.IsWindow(hwnd) && !Native.IsWindowEnabled(hwnd);
+            bool returned = joined || modalOpened;
+            if (joined && failure != null)
             {
                 if (failure is HelperException)
                 {
@@ -1311,11 +1465,33 @@ namespace Alcove
                 r["unresponsive"] = true;
                 return r;
             }
+            if (!returned)
+            {
+                // The pattern call is still running and the window answers messages.
+                r["node"] = before;
+                r["pending"] = true;
+                return r;
+            }
             try
             {
-                r["node"] = Node(element.GetUpdatedCache(nodeCacheControl), 0);
+                Dictionary<string, object> node = Node(element.GetUpdatedCache(nodeCacheControl), 0);
+                if (passwordLineage)
+                {
+                    MarkPassword(node);
+                }
+                r["node"] = node;
             }
             catch (ElementNotAvailableException)
+            {
+                r["node"] = before;
+                r["gone"] = true;
+            }
+            catch (COMException)
+            {
+                r["node"] = before;
+                r["gone"] = true;
+            }
+            catch (InvalidOperationException)
             {
                 r["node"] = before;
                 r["gone"] = true;
@@ -1491,6 +1667,60 @@ namespace Alcove
             return v is bool && (bool)v;
         }
 
+        // Whether the element is a password field, from its cached IsPassword. A read that fails
+        // counts as a password field so its text is never exposed.
+        static bool IsPasswordElement(AutomationElement element)
+        {
+            try
+            {
+                object v = element.GetCachedPropertyValue(AutomationElement.IsPasswordProperty, true);
+                return v is bool && (bool)v;
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+        }
+
+        // Whether a bounded number of the element's parents is a password field, read live. An
+        // element below a password field is treated as a password field itself.
+        static bool HasPasswordAncestor(AutomationElement element)
+        {
+            AutomationElement current = TreeWalker.RawViewWalker.GetParent(element);
+            for (int i = 0; i < 64 && current != null; i++)
+            {
+                try
+                {
+                    object v = current.GetCurrentPropertyValue(AutomationElement.IsPasswordProperty);
+                    if (v is bool && (bool)v)
+                    {
+                        return true;
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                    return true;
+                }
+                catch (ElementNotAvailableException)
+                {
+                    return false;
+                }
+                current = TreeWalker.RawViewWalker.GetParent(current);
+            }
+            return false;
+        }
+
+        // Marks a node as a password field: the password flag is set and the value is removed.
+        static void MarkPassword(Dictionary<string, object> node)
+        {
+            node.Remove("value");
+            List<object> flags = (List<object>)node["flags"];
+            if (!flags.Contains("password"))
+            {
+                flags.Add("password");
+            }
+        }
+
         // Builds the node object from the element's cached properties.
         Dictionary<string, object> Node(AutomationElement element, int depth)
         {
@@ -1499,7 +1729,7 @@ namespace Alcove
             n["depth"] = depth;
             n["role"] = RoleName(element.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType);
             n["name"] = (element.GetCachedPropertyValue(AutomationElement.NameProperty) as string) ?? "";
-            bool password = CachedBool(element, AutomationElement.IsPasswordProperty);
+            bool password = IsPasswordElement(element);
             string value = password ? null : CachedValue(element);
             if (!string.IsNullOrEmpty(value))
             {
@@ -1672,7 +1902,11 @@ namespace Alcove
                     {
                         walk.Nodes.Add(Node(child, nodeDepth));
                     }
-                    WalkChildren(walk, child, level + 1, listed ? nodeDepth + 1 : nodeDepth);
+                    // The children of a password field are not listed, so a bullet row cannot expose the text.
+                    if (!IsPasswordElement(child))
+                    {
+                        WalkChildren(walk, child, level + 1, listed ? nodeDepth + 1 : nodeDepth);
+                    }
                     if (walk.Truncated)
                     {
                         return;
@@ -1813,7 +2047,8 @@ namespace Alcove
                     {
                         search.Found.Add(child);
                     }
-                    if (search.Found.Count < search.Need)
+                    // A password field is a match but its children are not searched.
+                    if (search.Found.Count < search.Need && !IsPasswordElement(child))
                     {
                         SearchChildren(search, child, level + 1);
                     }
@@ -1896,17 +2131,21 @@ namespace Alcove
                 throw new HelperException(SearchStopped(search));
             }
             List<object> nodes = new List<object>();
+            bool vanished = false;
             for (int i = first; i < search.Found.Count; i++)
             {
                 try
                 {
                     nodes.Add(Node(search.Found[i].GetUpdatedCache(nodeCacheControl), 0));
                 }
-                catch (ElementNotAvailableException) { }
+                catch (ElementNotAvailableException)
+                {
+                    vanished = true;
+                }
             }
             Dictionary<string, object> r = new Dictionary<string, object>();
             r["nodes"] = nodes;
-            if (search.Stopped != Stop.None)
+            if (search.Stopped != Stop.None || vanished)
             {
                 r["truncated"] = true;
             }
@@ -1937,9 +2176,9 @@ namespace Alcove
                 length = TextCap;
             }
             AutomationElement element = Target(req);
-            if (CachedBool(element, AutomationElement.IsPasswordProperty))
+            if (IsPasswordElement(element) || HasPasswordAncestor(element))
             {
-                throw new HelperException("the element is a password field; its text is not read");
+                throw new HelperException("the element is a password field; its text is not read; it cannot be read through UI Automation");
             }
 
             string text = null;
@@ -2052,7 +2291,7 @@ namespace Alcove
                 }
                 try
                 {
-                    if (!CachedBool(child, AutomationElement.IsPasswordProperty))
+                    if (!IsPasswordElement(child))
                     {
                         ControlType type = child.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType;
                         if (type == ControlType.Text || type == ControlType.ListItem || type == ControlType.Edit || type == ControlType.Document)
@@ -2111,6 +2350,10 @@ namespace Alcove
                 }
             }
             Dictionary<string, object> node = Node(element, 0);
+            if (HasPasswordAncestor(element))
+            {
+                MarkPassword(node);
+            }
             int x = (int)node["x"], y = (int)node["y"], w = (int)node["w"], h = (int)node["h"];
             int cx = x + w / 2, cy = y + h / 2;
             List<object> flags = (List<object>)node["flags"];
@@ -2183,8 +2426,13 @@ namespace Alcove
                 throw new HelperException("no element has the keyboard focus; click a window or use win.action focus");
             }
             scopeWindow = TopWindow(element);
+            Dictionary<string, object> node = Node(element, 0);
+            if (HasPasswordAncestor(element))
+            {
+                MarkPassword(node);
+            }
             Dictionary<string, object> r = new Dictionary<string, object>();
-            r["node"] = Node(element, 0);
+            r["node"] = node;
             r["window"] = WindowObjectOrNull(scopeWindow);
             return r;
         }
