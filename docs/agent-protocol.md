@@ -50,7 +50,7 @@ Capabilities:
 | agent → host | `file.done` | `id`, `path` or `error` | result |
 | host → agent | `shutdown` | — | graceful OS shutdown (`shutdown /s /t 0` or `systemctl poweroff`) |
 | host → agent | `exec` | `cmd` (string) | run a command with the default shell and no time limit; answered with `exec.result` (`code` -1 and `out` "exec disabled" unless the agent was started with `--allow-exec`) |
-| agent → host | `exec.result` | `code`, `out` | exit code and combined stdout and stderr of `exec`; `out` keeps the last 200000 bytes, starting on a character boundary (there is no `truncated` field) |
+| agent → host | `exec.result` | `code`, `out` | exit code and combined stdout and stderr of `exec`; `out` keeps the last 200000 bytes, starting on a character boundary when older bytes were dropped (there is no `truncated` field) |
 
 Unknown `t` values are ignored. Strings are UTF-8; the guest clipboard is
 converted from/to UTF-16 on Windows by the agent.
@@ -121,7 +121,9 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   the child, at most `timeout_ms`. On timeout the process tree is killed,
   `timed_out` is true and `code` is -1.
 - `exec.run` keeps the last 200000 bytes of each stream; `truncated` is true
-  when either stream lost earlier bytes. Invalid UTF-8 becomes U+FFFD.
+  when either stream lost earlier bytes. A character split by the cut is
+  dropped, so a truncated stream starts on a character boundary. Other
+  invalid UTF-8 becomes U+FFFD.
 - Killing a tree (timeout, `exec.kill`, `proc.kill` with `tree`) runs
   `taskkill /F /T /PID <pid>` on Windows; elsewhere each child leads its own
   process group and the group receives SIGKILL.
@@ -146,7 +148,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - The table holds 64 jobs. Starting one more forgets the oldest exited job;
   with 64 running jobs `exec.start` fails and names `exec.kill`.
 - `exec.list` reports each job's `cmd` text (for `argv`, the elements joined
-  by spaces) cut to 4096 characters with a trailing `…` when longer, and `started` in the guest's local time with its offset.
+  by spaces) cut to 4096 characters with a trailing `…` when longer, and
+  `started` in the guest's local time with its offset.
 - When a job's process exits the agent sends
   `{"t":"ev","name":"job.exited","job":"<id>","code":<int>}` to every open
   connection.
@@ -203,7 +206,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | One message read by the agent (a line with its newline) | 1 MiB (`proto.MaxLine`); a longer line closes the connection |
 | Binary payload of one `fs.read` / `fs.write` / `file.chunk` | 256 KiB (262144 bytes) before base64 |
 | `exec.run` output | last 200000 bytes per stream |
-| `exec` (v1) output | last 200000 bytes of the combined output |
+| `exec` (v1) output | last 200000 bytes of the combined output, starting on a character boundary |
 | `exec.list` `cmd` | 4096 characters per job, then `…` |
 | `proc.list` `cmd` | 8192 characters per process, then `…` |
 | `clipboard.text` / `clipboard.changed` text | 700000 bytes of UTF-8, cut on a character boundary |
@@ -226,9 +229,9 @@ reply can be several megabytes long. What bounds each reply the agent writes:
   text.
 - `fs.list` is bounded by 5000 entries, not by bytes. A name is at most 255
   characters on the supported file systems, which keeps a listing of one
-  folder under 8 MiB unless the names consist mostly of control characters. With `recursive` a name is a relative path and a tree of
-  5000 entries with very long paths can pass 8 MiB; the host then closes the
-  connection.
+  folder under 8 MiB unless the names consist mostly of control characters.
+  With `recursive` a name is a relative path and a tree of 5000 entries with
+  very long paths can pass 8 MiB; the host then closes the connection.
 
 ### Known limitations
 

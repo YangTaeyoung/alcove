@@ -186,8 +186,8 @@ func (s *Server) execRun(req proto.Message) (proto.Message, error) {
 	errOut, errCut := stderr.snapshot()
 	return proto.Message{
 		"code":      code,
-		"stdout":    text(out),
-		"stderr":    text(errOut),
+		"stdout":    streamText(out, outCut),
+		"stderr":    streamText(errOut, errCut),
 		"timed_out": timedOut.Load(),
 		"truncated": outCut || errCut,
 	}, nil

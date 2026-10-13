@@ -28,11 +28,39 @@ func TestCutUTF8Bytes(t *testing.T) {
 	}
 }
 
-func TestTailUTF8(t *testing.T) {
-	got := tailUTF8([]byte("가나다"), 7)
-	if got != "나다" {
-		t.Fatalf("tail starts inside a rune: %q", got)
+func TestStreamText(t *testing.T) {
+	if got := streamText([]byte("\x9c\n가"), true); got != "\n가" {
+		t.Fatalf("cut stream starts inside a character: %q", got)
 	}
+	if got := streamText([]byte("\x9c\n"), false); got != "�\n" {
+		t.Fatalf("uncut stream: %q", got)
+	}
+}
+
+const koreanTail = `yes 한 | head -c 300000; printf ab`
+
+func checkKoreanTail(t *testing.T, label, out string) {
+	t.Helper()
+	if len(out) > 200000 || len(out) < 199990 || strings.ContainsRune(out, utf8.RuneError) || !strings.HasSuffix(out, "한\nab") {
+		t.Fatalf("%s: %d bytes, replacement character %v, tail %q", label, len(out), strings.ContainsRune(out, utf8.RuneError), out[max(0, len(out)-8):])
+	}
+}
+
+func TestExecRunTruncatedStreamStartsOnACharacter(t *testing.T) {
+	c, _ := newRPCClient(t, Options{})
+	res := c.ok("exec.run", proto.Message{"cmd": koreanTail, "shell": "sh"})
+	if res["truncated"] != true {
+		t.Fatalf("res not truncated: %v", res["truncated"])
+	}
+	checkKoreanTail(t, "exec.run stdout", res.String("stdout"))
+}
+
+func TestV1ExecTruncatedStreamStartsOnACharacter(t *testing.T) {
+	r, w, c := startServer(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), AllowExec: true})
+	c.SetDeadline(time.Now().Add(20 * time.Second))
+	expect(t, r, "hello")
+	w.Send(proto.Message{"t": "exec", "cmd": koreanTail})
+	checkKoreanTail(t, "exec.result out", expect(t, r, "exec.result").String("out"))
 }
 
 func TestExecListCutsLongCommands(t *testing.T) {

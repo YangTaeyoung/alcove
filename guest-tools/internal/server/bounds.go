@@ -34,11 +34,11 @@ func cutUTF8Bytes(s string, max int) string {
 	return s[:max]
 }
 
-// tailUTF8 returns the last max bytes of b, starting on a character boundary.
-func tailUTF8(b []byte, max int) string {
-	if len(b) > max {
-		b = b[len(b)-max:]
-		for len(b) > 0 && !utf8.RuneStart(b[0]) {
+// streamText converts the bytes a ring kept to a string. When older bytes were
+// dropped (cut), leading continuation bytes of a split character are skipped.
+func streamText(b []byte, cut bool) string {
+	if cut {
+		for skip := 0; skip < utf8.UTFMax-1 && len(b) > 0 && !utf8.RuneStart(b[0]); skip++ {
 			b = b[1:]
 		}
 	}

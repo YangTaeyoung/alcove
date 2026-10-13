@@ -305,7 +305,7 @@ func runShell(cmd string) (string, int) {
 	combined := newRing(runStreamBytes)
 	c.Stdout, c.Stderr = combined, combined
 	err = c.Run()
-	out, _ := combined.snapshot()
+	out, cut := combined.snapshot()
 	code := 0
 	if err != nil {
 		code = 1
@@ -313,5 +313,5 @@ func runShell(cmd string) (string, int) {
 			code = ee.ExitCode()
 		}
 	}
-	return tailUTF8(out, runStreamBytes), code
+	return streamText(out, cut), code
 }
