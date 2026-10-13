@@ -57,6 +57,9 @@ namespace Alcove
             Session session = new Session();
             Log("started in session " + Process.GetCurrentProcess().SessionId + " at " + Native.IntegrityLevel() + " integrity");
             Send("{\"ev\":\"ready\"}");
+            Thread watcher = new Thread(new WindowWatch().Run);
+            watcher.IsBackground = true;
+            watcher.Start();
 
             string line;
             while ((line = input.ReadLine()) != null)
@@ -352,8 +355,32 @@ namespace Alcove
             public int X, Y;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSG
+        {
+            public IntPtr Hwnd;
+            public uint Message;
+            public IntPtr WParam;
+            public IntPtr LParam;
+            public uint Time;
+            public POINT Point;
+            public uint Private;
+        }
+
         public const uint GW_OWNER = 4;
         public const uint GA_ROOT = 2;
+        public const int SW_MAXIMIZE = 3;
+        public const int SW_SHOWNOACTIVATE = 4;
+        public const int SW_MINIMIZE = 6;
+        public const int SW_RESTORE = 9;
+        public const uint WM_NULL = 0;
+        public const uint WM_CLOSE = 0x0010;
+        public const uint SMTO_ABORTIFHUNG = 0x0002;
+        public const uint SWP_NOSIZE = 0x0001;
+        public const uint SWP_NOMOVE = 0x0002;
+        public const uint SWP_NOZORDER = 0x0004;
+        public const uint SWP_NOACTIVATE = 0x0010;
+        public const uint SWP_ASYNCWINDOWPOS = 0x4000;
         public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
         public const int DWMWA_CLOAKED = 14;
 
@@ -374,6 +401,17 @@ namespace Alcove
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
         [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+        [DllImport("user32.dll")] public static extern IntPtr HungWindowFromGhostWindow(IntPtr ghost);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hwnd, bool altTab);
+        [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessageW(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PeekMessageW(out MSG message, IntPtr hwnd, uint min, uint max, uint remove);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
         [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
         [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
         [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
@@ -388,6 +426,18 @@ namespace Alcove
         [DllImport("advapi32.dll")] public static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr info, uint length, out uint needed);
         [DllImport("advapi32.dll")] public static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
         [DllImport("advapi32.dll")] public static extern IntPtr GetSidSubAuthority(IntPtr sid, uint index);
+
+        // The top-level window that contains the foreground window, or zero.
+        public static IntPtr ForegroundWindow()
+        {
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero)
+            {
+                return hwnd;
+            }
+            IntPtr root = GetAncestor(hwnd, GA_ROOT);
+            return root != IntPtr.Zero ? root : hwnd;
+        }
 
         // The integrity level of this process: low, medium, high, system or unknown.
         public static string IntegrityLevel()
@@ -451,6 +501,7 @@ namespace Alcove
         public int Number;
         public string Key;
         public AutomationElement Element;
+        public IntPtr Window;
         public long Used;
     }
 
@@ -481,6 +532,97 @@ namespace Alcove
         }
     }
 
+    // Compares the titled windows every 300 ms and writes an event for each difference.
+    sealed class WindowWatch
+    {
+        const int IntervalMs = 300;
+
+        Dictionary<IntPtr, Dictionary<string, object>> known = new Dictionary<IntPtr, Dictionary<string, object>>();
+        IntPtr foreground;
+
+        public void Run()
+        {
+            try { Native.SetThreadDpiAwarenessContext(new IntPtr(-4)); }
+            catch (EntryPointNotFoundException) { }
+            Compare(false);
+            while (true)
+            {
+                Thread.Sleep(IntervalMs);
+                try
+                {
+                    Compare(true);
+                }
+                catch (Exception e)
+                {
+                    UiaHelper.Log("the window comparison failed: " + e);
+                }
+            }
+        }
+
+        void Compare(bool report)
+        {
+            IntPtr front = Native.ForegroundWindow();
+            Dictionary<IntPtr, Dictionary<string, object>> now = new Dictionary<IntPtr, Dictionary<string, object>>();
+            List<IntPtr> order = new List<IntPtr>();
+            foreach (IntPtr hwnd in Session.ListedWindows(front))
+            {
+                Dictionary<string, object> window = Session.WindowObject(hwnd, front);
+                if (((string)window["title"]).Length > 0)
+                {
+                    now[hwnd] = window;
+                    order.Add(hwnd);
+                }
+            }
+            if (report)
+            {
+                foreach (KeyValuePair<IntPtr, Dictionary<string, object>> old in known)
+                {
+                    if (!now.ContainsKey(old.Key))
+                    {
+                        old.Value["foreground"] = false;
+                        Emit("window.closed", old.Value);
+                    }
+                }
+                foreach (IntPtr hwnd in order)
+                {
+                    Dictionary<string, object> window = now[hwnd];
+                    Dictionary<string, object> old;
+                    if (!known.TryGetValue(hwnd, out old))
+                    {
+                        Emit("window.opened", window);
+                        if ((bool)window["modal"] || (string)window["class"] == "#32770")
+                        {
+                            Emit("dialog.opened", window);
+                        }
+                    }
+                    else if ((string)old["title"] != (string)window["title"])
+                    {
+                        Emit("window.title", window);
+                    }
+                }
+                if (front != foreground && front != IntPtr.Zero)
+                {
+                    Dictionary<string, object> window;
+                    if (!now.TryGetValue(front, out window))
+                    {
+                        window = Session.WindowObject(front, front);
+                    }
+                    Emit("window.foreground", window);
+                }
+            }
+            known = now;
+            foreground = front;
+        }
+
+        static void Emit(string name, Dictionary<string, object> window)
+        {
+            Dictionary<string, object> ev = new Dictionary<string, object>();
+            ev["ev"] = name;
+            ev["window"] = window;
+            UiaHelper.Send(Json.Write(ev));
+        }
+    }
+
     // The state of one helper process: element refs and the ops.
     sealed class Session
     {
@@ -496,11 +638,20 @@ namespace Alcove
         const int TextCap = 200000;
         const int ValueCut = 200;
         const int MaxWalkDepth = 256;
+        const int RespondMs = 2000;
+        const int WindowStateMs = 2000;
+        const int CloseWaitMs = 2000;
+        const int ForegroundStepMs = 400;
+        const int ActWaitMs = 1500;
+        const int ActSettleMs = 100;
+        const int ActRespondMs = 500;
 
         readonly Dictionary<string, RefEntry> refsByKey = new Dictionary<string, RefEntry>();
         readonly Dictionary<int, RefEntry> refsByNumber = new Dictionary<int, RefEntry>();
         int nextRef = 1;
         long clock;
+        // The top-level window of the elements the running request lists or acts on, or zero.
+        IntPtr scopeWindow;
 
         readonly CacheRequest nodeCacheControl;
         readonly CacheRequest nodeCacheRaw;
@@ -582,10 +733,13 @@ namespace Alcove
         {
             watch.Restart();
             budgetMs = op == "ui.tree" ? TreeBudgetMs : op == "ui.text" ? TextBudgetMs : FindBudgetMs;
+            scopeWindow = IntPtr.Zero;
             switch (op)
             {
                 case "ping": return Ping();
                 case "win.list": return WinList();
+                case "win.action": return WinAction(req);
+                case "ui.act": return UiAct(req);
                 case "ui.tree": return UiTree(req);
                 case "ui.find": return UiFind(req);
                 case "ui.text": return UiText(req);
@@ -613,7 +767,7 @@ namespace Alcove
 
         Dictionary<string, object> WinList()
         {
-            IntPtr foreground = Native.GetForegroundWindow();
+            IntPtr foreground = Native.ForegroundWindow();
             List<object> windows = new List<object>();
             foreach (IntPtr hwnd in ListedWindows(foreground))
             {
@@ -625,7 +779,7 @@ namespace Alcove
         }
 
         // Top-level windows in z-order that are shown and titled, plus the foreground window.
-        static List<IntPtr> ListedWindows(IntPtr foreground)
+        internal static List<IntPtr> ListedWindows(IntPtr foreground)
         {
             List<IntPtr> all = new List<IntPtr>();
             Native.EnumWindows(delegate(IntPtr hwnd, IntPtr lParam) { all.Add(hwnd); return true; }, IntPtr.Zero);
@@ -646,7 +800,7 @@ namespace Alcove
             return Native.DwmGetWindowAttribute(hwnd, Native.DWMWA_CLOAKED, out cloaked, 4) == 0 && cloaked != 0;
         }
 
-        static string WindowTitle(IntPtr hwnd)
+        internal static string WindowTitle(IntPtr hwnd)
         {
             StringBuilder sb = new StringBuilder(1024);
             Native.GetWindowTextW(hwnd, sb, sb.Capacity);
@@ -683,12 +837,12 @@ namespace Alcove
             }
         }
 
-        static string HwndId(IntPtr hwnd)
+        internal static string HwndId(IntPtr hwnd)
         {
             return "0x" + hwnd.ToInt64().ToString("x", CultureInfo.InvariantCulture);
         }
 
-        static Dictionary<string, object> WindowObject(IntPtr hwnd, IntPtr foreground)
+        internal static Dictionary<string, object> WindowObject(IntPtr hwnd, IntPtr foreground)
         {
             Dictionary<string, object> w = new Dictionary<string, object>();
             string cls = WindowClass(hwnd);
@@ -703,6 +857,20 @@ namespace Alcove
                 {
                     pid = corePid;
                 }
+            }
+            else if (cls == "Ghost")
+            {
+                // The window the system shows in place of a window that stopped responding reports that window's process.
+                try
+                {
+                    IntPtr hung = Native.HungWindowFromGhostWindow(hwnd);
+                    uint hungPid;
+                    if (hung != IntPtr.Zero && Native.GetWindowThreadProcessId(hung, out hungPid) != 0 && hungPid != 0)
+                    {
+                        pid = hungPid;
+                    }
+                }
+                catch (EntryPointNotFoundException) { }
             }
             bool minimized = Native.IsIconic(hwnd);
             Native.RECT rect = new Native.RECT();
@@ -730,7 +898,7 @@ namespace Alcove
         // Resolves a window id, "foreground" or a title part to a window handle.
         static IntPtr ResolveWindow(string window)
         {
-            IntPtr foreground = Native.GetForegroundWindow();
+            IntPtr foreground = Native.ForegroundWindow();
             if (window == null || window == "foreground")
             {
                 if (foreground == IntPtr.Zero)
@@ -791,11 +959,28 @@ namespace Alcove
             {
                 return null;
             }
-            return WindowObject(hwnd, Native.GetForegroundWindow());
+            return WindowObject(hwnd, Native.ForegroundWindow());
+        }
+
+        // True when the window's thread handles a message within the given time.
+        static bool Responds(IntPtr hwnd, int ms)
+        {
+            IntPtr result;
+            return Native.SendMessageTimeoutW(hwnd, Native.WM_NULL, IntPtr.Zero, IntPtr.Zero, Native.SMTO_ABORTIFHUNG, (uint)ms, out result) != IntPtr.Zero;
+        }
+
+        static void RequireResponding(IntPtr hwnd)
+        {
+            if (Native.IsHungAppWindow(hwnd) || (Native.IsWindow(hwnd) && !Responds(hwnd, RespondMs)))
+            {
+                throw new HelperException("window " + HwndId(hwnd) + " " + Json.Write(WindowTitle(hwnd))
+                    + " is not responding; wait for it or end its process with proc.kill");
+            }
         }
 
         static AutomationElement WindowElement(IntPtr hwnd, CacheRequest cache)
         {
+            RequireResponding(hwnd);
             try
             {
                 using (cache.Activate())
@@ -807,6 +992,335 @@ namespace Alcove
             {
                 throw new HelperException("window " + HwndId(hwnd) + " no longer exists; call win.list again");
             }
+        }
+
+        // ---- win.action ----
+
+        static bool WaitUntil(Func<bool> done, int ms)
+        {
+            Stopwatch waited = Stopwatch.StartNew();
+            while (!done())
+            {
+                if (waited.ElapsedMilliseconds >= ms)
+                {
+                    return false;
+                }
+                Thread.Sleep(20);
+            }
+            return true;
+        }
+
+        static string NotResponding(IntPtr hwnd, string what)
+        {
+            return "window " + HwndId(hwnd) + " " + Json.Write(WindowTitle(hwnd)) + " " + what + " within "
+                + (WindowStateMs / 1000) + " s; check responding in win.list, then retry or end its process with proc.kill";
+        }
+
+        // Asks the window to change its show state and waits until it has.
+        static void Show(IntPtr hwnd, int command, Func<bool> done, string what)
+        {
+            if (done())
+            {
+                return;
+            }
+            Native.ShowWindowAsync(hwnd, command);
+            if (!WaitUntil(done, WindowStateMs))
+            {
+                throw new HelperException(NotResponding(hwnd, what));
+            }
+        }
+
+        static void ShowNormal(IntPtr hwnd)
+        {
+            Show(hwnd, Native.SW_SHOWNOACTIVATE, delegate { return !Native.IsIconic(hwnd) && !Native.IsZoomed(hwnd); }, "did not return to its normal size");
+        }
+
+        static bool IsForeground(IntPtr hwnd)
+        {
+            return Native.ForegroundWindow() == hwnd;
+        }
+
+        // Brings the window to the foreground: SetForegroundWindow first, then the same call with this
+        // thread's input attached to the foreground window's thread, then SwitchToThisWindow. A
+        // minimized window is restored first.
+        static void Focus(IntPtr hwnd)
+        {
+            Show(hwnd, Native.SW_RESTORE, delegate { return !Native.IsIconic(hwnd); }, "did not leave the minimized state");
+            if (IsForeground(hwnd))
+            {
+                return;
+            }
+            string step = "SetForegroundWindow";
+            if (!Native.SetForegroundWindow(hwnd) || !WaitUntil(delegate { return IsForeground(hwnd); }, ForegroundStepMs))
+            {
+                step = "SetForegroundWindow with attached input";
+                IntPtr current = Native.ForegroundWindow();
+                uint ignored;
+                uint self = Native.GetCurrentThreadId();
+                uint other = current == IntPtr.Zero || Native.IsHungAppWindow(current) ? 0 : Native.GetWindowThreadProcessId(current, out ignored);
+                Native.MSG message;
+                Native.PeekMessageW(out message, IntPtr.Zero, 0, 0, 0);
+                bool attached = other != 0 && other != self && Native.AttachThreadInput(self, other, true);
+                try
+                {
+                    Native.BringWindowToTop(hwnd);
+                    Native.SetForegroundWindow(hwnd);
+                }
+                finally
+                {
+                    if (attached)
+                    {
+                        Native.AttachThreadInput(self, other, false);
+                    }
+                }
+                if (!WaitUntil(delegate { return IsForeground(hwnd); }, ForegroundStepMs))
+                {
+                    step = "SwitchToThisWindow";
+                    Native.SwitchToThisWindow(hwnd, true);
+                    if (!WaitUntil(delegate { return IsForeground(hwnd); }, ForegroundStepMs))
+                    {
+                        throw new HelperException("window " + HwndId(hwnd) + " " + Json.Write(WindowTitle(hwnd))
+                            + " did not come to the foreground; click its title bar through the display");
+                    }
+                }
+            }
+            UiaHelper.Log("window " + HwndId(hwnd) + " came to the foreground through " + step);
+        }
+
+        static void Frame(IntPtr hwnd, out Native.RECT outer, out Native.RECT visible)
+        {
+            Native.GetWindowRect(hwnd, out outer);
+            if (Native.DwmGetWindowAttribute(hwnd, Native.DWMWA_EXTENDED_FRAME_BOUNDS, out visible, 16) != 0)
+            {
+                visible = outer;
+            }
+        }
+
+        Dictionary<string, object> WinAction(Dictionary<string, object> req)
+        {
+            string action = Params.Str(req, "action");
+            string window = Params.Str(req, "window");
+            if (window == null)
+            {
+                throw new HelperException("pass window: a window id from win.list, a title part, or foreground");
+            }
+            IntPtr hwnd = ResolveWindow(window);
+            Dictionary<string, object> r = new Dictionary<string, object>();
+            switch (action)
+            {
+                case "focus":
+                    Focus(hwnd);
+                    break;
+                case "minimize":
+                    Show(hwnd, Native.SW_MINIMIZE, delegate { return Native.IsIconic(hwnd); }, "was not minimized");
+                    break;
+                case "maximize":
+                    Show(hwnd, Native.SW_MAXIMIZE, delegate { return Native.IsZoomed(hwnd) && !Native.IsIconic(hwnd); }, "was not maximized");
+                    break;
+                case "restore":
+                {
+                    bool minimized = Native.IsIconic(hwnd);
+                    Show(hwnd, Native.SW_RESTORE, delegate { return minimized ? !Native.IsIconic(hwnd) : !Native.IsZoomed(hwnd); },
+                        minimized ? "did not leave the minimized state" : "did not leave the maximized state");
+                    break;
+                }
+                case "close":
+                    Native.PostMessageW(hwnd, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                    r["closed"] = WaitUntil(delegate { return !Native.IsWindow(hwnd) || !Native.IsWindowVisible(hwnd); }, CloseWaitMs);
+                    break;
+                case "move":
+                case "resize":
+                {
+                    bool move = action == "move";
+                    string first = move ? "x" : "w", second = move ? "y" : "h";
+                    if (!Params.Has(req, first) || !Params.Has(req, second))
+                    {
+                        throw new HelperException(action + " needs " + first + " and " + second);
+                    }
+                    int a = Params.Int(req, first, 0), b = Params.Int(req, second, 0);
+                    if (!move && (a < 1 || b < 1))
+                    {
+                        throw new HelperException("w and h must be 1 or more");
+                    }
+                    ShowNormal(hwnd);
+                    Native.RECT outer, visible;
+                    Frame(hwnd, out outer, out visible);
+                    uint flags = Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS;
+                    if (move)
+                    {
+                        Native.SetWindowPos(hwnd, IntPtr.Zero, a - (visible.Left - outer.Left), b - (visible.Top - outer.Top), 0, 0, flags | Native.SWP_NOSIZE);
+                    }
+                    else
+                    {
+                        int extraW = (outer.Right - outer.Left) - (visible.Right - visible.Left);
+                        int extraH = (outer.Bottom - outer.Top) - (visible.Bottom - visible.Top);
+                        Native.SetWindowPos(hwnd, IntPtr.Zero, 0, 0, a + extraW, b + extraH, flags | Native.SWP_NOMOVE);
+                    }
+                    Native.RECT was = outer;
+                    WaitUntil(delegate
+                    {
+                        Native.RECT now, shown;
+                        Frame(hwnd, out now, out shown);
+                        bool changed = now.Left != was.Left || now.Top != was.Top || now.Right != was.Right || now.Bottom != was.Bottom;
+                        bool asked = move ? shown.Left == a && shown.Top == b : shown.Right - shown.Left == a && shown.Bottom - shown.Top == b;
+                        return changed || asked;
+                    }, WindowStateMs);
+                    break;
+                }
+                default:
+                    throw new HelperException("action must be one of focus, minimize, maximize, restore, close, move, resize");
+            }
+            r["window"] = Native.IsWindow(hwnd) && Native.IsWindowVisible(hwnd) ? WindowObject(hwnd, Native.ForegroundWindow()) : null;
+            return r;
+        }
+
+        // ---- ui.act ----
+
+        static readonly string[] actions = { "invoke", "toggle", "expand", "collapse", "select", "set_value", "focus", "scroll_into_view" };
+
+        // The ui.act actions the element supports.
+        static List<string> SupportedActions(AutomationElement element)
+        {
+            List<string> supported = new List<string>();
+            object pattern;
+            if (element.TryGetCurrentPattern(InvokePattern.Pattern, out pattern)) { supported.Add("invoke"); }
+            if (element.TryGetCurrentPattern(TogglePattern.Pattern, out pattern)) { supported.Add("toggle"); }
+            if (element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out pattern)) { supported.Add("expand"); supported.Add("collapse"); }
+            if (element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern)) { supported.Add("select"); }
+            if (element.TryGetCurrentPattern(ValuePattern.Pattern, out pattern)) { supported.Add("set_value"); }
+            if (CachedBool(element, AutomationElement.IsKeyboardFocusableProperty)) { supported.Add("focus"); }
+            if (element.TryGetCurrentPattern(ScrollItemPattern.Pattern, out pattern)) { supported.Add("scroll_into_view"); }
+            return supported;
+        }
+
+        static object PatternFor(AutomationElement element, AutomationPattern pattern, string action)
+        {
+            object found;
+            if (element.TryGetCurrentPattern(pattern, out found))
+            {
+                return found;
+            }
+            List<string> supported = SupportedActions(element);
+            throw new HelperException("the element does not support " + action + "; "
+                + (supported.Count > 0 ? "it supports " + string.Join(", ", supported.ToArray()) : "it supports no ui.act action")
+                + "; click it through the display for anything else");
+        }
+
+        static void Perform(AutomationElement element, string action, string value)
+        {
+            switch (action)
+            {
+                case "invoke":
+                    ((InvokePattern)PatternFor(element, InvokePattern.Pattern, action)).Invoke();
+                    break;
+                case "toggle":
+                    ((TogglePattern)PatternFor(element, TogglePattern.Pattern, action)).Toggle();
+                    break;
+                case "expand":
+                    ((ExpandCollapsePattern)PatternFor(element, ExpandCollapsePattern.Pattern, action)).Expand();
+                    break;
+                case "collapse":
+                    ((ExpandCollapsePattern)PatternFor(element, ExpandCollapsePattern.Pattern, action)).Collapse();
+                    break;
+                case "select":
+                    ((SelectionItemPattern)PatternFor(element, SelectionItemPattern.Pattern, action)).Select();
+                    break;
+                case "set_value":
+                    ValuePattern valuePattern = (ValuePattern)PatternFor(element, ValuePattern.Pattern, action);
+                    if (valuePattern.Current.IsReadOnly)
+                    {
+                        throw new HelperException("the element is read-only; its value cannot be set");
+                    }
+                    valuePattern.SetValue(value);
+                    break;
+                case "focus":
+                    element.SetFocus();
+                    break;
+                case "scroll_into_view":
+                    ((ScrollItemPattern)PatternFor(element, ScrollItemPattern.Pattern, action)).ScrollIntoView();
+                    break;
+            }
+        }
+
+        Dictionary<string, object> UiAct(Dictionary<string, object> req)
+        {
+            string action = Params.Str(req, "action");
+            if (action == null || Array.IndexOf(actions, action) < 0)
+            {
+                throw new HelperException("action must be one of " + string.Join(", ", actions));
+            }
+            string value = Params.Str(req, "value");
+            if (action == "set_value" && value == null)
+            {
+                throw new HelperException("set_value needs value");
+            }
+            AutomationElement element = Target(req);
+            IntPtr hwnd = scopeWindow;
+            Dictionary<string, object> before = Node(element, 0);
+            if (action == "focus" && hwnd != IntPtr.Zero && Native.IsWindow(hwnd))
+            {
+                Focus(hwnd);
+            }
+
+            Exception failure = null;
+            Thread worker = new Thread(delegate()
+            {
+                try
+                {
+                    Perform(element, action, value);
+                }
+                catch (Exception e)
+                {
+                    failure = e;
+                }
+            });
+            worker.IsBackground = true;
+            worker.SetApartmentState(ApartmentState.MTA);
+            worker.Start();
+            bool known = hwnd != IntPtr.Zero && Native.IsWindow(hwnd);
+            bool wasEnabled = known && Native.IsWindowEnabled(hwnd);
+            // The action counts as done when it returned, or when the window stopped taking input for a window it opened.
+            bool returned = WaitUntil(delegate { return worker.Join(0) || (wasEnabled && !Native.IsWindowEnabled(hwnd)); }, ActWaitMs) && worker.Join(0);
+            if (returned && failure != null)
+            {
+                if (failure is HelperException)
+                {
+                    throw failure;
+                }
+                if (failure is ElementNotEnabledException)
+                {
+                    throw new HelperException("the element is disabled; wait until it is enabled");
+                }
+                if (failure is ElementNotAvailableException)
+                {
+                    throw new HelperException("element " + before["ref"] + " no longer exists; call ui.tree again");
+                }
+                if (failure is InvalidOperationException)
+                {
+                    throw new HelperException(action + " is not possible on the element in its present state: " + failure.Message);
+                }
+                UiaHelper.Log("'ui.act' " + action + " failed: " + failure);
+                throw new HelperException(action + " failed: " + failure.Message + "; see helper.log in the agent's uia folder");
+            }
+
+            Dictionary<string, object> r = new Dictionary<string, object>();
+            Thread.Sleep(ActSettleMs);
+            if (hwnd != IntPtr.Zero && Native.IsWindow(hwnd) && !Responds(hwnd, ActRespondMs))
+            {
+                r["node"] = before;
+                r["unresponsive"] = true;
+                return r;
+            }
+            try
+            {
+                r["node"] = Node(element.GetUpdatedCache(nodeCacheControl), 0);
+            }
+            catch (ElementNotAvailableException)
+            {
+                r["node"] = before;
+                r["gone"] = true;
+            }
+            return r;
         }
 
         // ---- refs ----
@@ -834,6 +1348,7 @@ namespace Alcove
             if (key != null && refsByKey.TryGetValue(key, out entry))
             {
                 entry.Element = element;
+                entry.Window = scopeWindow;
                 entry.Used = ++clock;
                 return "e" + entry.Number.ToString(CultureInfo.InvariantCulture);
             }
@@ -841,6 +1356,7 @@ namespace Alcove
             entry.Number = nextRef++;
             entry.Key = key;
             entry.Element = element;
+            entry.Window = scopeWindow;
             entry.Used = ++clock;
             refsByNumber[entry.Number] = entry;
             if (key != null)
@@ -889,6 +1405,11 @@ namespace Alcove
             if (!refsByNumber.TryGetValue(number, out entry))
             {
                 throw new HelperException(gone);
+            }
+            scopeWindow = entry.Window;
+            if (entry.Window != IntPtr.Zero && Native.IsWindow(entry.Window))
+            {
+                RequireResponding(entry.Window);
             }
             try
             {
@@ -1100,6 +1621,7 @@ namespace Alcove
                 hwnd = ResolveWindow(Params.Str(req, "window"));
                 root = WindowElement(hwnd, walk.Cache);
             }
+            scopeWindow = hwnd;
 
             walk.Nodes.Add(Node(root, 0));
             WalkChildren(walk, root, 0, 1);
@@ -1217,7 +1739,8 @@ namespace Alcove
                 names.Sort(StringComparer.Ordinal);
                 throw new HelperException("unknown role " + Json.Write(selector.Role) + "; use one of " + string.Join(", ", names.ToArray()));
             }
-            AutomationElement root = WindowElement(ResolveWindow(selector.Window), matchCache);
+            scopeWindow = ResolveWindow(selector.Window);
+            AutomationElement root = WindowElement(scopeWindow, matchCache);
             if (IsMatch(search, root))
             {
                 search.Found.Add(root);
@@ -1659,9 +2182,10 @@ namespace Alcove
             {
                 throw new HelperException("no element has the keyboard focus; click a window or use win.action focus");
             }
+            scopeWindow = TopWindow(element);
             Dictionary<string, object> r = new Dictionary<string, object>();
             r["node"] = Node(element, 0);
-            r["window"] = WindowObjectOrNull(TopWindow(element));
+            r["window"] = WindowObjectOrNull(scopeWindow);
             return r;
         }
     }

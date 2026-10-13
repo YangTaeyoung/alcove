@@ -118,6 +118,7 @@ func (s *Server) handle(c net.Conn) {
 		"token": s.opt.Token, "caps": s.caps()})
 	s.addConn(cn)
 	defer s.removeConn(cn)
+	s.startUI()
 
 	done := make(chan struct{})
 	defer close(done)

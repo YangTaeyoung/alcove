@@ -88,3 +88,19 @@ func killByName(name string, tree bool) (int, error) {
 	}
 	return killed, nil
 }
+
+// resolveProgram returns the program to start for an app.launch path.
+func resolveProgram(path string) string { return path }
+
+// processParents maps each running process to its parent.
+func processParents() map[int]int {
+	procs, err := listProcesses()
+	if err != nil {
+		return nil
+	}
+	parents := make(map[int]int, len(procs))
+	for _, p := range procs {
+		parents[p.PID] = p.PPID
+	}
+	return parents
+}

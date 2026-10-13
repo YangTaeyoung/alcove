@@ -15,15 +15,22 @@ type uiCall struct {
 	timeout time.Duration
 }
 
+// fakeUI records the calls of requests in calls and the calls the server
+// makes on its own, which carry no parameters, in starts.
 type fakeUI struct {
-	mu    sync.Mutex
-	calls []uiCall
-	err   error
+	mu     sync.Mutex
+	calls  []uiCall
+	starts []uiCall
+	err    error
 }
 
 func (f *fakeUI) Call(op string, params map[string]any, timeout time.Duration) (map[string]any, error) {
 	f.mu.Lock()
-	f.calls = append(f.calls, uiCall{op, params, timeout})
+	if params == nil {
+		f.starts = append(f.starts, uiCall{op, params, timeout})
+	} else {
+		f.calls = append(f.calls, uiCall{op, params, timeout})
+	}
 	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
@@ -73,6 +80,28 @@ func TestUIOpsPassThrough(t *testing.T) {
 		if len(got.params) != 2 || got.params["role"] != "button" || got.params["limit"] != float64(5) {
 			t.Errorf("%s: params %v", c.op, got.params)
 		}
+	}
+}
+
+func TestConnectionStartsTheUIHelper(t *testing.T) {
+	ui := &fakeUI{}
+	_, r, _, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui})
+	expect(t, r, "hello")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ui.mu.Lock()
+		starts := append([]uiCall(nil), ui.starts...)
+		ui.mu.Unlock()
+		if len(starts) == 1 {
+			if starts[0].op != "ping" || starts[0].timeout != 20*time.Second {
+				t.Fatalf("start call %+v", starts[0])
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("start calls %d", len(starts))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

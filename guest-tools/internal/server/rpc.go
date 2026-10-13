@@ -106,4 +106,5 @@ func (s *Server) registerBuiltins() {
 	s.registerShell()
 	s.registerFiles()
 	s.registerUI()
+	s.registerLaunch()
 }

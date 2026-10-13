@@ -7,7 +7,10 @@ import (
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
 
-const errNoUI = "UI Automation is only available on Windows guests"
+const (
+	errNoUI        = "UI Automation is only available on Windows guests"
+	uiStartTimeout = 20 * time.Second
+)
 
 // UI is the UI Automation helper behind the ui and win ops.
 type UI interface {
@@ -17,6 +20,19 @@ type UI interface {
 // HandleUIEvent re-emits a helper event to every open connection.
 func (s *Server) HandleUIEvent(name string, fields map[string]any) {
 	s.emit(name, fields)
+}
+
+// startUI starts the helper in the background when it does not run; window
+// events reach the connections from then on.
+func (s *Server) startUI() {
+	if s.opt.UI == nil {
+		return
+	}
+	go func() {
+		if _, err := s.opt.UI.Call("ping", nil, uiStartTimeout); err != nil {
+			s.opt.Logger.Printf("UI helper: %v", err)
+		}
+	}()
 }
 
 func (s *Server) registerUI() {

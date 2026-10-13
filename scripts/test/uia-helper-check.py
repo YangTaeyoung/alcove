@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Checks the agent's win.* and ui.* read operations against a running Windows VM.
+"""Checks the agent's win.*, ui.* and app.launch operations and its window
+events against a running Windows VM.
 
 Talks docs/agent-protocol.md directly on the forwarded agent port and drives
-Notepad and File Explorer in the guest. Needs the agent installed with
---allow-exec (scripts/test/install-agent.py) and no Notepad running. Each
-check prints `PASS <n> <title>` or `FAIL <n>: <reason>`; the script exits 1
-when a check failed. Files go under C:\\alcove-e2e\\uia.
+Notepad, File Explorer and the fixture app (build/alcove-fixture-windows-arm64.exe,
+built by scripts/test/all.sh) in the guest. Needs the agent installed with
+--allow-exec (scripts/test/install-agent.py) and neither Notepad nor the
+fixture running. Each check prints `PASS <n> <title>` or `FAIL <n>: <reason>`;
+the script exits 1 when a check failed. Files go under C:\\alcove-e2e.
 
 Before Notepad starts, the files of its saved tabs are copied to a temporary
 directory on the host, whose path is printed. However the run ends, a second
-connection ends the Notepad processes the script started, puts Notepad's
-saved tabs back, closes the File Explorer window the script opened and
-deletes the files it wrote. The host copy is deleted after the tabs were
+connection ends the Notepad and fixture processes the script started, puts
+Notepad's saved tabs back, closes the File Explorer window the script opened
+and deletes the files it wrote. The host copy is deleted after the tabs were
 put back; when that fails it stays and the script prints how to restore them.
 
 Usage: uia-helper-check.py [--agent-port N] [--only N[,N...]] [--kill-helper]
@@ -20,9 +22,16 @@ Usage: uia-helper-check.py [--agent-port N] [--only N[,N...]] [--kill-helper]
 that a ref of the first replacement is unknown to the second; the checks then
 run against the helper the agent started for the next operation.
 """
-import argparse, base64, json, ntpath, os, re, select, shutil, signal, socket, sys, tempfile, time
+import argparse, base64, hashlib, json, ntpath, os, re, select, shutil, signal, socket, sys, tempfile, time
 
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+FIXTURE_BUILD = os.path.join(ROOT, "build", "alcove-fixture-windows-arm64.exe")
 E2E = r"C:\alcove-e2e"
+FIXTURE = E2E + r"\alcove-fixture.exe"
+FIXTURE_TITLE = "Alcove Fixture"
+MESSAGE = '안녕 "fixture"'
+SECRET = "hunter2-비밀-7Q"
+CHUNK = 262144
 
 BASE = r"C:\alcove-e2e\uia"
 NOTE_NAME = "alcove-uia-check.txt"
@@ -40,6 +49,7 @@ FRAME_PS = ("$v = Get-CimInstance Win32_VideoController | Where-Object { $_.Curr
 NODE_KEYS = {"ref", "depth", "role", "name", "x", "y", "w", "h", "flags"}
 NODE_FLAGS = {"focused", "disabled", "offscreen", "selected", "checked", "expanded", "collapsed", "password"}
 WINDOW_KEYS = {"id", "title", "pid", "process", "class", "x", "y", "w", "h", "state", "foreground", "responding", "modal"}
+FIXTURE_LOG = BASE + r"\fixture.log"
 
 
 class Failure(Exception):
@@ -56,6 +66,7 @@ class Agent:
         self.s = socket.create_connection(("127.0.0.1", port), timeout=10)
         self.buf = b""
         self.next_id = 0
+        self.events = []
         self.hello = self._next(10)
         expect(self.hello and self.hello.get("t") == "hello", f"expected hello, got {self.hello!r}")
         self.send({"t": "welcome", "v": 1})
@@ -77,8 +88,16 @@ class Agent:
         line, self.buf = self.buf.split(b"\n", 1)
         return json.loads(line)
 
+    def _file(self, m):
+        """Answers a ping and keeps an event with its arrival time."""
+        if m.get("t") == "ping":
+            self.send({"t": "pong"})
+        elif m.get("t") == "ev":
+            m["at"] = time.time()
+            self.events.append(m)
+
     def ask(self, op, timeout=150, **params):
-        """Sends a request and returns its reply as the agent sent it; answers pings while waiting."""
+        """Sends a request and returns its reply as the agent sent it; answers pings and keeps events while waiting."""
         self.next_id += 1
         rid = self.next_id
         self.send({"t": "req", "id": rid, "op": op, **params})
@@ -86,10 +105,23 @@ class Agent:
         while True:
             m = self._next(max(0, end - time.time()))
             expect(m is not None, f"no reply to {op} within {timeout} s")
-            if m.get("t") == "ping":
-                self.send({"t": "pong"})
-            elif m.get("t") == "res" and m.get("id") == rid:
+            if m.get("t") == "res" and m.get("id") == rid:
                 return m
+            self._file(m)
+
+    def event(self, name, pick, what, timeout=10):
+        """Returns the first kept or arriving event of that name for which pick(event) is true."""
+        end = time.time() + timeout
+        seen = 0
+        while True:
+            for e in self.events[seen:]:
+                if e.get("name") == name and pick(e):
+                    return e
+            seen = len(self.events)
+            m = self._next(max(0, end - time.time()))
+            expect(m is not None, f"no {name} event {what} within {timeout} s; events since the check began: "
+                                  f"{[(e.get('name'), (e.get('window') or {}).get('title', e.get('pid'))) for e in self.events]!r}")
+            self._file(m)
 
     def call(self, op, timeout=150, **params):
         """Sends a request and returns its result; a failed reply fails the check."""
@@ -131,6 +163,9 @@ class Run:
         self.document_role = None
         self.explorer_before = None
         self.explorer_window = None
+        self.fixture_pushed = False
+        self.fixture_pids = []
+        self.fixture = None
 
     def windows(self):
         return self.a.call("win.list")["windows"]
@@ -172,6 +207,34 @@ class Run:
 
     def notepad_pids(self):
         return {p["pid"] for p in self.a.call("proc.list", name="notepad")["procs"]}
+
+    def push_fixture(self):
+        """Writes the fixture build to FIXTURE unless the guest already holds those bytes."""
+        expect(os.path.exists(FIXTURE_BUILD), f"missing {FIXTURE_BUILD}; build it with scripts/test/all.sh")
+        data = open(FIXTURE_BUILD, "rb").read()
+        digest = hashlib.sha256(data).hexdigest()
+        self.fixture_pushed = True
+        st = self.a.call("fs.stat", path=FIXTURE, sha256=True)
+        if st["exists"] and st.get("sha256") == digest:
+            return
+        for off in range(0, len(data), CHUNK):
+            self.a.call("fs.write", path=FIXTURE, offset=off, truncate=off == 0, mkdirs=True,
+                        data=base64.b64encode(data[off:off + CHUNK]).decode())
+        st = self.a.call("fs.stat", path=FIXTURE, sha256=True)
+        expect(st.get("sha256") == digest, f"{FIXTURE} has SHA-256 {st.get('sha256')!r} after the upload, the build has {digest}")
+
+    def launch_fixture(self):
+        """Starts the fixture through app.launch and returns the reply."""
+        expect(self.a.call("proc.list", name="alcove-fixture")["procs"] == [],
+               "alcove-fixture.exe runs already; end it in the guest before this check")
+        self.push_fixture()
+        r = self.a.call("app.launch", path=FIXTURE, args=["--log", FIXTURE_LOG])
+        expect(type(r.get("pid")) is int and r["pid"] > 0, f"app.launch returned pid {r.get('pid')!r}")
+        self.fixture_pids.append(r["pid"])
+        return r
+
+    def fixture_log(self):
+        return self.read_file(FIXTURE_LOG).decode("utf-8", "replace").splitlines()
 
 
 def restore(a, root, copy, names):
@@ -385,6 +448,11 @@ def _(a, run):
         check_node(n, "ui.tree")
     r = a.call("ui.tree", window=w["id"], max=2000)
     expect(r["truncated"] is False and len(r["nodes"]) < whole, f"filter interactive gave {len(r['nodes'])} of {whole} nodes")
+    fitting = a.call("ui.tree", window=w["id"], max=len(r["nodes"]))
+    expect(fitting["truncated"] is False and len(fitting["nodes"]) == len(r["nodes"]),
+           f"max equal to the {len(r['nodes'])} listed nodes gave {len(fitting['nodes'])} nodes, truncated {fitting['truncated']!r}")
+    size_only = a.call("ui.text", ref=items[0]["ref"], mode="descendants", length=0)
+    expect(size_only["text"] == "" and size_only["total"] == row["total"], f"ui.text with length 0 answered {size_only!r}")
     return (f"{whole} nodes with filter all in {whole_s:.2f} s, {len(r['nodes'])} with interactive; max {limit} answered in {cut_s:.2f} s; "
             f"found {[(n['role'], n['name'], n['flags']) for n in found]!r}")
 
@@ -401,6 +469,221 @@ def _(a, run):
     root = a.call("ui.tree", root=r["node"]["ref"], depth=0)
     expect([n["ref"] for n in root["nodes"]] == [r["node"]["ref"]], f"ui.tree with the focused ref as root gave {root['nodes']!r}")
     return f"{r['node']['role']} {r['node']['name']!r} in {r['window']['title']!r}"
+
+
+def same_window(a, wid):
+    """Returns the win.list entry with that id, or None."""
+    return next((w for w in a.call("win.list")["windows"] if w["id"] == wid), None)
+
+
+def act(a, run, action, **selector):
+    """Runs ui.act on an element of the fixture window and returns the reply."""
+    r = a.call("ui.act", window=run.fixture["id"], action=action, **selector)
+    check_node(r["node"], f"ui.act {action}")
+    expect(set(r) <= {"t", "id", "ok", "node", "gone", "unresponsive"}, f"ui.act {action} returned unknown fields: {sorted(r)!r}")
+    return r
+
+
+@check("app.launch starts the fixture, returns its window and a window.opened event arrives")
+def _(a, run):
+    seen = len(a.events)
+    t0 = time.time()
+    r = run.launch_fixture()
+    took = time.time() - t0
+    w = r.get("window")
+    expect(w is not None, f"app.launch returned no window: {r!r}")
+    check_window(w, "app.launch window")
+    expect(w["title"] == FIXTURE_TITLE and w["process"].lower() == "alcove-fixture.exe" and w["pid"] == r["pid"],
+           f"the window is {w!r} for pid {r['pid']}")
+    expect(w["state"] == "normal" and w["responding"] is True and w["w"] > 300 and w["h"] > 300, f"the window is {w!r}")
+    ev = a.event("window.opened", lambda e: e in a.events[seen:] and e["window"]["id"] == w["id"], f"for window {w['id']}")
+    check_window(ev["window"], "window.opened")
+    expect(ev["window"]["title"] == FIXTURE_TITLE, f"the event carries {ev['window']!r}")
+    listed = same_window(a, w["id"])
+    expect(listed and listed["title"] == FIXTURE_TITLE, f"win.list does not show window {w['id']}")
+    label = a.call("ui.find", window=w["id"], role="Text", name="한글 라벨")["nodes"]
+    expect(len(label) == 1, f"{len(label)} Text elements are named 한글 라벨")
+    run.fixture = w
+    return f"pid {r['pid']}, window {w['id']} {w['w']}x{w['h']} after {took:.2f} s, foreground {w['foreground']}, event {ev['at'] - t0:.2f} s after the request"
+
+
+@check("ui.act sets the message, presses Send and ui.text reads the finished transcript")
+def _(a, run):
+    expect(run.fixture, "check 8 did not start the fixture")
+    r = act(a, run, "set_value", role="Edit", name="Message", value=MESSAGE)
+    expect(r["node"].get("value") == MESSAGE, f"after set_value the node is {r['node']!r}")
+    r = act(a, run, "invoke", role="Button", name="Send")
+    expect(r["node"]["name"] == "Send", f"ui.act invoke returned {r['node']!r}")
+    t0 = time.time()
+    lengths = []
+    while True:
+        t = a.call("ui.text", window=run.fixture["id"], role="Document", name="Transcript")
+        lengths.append(t["total"])
+        if "[done]" in t["text"]:
+            break
+        expect(time.time() - t0 < 20, f"the transcript has no [done] after 20 s: {t['text']!r}")
+        time.sleep(0.1)
+    text = t["text"]
+    expect(f"You: {MESSAGE}\n" in text, f"the transcript lacks the sent line: {text!r}")
+    bot = [l for l in text.split("\n") if l.startswith("Bot: ")]
+    expect(len(bot) == 1, f"the transcript has {len(bot)} Bot lines: {text!r}")
+    words = bot[0][len("Bot: "):].split()
+    expect(words == (["echo"] + MESSAGE.split()) * 10, f"the reply is {words!r}")
+    expect(len(set(lengths)) > 3, f"ui.text saw the transcript at only {len(set(lengths))} lengths while it was written")
+    sent = [l for l in run.fixture_log() if " send " in l]
+    expect(sent and sent[-1].endswith(" send " + MESSAGE), f"the fixture log has no send line for the message: {sent!r}")
+    wrong = a.ask("ui.act", window=run.fixture["id"], role="Button", name="Send", action="toggle")
+    expect(wrong.get("ok") is False and "does not support toggle" in wrong.get("error", "") and "invoke" in wrong["error"],
+           f"ui.act toggle on a button answered {wrong!r}")
+    return f"{len(text)} characters, {len(words)} reply words, read at {len(set(lengths))} lengths in {time.time() - t0:.1f} s"
+
+
+@check("the Dialog button raises dialog.opened and win.action close raises window.closed")
+def _(a, run):
+    expect(run.fixture, "check 8 did not start the fixture")
+    seen = len(a.events)
+    t0 = time.time()
+    act(a, run, "invoke", role="Button", name="Dialog")
+    ev = a.event("dialog.opened", lambda e: e in a.events[seen:] and e["window"]["title"] == "Fixture Dialog", "titled Fixture Dialog")
+    opened_after = ev["at"] - t0
+    d = ev["window"]
+    check_window(d, "dialog.opened")
+    expect(d["class"] == "#32770" and d["modal"] is True and d["pid"] == run.fixture["pid"], f"the dialog is {d!r}")
+    expect(any(e.get("name") == "window.opened" and e["window"]["id"] == d["id"] for e in a.events[seen:]),
+           f"no window.opened event for the dialog {d['id']}")
+    body = a.call("ui.find", window=d["id"], role="Text", name="Dialog body")["nodes"]
+    expect(len(body) == 1, f"the dialog has {len(body)} Text elements named Dialog body")
+    seen = len(a.events)
+    t0 = time.time()
+    r = a.call("win.action", window=d["id"], action="close")
+    expect(r.get("closed") is True and r.get("window") is None, f"win.action close answered {r!r}")
+    ev = a.event("window.closed", lambda e: e in a.events[seen:] and e["window"]["id"] == d["id"], f"for window {d['id']}")
+    expect(same_window(a, d["id"]) is None, f"win.list still shows the dialog {d['id']}")
+    gone = a.ask("win.action", window=d["id"], action="close")
+    expect(gone.get("ok") is False and "win.list" in gone.get("error", ""), f"win.action on the closed dialog answered {gone!r}")
+    return f"dialog {d['id']}; dialog.opened {opened_after:.2f} s after the request, window.closed {ev['at'] - t0:.2f} s after the request"
+
+
+@check("win.action minimizes, restores, moves, resizes and focuses the fixture window")
+def _(a, run):
+    expect(run.fixture, "check 8 did not start the fixture")
+    wid = run.fixture["id"]
+
+    def do(action, **params):
+        r = a.call("win.action", window=wid, action=action, **params)
+        check_window(r["window"], f"win.action {action}")
+        expect(r["window"]["id"] == wid, f"win.action {action} answered for {r['window']['id']}")
+        listed = same_window(a, wid)
+        expect(listed and all(listed[k] == r["window"][k] for k in ("x", "y", "w", "h", "state")),
+               f"after {action} win.list shows {listed!r}, win.action returned {r['window']!r}")
+        return r["window"]
+
+    w = do("minimize")
+    expect(w["state"] == "minimized" and (w["w"], w["h"]) == (0, 0) and w["foreground"] is False, f"after minimize: {w!r}")
+    w = do("restore")
+    expect(w["state"] == "normal" and w["w"] > 0, f"after restore: {w!r}")
+    w = do("maximize")
+    fw, fh = run.frame or (None, None)
+    expect(w["state"] == "maximized" and (fw is None or (w["x"], w["y"], w["w"]) == (0, 0, fw)), f"after maximize: {w!r}")
+    w = do("restore")
+    expect(w["state"] == "normal", f"after the second restore: {w!r}")
+    w = do("move", x=40, y=40)
+    expect((w["x"], w["y"]) == (40, 40), f"after move to 40,40: {w!r}")
+    w = do("resize", w=800, h=600)
+    expect((w["x"], w["y"], w["w"], w["h"]) == (40, 40, 800, 600), f"after resize to 800x600: {w!r}")
+    send = a.call("ui.rect", window=wid, role="Button", name="Send")
+    expect(40 < send["cx"] < 840 and 40 < send["cy"] < 640, f"the Send button is at {send['cx']},{send['cy']}, outside the moved window")
+
+    other = a.call("win.action", window="Program Manager", action="focus")["window"]
+    expect(other["foreground"] is True, f"the desktop did not come to the foreground: {other!r}")
+    behind = same_window(a, wid)
+    expect(behind["foreground"] is False, f"the fixture is still in the foreground after the desktop was focused: {behind!r}")
+    w = do("focus")
+    expect(w["foreground"] is True, f"after focus: {w!r}")
+    expect(same_window(a, wid)["foreground"] is True, "win.list does not show the fixture in the foreground after focus")
+    r = act(a, run, "focus", role="Edit", name="Message")
+    expect("focused" in r["node"]["flags"], f"after ui.act focus the node is {r['node']!r}")
+    f = a.call("ui.focused")
+    expect(f["node"]["ref"] == r["node"]["ref"] and f["window"]["id"] == wid, f"ui.focused reports {f['node']!r} in {f['window']['title']!r}")
+    bad = a.ask("win.action", window=wid, action="resize", w=800)
+    expect(bad.get("ok") is False and bad.get("error") == "resize needs w and h", f"resize without h answered {bad!r}")
+    return f"window {wid} at {w['x']},{w['y']} {w['w']}x{w['h']}, foreground {w['foreground']}"
+
+
+@check("after Hang win.list reports the fixture as not responding and killing it raises process.exited")
+def _(a, run):
+    expect(run.fixture, "check 8 did not start the fixture")
+    wid, pid = run.fixture["id"], run.fixture["pid"]
+    t0 = time.time()
+    r = act(a, run, "invoke", role="Button", name="Hang")
+    act_s = time.time() - t0
+    expect(r.get("unresponsive") is True, f"ui.act invoke on Hang answered {r!r}")
+    while True:
+        w = same_window(a, wid)
+        expect(w is not None, f"window {wid} left win.list after Hang")
+        if w["responding"] is False:
+            break
+        expect(time.time() - t0 < 10, f"win.list still reports responding for {wid} 10 s after Hang")
+        time.sleep(0.3)
+    hung_after = time.time() - t0
+    tree = a.ask("ui.tree", window=wid)
+    expect(tree.get("ok") is False and "is not responding" in tree.get("error", "") and "proc.kill" in tree["error"],
+           f"ui.tree of the hung window answered {tree!r}")
+    end = time.time() + 5
+    while True:
+        titled = [w for w in a.call("win.list")["windows"] if FIXTURE_TITLE in w["title"]]
+        ghost = [w for w in titled if w["class"] == "Ghost"]
+        if ghost or time.time() > end:
+            break
+        time.sleep(0.3)
+    stray = [w for w in titled if w["pid"] != pid or w["process"].lower() != "alcove-fixture.exe"]
+    expect(stray == [], f"a window titled like the fixture reports another process: {stray!r}")
+    seen = len(a.events)
+    t0 = time.time()
+    expect(a.call("proc.kill", pid=pid)["killed"] == 1, "proc.kill did not report one killed process")
+    ev = a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}")
+    expect(type(ev.get("code")) is int and ev.get("path", "").lower() == FIXTURE.lower(), f"the event is {ev!r}")
+    a.event("window.closed", lambda e: e in a.events[seen:] and e["window"]["id"] == wid, f"for window {wid}")
+    run.fixture = None
+    return (f"ui.act answered after {act_s:.1f} s, responding false {hung_after:.1f} s after Hang, "
+            + (f"the system's {ghost[0]['title']!r} window reports pid {ghost[0]['pid']}, " if ghost else "no Ghost window appeared, ")
+            + f"process.exited {ev['at'] - t0:.2f} s after proc.kill with code {ev['code']}")
+
+
+@check("the text of a password field is never returned and ui.act set_value still fills it")
+def _(a, run):
+    r = run.launch_fixture()
+    expect(r.get("window"), f"app.launch returned no window: {r!r}")
+    run.fixture = r["window"]
+    wid = run.fixture["id"]
+    r = act(a, run, "set_value", role="Edit", name="Secret", value=SECRET)
+    expect("password" in r["node"]["flags"] and "value" not in r["node"], f"after set_value the node is {r['node']!r}")
+    end = time.time() + 5
+    while True:
+        changes = [l for l in run.fixture_log() if " secret " in l]
+        if changes and changes[-1].endswith(f" secret {len(SECRET)}"):
+            break
+        expect(time.time() < end, f"the fixture did not log a secret of {len(SECRET)} characters: {changes!r}")
+        time.sleep(0.2)
+    replies = {}
+    for mode in ("auto", "pattern", "descendants"):
+        replies[f"ui.text {mode}"] = a.ask("ui.text", window=wid, role="Edit", name="Secret", mode=mode)
+        expect(replies[f"ui.text {mode}"].get("error") == "the element is a password field; its text is not read",
+               f"ui.text mode {mode} of the password field answered {replies[f'ui.text {mode}']!r}")
+    replies["ui.text by ref"] = a.ask("ui.text", ref=r["node"]["ref"])
+    replies["ui.text of the window"] = a.call("ui.text", window=wid, role="Window", mode="descendants")
+    replies["ui.tree"] = a.call("ui.tree", window=wid, filter="all", max=2000)
+    replies["ui.tree interactive"] = a.call("ui.tree", window=wid)
+    replies["ui.find"] = a.call("ui.find", window=wid, name="Secret")
+    replies["ui.rect"] = a.call("ui.rect", window=wid, role="Edit", name="Secret")
+    replies["ui.focused"] = a.call("ui.focused")
+    for what, reply in replies.items():
+        expect(SECRET not in json.dumps(reply, ensure_ascii=False), f"{what} returned the typed secret")
+    field = [n for n in replies["ui.tree interactive"]["nodes"] if n["role"] == "Edit" and n["name"] == "Secret"]
+    expect(len(field) == 1 and "password" in field[0]["flags"] and "value" not in field[0], f"ui.tree lists the field as {field!r}")
+    shown = replies["ui.text of the window"]["text"].split("\n")
+    expect("Message" in shown and "한글 라벨" in shown, f"the text below the window is {shown!r}")
+    return f"{len(replies)} replies checked; the fixture logged a secret of {len(SECRET)} characters"
 
 
 def wait_gone(a, pids, timeout=15):
@@ -433,24 +716,34 @@ def restore_notepad(a, run):
 
 
 def cleanup(port, run):
-    """On a new connection: ends the Notepad processes the run started, puts
-    Notepad's saved tabs back, closes the File Explorer windows the run opened
-    and deletes the files it wrote. Returns the sentences that say what could
-    not be cleaned up."""
+    """On a new connection: ends the fixture and Notepad processes the run
+    started, puts Notepad's saved tabs back, closes the File Explorer windows
+    the run opened and deletes the files it wrote. Returns the sentences that
+    say what could not be cleaned up."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     problems = []
     try:
         a = Agent(port)
     except Exception as e:
-        problems.append(f"cleanup did not run: {e}; Notepad, a File Explorer window and files under {E2E} may remain in the guest")
+        problems.append(f"cleanup did not run: {e}; the fixture, Notepad, a File Explorer window and files under {E2E} may remain in the guest")
         if run.notepad_copy:
             problems.append(f"Notepad's saved tabs as they were before the run are in {run.notepad_copy} on the host")
         return problems
 
-    steps = []
+    def kill_fixtures():
+        for pid in run.fixture_pids:
+            if any(p["pid"] == pid for p in a.call("proc.list", name="alcove-fixture")["procs"]):
+                a.call("proc.kill", pid=pid)
+        end = time.time() + 10
+        while {p["pid"] for p in a.call("proc.list", name="alcove-fixture")["procs"]} & set(run.fixture_pids) and time.time() < end:
+            time.sleep(0.3)
+
+    steps = [("ending the fixture", kill_fixtures)]
     if run.explorer_before is not None:
         steps.append(("closing File Explorer", lambda: close_explorer(a, explorer_windows(a) - run.explorer_before)))
     steps.append((f"deleting {BASE}", lambda: a.call("fs.delete", path=BASE, recursive=True)))
+    if run.fixture_pushed:
+        steps.append((f"deleting {FIXTURE}", lambda: a.call("fs.delete", path=FIXTURE)))
     steps.append((f"deleting {E2E}", lambda: a.ask("fs.delete", path=E2E)))
     if run.notepad_before is not None:
         problem = restore_notepad(a, run)
