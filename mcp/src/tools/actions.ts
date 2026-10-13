@@ -3,7 +3,7 @@
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, batchResult, observationTime, observeParams, observePayload, waitForResult, type ObserveArgs } from "../observation.js";
-import { fail, text, vmName, type Registrar } from "../toolkit.js";
+import { FIND_TEXT_TIMEOUT_MS, fail, text, vmName, type Registrar } from "../toolkit.js";
 
 const buttonEnum = z.enum(["left", "right", "middle"]);
 const regionSchema = z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() });
@@ -119,7 +119,7 @@ export function register(r: Registrar, client: ControlClient): void {
           ...(regex !== undefined ? { regex } : {}),
           ...(region ? { region } : {}),
           ...(languages ? { languages } : {}),
-        }, 60000);
+        }, FIND_TEXT_TIMEOUT_MS);
         const matches = (reply.matches as Array<Record<string, unknown>>) ?? [];
         const shown = matches.slice(0, 200).map((m) => `"${m.text}" at (${m.cx}, ${m.cy}) [${m.x},${m.y} ${m.w}x${m.h}]`);
         const more = matches.length > 200 ? [`...${matches.length - 200} more matches not shown; narrow the query or region`] : [];

@@ -83,6 +83,13 @@ export function uiCallTimeout(helperCalls = 1): number {
   return helperCalls * (HELPER_QUEUE_MS + HELPER_CALL_MS) + UI_FACTS_BUDGET_MS + CALL_MARGIN_MS;
 }
 
+/** Longest `vm.find_text` waits for its turn in the control server's line of text recognitions, in ms. */
+export const TEXT_TURN_MS = 60000;
+/** Allowance in ms for the recognition of `vm.find_text` once its turn has come. */
+export const TEXT_READING_MS = 10000;
+/** `client.call` timeout in ms of `alcove_find_text`: the wait for its turn, the recognition and the margin. */
+export const FIND_TEXT_TIMEOUT_MS = TEXT_TURN_MS + TEXT_READING_MS + CALL_MARGIN_MS;
+
 /** `uiCallTimeout` of a control op that makes one helper call. */
 export const UI_CALL_TIMEOUT_MS = uiCallTimeout(1);
 /** `client.call` timeout in ms of `alcove_deploy`: copy, installer, launch and window wait. */

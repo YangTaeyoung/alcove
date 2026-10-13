@@ -3,19 +3,23 @@ import assert from "node:assert/strict";
 import { register as registerActions } from "./tools/actions.js";
 import { register as registerCore } from "./tools/core.js";
 import type { ControlClient } from "./control.js";
-import type { Registrar, ToolHandler } from "./toolkit.js";
+import { CALL_MARGIN_MS, TEXT_READING_MS, TEXT_TURN_MS, type Registrar, type ToolHandler } from "./toolkit.js";
 
 type Call = { op: string; params: Record<string, unknown> };
 
 function rig(reply: Record<string, unknown> = {}) {
   const calls: Call[] = [];
+  const timeouts: Array<number | undefined> = [];
   const handlers = new Map<string, ToolHandler>();
   const registrar: Registrar = { tool: (_set, name, _config, handler) => void handlers.set(name, handler) };
-  const client = { call: async (op: string, params: Record<string, unknown> = {}) => (calls.push({ op, params }), reply) } as unknown as ControlClient;
+  const client = {
+    call: async (op: string, params: Record<string, unknown> = {}, timeoutMs?: number) => (calls.push({ op, params }), timeouts.push(timeoutMs), reply),
+  } as unknown as ControlClient;
   registerActions(registrar, client);
   registerCore(registrar, client);
   return {
     calls,
+    timeouts,
     run: async (tool: string, args: Record<string, unknown>) => {
       await handlers.get(tool)!(args);
       return calls[calls.length - 1];
@@ -48,6 +52,13 @@ test("the basic action tools send the parameter names the control ops read", asy
   assert.deepEqual(sent(await run("alcove_scroll", { name: "W", x: 1, y: 2, dy: 3 })), { op: "vm.mouse.scroll", params: { name: "W", x: 1, y: 2, dy: 3, dx: 0, observe: "summary" } });
   assert.deepEqual(sent(await run("alcove_type", { name: "W", text: "hi", delay_ms: 5 })), { op: "vm.type", params: { name: "W", text: "hi", delay: 5, observe: "summary" } });
   assert.deepEqual(sent(await run("alcove_press_keys", { name: "W", keys: "ctrl+c", hold_ms: 7 })), { op: "vm.key.press", params: { name: "W", keys: "ctrl+c", hold: 7, observe: "summary" } });
+});
+
+test("alcove_find_text waits for the turn the control server gives a text search, a recognition and the margin", async () => {
+  const { run, timeouts } = rig({ matches: [] });
+  await run("alcove_find_text", { name: "W" });
+  assert.deepEqual([TEXT_TURN_MS, TEXT_READING_MS, CALL_MARGIN_MS], [60000, 10000, 5000]);
+  assert.deepEqual(timeouts, [75000]);
 });
 
 test("find_text, screenshot, wait_for and batch send the parameter names the control ops read", async () => {
