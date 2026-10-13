@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -73,5 +74,41 @@ func TestInsideDir(t *testing.T) {
 	}
 	if insideDir("", dir+sep+"agent.log") {
 		t.Error("a path is inside an empty folder name")
+	}
+}
+
+func TestDataFoldersLieUnderProgramData(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "ProgramData")
+	alcoveDir, uiaDir, err := dataFolders(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alcoveDir != filepath.Join(base, "Alcove") || uiaDir != filepath.Join(base, "Alcove", "uia") {
+		t.Fatalf("folders %q and %q", alcoveDir, uiaDir)
+	}
+	if _, err := os.Stat(alcoveDir); !os.IsNotExist(err) {
+		t.Fatalf("the folder was created: %v", err)
+	}
+}
+
+func TestDataFoldersNameNoFolderWithoutProgramData(t *testing.T) {
+	alcoveDir, uiaDir, err := dataFolders("")
+	want := "the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err %v", err)
+	}
+	if alcoveDir != "" || uiaDir != "" {
+		t.Fatalf("folders %q and %q", alcoveDir, uiaDir)
+	}
+}
+
+func TestNoHelperAnswersEveryCallWithItsError(t *testing.T) {
+	_, _, err := dataFolders("")
+	ui := noHelper{err}
+	for _, op := range []string{"ping", "win.list", "ui.tree", "ui.at"} {
+		out, got := ui.CallContext(context.Background(), op, map[string]any{"window": "foreground"}, 0)
+		if out != nil || got == nil || got.Error() != errNoProgramData {
+			t.Fatalf("%s: %v %v", op, out, got)
+		}
 	}
 }

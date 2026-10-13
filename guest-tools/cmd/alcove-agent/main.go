@@ -5,6 +5,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -44,23 +46,25 @@ func main() {
 	}
 
 	var alcoveDir, uiaDir string
-	var lockErr error
+	var dataErr, lockErr error
 	if uia.Available() {
-		base := os.Getenv("ProgramData")
-		if base == "" {
-			base = os.TempDir()
+		alcoveDir, uiaDir, dataErr = dataFolders(os.Getenv("ProgramData"))
+		if dataErr == nil {
+			lockErr = uia.LockHelperFolders(alcoveDir, uiaDir)
 		}
-		alcoveDir = filepath.Join(base, "Alcove")
-		uiaDir = filepath.Join(alcoveDir, "uia")
-		lockErr = uia.LockHelperFolders(alcoveDir, uiaDir)
 	}
 	logger := log.Default()
 	if *logPath != "" {
-		if f, err := openLog(*logPath, alcoveDir, lockErr); err != nil {
+		if dataErr != nil {
+			fmt.Fprintf(os.Stderr, "log: %s is not opened because %%ProgramData%% is not set\n", *logPath)
+		} else if f, err := openLog(*logPath, alcoveDir, lockErr); err != nil {
 			fmt.Fprintln(os.Stderr, "log:", err)
 		} else {
 			logger = log.New(f, "", log.LstdFlags)
 		}
+	}
+	if dataErr != nil {
+		logger.Print(dataErr)
 	}
 	if lockErr != nil {
 		logger.Printf("the helper folders are not locked (%v); the UI helper will not start until they can be locked", lockErr)
@@ -75,7 +79,9 @@ func main() {
 	logger.Printf("alcove-agent %s listening on %s (token %s, exec %v)", server.AgentVersion, l.Addr(), mask(*tok), *allowExec)
 	var s *server.Server
 	var ui server.UI
-	if uia.Available() {
+	if dataErr != nil {
+		ui = noHelper{dataErr}
+	} else if uia.Available() {
 		helper := uia.New(uia.DefaultLauncher(uiaDir),
 			func(name string, fields map[string]any) { s.HandleUIEvent(name, fields) })
 		helper.SetOnStart(func() { s.HandleUIStart() })
@@ -87,6 +93,27 @@ func main() {
 	err = s.Serve(l)
 	s.Close()
 	logger.Fatal(err)
+}
+
+// errNoProgramData is the answer of every UI operation of an agent that was
+// started without %ProgramData%.
+const errNoProgramData = "the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task"
+
+// dataFolders returns the Alcove folder under programData and the uia folder
+// inside it. An empty programData is an error and names no folder.
+func dataFolders(programData string) (alcoveDir, uiaDir string, err error) {
+	if programData == "" {
+		return "", "", errors.New(errNoProgramData)
+	}
+	alcoveDir = filepath.Join(programData, "Alcove")
+	return alcoveDir, filepath.Join(alcoveDir, "uia"), nil
+}
+
+// noHelper answers every UI operation with its error and starts no process.
+type noHelper struct{ err error }
+
+func (n noHelper) CallContext(context.Context, string, map[string]any, time.Duration) (map[string]any, error) {
+	return nil, n.err
 }
 
 // openLog opens the log file for appending after creating its folder. A log
