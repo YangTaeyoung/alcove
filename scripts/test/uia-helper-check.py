@@ -29,6 +29,7 @@ FIXTURE_BUILD = os.path.join(ROOT, "build", "alcove-fixture-windows-arm64.exe")
 E2E = r"C:\alcove-e2e"
 FIXTURE = E2E + r"\alcove-fixture.exe"
 FIXTURE_TITLE = "Alcove Fixture"
+HELD_TITLE = "Alcove Fixture held"
 MESSAGE = '안녕 "fixture"'
 SECRET = "hunter2-비밀-7Q"
 CHUNK = 262144
@@ -51,7 +52,8 @@ NODE_FLAGS = {"focused", "disabled", "offscreen", "selected", "checked", "expand
 WINDOW_KEYS = {"id", "title", "pid", "process", "class", "x", "y", "w", "h", "state", "foreground", "responding", "modal"}
 FIXTURE_LOG = BASE + r"\fixture.log"
 CRASH_CODE = 3221227010
-WER_ARCHIVE = r"C:\ProgramData\Microsoft\Windows\WER\ReportArchive"
+WER_DIRS = (r"C:\ProgramData\Microsoft\Windows\WER\ReportArchive", r"C:\ProgramData\Microsoft\Windows\WER\ReportQueue")
+HELPER_EXITED = "UI helper exited; retry"
 
 
 class Failure(Exception):
@@ -179,7 +181,7 @@ class Run:
         self.fixture_pushed = False
         self.fixture_pids = []
         self.fixture = None
-        self.wer_dirs = []
+        self.wer_since = None
 
     def windows(self):
         return self.a.call("win.list")["windows"]
@@ -706,29 +708,35 @@ def _(a, run):
     return f"{len(replies)} replies checked; the fixture logged a secret of {len(SECRET)} characters"
 
 
-@check("the Titles button emits a bounded number of window.title events ending at the base title")
-def _(a, run):
+def running_fixture(a, run):
+    """Returns the id of the fixture window; starts the fixture when it does not run."""
     if not run.fixture or same_window(a, run.fixture["id"]) is None:
         r = run.launch_fixture()
         expect(r.get("window"), f"app.launch returned no window: {r!r}")
         run.fixture = r["window"]
-    wid = run.fixture["id"]
+    return run.fixture["id"]
+
+
+@check("the Titles button raises one window.title for the held title and one, a second later, for the base title")
+def _(a, run):
+    wid = running_fixture(a, run)
     seen = len(a.events)
     a.call("ui.act", window=wid, role="Button", name="Titles", action="invoke")
-    # The title changes every 50 ms for 5 s and then returns to the base title.
-    a.pump(7.5)
+    # The title changes every 50 ms for 5 s, is HELD_TITLE for 600 ms and then the base title.
+    a.pump(9)
     titles = [e for e in a.events[seen:] if e.get("name") == "window.title" and e["window"]["id"] == wid]
-    expect(4 <= len(titles) <= 7, f"{len(titles)} window.title events arrived: {[e['window']['title'] for e in titles]!r}")
-    expect(titles[-1]["window"]["title"] == FIXTURE_TITLE,
-           f"the last window.title carries {titles[-1]['window']['title']!r}, expected {FIXTURE_TITLE!r}")
+    shown = [e["window"]["title"] for e in titles]
+    expect(2 <= len(titles) <= 8 and shown[-2:] == [HELD_TITLE, FIXTURE_TITLE], f"the window.title events carry {shown!r}")
+    gaps = [b["at"] - a_["at"] for a_, b in zip(titles, titles[1:])]
+    expect(all(g >= 0.9 for g in gaps), f"window.title events arrived {[round(g, 2) for g in gaps]!r} s apart: {shown!r}")
     final = same_window(a, wid)
     expect(final and final["title"] == FIXTURE_TITLE, f"the window title did not return to {FIXTURE_TITLE!r}: {final!r}")
-    return f"{len(titles)} window.title events, last {titles[-1]['window']['title']!r}"
+    return f"{len(titles)} window.title events {shown!r}, the last two {gaps[-1]:.2f} s apart"
 
 
 @check("ui.act invoke on Crash ends the fixture with a crash code and a WER report")
 def _(a, run):
-    # Crash needs a fresh process; end the fixture earlier checks left running.
+    # End the fixture earlier checks left running.
     running = {p["pid"] for p in a.call("proc.list", name="alcove-fixture")["procs"]}
     for pid in running:
         a.call("proc.kill", pid=pid)
@@ -742,6 +750,7 @@ def _(a, run):
     run.fixture = r["window"]
     wid, pid = run.fixture["id"], run.fixture["pid"]
     seen = len(a.events)
+    run.wer_since = since
     t0 = time.time()
     act = a.ask("ui.act", window=wid, role="Button", name="Crash", action="invoke")
     if act.get("ok") is True:
@@ -750,24 +759,65 @@ def _(a, run):
     ev = a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}")
     expect(ev.get("code") == CRASH_CODE, f"process.exited carries code {ev.get('code')!r}, expected {CRASH_CODE}")
     run.fixture = None
-    # Wait for Windows Error Reporting to finish, which releases the crashed exe.
-    end = time.time() + 15
-    found = find_wer(a, since)
-    while not found and time.time() < end:
-        time.sleep(0.5)
-        found = find_wer(a, since)
-    run.wer_dirs.extend(found)
-    expect(found, f"no AppCrash_alcove-fixture report created after the check started under {WER_ARCHIVE}")
-    return f"process.exited code {ev['code']} {ev['at'] - t0:.2f} s after invoke; WER report {ntpath.basename(found[0])}"
+    found = wait_wer(a, since)
+    expect(found, f"no AppCrash_alcove-fixture report created after the check started under {' or '.join(WER_DIRS)}")
+    return (f"ui.act answered {sorted(k for k in ('gone', 'pending', 'unresponsive') if act.get(k)) or act.get('error')!r}, "
+            f"process.exited code {ev['code']} {ev['at'] - t0:.2f} s after invoke; WER report {ntpath.basename(found[0])}")
+
+
+@check("a helper started with several windows open sends no window.title for 3 s")
+def _(a, run):
+    running_fixture(a, run)
+    killed = kill_helper(a)
+    seen = len(a.events)
+    ping = a.call("ui.ping")
+    expect(ping["pid"] != killed, f"helper process {killed} answers after it was killed")
+    listed = {w["id"]: w["title"] for w in run.windows() if w["title"]}
+    expect(len(listed) >= 2, f"only {len(listed)} titled windows are open: {sorted(listed.values())!r}")
+    a.pump(3)
+    titles = [e["window"] for e in a.events[seen:] if e.get("name") == "window.title"]
+    unchanged = [w["title"] for w in titles if listed.get(w["id"]) == w["title"]]
+    expect(not unchanged, f"window.title arrived for {len(unchanged)} of {len(listed)} windows whose title did not change: {unchanged!r}")
+    return f"helper pid {ping['pid']} with {len(listed)} titled windows open; {len(titles)} window.title events"
+
+
+@check("ui.ping sent right after the helper was killed starts the next helper, 20 times in a row")
+def _(a, run):
+    rounds, early, slowest = 20, 0, 0.0
+    pid = a.call("ui.ping")["pid"]
+    for n in range(1, rounds + 1):
+        a.call("proc.kill", pid=pid)
+        t0 = time.time()
+        r = a.ask("ui.ping")
+        # A ping that reached the helper while it was ending is sent again at once.
+        while r.get("ok") is False and r.get("error") == HELPER_EXITED:
+            early += 1
+            expect(time.time() - t0 < 30, f"round {n}: ui.ping still answers {HELPER_EXITED!r} 30 s after the kill")
+            r = a.ask("ui.ping")
+        expect(r.get("ok") is True, f"round {n}: ui.ping after the kill answered {r.get('error')!r}")
+        expect(r["pid"] != pid, f"round {n}: helper process {pid} answers after it was killed")
+        pid, slowest = r["pid"], max(slowest, time.time() - t0)
+    return f"{rounds} helpers started, slowest answer after {slowest:.2f} s, {early} pings reached a helper that was ending"
 
 
 def find_wer(a, since_ticks):
     """Returns the AppCrash_alcove-fixture report folders created after since_ticks."""
-    ps = (f"Get-ChildItem -LiteralPath '{WER_ARCHIVE}' -Directory -ErrorAction SilentlyContinue | "
+    dirs = ",".join(f"'{d}'" for d in WER_DIRS)
+    ps = (f"Get-ChildItem -LiteralPath {dirs} -Directory -ErrorAction SilentlyContinue | "
           "Where-Object { $_.Name -like 'AppCrash_alcove-fixture*' -and $_.CreationTimeUtc.Ticks -gt "
           f"{since_ticks} }} | ForEach-Object {{ $_.FullName }}")
     out = a.call("exec.run", cmd=ps)["stdout"]
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def wait_wer(a, since_ticks, timeout=15):
+    """Polls find_wer until it returns a folder or the timeout passes."""
+    end = time.time() + timeout
+    while True:
+        found = find_wer(a, since_ticks)
+        if found or time.time() > end:
+            return found
+        time.sleep(0.5)
 
 
 def wait_gone(a, pids, timeout=15):
@@ -824,17 +874,19 @@ def cleanup(port, run):
             time.sleep(0.3)
 
     def remove_wer():
-        for d in run.wer_dirs:
+        for d in wait_wer(a, run.wer_since):
             a.call("exec.run", cmd=f"Remove-Item -LiteralPath '{d}' -Recurse -Force -ErrorAction SilentlyContinue")
+        left = find_wer(a, run.wer_since)
+        expect(not left, f"the report folders {left!r} are still there")
 
     steps = [("ending the fixture", kill_fixtures)]
-    if run.wer_dirs:
+    if run.wer_since is not None:
         steps.append(("removing the crash WER reports", remove_wer))
     if run.explorer_before is not None:
         steps.append(("closing File Explorer", lambda: close_explorer(a, explorer_windows(a) - run.explorer_before)))
     steps.append((f"deleting {BASE}", lambda: a.call("fs.delete", path=BASE, recursive=True)))
     def delete_fixture_exe():
-        # A just-crashed fixture can hold its exe open briefly while WER finishes.
+        # Retries the delete for 15 s.
         end = time.time() + 15
         while True:
             res = a.ask("fs.delete", path=FIXTURE)
