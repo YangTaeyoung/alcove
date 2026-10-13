@@ -111,6 +111,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `ui.rect` | `ref` or selector fields, `scroll` (bool) | `node`, `cx`, `cy`, `clickable`; `blocked` (a sentence, when not clickable) |
 | `ui.act` | `ref` or selector fields, `action` (`invoke`, `toggle`, `expand`, `collapse`, `select`, `set_value`, `focus`, `scroll_into_view`), `value` (for `set_value`) | `node`; `unresponsive: true`, `gone: true` or `pending: true` when the node could not be read after the action |
 | `ui.focused` | — | `node`, `window` |
+| `ui.at` | exactly one of `x` and `y`, `ref`, `focused: true`; `budgetMs` (default 250, 50–2000) | `node`, `window` (`id`, `title`), `byAutomationId`, `byName` |
 | `ui.ping` | — | `pong`, `pid`, `session`, `integrity`, `dpi`, `clr`, `refs` |
 
 ### Commands (`exec.run`, `exec.start`)
@@ -214,8 +215,9 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   agent lists the windows before the start and then every 150 ms:
   - candidates are the titled windows that were not listed before the start
     and not already claimed by another in-flight or finished `app.launch` (a
-    claim ends when its window closes and when a helper starts; the agent
-    keeps the 1024 newest claims);
+    claim ends when its window closes; a helper start ends the claims of the
+    launches that have answered and keeps those of launches still waiting for
+    their window; the agent keeps the 1024 newest claims);
   - a candidate of the started process or one of its descendants is chosen,
     and beats a candidate of any other process whatever their sizes;
   - when the started process has exited, or 2 s after the start, a candidate
@@ -254,37 +256,88 @@ with inheritance removed (`icacls` reads it back as
 `BUILTIN\Administrators:(OI)(CI)(F)` and `NT AUTHORITY\SYSTEM:(OI)(CI)(F)`),
 so `agent.log`, `install.log` and `helper.log` are readable by administrators
 only. Each folder is opened without following a reparse point, and its owner
-and access list are checked and set on that handle (`SetSecurityInfo`). The lock is applied first thing at install and at
-agent start, before a log file is opened, and again at every helper start; the
-parent keeps the agent's logs, the uia folder keeps only its logs (every other
-entry is deleted at each start), and a reparse point in either folder,
-including one at the uia path, is removed rather than followed and the uia
-folder is created again. The agent opens no log file that is a reparse point
-and none inside a folder it could not lock. When a folder cannot be locked the
-helper does not start:
+and access list are checked and set on that handle (`SetSecurityInfo`). The
+lock is applied first thing at install and at agent start, before a log file
+is opened, and again at every helper start; the parent keeps the agent's logs,
+the uia folder keeps only its logs (every other entry is deleted at each
+start; a deletion that fails is tried again every 50 ms for 2 s), and a
+reparse point in either folder, including one at the uia path, is removed
+rather than followed and the uia folder is created again.
+
+A folder that exists and whose owner, read through that handle, is neither
+`BUILTIN\Administrators` nor `NT AUTHORITY\SYSTEM` is not adopted: it is
+renamed to `<name>.untrusted-<yyyyMMddHHmmss>` (UTC) beside it and a new,
+locked folder is created in its place, so a handle someone kept on the old
+folder names the renamed one. This applies to `C:\ProgramData\Alcove` and to
+its `uia` folder; the renamed folder is left for an administrator to remove.
+When the rename fails (a handle is open on something inside the folder, or on
+the folder without delete sharing) the folder is not locked, with the reason
+`<dir> belongs to <owner> and could not be moved aside (<error>); remove it as an administrator and restart alcove-agent`.
+
+The agent opens no log file that is a reparse point and none inside a folder
+it could not lock; it then writes
+`log: <path> is not opened because its folder is not locked (<reason>)` to
+stderr and logs there. When a folder cannot be locked the helper does not
+start:
 `the UI helper folder <dir> could not be locked (<reason>); fix its owner and access list, then retry`.
-A reparse point at `C:\ProgramData\Alcove` itself gives the reason
-`C:\ProgramData\Alcove is a reparse point; remove it`; something at a folder
-path that is not a directory gives
-`<dir> is not a directory; remove it and restart alcove-agent`. Before a start
-the agent waits up to 10 s for the previous helper process to end
-(`the previous UI helper process has not ended after 10 s; retry`). A helper
-whose files cannot be written or compiled answers
-`the UI helper could not be prepared in <dir>: <reason>; check free space and the folder's access list`.
-On the wire these start failures follow
-`could not start the UI helper through PowerShell: ` (lock, wait and file
-failures) or `UI helper failed to start through PowerShell: ` (a failure the
-bootstrap script reports).
+The reasons:
+
+- `C:\ProgramData\Alcove is a reparse point; remove it` (a reparse point at
+  the folder itself),
+- `<dir> is not a directory; remove it and restart alcove-agent`,
+- `<dir> belongs to <owner> and could not be moved aside (<error>); remove it as an administrator and restart alcove-agent`,
+- `open <dir>: <system error>`,
+- `<dir>: SetSecurityInfo: <system error>`,
+- `<dir> still has the access list <sddl>; fix it with icacls and restart alcove-agent`,
+- `SetNamedSecurityInfo(<path>): <system error>` and the system error of a
+  deletion, for an entry of the folder.
+
+An agent started without `%ProgramData%` uses no other folder: it opens no log
+file (`log: <path> is not opened because %ProgramData% is not set` on stderr),
+logs to stderr, starts no helper, and answers every `ui.*` and `win.*`
+operation with
+`the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task`.
+
+Before a start the agent waits up to 10 s for the previous helper process to
+end (`the previous UI helper process has not ended after 10 s; retry`); the
+wait and the start do not hold up `Close` or the queue of other requests. The
+start failures:
+
+- `the UI helper could not be prepared in <dir>: <reason>; check free space and the folder's access list`
+  (the helper files could not be written or read),
+- `the UI helper could not be started (<reason>); restart alcove-agent and retry`
+  (the system directory, a pipe or the PowerShell process),
+- `the UI helper could not be compiled: <first compiler error>; reinstall the guest tools`,
+- `the UI helper stopped: <message>; retry, and restart alcove-agent if it repeats`
+  (the helper's serving thread ended with an error after it had started; the
+  requests inside it get this answer).
+
+On the wire the failures of a start follow
+`could not start the UI helper through PowerShell: ` (lock, wait, file and
+process failures) or `UI helper failed to start through PowerShell: ` (a
+failure the bootstrap script reports before the helper is ready); the
+`the UI helper stopped: …` sentence of a helper that had been ready comes
+without a prefix.
 The helper's environment is the agent's without `COR_*`, `COMPlus_*`,
 `DOTNET_*` and `PSModulePath`, and `TEMP`/`TMP` point inside the locked
 folder. Measured on the Windows 11 ARM64 test guest: the first `ui.ping` after
 an agent start answers after 0.59–0.60 s (1.1–2.0 s for the first one after a
 boot), of which the compile takes 0.35 s; a helper that was killed is replaced
-in 0.6–1.1 s. The helper, and an app launched through `app.launch`, inherit
-the agent's elevated token. `alcove-agent --install` locks the folders before
-it copies or registers anything and fails when they cannot be locked
+in 0.6–1.1 s. A helper killed while it starts leaves no process behind that
+blocks the next start: of 84 kills between 0 and 1.3 s after the start, the
+compiler was running in 8 and the next start succeeded in all of those.
+Without the repeated deletion, 4 of 24 kills between 0.3 and 1.2 s after the
+start made the next start fail once because deleting the file the compile had
+just written was refused; with it, none of 40 further kills between 0.7 and
+1.3 s did, and the slowest next start took 0.25 s longer than the others. The helper, and an app launched through
+`app.launch`, inherit the agent's elevated token. `alcove-agent --install`
+locks the folders in the same way before it copies or registers anything and
+fails, with exit code 1 and a line on stderr that begins `install failed: `,
+when they cannot be locked
 (`the Alcove data folder <dir> could not be locked (<reason>); fix its owner and access list with icacls, then run alcove-agent --install again`)
-or when `%ProgramData%` is empty; it then writes no `install.log`.
+or when `%ProgramData%` is empty
+(`the ProgramData environment variable is empty, so the Alcove data folder cannot be located; set it (normally C:\ProgramData) and run alcove-agent --install again`);
+it then writes no `install.log`.
 
 **One request at a time.** The agent hands requests to the helper one by one
 in the order they arrived. An operation's time limit (20 s; 30 s for
@@ -359,7 +412,8 @@ than being hung, is not reported as not responding.
   `window <id> is part of the Windows shell and is not closed; close app windows only`.
   When the message cannot be posted: a window that no longer exists answers
   `closed: true` with `window: null`; one that denies the post answers
-  `window <id> belongs to a process the helper cannot send to`; any other
+  `window <id> belongs to a process the helper cannot send to; run the app without elevation or use input ops`;
+  any other
   failure answers `window <id> could not be asked to close (error <n>); retry`
   with the Windows error code.
 - A show-state change (`minimize`, `maximize`, `restore`) that does not take
@@ -388,6 +442,11 @@ than being hung, is not reported as not responding.
 - `value` is the value-pattern value cut at 200 characters with `…`; it is
   absent when empty and for password fields. `aid` is the automation id,
   absent when empty. Line ends in `value` and in `ui.text` are LF.
+- A password field (flag `password`) has `name: ""` in every reply, whatever
+  name its provider reports, and no `value`; its `aid` and rectangle are
+  given. The selector fields `name` and `nameContains` are compared with the
+  name the provider reports, so `role: Edit, name: Password` finds a labelled
+  password field; the node that comes back has the empty name.
 - `flags` come from `focused`, `disabled`, `offscreen`, `selected`,
   `checked`, `expanded`, `collapsed`, `password`. The children of a window
   whose modal dialog is open are `disabled`.
@@ -430,8 +489,10 @@ field, or an element below one, answers
 in every mode; a failed password-property read counts as a password field, as
 do a parent that cannot be read and a chain of more than 256 parents; and
 `ui.tree`, `ui.find` and the descendant text of `ui.text` do not list what is
-below a password field. A node below a password field in a `ui.rect`, `ui.act`
-or `ui.focused` reply has the `password` flag, an empty `name` and no `value`.
+below a password field. A node below a password field in a `ui.rect`, `ui.act`,
+`ui.focused` or `ui.at` reply has the `password` flag, an empty `name` and no
+`value`, as the password field itself has; a parent whose read fails with a
+system error counts as a password field too.
 The document text of a Chromium page shows a password field as bullets.
 
 **`ui.rect`**: `cx`, `cy` are the centre of the element's rectangle;
@@ -463,8 +524,12 @@ view first when it has a scroll-item pattern.
   answers after about 2.1 s), otherwise `pending: true`.
 - When the element is gone after the action the reply carries the node as it
   was before and `gone: true`. The same reply is given when the element's
-  window no longer exists after the call and when the pattern call failed
-  because the element or its app went away during it.
+  window no longer exists after the call, and when the pattern call failed
+  with a UI Automation or COM error and the window stopped existing within
+  0.5 s of it. A pattern call that failed that way while the window stays
+  answers
+  `the element's app did not complete <action> (<hresult>); read the element again with ui.find and retry`
+  (`<hresult>` as `0x80004005`).
 - A disabled element is refused before the call:
   `the element is disabled; wait until it is enabled`. More than eight `ui.act`
   calls still running in one app answer
@@ -478,6 +543,61 @@ view first when it has a scroll-item pattern.
 **`ui.focused`** returns the element with the keyboard focus and its window
 (`window` is `null` when the element has none), or
 `no element has the keyboard focus; click a window or use win.action focus`.
+
+**`ui.at`** tells what a point, a ref or the keyboard focus is aimed at,
+within a time limit, and how a selector would name it. It registers no ref,
+moves no focus and sends nothing to the app. The request has exactly one of
+
+- `x`, `y`: whole numbers, physical pixels of the guest screen (the space of
+  window rectangles and node `x`, `y`, `w`, `h`),
+- `ref`: an element ref,
+- `focused: true`: the element with the keyboard focus,
+
+otherwise `pass x and y, ref, or focused: true`. `budgetMs` (default 250) is
+the time for the whole answer; a value outside 50–2000 is brought into that
+range.
+
+```
+{"node":{"depth":0,"role":"Button","name":"Send","aid":"1","x":678,"y":124,"w":96,"h":28,"flags":[]},
+ "window":{"id":"0x603b6","title":"Alcove Fixture"},
+ "byAutomationId":{"matches":1,"index":0},
+ "byName":{"matches":1,"index":0}}
+```
+
+- `node` is a node object with `depth: 0`. It has `ref` only when the request
+  named a ref (that ref). For a point it is the deepest element there, for
+  `focused` the focused element, each replaced by its nearest ancestor in the
+  control view (the view `ui.find` searches) when it is not in that view, and
+  by the outermost password field above it when it lies below one. For a ref
+  it is that element itself.
+- `window` is the top-level window that contains the element: `id` as in
+  `win.list` and `title`, which is `""` for a popup or a menu.
+- `byAutomationId` is present when the node has an `aid`: `matches` counts the
+  elements of that window which the selector `{role, automationId}` matches,
+  and `index` is the node's place among them in the order a selector search
+  visits them, so `{window, role, automationId, index}` names the node.
+  `byName` is the same for `{role, name}` and present when `name` is not
+  empty, so never for a password field or a node below one. Either is `null`
+  when the count did not finish within the time, and when the walk did not
+  meet the element (an element outside the control view, or below a password
+  field, named by a ref).
+- Errors: `no element at (<x>, <y>); take a screenshot to see what is there`
+  (a point outside every screen, on the desktop window itself, or in a window
+  that refuses UI Automation), `no element has the keyboard focus; click the field first`,
+  `element <ref> no longer exists; call ui.tree again`.
+- The UI Automation calls run on a thread the helper abandons at the time
+  limit, so the reply comes within `budgetMs` + 100 ms and the helper serves
+  the next request at once. An app that did not answer in time gives
+  `no element at (<x>, <y>): the app did not answer within <n> ms; retry`,
+  `the focused element was not read: the app did not answer within <n> ms; retry` or
+  `element <ref> was not read: the app did not answer within <n> ms; retry`.
+  The same sentence is given at once for a window the system reports as not
+  responding and while eight earlier `ui.at` calls into that app are still
+  waiting.
+- Measured on the test guest: 50 calls on a button of the fixture app took
+  13–14 ms in the median and 16–26 ms at most; on the fixture made to hang, a
+  call with the default limit answered after 252–254 ms and one with
+  `budgetMs: 100` after 110 ms, and `win.list` after it took 1 ms.
 
 #### Window events
 
@@ -505,17 +625,23 @@ agent sends one event per difference, each with the window object:
 - The first comparison of a helper also records the titles and the foreground
   window, so a helper start sends no `window.title` or `window.foreground` for
   windows that did not change.
-- At most one `window.title` is sent per window per second. A new title is
-  sent once it was the same in two comparisons in a row and a second has
-  passed since that window's previous `window.title`; a title that changes in
-  every comparison sends nothing until it rests, and a title that returns to
-  the one last sent sends nothing. The fixture's `Titles` button (a new title
-  every 50 ms for 5 s, then one held for 600 ms, then the base title) raises
-  two events: one for the held title and one for the base title.
+- At most one `window.title` is sent per window per second: the title a
+  window has at a comparison is sent when it differs from the one last sent
+  for that window and a second has passed since that window's previous
+  `window.title`. A title that keeps changing therefore raises an event about
+  every 1.2 s (the first comparison after the second), each with the title of
+  that moment, and the last event carries the title the window ends with; a
+  title that returns to the one last sent sends nothing. The fixture's
+  `Titles` button (a new title every 50 ms for 5 s, then the base title)
+  raises 6 events 1.21–1.25 s apart: 5 with a numbered title and the last
+  with the base title.
 - At most one `window.foreground` is sent per window per second. One that
   falls inside that second is sent once the second has passed, when the
   window is still in front, so the last `window.foreground` names the window
-  in front.
+  in front. When the window the last event named no longer exists, the window
+  in front is announced at the next comparison without waiting for its second
+  (a dialog that closes 0.6 s after its owner was announced: the owner's
+  `window.foreground` arrives together with the dialog's `window.closed`).
 - Each connection has a bounded event queue of 256 messages. When it is full
   (a client that does not read) events are dropped and counted, and the agent
   puts `{"t":"ev","name":"events.dropped","count":<n>}` in the place of the
