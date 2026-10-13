@@ -117,13 +117,20 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public var templateEpoch: Int?
     /// On a clone: the absolute path of the template's bundle directory when the clone was made.
     public var templatePath: String?
+    /// A UUID string that names this VM's disks as a clone template. Set when `diskEpoch` is first
+    /// set and the same in every later save; nil until the VM is cloned for the first time.
+    public var diskID: String?
+    /// On a clone: the template's `diskID` when the clone was made. A VM with a `templateEpoch` starts
+    /// only while this equals the `diskID` stored in the bundle at `templatePath`.
+    public var templateDiskID: String?
 
     public init(schemaVersion: Int = VMConfig.currentSchemaVersion, name: String, guestOS: GuestOS, cpuCount: Int,
                 memoryMiB: Int, disks: [Disk], cdroms: [CDROM] = [], network: Network = .user(portForwards: []),
                 display: DisplayDevice, tpm: Bool = false, usbPassthrough: [USBSelector] = [],
                 sharedFolders: [SharedFolder] = [], macAddress: String = VMConfig.randomMAC(), createdAt: Date = Date(),
                 agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil, cloneOf: String? = nil,
-                diskEpoch: Int? = nil, templateEpoch: Int? = nil, templatePath: String? = nil) {
+                diskEpoch: Int? = nil, templateEpoch: Int? = nil, templatePath: String? = nil,
+                diskID: String? = nil, templateDiskID: String? = nil) {
         self.schemaVersion = schemaVersion; self.name = name; self.guestOS = guestOS; self.cpuCount = cpuCount
         self.memoryMiB = memoryMiB; self.disks = disks; self.cdroms = cdroms; self.network = network
         self.display = display; self.tpm = tpm; self.usbPassthrough = usbPassthrough
@@ -132,6 +139,21 @@ public struct VMConfig: Codable, Sendable, Equatable {
         self.agentHostPort = agentHostPort ?? VMConfig.agentPort(for: agentToken)
         self.cloneOf = cloneOf
         self.diskEpoch = diskEpoch; self.templateEpoch = templateEpoch; self.templatePath = templatePath
+        self.diskID = diskID; self.templateDiskID = templateDiskID
+    }
+
+    /// This configuration with the disk identity fields taken from `stored` where `stored` holds more:
+    /// `diskEpoch` is the higher of the two (nil counts as lowest), `diskID` is `stored`'s when it has one,
+    /// and `cloneOf`, `templateEpoch`, `templatePath` and `templateDiskID` are `stored`'s where they are nil here.
+    public func preservingDiskIdentity(from stored: VMConfig) -> VMConfig {
+        var merged = self
+        if let epoch = stored.diskEpoch, diskEpoch.map({ $0 < epoch }) ?? true { merged.diskEpoch = epoch }
+        merged.diskID = stored.diskID ?? diskID
+        merged.cloneOf = cloneOf ?? stored.cloneOf
+        merged.templateEpoch = templateEpoch ?? stored.templateEpoch
+        merged.templatePath = templatePath ?? stored.templatePath
+        merged.templateDiskID = templateDiskID ?? stored.templateDiskID
+        return merged
     }
 
     /// Guest port the agent listens on.
@@ -231,7 +253,7 @@ extension VMConfig {
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, name, guestOS, cpuCount, memoryMiB, disks, cdroms, network, display, tpm,
              usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort, cloneOf,
-             diskEpoch, templateEpoch, templatePath
+             diskEpoch, templateEpoch, templatePath, diskID, templateDiskID
     }
 
     public init(from decoder: Decoder) throws {
@@ -257,5 +279,7 @@ extension VMConfig {
         diskEpoch = try c.decodeIfPresent(Int.self, forKey: .diskEpoch)
         templateEpoch = try c.decodeIfPresent(Int.self, forKey: .templateEpoch)
         templatePath = try c.decodeIfPresent(String.self, forKey: .templatePath)
+        diskID = try c.decodeIfPresent(String.self, forKey: .diskID)
+        templateDiskID = try c.decodeIfPresent(String.self, forKey: .templateDiskID)
     }
 }

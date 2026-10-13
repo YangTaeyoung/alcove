@@ -571,6 +571,97 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertTrue(moved.isSuspended)
     }
 
+    func testUpdateConfigKeepsTheStoredDiskIdentity() async throws {
+        let vm = try makeVM()
+        var draft = await vm.config
+        try await cloneAndDeleteClone(vm)
+        let id = try XCTUnwrap(try vm.bundle.loadConfig().diskID)
+        draft.memoryMiB = 1024
+        XCTAssertNil(draft.diskEpoch); XCTAssertNil(draft.diskID)
+        try await vm.update(config: draft)
+        let config = await vm.config
+        XCTAssertEqual(config.diskEpoch, 0)
+        XCTAssertEqual(config.diskID, id)
+        XCTAssertEqual(config.memoryMiB, 1024)
+    }
+
+    /// The clone is moved to another directory before the template starts. A config copy taken before
+    /// the start is applied with `update(config:)` and saved; then a copy taken before the clone is
+    /// saved and applied, in the opposite order.
+    func testStaleCloneStaysRefusedAfterOlderConfigCopiesAreSaved() async throws {
+        let vm = try makeVM()
+        var beforeClone = await vm.config
+        let moved = try moveAway(try await vm.cloneLinked(named: "Clone"))
+        var beforeStart = try vm.bundle.loadConfig()
+        let id = try XCTUnwrap(beforeStart.diskID)
+        XCTAssertEqual(beforeStart.diskEpoch, 0)
+        try await vm.start()
+        try await vm.shutdown(force: true)
+        XCTAssertEqual(try storedEpoch(vm), 1)
+        let clone = try controller(for: moved, engine: vm.engine)
+
+        beforeStart.memoryMiB = 1024
+        try await vm.update(config: beforeStart)
+        try vm.bundle.save(beforeStart)
+        var stored = try vm.bundle.loadConfig()
+        XCTAssertEqual(stored.diskEpoch, 1); XCTAssertEqual(stored.diskID, id); XCTAssertEqual(stored.memoryMiB, 1024)
+        var config = await vm.config
+        XCTAssertEqual(config, stored)
+        await assertStartRefused(clone, Self.staleClone)
+
+        XCTAssertNil(beforeClone.diskEpoch); XCTAssertNil(beforeClone.diskID)
+        beforeClone.cpuCount = 1
+        try vm.bundle.save(beforeClone)
+        try await vm.update(config: beforeClone)
+        stored = try vm.bundle.loadConfig()
+        XCTAssertEqual(stored.diskEpoch, 1); XCTAssertEqual(stored.diskID, id); XCTAssertEqual(stored.cpuCount, 1)
+        config = await vm.config
+        XCTAssertEqual(config.diskEpoch, 1); XCTAssertEqual(config.diskID, id); XCTAssertEqual(config.cpuCount, 1)
+        await assertStartRefused(clone, Self.staleClone)
+
+        try await vm.start()
+        XCTAssertEqual(try storedEpoch(vm), 2)
+        try await vm.shutdown(force: true)
+    }
+
+    func testCloneStaysACloneAfterADraftWithoutCloneFieldsIsSaved() async throws {
+        let vm = try makeVM()
+        let moved = try moveAway(try await vm.cloneLinked(named: "Clone"))
+        let clone = try controller(for: moved, engine: vm.engine)
+        let stored = try moved.loadConfig()
+        var draft = stored
+        draft.cloneOf = nil; draft.templateEpoch = nil; draft.templatePath = nil; draft.templateDiskID = nil
+        draft.memoryMiB = 1024
+        try moved.save(draft)
+        try await clone.update(config: draft)
+        var expected = stored
+        expected.memoryMiB = 1024
+        XCTAssertEqual(try moved.loadConfig(), expected)
+        let config = await clone.config; XCTAssertEqual(config, expected)
+
+        try await vm.start()
+        try await vm.shutdown(force: true)
+        await assertStartRefused(clone, Self.staleClone)
+    }
+
+    /// The template's bundle is deleted, and a VM with the same name is created at its path and cloned once.
+    func testCloneOfAReplacedTemplateRefusesToStart() async throws {
+        let vm = try makeVM()
+        let moved = try moveAway(try await vm.cloneLinked(named: "Clone"))
+        let path = vm.bundle.url.standardizedFileURL.path
+        try FileManager.default.removeItem(at: vm.bundle.url)
+        var config = VMConfig.defaults(name: "Fake", guestOS: .other)
+        config.cpuCount = 2; config.memoryMiB = 512; config.network = .none
+        let replacement = try VMBundle.create(config, in: vm.bundle.url.deletingLastPathComponent(), engine: vm.engine)
+        XCTAssertEqual(replacement.url.standardizedFileURL.path, path)
+        try replacement.cloneLinked(named: "Other", engine: vm.engine).deleteClone()
+        XCTAssertEqual(try replacement.loadConfig().diskEpoch, 0)
+        XCTAssertEqual(try moved.loadConfig().templateEpoch, 0)
+
+        let clone = try controller(for: moved, engine: vm.engine)
+        await assertStartRefused(clone, "the VM at \(path) is not the template 'Clone' was cloned from; the clone cannot run")
+    }
+
     func testEphemeralOverlayRemovedOnStop() async throws {
         let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
         let run = vm.bundle.runURL

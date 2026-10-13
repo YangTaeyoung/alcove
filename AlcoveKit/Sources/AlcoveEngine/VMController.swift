@@ -116,9 +116,11 @@ public actor VMController {
     /// resumes with the configuration saved next to its state
     /// (`VMBundle.suspendConfigURL`), because an `-incoming` stream only loads
     /// into the machine that produced it.
+    /// The disk identity fields of the current `config` and of the stored `config.json` are
+    /// preserved in the new one (`VMConfig.preservingDiskIdentity`), as `VMBundle.save` does.
     public func update(config: VMConfig) throws {
         try config.validate()
-        self.config = config
+        self.config = bundle.preservingStoredDiskIdentity(config.preservingDiskIdentity(from: self.config))
     }
 
     // MARK: - start / stop

@@ -253,10 +253,11 @@ final class VMBundleAndLocatorTests: XCTestCase {
 
     // MARK: - disk epoch (stand-in qemu-img)
 
+    /// Writes the `config.json` of `bundle` with `diskEpoch` set to `epoch` and every other field as stored.
     private func setDiskEpoch(_ epoch: Int?, of bundle: VMBundle) throws {
         var config = try bundle.loadConfig()
         config.diskEpoch = epoch
-        try bundle.save(config)
+        try config.encoded().write(to: bundle.configURL, options: .atomic)
     }
 
     private func setPermissions(_ mode: Int, of bundle: VMBundle) throws {
@@ -330,6 +331,91 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(try template.loadConfig().diskEpoch, 0)
     }
 
+    func testSaveKeepsTheStoredDiskEpochAndDiskIDWhenTheSavedConfigHasLess() throws {
+        let (template, engine) = try stubTemplate()
+        var beforeClone = try template.loadConfig()
+        _ = try template.cloneLinked(named: "Copy", engine: engine)
+        var beforeBump = try template.loadConfig()
+        let id = try XCTUnwrap(beforeBump.diskID)
+        XCTAssertEqual(beforeBump.diskEpoch, 0)
+        XCTAssertEqual(try template.advanceDiskEpoch(), 1)
+
+        beforeBump.memoryMiB = 2048
+        var written = try template.save(beforeBump)
+        XCTAssertEqual(written.diskEpoch, 1)
+        XCTAssertEqual(written.memoryMiB, 2048)
+        XCTAssertEqual(try template.loadConfig(), written)
+
+        XCTAssertNil(beforeClone.diskEpoch); XCTAssertNil(beforeClone.diskID)
+        beforeClone.cpuCount = 2
+        written = try template.save(beforeClone)
+        XCTAssertEqual(written.diskEpoch, 1)
+        XCTAssertEqual(written.diskID, id)
+        XCTAssertEqual(written.cpuCount, 2)
+        XCTAssertEqual(try template.loadConfig(), written)
+
+        var higher = written
+        higher.diskEpoch = 5; higher.diskID = "another"
+        written = try template.save(higher)
+        XCTAssertEqual(written.diskEpoch, 5)
+        XCTAssertEqual(written.diskID, id)
+        XCTAssertEqual(try template.loadConfig(), written)
+    }
+
+    func testSaveKeepsTheStoredCloneFieldsWhenTheSavedConfigHasNone() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "Copy", engine: engine)
+        let stored = try clone.loadConfig()
+        XCTAssertEqual(stored.cloneOf, "Base")
+        XCTAssertEqual(stored.templateEpoch, 0)
+        XCTAssertEqual(stored.templatePath, standardPath(template.url))
+        XCTAssertNotNil(stored.templateDiskID)
+
+        var draft = stored
+        draft.cloneOf = nil; draft.templateEpoch = nil; draft.templatePath = nil; draft.templateDiskID = nil
+        draft.memoryMiB = 2048
+        var expected = stored
+        expected.memoryMiB = 2048
+        XCTAssertEqual(try clone.save(draft), expected)
+        XCTAssertEqual(try clone.loadConfig(), expected)
+    }
+
+    func testFirstCloneSetsTheTemplateDiskIDAndClonesRecordIt() throws {
+        let (template, engine) = try stubTemplate()
+        XCTAssertNil(try template.loadConfig().diskID)
+
+        let first = try template.cloneLinked(named: "First", engine: engine).loadConfig()
+        let id = try XCTUnwrap(try template.loadConfig().diskID)
+        XCTAssertNotNil(UUID(uuidString: id))
+        XCTAssertEqual(first.templateDiskID, id)
+        XCTAssertNil(first.diskID)
+        XCTAssertNil(try template.loadConfig().templateDiskID)
+
+        XCTAssertEqual(try template.advanceDiskEpoch(), 1)
+        let second = try template.cloneLinked(named: "Second", engine: engine).loadConfig()
+        XCTAssertEqual(try template.loadConfig().diskID, id)
+        XCTAssertEqual(second.templateDiskID, id)
+    }
+
+    func testTemplateMismatchRefusesADifferentVMAtTheTemplatePath() throws {
+        let (template, engine) = try stubTemplate()
+        let old = try template.cloneLinked(named: "Copy", engine: engine).loadConfig()
+        let path = standardPath(template.url)
+        let other = "the VM at \(path) is not the template 'Copy' was cloned from; the clone cannot run"
+        XCTAssertNil(VMBundle.templateMismatch(for: old))
+
+        try FileManager.default.removeItem(at: template.url)
+        let replacement = try VMBundle.create(VMConfig.defaults(name: "Base", guestOS: .linux), in: tmp, engine: engine)
+        XCTAssertEqual(standardPath(replacement.url), path)
+        XCTAssertEqual(VMBundle.templateMismatch(for: old), other)
+
+        let fresh = try replacement.cloneLinked(named: "Fresh", engine: engine).loadConfig()
+        XCTAssertEqual(try replacement.loadConfig().diskEpoch, 0)
+        XCTAssertEqual(old.templateEpoch, 0)
+        XCTAssertEqual(VMBundle.templateMismatch(for: old), other)
+        XCTAssertNil(VMBundle.templateMismatch(for: fresh))
+    }
+
     // MARK: - linked clones (real qemu-img)
 
     func testFirstCloneSetsTheTemplateEpochAndLaterClonesKeepIt() throws {
@@ -341,6 +427,8 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(try template.loadConfig().diskEpoch, 0)
         XCTAssertEqual(first.templateEpoch, 0)
         XCTAssertEqual(first.templatePath, standardPath(template.url))
+        XCTAssertNotNil(first.templateDiskID)
+        XCTAssertEqual(first.templateDiskID, try template.loadConfig().diskID)
         XCTAssertNil(first.diskEpoch)
         XCTAssertNil(try template.loadConfig().templateEpoch)
         XCTAssertNil(try template.loadConfig().templatePath)
@@ -350,6 +438,7 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: template.configURL), stored)
         XCTAssertEqual(second.templateEpoch, 0)
         XCTAssertEqual(second.templatePath, standardPath(template.url))
+        XCTAssertEqual(second.templateDiskID, first.templateDiskID)
 
         try setDiskEpoch(4, of: template)
         let third = try template.cloneLinked(named: "Third", engine: engine).loadConfig()

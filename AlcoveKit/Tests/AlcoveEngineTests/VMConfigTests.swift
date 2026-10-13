@@ -112,6 +112,7 @@ final class VMConfigTests: XCTestCase {
         let old = Data(json.utf8)
         let c = try VMConfig.decode(old)
         XCTAssertNil(c.diskEpoch); XCTAssertNil(c.templateEpoch); XCTAssertNil(c.templatePath)
+        XCTAssertNil(c.diskID); XCTAssertNil(c.templateDiskID)
         XCTAssertEqual(c.cloneOf, "Template")
         XCTAssertFalse(VMConfig.needsMigration(old))
 
@@ -119,6 +120,61 @@ final class VMConfigTests: XCTestCase {
         withoutAgent.removeValue(forKey: "agentToken")
         withoutAgent["diskEpoch"] = 1
         XCTAssertTrue(VMConfig.needsMigration(try JSONSerialization.data(withJSONObject: withoutAgent)))
+    }
+
+    func testDiskIDFieldsRoundTripAndAreOmittedWhenNil() throws {
+        var c = VMConfig.defaults(name: "D", guestOS: .linux)
+        XCTAssertNil(c.diskID); XCTAssertNil(c.templateDiskID)
+        let plain = try c.encoded()
+        let json = String(decoding: plain, as: UTF8.self)
+        for key in ["diskID", "templateDiskID"] { XCTAssertFalse(json.contains(key), key) }
+        XCTAssertFalse(VMConfig.needsMigration(plain))
+
+        c.diskID = "own"; c.templateDiskID = "template"
+        let data = try c.encoded()
+        let back = try VMConfig.decode(data)
+        XCTAssertEqual(back.diskID, "own")
+        XCTAssertEqual(back.templateDiskID, "template")
+        XCTAssertFalse(VMConfig.needsMigration(data))
+
+        let made = VMConfig(name: "I", guestOS: .other, cpuCount: 1, memoryMiB: 512, disks: c.disks, display: .ramfb,
+                            diskID: "x", templateDiskID: "y")
+        XCTAssertEqual(made.diskID, "x"); XCTAssertEqual(made.templateDiskID, "y")
+    }
+
+    func testPreservingDiskIdentityKeepsTheHigherEpochAndTheStoredDiskID() {
+        var stored = VMConfig.defaults(name: "S", guestOS: .linux)
+        var draft = stored
+        draft.memoryMiB = 2048
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), draft)
+
+        stored.diskEpoch = 3; stored.diskID = "stored"
+        var expected = draft
+        expected.diskEpoch = 3; expected.diskID = "stored"
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), expected)
+        draft.diskEpoch = 2; draft.diskID = "other"
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), expected)
+        draft.diskEpoch = 3
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), expected)
+        draft.diskEpoch = 5
+        expected.diskEpoch = 5
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), expected)
+
+        stored.diskEpoch = nil; stored.diskID = nil
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), draft)
+    }
+
+    func testPreservingDiskIdentityKeepsStoredCloneFieldsWhereTheConfigHasNone() {
+        var stored = VMConfig.defaults(name: "C", guestOS: .linux)
+        var draft = stored
+        draft.memoryMiB = 2048
+        stored.cloneOf = "T"; stored.templateEpoch = 2; stored.templatePath = "/vms/T.alcovevm"; stored.templateDiskID = "id"
+        var expected = draft
+        expected.cloneOf = "T"; expected.templateEpoch = 2; expected.templatePath = "/vms/T.alcovevm"; expected.templateDiskID = "id"
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), expected)
+
+        draft.cloneOf = "U"; draft.templateEpoch = 0; draft.templatePath = "/x"; draft.templateDiskID = "z"
+        XCTAssertEqual(draft.preservingDiskIdentity(from: stored), draft)
     }
 
     func testRandomMACIsLocallyAdministeredUnicast() {
