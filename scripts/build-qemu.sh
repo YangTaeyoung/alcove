@@ -21,7 +21,6 @@ CLEAN=0; INSTALL=0
 for a in "$@"; do case "$a" in --clean) CLEAN=1;; --install) INSTALL=1;; *) echo "unknown arg $a" >&2; exit 2;; esac; done
 
 # libpng: QMP `screendump` defaults to PNG (install-windows.py, AlcoveQMP).
-# --disable-pvg: the engine is built without the apple-gfx devices.
 PKGS="meson pkgconf ninja glib pixman dtc libslirp capstone libusb zstd libpng"
 installed="$(brew list --versions $PKGS || true)"
 for pkg in $PKGS; do
@@ -101,6 +100,7 @@ shopt -u nullglob
 
 if [ "$CLEAN" = 1 ]; then rm -rf "$BLD"; fi
 mkdir -p "$BLD"
+# --disable-pvg (in the configure call below): the engine is built without the apple-gfx devices.
 if [ ! -f "$BLD/build.ninja" ]; then
   ( cd "$BLD" && "$SRC/configure" \
       --python="$PYTHON" \
