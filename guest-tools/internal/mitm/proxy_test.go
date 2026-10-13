@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -676,5 +677,147 @@ func TestTruncatedCaptureEndingMidCharacterIsShownAsText(t *testing.T) {
 	res := env.call("get", map[string]any{"exchange": 1, "part": "response"})
 	if res["body"] != "ab" || res["base64"] != nil {
 		t.Fatalf("got %v", res)
+	}
+}
+
+// holdingUpstream accepts connections and keeps its side open.
+func holdingUpstream(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		l.Close()
+		mu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		mu.Unlock()
+	})
+	return l.Addr().String()
+}
+
+func openTunnel(t *testing.T, env *testEnv, target string) net.Conn {
+	t.Helper()
+	c, err := net.Dial("tcp", env.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil || !strings.Contains(line, "200") {
+		t.Fatalf("CONNECT reply %q %v", line, err)
+	}
+	return c
+}
+
+func TestCloseReturnsWhileATunnelIsOpen(t *testing.T) {
+	addr := holdingUpstream(t)
+	env := newEnv(t)
+	env.call("config", map[string]any{"hosts": []any{"nomatch.test"}})
+	openTunnel(t, env, addr)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(env.call("list", nil)["pending"].([]any)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	done := make(chan struct{})
+	go func() { env.proxy.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return within 1s while a tunnel was open")
+	}
+}
+
+func TestTunnelEndsWhenTheClientHangsUp(t *testing.T) {
+	addr := holdingUpstream(t)
+	env := newEnv(t)
+	env.call("config", map[string]any{"hosts": []any{"nomatch.test"}})
+	c := openTunnel(t, env, addr)
+	c.Close()
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "tunnel" })
+	if x["url"] != addr {
+		t.Fatalf("tunnel row %v", x)
+	}
+}
+
+func TestPlainHTTPToUnselectedHostIsForwardedUntouched(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "real:%s", b)
+	}))
+	defer up.Close()
+	env := newEnv(t)
+	env.call("config", map[string]any{"hosts": []any{"nomatch.test"}})
+	env.call("rule.add", map[string]any{"action": map[string]any{"status": 418}})
+	resp, err := env.client.Post(up.URL+"/p", "text/plain", strings.NewReader("abc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "real:abc" {
+		t.Fatalf("got %d %q: the rule must not apply", resp.StatusCode, body)
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "tunnel" })
+	if x["url"] != up.URL+"/p" || x["reqBytes"].(float64) != 3 || x["resBytes"].(float64) != 8 || x["rule"] != nil {
+		t.Fatalf("row %v", x)
+	}
+	res := env.get(idOf(x), "response", nil)
+	if res["body"] != "" || res["total"].(float64) != 0 || len(res["headers"].([]any)) != 0 {
+		t.Fatalf("an untouched request kept capture data: %v", res)
+	}
+}
+
+func TestBodyBudgetReleasesOldestBodies(t *testing.T) {
+	env := newEnv(t)
+	env.proxy.store.budget = 10
+	for i := 0; i < 3; i++ {
+		env.proxy.store.add(&Exchange{Kind: "http", URL: "http://h/", ReqBody: []byte("abc"), ResBody: []byte("def")})
+	}
+	rows := env.exchanges(nil)
+	if rows[0]["bodyDropped"] != true || rows[1]["bodyDropped"] != true || rows[2]["bodyDropped"] != nil {
+		t.Fatalf("rows %v", rows)
+	}
+	dropped := env.get(1, "response", nil)
+	if dropped["bodyDropped"] != true || dropped["body"] != "" || dropped["total"].(float64) != 0 {
+		t.Fatalf("dropped get %v", dropped)
+	}
+	if kept := env.get(3, "response", nil); kept["body"] != "def" || kept["bodyDropped"] != nil {
+		t.Fatalf("kept get %v", kept)
+	}
+	if env.proxy.store.used > 10 {
+		t.Fatalf("used %d over budget", env.proxy.store.used)
+	}
+}
+
+func TestSilentClientConnectionIsClosed(t *testing.T) {
+	old := firstBytesTimeout
+	firstBytesTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { firstBytesTimeout = old })
+	env := newEnv(t)
+	c, err := net.Dial("tcp", env.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("expected the proxy to close a silent connection, got %v", err)
 	}
 }

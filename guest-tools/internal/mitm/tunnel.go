@@ -7,8 +7,9 @@ import (
 	"time"
 )
 
-// tunnel connects to the upstream authority and copies bytes both ways until
-// either side ends, then records a tunnel row with the byte counts.
+// tunnel connects to the upstream authority and copies bytes both ways. When
+// either direction ends, both connections are closed. A tunnel row with the
+// byte counts is recorded when the copy has finished.
 func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 	start := time.Now()
 	ex := &Exchange{
@@ -27,7 +28,11 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 		p.record(ex)
 		return
 	}
-	defer up.Close()
+	if !p.trackAux(up) {
+		up.Close()
+		return
+	}
+	defer p.untrackAux(up)
 	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
@@ -35,17 +40,17 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 	var up2down, down2up atomic.Int64
 	endPending := p.beginPending(&pendingEntry{time: start, kind: "tunnel", method: "CONNECT", url: authority, req: down2up.Load, res: up2down.Load})
 	defer endPending()
+
 	done := make(chan struct{}, 2)
-	pipe := func(dst net.Conn, src io.Reader, n *atomic.Int64) {
+	pipe := func(dst io.Writer, src io.Reader, n *atomic.Int64) {
 		_, _ = io.Copy(dst, &countingReader{r: src, n: n})
-		if tc, ok := dst.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
 		done <- struct{}{}
 	}
 	go pipe(up, client, &down2up)
 	go pipe(client.Conn, up, &up2down)
 	<-done
+	up.Close()
+	client.Close()
 	<-done
 	ex.ReqBytes = down2up.Load()
 	ex.ResBytes = up2down.Load()

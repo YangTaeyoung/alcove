@@ -10,6 +10,8 @@ import (
 const (
 	maxBodyBytes = 2 << 20
 	maxExchanges = 2000
+
+	defaultBodyBudget = 256 << 20
 )
 
 // Exchange is one captured request/response pair, tunnel or TLS failure.
@@ -34,7 +36,10 @@ type Exchange struct {
 	ResBody      []byte
 	ReqTruncated bool
 	ResTruncated bool
+	BodyDropped  bool
 }
+
+func (e *Exchange) bodyBytes() int64 { return int64(len(e.ReqBody) + len(e.ResBody)) }
 
 // capBuf keeps the first max bytes written to it and counts the rest.
 type capBuf struct {
@@ -80,9 +85,13 @@ type Store struct {
 	max   int
 	items []*Exchange
 	next  int64
+
+	// budget caps the body bytes held by all rows; used is what they hold now.
+	budget int64
+	used   int64
 }
 
-func newStore(max int) *Store { return &Store{max: max, next: 1} }
+func newStore(max int) *Store { return &Store{max: max, next: 1, budget: defaultBodyBudget} }
 
 func (s *Store) add(e *Exchange) int64 {
 	if u, err := url.Parse(e.URL); err == nil && e.Host == "" {
@@ -94,8 +103,23 @@ func (s *Store) add(e *Exchange) int64 {
 	e.ID = s.next
 	s.next++
 	s.items = append(s.items, e)
+	s.used += e.bodyBytes()
 	if len(s.items) > s.max {
-		s.items = append([]*Exchange(nil), s.items[len(s.items)-s.max:]...)
+		cut := len(s.items) - s.max
+		for _, old := range s.items[:cut] {
+			s.used -= old.bodyBytes()
+		}
+		s.items = append([]*Exchange(nil), s.items[cut:]...)
+	}
+	for _, old := range s.items {
+		if s.used <= s.budget {
+			break
+		}
+		if size := old.bodyBytes(); size > 0 {
+			s.used -= size
+			old.ReqBody, old.ResBody = nil, nil
+			old.BodyDropped = true
+		}
 	}
 	return e.ID
 }
@@ -117,6 +141,7 @@ func (s *Store) clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items = nil
+	s.used = 0
 }
 
 type listFilter struct {

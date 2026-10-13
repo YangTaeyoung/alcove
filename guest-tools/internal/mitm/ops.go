@@ -225,6 +225,9 @@ func (p *Proxy) opList(params map[string]any) (map[string]any, error) {
 		if e.Error != "" {
 			row["error"] = e.Error
 		}
+		if e.BodyDropped {
+			row["bodyDropped"] = true
+		}
 		out = append(out, row)
 		next = e.ID
 	}
@@ -275,6 +278,9 @@ func (p *Proxy) opGet(params map[string]any) (map[string]any, error) {
 	res := map[string]any{"headers": headers, "total": len(decoded), "bodyTruncated": truncated}
 	if encoding != "" {
 		res["encoding"] = encoding
+	}
+	if e.BodyDropped {
+		res["bodyDropped"] = true
 	}
 	view := decoded
 	if truncated && !undecodable {

@@ -20,6 +20,10 @@ const (
 	responseTimeout  = 120 * time.Second
 )
 
+// firstBytesTimeout bounds how long a new client connection may take to send
+// its first bytes and its CONNECT or request header.
+var firstBytesTimeout = 30 * time.Second
+
 type config struct {
 	hosts   []string
 	secrets bool
@@ -136,6 +140,25 @@ func (p *Proxy) Close() {
 	}
 }
 
+// trackAux registers a connection owned by a tracked handler so that Close
+// closes it too.
+func (p *Proxy) trackAux(c net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	p.conns[c] = struct{}{}
+	return true
+}
+
+func (p *Proxy) untrackAux(c net.Conn) {
+	c.Close()
+	p.mu.Lock()
+	delete(p.conns, c)
+	p.mu.Unlock()
+}
+
 func (p *Proxy) track(c net.Conn) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -166,16 +189,19 @@ func (c *bufConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
 func (p *Proxy) handleConn(conn net.Conn) {
 	br := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(firstBytesTimeout))
 	head, err := br.Peek(8)
 	if err != nil {
 		return
 	}
 	bc := &bufConn{Conn: conn, r: br}
 	if string(head) != "CONNECT " {
+		_ = conn.SetReadDeadline(time.Time{})
 		p.serveHTTP(bc, p.handler("", ""))
 		return
 	}
 	req, err := http.ReadRequest(br)
+	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		return
 	}
@@ -284,9 +310,10 @@ func (l *oneConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
 func (p *Proxy) serveHTTP(conn net.Conn, h http.Handler) {
 	ln := &oneConnListener{conn: conn, done: make(chan struct{})}
 	srv := &http.Server{
-		Handler:     h,
-		ErrorLog:    log.New(io.Discard, "", 0),
-		IdleTimeout: 2 * time.Minute,
+		Handler:           h,
+		ErrorLog:          log.New(io.Discard, "", 0),
+		IdleTimeout:       2 * time.Minute,
+		ReadHeaderTimeout: firstBytesTimeout,
 		ConnState: func(_ net.Conn, s http.ConnState) {
 			if s == http.StateClosed {
 				ln.Close()

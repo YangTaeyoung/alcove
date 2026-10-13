@@ -95,9 +95,10 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		host, _ = splitAuthority(authority, "")
 	}
 
+	untouched := authority == "" && !p.intercepts(host)
 	cfg := p.config()
-	reqCap := newCapBuf(cfg.bodies)
-	resCap := newCapBuf(cfg.bodies)
+	reqCap := newCapBuf(cfg.bodies && !untouched)
+	resCap := newCapBuf(cfg.bodies && !untouched)
 	ex := &Exchange{
 		Time:       start,
 		Kind:       "http",
@@ -105,7 +106,10 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		URL:        target,
 		ReqHeaders: headerPairs(r.Header),
 	}
-	pe := &pendingEntry{time: start, kind: "http", method: r.Method, url: target, req: reqCap.count, res: resCap.count}
+	if untouched {
+		ex.Kind, ex.ReqHeaders = "tunnel", nil
+	}
+	pe := &pendingEntry{time: start, kind: ex.Kind, method: r.Method, url: target, req: reqCap.count, res: resCap.count}
 	endPending := p.beginPending(pe)
 	defer func() {
 		defer endPending()
@@ -120,6 +124,12 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		io.Reader
 		io.Closer
 	}{io.TeeReader(reqBody, reqCap), reqBody}
+
+	if untouched {
+		p.forward(w, r, target, ex, resCap)
+		ex.ResHeaders = nil
+		return
+	}
 
 	var act ruleAction
 	if a, id, ok := p.rules.pick(host, r.URL.Path, r.Method); ok {

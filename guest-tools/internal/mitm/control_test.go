@@ -53,7 +53,7 @@ func TestControlLoop(t *testing.T) {
 	if ready["ev"] != "ready" || int(ready["port"].(float64)) != l.Addr().(*net.TCPAddr).Port || ready["ca"] != ca.PEMPath() {
 		t.Fatalf("ready %v", ready)
 	}
-	send(`{"id":1,"op":"config","hosts":["*.x.test"],"secrets":false}`)
+	send(`{"id":1,"op":"config","hosts":["127.0.0.1"],"secrets":false}`)
 	if r := readLine(); r["id"].(float64) != 1 || r["ok"] != true {
 		t.Fatalf("config reply %v", r)
 	}
