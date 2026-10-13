@@ -27,6 +27,14 @@ func (s *Server) HandleUIEvent(name string, fields map[string]any) {
 	s.emit(name, fields)
 }
 
+// HandleUIStart forgets the windows launches have taken; it runs when a UI
+// helper process has started.
+func (s *Server) HandleUIStart() {
+	s.launchMu.Lock()
+	s.claimed.clear()
+	s.launchMu.Unlock()
+}
+
 func (s *Server) registerUI() {
 	const normal, long = 20 * time.Second, 30 * time.Second
 	ops := []struct {

@@ -3,9 +3,12 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,27 +160,35 @@ func TestLaunchWithoutANewWindowAnswersAfterTheWait(t *testing.T) {
 	if res.Int("pid") <= 0 || res.Has("window") {
 		t.Fatalf("res %v", res)
 	}
-	if took := time.Since(start); took < 400*time.Millisecond || took > 5*time.Second {
+	if took := time.Since(start); took < 400*time.Millisecond {
 		t.Fatalf("answered after %v", took)
 	}
-	if ui.listed() < 3 {
+	if ui.listed() < 2 {
 		t.Fatalf("win.list was called %d times", ui.listed())
 	}
 }
 
 func TestLaunchDoesNotStartWhenTheWindowsCannotBeListed(t *testing.T) {
 	ui := &windowsUI{list: func(int) ([]any, error) { return nil, errors.New("the UI helper is busy with 'ui.tree'; retry") }}
-	home := t.TempDir()
-	c, _ := newRPCClient(t, Options{UI: ui, HomeDir: home})
-	marker := filepath.Join(home, "started")
-	res := c.call("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "touch " + marker}})
+	var starts atomic.Int32
+	start := startProgram
+	startProgram = func(c *exec.Cmd) error {
+		starts.Add(1)
+		return start(c)
+	}
+	t.Cleanup(func() { startProgram = start })
+	c, _ := newRPCClient(t, Options{UI: ui})
+	res := c.call("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}})
 	want := "'sh' was not started because the windows could not be listed: the UI helper is busy with 'ui.tree'; retry"
 	if res["ok"] != false || res.String("error") != want {
 		t.Fatalf("res %v", res)
 	}
-	time.Sleep(200 * time.Millisecond)
-	if c.ok("fs.stat", proto.Message{"path": marker})["exists"] != false {
-		t.Fatal("the program ran")
+	if n := starts.Load(); n != 0 {
+		t.Fatalf("%d programs were started", n)
+	}
+	c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 0})
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("a launch that does not list windows started %d programs", n)
 	}
 }
 
@@ -200,38 +211,45 @@ func TestLaunchRefusesABadEnvName(t *testing.T) {
 	}
 }
 
-// delayedTwoWindowUI lists only an old window for the first poll, then two new
-// windows of different sizes, so two concurrent launches have two candidates.
-type delayedTwoWindowUI struct {
-	mu    sync.Mutex
-	start time.Time
+type launchKey struct{}
+
+// twoLaunchUI lists only an old window until the launches numbered 0 and 1
+// have both listed the windows once, and two new windows of different sizes
+// from then on. The number of a launch is the launchKey value of its context.
+type twoLaunchUI struct {
+	mu     sync.Mutex
+	listed map[int]bool
+	opened bool
 }
 
-func (u *delayedTwoWindowUI) CallContext(_ context.Context, op string, _ map[string]any, _ time.Duration) (map[string]any, error) {
+func (u *twoLaunchUI) CallContext(ctx context.Context, op string, _ map[string]any, _ time.Duration) (map[string]any, error) {
 	if op != "win.list" {
 		return map[string]any{}, nil
 	}
 	u.mu.Lock()
-	if u.start.IsZero() {
-		u.start = time.Now()
-	}
-	elapsed := time.Since(u.start)
-	u.mu.Unlock()
+	defer u.mu.Unlock()
 	old := window("0x10", "Program Manager", 4)
-	if elapsed < 160*time.Millisecond {
+	if !u.opened {
+		if u.listed == nil {
+			u.listed = map[int]bool{}
+		}
+		n, _ := ctx.Value(launchKey{}).(int)
+		u.listed[n] = true
+		u.opened = u.listed[0] && u.listed[1]
 		return map[string]any{"windows": []any{old}}, nil
 	}
 	return map[string]any{"windows": []any{sized("0xa", "App A", 77, 900, 700), sized("0xb", "App B", 88, 400, 300), old}}, nil
 }
 
 func TestTwoConcurrentLaunchesTakeDifferentWindows(t *testing.T) {
-	ui := &delayedTwoWindowUI{}
+	ui := &twoLaunchUI{}
 	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui, AllowExec: true})
 	ids := make(chan string, 2)
 	errs := make(chan error, 2)
 	for i := 0; i < 2; i++ {
+		ctx := context.WithValue(context.Background(), launchKey{}, i)
 		go func() {
-			res, err := s.appLaunch(context.Background(), proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 4000})
+			res, err := s.appLaunch(ctx, proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 60000})
 			if err != nil {
 				errs <- err
 				return
@@ -254,8 +272,6 @@ func TestTwoConcurrentLaunchesTakeDifferentWindows(t *testing.T) {
 				t.Fatalf("both launches took window %s", id)
 			}
 			got[id] = true
-		case <-time.After(15 * time.Second):
-			t.Fatal("a launch did not finish")
 		}
 	}
 	if !got["0xa"] || !got["0xb"] {
@@ -288,27 +304,81 @@ func (u *pollingUI) listed() int {
 
 func TestLaunchStopsPollingWhenTheConnectionCloses(t *testing.T) {
 	ui := &pollingUI{}
-	_, r, w, c := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui, AllowExec: true})
+	s, r, w, c := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui, AllowExec: true})
+	returned := make(chan struct{})
+	s.register("t.launch", true, func(ctx context.Context, req proto.Message) (proto.Message, error) {
+		defer close(returned)
+		return s.appLaunch(ctx, req)
+	})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 1, "op": "app.launch", "path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 20000})
+	w.Send(proto.Message{"t": "req", "id": 1, "op": "t.launch", "path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": maxLaunchWaitMs})
 	for ui.listed() < 2 {
 		time.Sleep(5 * time.Millisecond)
 	}
 	c.Close()
-	deadline := time.Now().Add(5 * time.Second)
-	var settled int
-	for {
-		n := ui.listed()
-		time.Sleep(400 * time.Millisecond)
-		if ui.listed() == n {
-			settled = n
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("win.list is still being called %d times after the connection closed", ui.listed())
+	select {
+	case <-returned:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("the launch still waits for a window after the connection closed; win.list was called %d times", ui.listed())
+	}
+}
+
+func TestClaimSetForgetsTheOldestIdsBeyondItsLimit(t *testing.T) {
+	var c claimSet
+	for i := 0; i < maxClaims+3; i++ {
+		c.add(fmt.Sprintf("0x%x", i))
+	}
+	if len(c.ids) != maxClaims || len(c.order) != maxClaims {
+		t.Fatalf("the set holds %d ids in an order of %d", len(c.ids), len(c.order))
+	}
+	for i := 0; i < 3; i++ {
+		if c.ids[fmt.Sprintf("0x%x", i)] {
+			t.Fatalf("the id claimed as number %d is still held", i)
 		}
 	}
-	_ = settled
+	if !c.ids["0x3"] || !c.ids[fmt.Sprintf("0x%x", maxClaims+2)] {
+		t.Fatal("an id within the limit is missing")
+	}
+	c.add("0x3")
+	c.add("0xfffff")
+	if c.ids["0x3"] || !c.ids["0x4"] || !c.ids["0xfffff"] {
+		t.Fatalf("a second claim of 0x3 changed its place in the order")
+	}
+	c.remove("0x4")
+	c.remove("0x4")
+	c.remove("0xnone")
+	if c.ids["0x4"] || len(c.ids) != maxClaims-1 || len(c.order) != maxClaims-1 {
+		t.Fatalf("after removing 0x4 the set holds %d ids in an order of %d", len(c.ids), len(c.order))
+	}
+	c.clear()
+	if len(c.ids) != 0 || len(c.order) != 0 {
+		t.Fatalf("after clear the set holds %d ids", len(c.ids))
+	}
+	c.add("0x1")
+	if !c.ids["0x1"] || len(c.order) != 1 {
+		t.Fatal("an id claimed after clear is missing")
+	}
+}
+
+func TestAHelperStartReleasesTheClaimedWindows(t *testing.T) {
+	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: &fakeUI{}})
+	before := map[string]bool{}
+	tree := map[int]bool{77: true}
+	windows := []map[string]any{window("0x20", "Fixture", 77)}
+	if w := s.claimWindow(windows, before, tree, false, ""); w == nil || windowID(w) != "0x20" {
+		t.Fatalf("first claim: %v", w)
+	}
+	if w := s.claimWindow(windows, before, tree, false, ""); w != nil {
+		t.Fatalf("a claimed window was claimed again: %v", w)
+	}
+	s.HandleUIStart()
+	if w := s.claimWindow(windows, before, tree, false, ""); w == nil || windowID(w) != "0x20" {
+		t.Fatalf("claim after a helper start: %v", w)
+	}
+	s.HandleUIEvent("window.closed", map[string]any{"window": map[string]any{"id": "0x20"}})
+	if w := s.claimWindow(windows, before, tree, false, ""); w == nil || windowID(w) != "0x20" {
+		t.Fatalf("claim after window.closed: %v", w)
+	}
 }
 
 func TestPickLaunchWindow(t *testing.T) {

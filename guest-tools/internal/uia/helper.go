@@ -69,6 +69,7 @@ type waiter struct {
 type Helper struct {
 	launch  Launcher
 	onEvent func(name string, fields map[string]any)
+	onStart func()
 
 	startTimeout time.Duration
 	queueWait    time.Duration
@@ -89,6 +90,14 @@ type Helper struct {
 func New(launch Launcher, onEvent func(name string, fields map[string]any)) *Helper {
 	return &Helper{launch: launch, onEvent: onEvent, logger: log.Default(),
 		startTimeout: defaultStartTimeout, queueWait: defaultQueueWait}
+}
+
+// SetOnStart sets a function that runs each time a helper child has announced
+// that it is ready.
+func (h *Helper) SetOnStart(fn func()) {
+	h.mu.Lock()
+	h.onStart = fn
+	h.mu.Unlock()
 }
 
 // SetLogPath sets the helper log file named in start-timeout errors.
@@ -188,9 +197,10 @@ func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (
 // the child as needed. The returned fields exclude "id" and "ok". The call
 // waits for its turn first; timeout counts from the moment the request is
 // handed to the child, and a child that does not answer within it is killed. A
-// call whose context is cancelled before its request reaches the child leaves
-// the queue without touching the helper; a request already handed to the child
-// runs to its end.
+// call whose context is cancelled before its request reaches the child, while
+// it waits for its turn or for a starting child to become ready, gives up its
+// turn without sending the request; a request already handed to the child runs
+// to its end.
 func (h *Helper) CallContext(ctx context.Context, op string, params map[string]any, timeout time.Duration) (map[string]any, error) {
 	if err := h.acquire(ctx, op); err != nil {
 		return nil, err
@@ -227,6 +237,8 @@ func (h *Helper) CallContext(ctx context.Context, op string, params map[string]a
 	case <-c.ready:
 	case <-c.done:
 		return nil, c.err
+	case <-ctx.Done():
+		return nil, errors.New(errCancelled)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -389,12 +401,17 @@ func (h *Helper) handleLine(c *child, line []byte) {
 	delete(m, "ev")
 	if name == "ready" {
 		h.mu.Lock()
-		if !c.isReady {
+		first := !c.isReady
+		if first {
 			c.isReady = true
 			c.startTimer.Stop()
 			close(c.ready)
 		}
+		onStart := h.onStart
 		h.mu.Unlock()
+		if first && onStart != nil {
+			onStart()
+		}
 		return
 	}
 	if name == "fatal" {

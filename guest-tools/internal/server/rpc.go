@@ -30,16 +30,18 @@ type opEntry struct {
 }
 
 // conn is one open agent connection. A single writer goroutine drains out:
-// replies and keepalives wait for room, events are dropped and counted when
-// the queue is full, and the dropped count is announced once the writer catches
-// up. A write that does not finish within connWriteTimeout closes the
-// connection.
+// replies and keepalives wait for room; an event that finds no room is dropped
+// and counted. The count goes out as an events.dropped event at the place of
+// the dropped events: in the queue just before the next event that is queued,
+// or written by the writer when the queue is empty. A write that does not
+// finish within connWriteTimeout closes the connection.
 type conn struct {
 	nc  net.Conn
 	w   *proto.Writer
 	lg  *log.Logger
 	out chan proto.Message
 
+	// mu orders the events put into out and guards dropped.
 	mu      sync.Mutex
 	dropped int64
 
@@ -61,22 +63,47 @@ func (c *conn) send(m proto.Message) {
 	}
 }
 
-// enqueueEvent queues an event without blocking; a full queue drops and counts
-// it instead.
+// enqueueEvent queues an event without blocking. Without room it drops and
+// counts the event. After a drop the event needs room for two messages: the
+// events.dropped message with the count is queued first, then the event.
 func (c *conn) enqueueEvent(ev proto.Message) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dropped > 0 {
+		if cap(c.out)-len(c.out) < 2 {
+			c.dropped++
+			return
+		}
+		select {
+		case c.out <- droppedEvent(c.dropped):
+			c.dropped = 0
+		case <-c.done:
+			return
+		default:
+			c.dropped++
+			return
+		}
+	}
 	select {
 	case c.out <- ev:
 	case <-c.done:
 	default:
-		c.mu.Lock()
 		c.dropped++
-		c.mu.Unlock()
 	}
 }
 
-func (c *conn) takeDropped() int64 {
+func droppedEvent(n int64) proto.Message {
+	return proto.Message{"t": "ev", "name": "events.dropped", "count": n}
+}
+
+// takeDroppedWhenIdle returns the dropped count and resets it when events
+// were dropped and the queue is empty; otherwise it returns 0.
+func (c *conn) takeDroppedWhenIdle() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.dropped == 0 || len(c.out) > 0 {
+		return 0
+	}
 	n := c.dropped
 	c.dropped = 0
 	return n
@@ -93,8 +120,8 @@ func (c *conn) writeLoop() {
 			if !c.write(m) {
 				return
 			}
-			if n := c.takeDropped(); n > 0 {
-				if !c.write(proto.Message{"t": "ev", "name": "events.dropped", "count": n}) {
+			if n := c.takeDroppedWhenIdle(); n > 0 {
+				if !c.write(droppedEvent(n)) {
 					return
 				}
 			}

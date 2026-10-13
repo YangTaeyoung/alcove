@@ -18,6 +18,8 @@ const (
 	defaultLaunchWaitMs = 15000
 	maxLaunchWaitMs     = 300000
 	launchListTimeout   = 20 * time.Second
+	// maxClaims bounds the window ids app.launch remembers as taken.
+	maxClaims = 1024
 )
 
 var (
@@ -28,7 +30,49 @@ var (
 	// launchFrameSettle is how long app.launch waits for a packaged app's
 	// frame window to report the app's process.
 	launchFrameSettle = 3 * time.Second
+	// startProgram starts the program of an app.launch.
+	startProgram = func(c *exec.Cmd) error { return c.Start() }
 )
+
+// claimSet holds the ids of the windows launches have taken, in the order
+// they were taken, at most maxClaims of them.
+type claimSet struct {
+	ids   map[string]bool
+	order []string
+}
+
+// add records id; when that makes more than maxClaims ids, the oldest leave.
+func (c *claimSet) add(id string) {
+	if c.ids[id] {
+		return
+	}
+	if c.ids == nil {
+		c.ids = map[string]bool{}
+	}
+	c.ids[id] = true
+	c.order = append(c.order, id)
+	for len(c.order) > maxClaims {
+		delete(c.ids, c.order[0])
+		c.order = c.order[1:]
+	}
+}
+
+func (c *claimSet) remove(id string) {
+	if !c.ids[id] {
+		return
+	}
+	delete(c.ids, id)
+	for i, other := range c.order {
+		if other == id {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+}
+
+func (c *claimSet) clear() {
+	c.ids, c.order = nil, nil
+}
 
 func (s *Server) registerLaunch() {
 	s.register("app.launch", true, s.appLaunch)
@@ -86,7 +130,7 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 		}
 	}
 
-	if err := c.Start(); err != nil {
+	if err := startProgram(c); err != nil {
 		return nil, fmt.Errorf("cannot start '%s': %v; check the path with fs.stat", path, err)
 	}
 	pid, started := c.Process.Pid, c.Path
@@ -116,9 +160,9 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 func (s *Server) claimWindow(windows []map[string]any, before map[string]bool, tree map[int]bool, foreign bool, own string) map[string]any {
 	s.launchMu.Lock()
 	defer s.launchMu.Unlock()
-	w := pickLaunchWindow(windows, before, tree, foreign, s.claimed, own)
+	w := pickLaunchWindow(windows, before, tree, foreign, s.claimed.ids, own)
 	if w != nil {
-		s.claimed[windowID(w)] = true
+		s.claimed.add(windowID(w))
 	}
 	return w
 }
@@ -128,7 +172,7 @@ func (s *Server) unclaimWindow(id string) {
 		return
 	}
 	s.launchMu.Lock()
-	delete(s.claimed, id)
+	s.claimed.remove(id)
 	s.launchMu.Unlock()
 }
 

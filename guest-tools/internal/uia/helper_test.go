@@ -219,16 +219,15 @@ func TestTimeoutOfAQueuedCallStartsWhenTheHelperReceivesIt(t *testing.T) {
 	for h.busyNow() != "slow" {
 		time.Sleep(time.Millisecond)
 	}
-	const fastTimeout = 50 * time.Millisecond
+	const fastTimeout = time.Second
 	fast := make(chan result, 1)
 	go func() {
 		got, err := h.Call("fast", nil, fastTimeout)
 		fast <- result{got, err}
 	}()
 	waitQueued(t, h, 1)
-	// The queued call waits far longer than its own timeout; the timeout must
-	// not run until the helper receives the request.
-	time.Sleep(10 * fastTimeout)
+	// The queued call stays in the queue for longer than its own timeout.
+	time.Sleep(fastTimeout + fastTimeout/5)
 	close(release)
 	if r := <-fast; r.err != nil || r.fields["op"] != "fast" {
 		t.Fatalf("queued call: %v %v", r.fields, r.err)
@@ -840,4 +839,79 @@ func TestCloseStopsChild(t *testing.T) {
 		t.Fatalf("call after close: %v", err)
 	}
 	h.Close()
+}
+
+func TestCallCancelledWhileTheHelperStartsGivesUpItsTurn(t *testing.T) {
+	ready := make(chan struct{})
+	var received sync.Map
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		<-ready
+		sendReady(out)
+		readRequests(in, func(req map[string]any) bool {
+			received.Store(req["op"], true)
+			writeLine(out, map[string]any{"id": req["id"], "ok": true, "op": req["op"]})
+			return true
+		})
+	})
+	f.noReady = true
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := h.CallContext(ctx, "ui.tree", nil, longWait)
+		first <- err
+	}()
+	for f.launches.Load() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	second := make(chan result, 1)
+	go func() {
+		got, err := h.Call("win.list", nil, longWait)
+		second <- result{got, err}
+	}()
+	waitQueued(t, h, 1)
+	cancel()
+	if err := <-first; err == nil || err.Error() != errCancelled {
+		t.Fatalf("cancelled call: %v", err)
+	}
+	waitQueued(t, h, 0)
+	close(ready)
+	if r := <-second; r.err != nil || r.fields["op"] != "win.list" {
+		t.Fatalf("the call that waited behind the cancelled one: %v %v", r.fields, r.err)
+	}
+	if _, ok := received.Load("ui.tree"); ok {
+		t.Fatal("the cancelled request reached the helper")
+	}
+	if got := f.launches.Load(); got != 1 {
+		t.Fatalf("launches %d", got)
+	}
+}
+
+func TestOnStartRunsOncePerHelperThatBecameReady(t *testing.T) {
+	f := newFake(func(n int, in io.Reader, out io.Writer) {
+		if n == 0 {
+			readRequests(in, func(map[string]any) bool { return false })
+			out.(io.Closer).Close()
+			return
+		}
+		sendReady(out)
+		echoPlay(n, in, out)
+	})
+	var starts atomic.Int32
+	h := New(f.launcher(), nil)
+	h.SetOnStart(func() { starts.Add(1) })
+	defer h.Close()
+	if _, err := h.Call("ui.tree", nil, longWait); err == nil || err.Error() != "UI helper exited; retry" {
+		t.Fatalf("err %v", err)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("onStart ran %d times for the first helper", got)
+	}
+	if _, err := h.Call("ping", map[string]any{"x": 1}, longWait); err != nil {
+		t.Fatal(err)
+	}
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("onStart ran %d times for two helpers, the second of which announced ready twice", got)
+	}
 }

@@ -48,10 +48,10 @@ type Server struct {
 	jobs   *jobTable
 
 	launchMu sync.Mutex
-	// claimed holds the ids of windows an app.launch has taken, so that a
-	// concurrent launch does not take the same window; an id leaves the set
-	// when the window closes.
-	claimed map[string]bool
+	// claimed holds the ids of windows an app.launch has taken; a concurrent
+	// launch does not take one of them. An id leaves the set when its window
+	// closes, and the set is emptied when a UI helper starts.
+	claimed claimSet
 
 	ownMu   sync.Mutex
 	ownSeq  uint64
@@ -68,8 +68,7 @@ func New(opt Options) *Server {
 	if opt.HomeDir == "" {
 		opt.HomeDir, _ = os.UserHomeDir()
 	}
-	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable(),
-		claimed: map[string]bool{}}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable()}
 	s.registerBuiltins()
 	return s
 }

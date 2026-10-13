@@ -184,19 +184,75 @@ func TestConnDropsEventsWhenThePeerDoesNotReadAndAnnouncesTheCount(t *testing.T)
 			t.Fatalf("read %d events, %d dropped, no more: %v", read, dropped, err)
 		}
 		if m.String("name") == "events.dropped" {
-			dropped += m.Int("count")
-		} else {
-			read++
+			if dropped != 0 {
+				t.Fatalf("a second events.dropped arrived after %d events", read)
+			}
+			dropped = m.Int("count")
+			continue
 		}
+		if dropped != 0 {
+			t.Fatalf("event %d arrived after events.dropped", m.Int("i"))
+		}
+		if m.Int("i") != read {
+			t.Fatalf("event %d arrived as number %d", m.Int("i"), read)
+		}
+		read++
 	}
 	if dropped <= 0 {
 		t.Fatalf("events.dropped count is %d", dropped)
 	}
-	if read >= total {
-		t.Fatalf("the peer received %d of %d events with none dropped", read, total)
-	}
 	if read+dropped != total {
 		t.Fatalf("%d read plus %d dropped is not %d", read, dropped, total)
+	}
+}
+
+func TestEventsDroppedIsQueuedBeforeTheNextEventThatFits(t *testing.T) {
+	cli, srv := net.Pipe()
+	defer cli.Close()
+	c := newConn(srv, log.New(io.Discard, "", 0))
+	go c.writeLoop()
+	defer c.stopWriter()
+
+	total := eventQueueSize + 50
+	for i := 0; i < total; i++ {
+		c.enqueueEvent(proto.Message{"t": "ev", "name": "window.title", "i": i})
+	}
+	_ = cli.SetReadDeadline(time.Now().Add(10 * time.Second))
+	r := proto.NewReader(cli)
+	read := 0
+	next := func() proto.Message {
+		m, err := r.Next()
+		if err != nil {
+			t.Fatalf("after %d events: %v", read, err)
+		}
+		return m
+	}
+	for ; read < 10; read++ {
+		if m := next(); m.String("name") != "window.title" || m.Int("i") != read {
+			t.Fatalf("message %d is %v", read, m)
+		}
+	}
+	for cap(c.out)-len(c.out) < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	c.enqueueEvent(proto.Message{"t": "ev", "name": "window.closed"})
+	c.enqueueEvent(proto.Message{"t": "ev", "name": "window.opened"})
+
+	var m proto.Message
+	for m = next(); m.String("name") == "window.title"; m = next() {
+		if m.Int("i") != read {
+			t.Fatalf("event %d arrived as number %d", m.Int("i"), read)
+		}
+		read++
+	}
+	if m.String("name") != "events.dropped" || m.Int("count") != total-read {
+		t.Fatalf("after %d of %d events came %v", read, total, m)
+	}
+	if m = next(); m.String("name") != "window.closed" {
+		t.Fatalf("after events.dropped came %v", m)
+	}
+	if m = next(); m.String("name") != "window.opened" {
+		t.Fatalf("after window.closed came %v", m)
 	}
 }
 
