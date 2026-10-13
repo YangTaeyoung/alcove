@@ -4,7 +4,10 @@ Version 1. Lets automation on the Mac — the `alcove-mcp` server for Claude
 Code and other agents, `alcovectl`, scripts — drive VMs: list and start them,
 take screenshots, move the mouse, click, type, press keys, run shell commands
 and background jobs in the guest, list and kill guest processes, exchange
-clipboard text, and copy, sync, read and write guest files.
+clipboard text, copy, sync, read and write guest files, take and restore
+snapshots, forward ports, cut the guest's network link, lease a VM, change
+guest settings, diagnose a VM, and create linked clones and sessions that
+discard their changes.
 
 The same server runs inside the Alcove app (which owns the VMs while it is
 running) and inside `alcovectl serve` (headless, when the app is not running).
@@ -32,7 +35,9 @@ Each connection has two lanes.
   second request after the reply to the first.
 - **Serial lane**: every other op (`hello`, `vm.list`, `vm.status`, power,
   screenshot, mouse, keyboard, clipboard, `vm.batch`, `vm.wait_idle`,
-  `vm.wait_for`). These run one after another in the order they arrived, and
+  `vm.wait_for`, snapshots, forwards, `vm.set_network`, leases,
+  `vm.set_resolution`, `vm.set_environment`, `vm.doctor`, `vm.clone`,
+  `vm.delete`). These run one after another in the order they arrived, and
   their replies come in that order; a long `vm.wait_for` or `vm.batch` holds
   back the later requests of the serial lane of its connection.
 
@@ -51,10 +56,12 @@ affected. The control socket carries no events: a job's exit is seen through
 | `op` | Params | Result |
 |---|---|---|
 | `hello` | — | `{version: 1, host: "app"|"headless"}` |
-| `vm.list` | — | `{vms: [{name, guestOS, state, width, height, tools: bool}]}` |
-| `vm.status` | `name` | `{state, width, height, tools, agentCaps: [...], suspended: bool}` |
-| `vm.start` | `name` | `{state}` after the guest is running |
+| `vm.list` | — | `{vms: [{name, guestOS, state, suspended, width?, height?, error?, leasedBy?, cloneOf?, ephemeral?}]}` — see [VM rows](#vm-rows) |
+| `vm.status` | `name` | the VM's row plus, while it is running or paused, `tools: bool` and, with tools, `agentCaps: [...]` |
+| `vm.start` | `name`, `discardChanges?` | `{state, ephemeral}` after the guest is running — see [Starting](#starting) |
 | `vm.stop` | `name`, `force?` | `{state}` after the engine exited (graceful ACPI first) |
+| `vm.clone` | `name` (the template), `newName` | `{name}` — see [Linked clones](#linked-clones) |
+| `vm.delete` | `name` (a clone) | `{}` — see [Linked clones](#linked-clones) |
 | `vm.pause` / `vm.resume` | `name` | `{state}` |
 | `vm.screenshot` | `name`, `region?`, `scale?`, `format?`, `quality?`, `maxWidth?` | `{png | jpeg, mime, width, height, sentWidth, sentHeight, x, y, areaWidth, areaHeight, scale}` — see [Screenshots](#screenshots) |
 | `vm.mouse.move` | `name`, `x`, `y`, observe params | `{}` or `{observation}` |
@@ -85,6 +92,19 @@ affected. The control socket carries no events: a job's exit is seen through
 | `vm.fs.write` | `name`, `path`, `text`, `append?` | `{size}` |
 | `vm.fs.delete` | `name`, `path`, `recursive?` | `{deleted}` |
 | `vm.wait_idle` | `name`, `seconds?` (stable period, default 2), `timeout?` (default 30) | `{idle: bool}` — `true` when fewer than 0.5% of the frame's 32x32 tiles changed between samples 250 ms apart for the whole period, `false` at the timeout |
+| `vm.snapshot.list` | `name` | `{snapshots: [{name, date, vmStateBytes}]}` — see [Snapshots](#snapshots) |
+| `vm.snapshot.create` | `name`, `snapshot` | `{snapshot}` |
+| `vm.snapshot.restore` | `name`, `snapshot`, `waitTools?` s (default 30) | `{snapshot, tools: bool, clockSynced: bool}` |
+| `vm.snapshot.delete` | `name`, `snapshot` | `{}` |
+| `vm.forward.add` | `name`, `guestPort`, `hostPort?` | `{hostPort, guestPort}` — see [Port forwards](#port-forwards) |
+| `vm.forward.remove` | `name`, `hostPort` | `{}` |
+| `vm.forward.list` | `name` | `{forwards: [{hostPort, guestPort, kind: "config"|"agent"|"runtime"}]}` |
+| `vm.set_network` | `name`, `up` (bool) | `{up}` — see [Network link](#network-link) |
+| `vm.lease.acquire` | `name`, `owner?`, `ttl?` s (default 300), `lease?` (to renew) | `{lease, expiresIn}` — see [Leases and read-only ops](#leases-and-read-only-ops) |
+| `vm.lease.release` | `name`, `lease` | `{}` |
+| `vm.set_resolution` | `name`, `width`, `height` | `{width, height}` — see [Resolution](#resolution) |
+| `vm.set_environment` | `name`, any of `theme`, `timeZone`, `clock`, `locale`, `keyboardLayouts`, `dpiScale` | `{applied: [{setting, ok, detail, takesEffect}]}` — see [Guest environment](#guest-environment) |
+| `vm.doctor` | `name` | `{checks: [{id, ok, detail, hint?}]}` — see [Doctor](#doctor) |
 
 Key names: letters, digits, `enter return tab space esc escape backspace delete
 insert home end pageup pagedown up down left right f1..f20 capslock
@@ -257,16 +277,300 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   as for an action op, comparing the final screen with the screen at the start
   of the wait.
 
+## VM rows
+
+`vm.list` and `vm.status` describe a VM with the same fields:
+
+| field | meaning |
+|---|---|
+| `name`, `guestOS` | the VM's name and `windows`, `linux` or `other` |
+| `state` | `stopped`, `starting`, `running`, `paused`, `suspending`, `stopping` or `failed` |
+| `suspended` | a session saved to disk exists; the next `vm.start` resumes it |
+| `width`, `height` | the size of the latest frame read through this server; `vm.status` reads a frame of a running VM when none is known |
+| `error` | with `failed`: the engine's message |
+| `leasedBy` | the owner of the lease, while one is active |
+| `cloneOf` | on a linked clone: the name of its template |
+| `ephemeral` | `true` while a session started with `discardChanges` runs; absent otherwise |
+
+`vm.status` adds `tools` for a running or paused VM (it waits up to 2 s for
+the guest tools) and `agentCaps` when they are connected.
+
+## Starting
+
+`vm.start` on a VM that is already starting, running or paused answers its
+state without doing anything, except with `discardChanges: true`, which then
+answers `VM '<vm>' is already running; stop it first to start a session that
+discards changes`. `ephemeral` in the result says whether the running session
+discards its changes.
+
+`discardChanges` (a boolean, default `false`) starts a session whose disk
+writes go to qcow2 overlays (`run/ephemeral-<disk>.qcow2` in the bundle) and
+whose UEFI variable writes go to a copy (`run/ephemeral-efi-vars.fd`). When
+the session ends, by `vm.stop`, a guest shutdown or an engine crash seen by
+the server, these files are removed and the VM's disks are as they were before
+the start; the next start empties `run/` in any case. Snapshot ops work during such a session and act on the overlay, so
+its snapshots end with it. The session cannot be suspended to disk.
+
+A start that is refused answers `start failed: <reason>`. The reasons the
+server checks before it launches the engine:
+
+| reason | when |
+|---|---|
+| `the configuration of '<vm>' at <path>/config.json cannot be read; restore or repair config.json before starting` | the bundle's `config.json` is missing or does not decode |
+| `'<vm>' is a template with clones (<a>, <b>); delete the clones first or start a clone` | a linked clone of the VM exists (see [Linked clones](#linked-clones)) |
+| `'<vm>' has a suspended session; resume it or discard the suspended state before starting a session that discards changes` | `discardChanges` on a VM with a session saved to disk |
+| `the template of '<clone>' was not found at <path>; the clone cannot run without it` | a clone whose template bundle is gone or unreadable |
+| `the VM at <path> is not the template '<clone>' was cloned from; the clone cannot run` | another VM is stored at the template's path |
+| `the template '<template>' was started after '<clone>' was cloned from it, so the clone's disk no longer matches; delete the clone and clone again` | the template ran a session that keeps its changes after the clone was made |
+| `'<vm>' has been cloned, so each start is recorded in <path>/config.json, and that file could not be saved; make the bundle folder writable and start it again` | a VM that was cloned before cannot save its `config.json` (the system's description follows on a second line) |
+
+Other failures carry the engine's own output after `start failed: `.
+
+## Linked clones
+
+`vm.clone` creates a new VM named `newName` (surrounding whitespace is
+removed) next to the stopped VM `name`, its template:
+
+- Each disk of the clone is a qcow2 overlay backed by the template's disk
+  file, which it references by absolute path. The clone stores only its own
+  writes.
+- The clone has a copy of the template's UEFI variables, the template's CPU,
+  memory, display and shared folders, a new guest-tools token, a new MAC
+  address and a guest-tools port that no VM in the directory uses. It has no
+  CD-ROMs, USB passthrough or configured port forwards.
+- Its row carries `cloneOf`.
+
+Refusals of `vm.clone`:
+
+```
+'<vm>' is running; stop it before cloning it
+'<vm>' has a suspended session; resume and shut it down, or discard the suspended state, before cloning it
+'<vm>' is a clone of '<template>'; clone '<template>' instead
+cannot clone a VM with a TPM
+'<newName>' cannot be used as a VM name; choose a non-empty name without '/', ':' or ','
+a VM named '<newName>' already exists; choose another name
+qemu-img could not create the clone's disk (<message>); check the template's disk images and the free space, then clone again
+```
+
+**The template guard.** A clone reads every block it has not written from the
+template's disk, so the template must not change while a clone exists. For as
+long as a VM has a clone, `vm.start` of that VM is refused with the `is a
+template with clones` sentence, whether the clone is stopped or running, and
+also with `discardChanges`. The clones of a VM are the bundles in its
+directory, or listed in its `clones.json`, whose configuration names it as
+`cloneOf`.
+
+**Stale clones.** When a VM is cloned for the first time, its `config.json`
+receives a `diskID` and a `diskEpoch`, and every later cold start of that VM
+that keeps its changes (not a `discardChanges` session, not the resume of a
+suspended session) raises `diskEpoch` by one. A clone records both values and
+the template's path. A clone that was not visible to the template guard (its
+bundle was moved away, for example) and comes back after the template ran is
+refused by `vm.start` with one of the three clone sentences under
+[Starting](#starting); the way out is to delete it and clone again. Saving a
+VM's configuration never lowers or removes these values.
+
+`vm.delete` deletes the stopped clone `name`: its bundle directory with its
+disks and its entry in the template's clone list. With the last clone gone the
+template starts again. Refusals:
+
+```
+'<vm>' is not a clone; delete it in the Alcove app
+'<vm>' is running; stop it before deleting it
+```
+
+`vm.delete` also drops the VM's lease, its runtime forwards and its cached
+frame size. Both ops answer `no VM named '<vm>'; call vm.list` for an unknown
+`name`, and `this control host cannot clone or delete VMs` on a host without
+VM provisioning (the app and `alcovectl serve` both have it).
+
+## Snapshots
+
+A snapshot is an internal qcow2 snapshot of every disk of the VM plus the
+memory and device state, stored in the first disk's image. The four ops need a
+running or paused VM. A snapshot's memory state takes about as much disk space
+as the guest's used memory; deleting a snapshot frees that space inside the
+image for later writes, and the image file keeps its size.
+
+- `vm.snapshot.list` reads the snapshots of the first disk: `name`, `date`
+  (ISO 8601, UTC) and `vmStateBytes`, the size of the memory state.
+- `vm.snapshot.create` saves the snapshot `snapshot`: a name of 1 to 128
+  characters without a line break (`snapshot name must be 1 to 128 characters
+  without a line break; choose another name`) that is not in use (`a snapshot
+  named '<s>' already exists in '<vm>'; call vm.snapshot.delete first or
+  choose another name`). The guest is stopped while the state is written.
+- `vm.snapshot.restore` returns the VM to `snapshot`. A running guest is
+  stopped for the load and runs again afterwards, also when the load fails; a
+  paused VM stays paused. Everything since the snapshot is lost: disk contents,
+  running programs, guest jobs started later. The server then drops its
+  connection to the guest tools, connects again for up to `waitTools` seconds
+  (default 30; it tries once even with 0) and, when the tools are connected and
+  can run commands, sets the guest clock to the host's. `tools` says whether
+  they connected, `clockSynced` whether the clock was set. With
+  `clockSynced: false`, call `vm.set_environment` with `clock: "host"` once
+  `vm.status` shows the tools. Runtime port forwards stay in place.
+- `vm.snapshot.delete` deletes `snapshot`.
+- `vm.snapshot.restore` and `vm.snapshot.delete` of a name that is not listed
+  answer `no snapshot '<s>' in '<vm>'; call vm.snapshot.list`.
+- A failure of the engine answers `snapshot create failed: <message>`,
+  `snapshot restore failed: <message>` or `snapshot delete failed: <message>`
+  with the engine's message, or `the engine closed its control connection;
+  check vm.status` when the engine went away.
+
+## Port forwards
+
+A forward listens on `127.0.0.1:<hostPort>` on the Mac and connects to
+`<guestPort>` in the guest (TCP, user-mode networking). `vm.forward.list`
+shows three kinds:
+
+| `kind` | what it is |
+|---|---|
+| `config` | the TCP forwards of the VM's configuration; they exist for the whole run |
+| `agent` | the forward the guest tools use (guest port 7645) |
+| `runtime` | forwards added with `vm.forward.add`, in the order they were added |
+
+- `vm.forward.add` takes `guestPort` (1 to 65535) and `hostPort` (0 to 65535;
+  0, `null` or absent lets the server pick a free port). A `hostPort` that a
+  `config`, `agent` or `runtime` forward of the VM uses, or that the engine
+  cannot listen on, answers `host port <n> is taken; pass hostPort: 0 to let
+  Alcove choose`. Out-of-range values answer `guestPort must be between 1 and
+  65535` / `hostPort must be between 1 and 65535`.
+- `vm.forward.remove` removes the runtime forward on `hostPort` (1 to 65535).
+  Any other port answers `no runtime forward on host port <n> in '<vm>'; call
+  vm.forward.list (forwards from the VM configuration cannot be removed while
+  it runs)`.
+- When the engine reports that it no longer has the forward, `vm.forward.remove`
+  drops it from the list and succeeds.
+- Runtime forwards belong to the engine process they were added to. They are
+  gone when the VM stops, and the server forgets them when the VM is started
+  again, by this server or by anything else.
+- A guest firewall decides whether the guest port answers: a forward to a port
+  that Windows Firewall blocks connects on the Mac and then delivers nothing.
+- The three ops need a running or paused VM.
+
+## Network link
+
+`vm.set_network` with `up: false` takes the link of the guest's network
+adapter down (the guest sees an unplugged cable); `up: true` brings it back.
+`up` must be a boolean. The guest tools connect through the same adapter:
+
+- While the link is down, an op that needs the guest tools waits for its
+  reply and then answers `guest tools in '<vm>' did not answer <op> in time;
+  check vm.status and retry`. `vm.status` keeps reporting `tools: true`,
+  because the host side of the connection stays open. Jobs already started in
+  the guest keep running.
+- After `up: true`, the first op that needs the guest tools can answer `guest
+  tools in '<vm>' disconnected during <op>; retry once the guest is back`; the
+  server connects again on the next op, so retry it.
+
 ## Leases and read-only ops
 
-An op that is not read-only is refused while another connection holds a lease
-on the VM, unless it passes the lease's token as `lease`. The read-only ops,
-which ignore leases, are `hello`, `vm.list`, `vm.status`, `vm.screenshot`,
-`vm.wait_idle`, `vm.wait_for`, `vm.find_text`, `vm.clipboard.get`,
-`vm.exec.read`, `vm.exec.list`, `vm.process.list`, `vm.fs.list`, `vm.fs.read`,
-`vm.pull_file`, `vm.snapshot.list`, `vm.forward.list`, `vm.lease.acquire`,
-`vm.lease.release` and `vm.doctor`. The action ops and `vm.batch` are not
-read-only; a batch checks the lease once, for the whole batch.
+A lease reserves a VM for one holder. An op that is not read-only and names
+the VM in `name` is refused while a lease is active, unless it passes the
+lease's token as `lease`:
+
+```
+VM '<vm>' is leased by <owner> for another <n> s; pass its lease token, wait, or ask the owner to release it
+```
+
+- `vm.lease.acquire` grants the lease when the VM has none: `owner` is free
+  text shown to others (default `unknown`), `ttl` the duration in seconds
+  (default 300; values below 1 count as 1, values above 3600 as 3600). The
+  result holds the token `lease` and `expiresIn`, the seconds granted.
+- With the holder's token as `lease`, `vm.lease.acquire` renews: the lease
+  keeps its token and owner and runs for `ttl` seconds from now. Without the
+  token, or with another one, it answers the refusal above.
+- `vm.lease.release` with the token ends the lease. On a VM without a lease it
+  does nothing; with a token that is not the holder's it answers `lease token
+  does not match; only the holder can release '<vm>'`.
+- A lease ends by itself when its time is up. Leases live in the server: a
+  server restart ends them all, and `vm.delete` ends the lease of the VM it
+  deletes.
+- The token is a capability, not an identity: any connection that passes it
+  acts as the holder. `vm.status` and `vm.list` show `leasedBy`.
+
+The read-only ops, which ignore leases, are `hello`, `vm.list`, `vm.status`,
+`vm.screenshot`, `vm.wait_idle`, `vm.wait_for`, `vm.find_text`,
+`vm.clipboard.get`, `vm.exec.read`, `vm.exec.list`, `vm.process.list`,
+`vm.fs.list`, `vm.fs.read`, `vm.pull_file`, `vm.snapshot.list`,
+`vm.forward.list`, `vm.lease.acquire`, `vm.lease.release`, `vm.doctor` and
+`vm.record.status`. Every other op is guarded, among them the power ops,
+`vm.clone` (through its template's lease) and `vm.delete`. The action ops and
+`vm.batch` are not read-only; a batch checks the lease once, for the whole
+batch.
+
+## Resolution
+
+`vm.set_resolution` asks the guest tools to switch the guest's primary display
+to `width` x `height` (320 to 7680 by 200 to 4320, otherwise `width must be
+320...7680 and height 200...4320`). It then reads the frame every 500 ms for
+up to 8 s, until its size changes or equals the request, and answers the size
+of the last frame read. A guest that does not offer the mode leaves the size
+as it was, and the result says so. The op needs a running VM with connected
+guest tools.
+
+## Guest environment
+
+`vm.set_environment` changes guest settings by running a script through the
+guest tools (PowerShell on Windows, `sh` on Linux; each script may take 60 s).
+It needs guest tools that run commands (`--allow-exec`). At least one setting
+is required (`pass at least one of theme, timeZone, clock, locale,
+keyboardLayouts, dpiScale`); a setting given as `null` counts as absent. All
+values are checked before anything is applied; the settings are then applied
+in the order of this table.
+
+| setting | value | guests | `takesEffect` |
+|---|---|---|---|
+| `clock` | `"host"` (the host's time now) or an ISO 8601 time with an offset, e.g. `2026-10-13T09:30:00Z`, with or without fractional seconds | Windows, Linux | `now` |
+| `timeZone` | a zone id of the guest OS: a Windows id such as `Korea Standard Time`, an IANA name such as `Asia/Seoul` on Linux; 1 to 64 characters from letters, digits, space and `_ - + / ( ) . :`, not starting with `-` | Windows, Linux | `now` |
+| `locale` | a language tag such as `ko-KR`: letters, digits and `-`, 2 to 35 characters, not starting with `-`. Sets the regional format and adds the language to the user's language list | Windows | `app restart` |
+| `keyboardLayouts` | a non-empty array of language tags; the user's input languages become exactly these, in this order | Windows | `now` |
+| `theme` | `dark` or `light`, for apps and for the system | Windows | `now` |
+| `dpiScale` | a whole percentage from 100 to 500; the nearest of 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500 is set. Windows redraws the desktop and open windows at the new scale without a sign-out | Windows | `now` |
+
+The result lists one row per requested setting: `setting`, `ok`, `detail` (what
+the script printed, e.g. the new time or zone id; the script's error text when
+`ok` is false) and `takesEffect` — `now` or `app restart` (programs started
+afterwards see it). A setting
+the guest OS has no script for is a row with `ok: false` and `detail` `not
+supported on <os> guests`. The op itself succeeds when a row fails, so read
+the rows.
+
+Refusals for values: `theme must be 'dark' or 'light'`, `dpiScale must be
+between 100 and 500`, `clock must be 'host' or an ISO 8601 time such as
+2026-10-13T09:30:00Z`, `timeZone must be 1 to 64 characters: letters, digits,
+space and _ - + / ( ) . :, not starting with '-'`, `locale must be a language
+tag such as ko-KR (letters, digits and '-', 2 to 35 characters, not starting
+with '-')`, `keyboardLayouts must be a non-empty list of language tags such as
+en-US`, `keyboardLayouts entries must be language tags such as en-US (...)`.
+
+## Doctor
+
+`vm.doctor` reports measured facts about a VM as rows `{id, ok, detail}`; a
+row that is not ok carries `hint`, the next step. It works on a stopped VM and
+ignores leases. Rows come in this order and the list ends at the first row
+that makes the later ones impossible:
+
+| `id` | `detail` | not ok when | ends the list |
+|---|---|---|---|
+| `engine` | the engine binary the server runs VMs with, or `managed by the Alcove app` | never | |
+| `host` | `app` or `headless` | never | |
+| `state` | the VM's state | not `running` (hint `call vm.start`, or `call vm.resume` when paused) | when not running |
+| `display` | `<W>x<H>` of the current frame | no frame can be read | |
+| `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s | when not ok |
+| `rpc` | `proto <n>` | below 2 | when `rpc` or `exec` is not ok |
+| `exec` | `enabled` or `disabled` | the tools were started without `--allow-exec` | |
+| `probe` | why the guest probe gave nothing | present only on failure: the guest OS has no probe script, the script failed or printed no JSON | always |
+| `session` | `<user>, unlocked` / `<user>, locked` / `<user>, lock state not checked on this guest` | locked, or the guest reported no user | |
+| `disk` | `<n> bytes free` on the system drive | below 2 GiB, or not reported | |
+| `clock` | `skew <n> s` between guest and host | above 5 s (hint `vm.set_environment clock=host`), or no valid time reported | |
+| `network` | `example.com resolves` / `does not resolve` | the name does not resolve in the guest | |
+| `scale` | `<p> %` or `not checked on this guest` | never | |
+
+`session` is `locked` on Windows while a `LogonUI` process exists. `scale` is
+the system DPI a newly started DPI-aware process reads on Windows, as a
+percentage of 96. A fact the guest cannot measure reads `not checked on this
+guest` and counts as ok.
 
 ## Shell, processes and files
 
@@ -362,4 +666,21 @@ timeout must be between 1 and 86400 seconds
 no job 'j9'; call exec.list
 'C:\out\app.exe' exists in the guest; pass overwrite
 guest tools in 'Win' did not answer vm.fs.read in time; check vm.status and retry
+VM 'Win' is leased by ci-agent for another 240 s; pass its lease token, wait, or ask the owner to release it
+no snapshot 'clean' in 'Win'; call vm.snapshot.list
+host port 8080 is taken; pass hostPort: 0 to let Alcove choose
+start failed: 'Win' is a template with clones (Win clone); delete the clones first or start a clone
 ```
+
+## Limits
+
+- One process owns a VM directory. Two control hosts (the Alcove app and
+  `alcovectl serve`, or two `alcovectl serve`) that manage the same directory
+  are not supported: each keeps its own VM states, leases and forwards.
+- The template guard and the stale-clone check read the bundles at the moment
+  of a start. A clone that another process creates between the moment a
+  template's `diskEpoch` is raised and the moment its engine takes over the
+  disks is not detected.
+- A linked clone references its template's disk files by absolute path: a
+  template bundle that is moved or renamed on disk leaves its clones without
+  their backing files.

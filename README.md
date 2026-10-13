@@ -9,7 +9,7 @@
   <a href="#quick-start"><img alt="platform" src="https://img.shields.io/badge/platform-macOS%2015%2B%20·%20Apple%20silicon-0B84FF?style=flat-square"></a>
   <a href="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-MIT%20·%20GPL--2.0%20patches-6E7681?style=flat-square"></a>
-  <a href="#automate-it-from-claude-code"><img alt="MCP" src="https://img.shields.io/badge/MCP-46%20tools-E8952E?style=flat-square"></a>
+  <a href="#automate-it-from-claude-code"><img alt="MCP" src="https://img.shields.io/badge/MCP-53%20tools-E8952E?style=flat-square"></a>
 </p>
 
 <p><b>A virtual machine app for the Mac, written from scratch on top of QEMU and Apple's Hypervisor framework —<br>and the first one your coding agent can drive by itself.</b></p>
@@ -101,7 +101,7 @@ headless engine when it is not.
 ```
 
 <details>
-<summary><b>All 46 tools</b></summary>
+<summary><b>All 53 tools</b></summary>
 
 | Toolset | Tool | What it does |
 |---|---|---|
@@ -115,6 +115,10 @@ headless engine when it is not.
 | `core` | `alcove_get_clipboard` / `alcove_set_clipboard` | Clipboard both ways |
 | `core` | `alcove_push_file` | Copy a file from the Mac into the guest, to the Desktop or to an exact path |
 | `core` | `alcove_wait_idle` | Wait until the screen stops changing |
+| `core` | `alcove_find_text` | Read the screen with OCR: lines of text with the point to click |
+| `core` | `alcove_wait_for` | Wait for text on screen, a process, a file, a listening port, a log line or job output |
+| `core` | `alcove_batch` | A sequence of input steps without interruption from other callers, with one screen report |
+| `core` | `alcove_mouse_down` / `alcove_mouse_up` / `alcove_key_down` / `alcove_key_up` | Hold and release a mouse button or a key |
 | `shell` | `alcove_exec_start` | Start a build, test run or server as a background job |
 | `shell` | `alcove_exec_read` / `alcove_exec_write` | Follow a job's output by offset; write to its stdin |
 | `shell` | `alcove_exec_kill` / `alcove_exec_list` | Stop a job with its process tree; list jobs and exit codes |
@@ -124,7 +128,7 @@ headless engine when it is not.
 | `files` | `alcove_fs_list` / `alcove_fs_read` / `alcove_fs_write` / `alcove_fs_delete` | List a guest folder; read a text file by range or its last lines; write text; delete |
 | `state` | `alcove_pause_vm` / `alcove_resume_vm` | Freeze a running VM in memory; continue it |
 | `state` | `alcove_snapshot_list` / `alcove_snapshot_create` / `alcove_snapshot_restore` / `alcove_snapshot_delete` | Named disk and memory snapshots; restoring waits for the guest tools and syncs the guest clock |
-| `state` | `alcove_clone_vm` / `alcove_delete_vm` | A linked clone of a stopped VM; permanently delete a VM |
+| `state` | `alcove_clone_vm` / `alcove_delete_vm` | A linked clone of a stopped VM; permanently delete a clone |
 | `state` | `alcove_lease_acquire` / `alcove_lease_release` | Keep other agents' state-changing calls off a VM until the lease ends |
 | `state` | `alcove_port_forward_add` / `alcove_port_forward_remove` / `alcove_port_forward_list` | Forward a host port on 127.0.0.1 to a guest port |
 | `state` | `alcove_set_network` / `alcove_set_resolution` / `alcove_set_environment` | Guest network link, screen resolution; theme, time zone, clock, locale, keyboard layouts and display scale |
@@ -134,9 +138,10 @@ headless engine when it is not.
 
 The server lists every toolset by default. `ALCOVE_MCP_TOOLSETS` selects some
 of `core`, `shell`, `files` and `state` (the names `ui`, `evidence`, `replay` and
-`http` are accepted and hold no tools yet). `core` has 16 tools: VM lifecycle,
-screenshot, pointer, keyboard, `alcove_exec`, the clipboard, `alcove_push_file`
-and `alcove_wait_idle`. For example, `core` and `files`:
+`http` are accepted and hold no tools yet). `core` has 23 tools: VM lifecycle,
+screenshot, pointer, keyboard, held buttons and keys, `alcove_batch`,
+`alcove_exec`, the clipboard, `alcove_push_file`, `alcove_wait_idle`,
+`alcove_wait_for` and `alcove_find_text`. For example, `core` and `files`:
 
 ```bash
 claude mcp add alcove -e ALCOVE_MCP_TOOLSETS=core,files -- node "$PWD/dist/index.js"
@@ -182,7 +187,7 @@ can do.
 Alcove/          the macOS app
 AlcoveKit/       Swift package: display protocol, QMP, engine, agent client,
                  control API, and the alcovectl command line tool
-qemu-patches/    the display backend patch, applied to a pinned QEMU tag
+qemu-patches/    the display backend and an NVMe snapshot fix, applied to a pinned QEMU tag
 guest-tools/     the Go agent that runs inside Windows and Linux guests
 mcp/             the MCP server
 scripts/         engine build, unattended Windows install, test harnesses

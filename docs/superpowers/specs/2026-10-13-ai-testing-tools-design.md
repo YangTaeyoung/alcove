@@ -326,8 +326,8 @@ Each item is the first task of the sub-project that depends on it.
 |---|---|
 | Calling the UI Automation COM interfaces from Go without cgo on Windows ARM64, or shipping a helper process instead | AT4 |
 | Whether Chromium-based windows (Electron, WebView2) expose a usable UI Automation tree to the agent | AT4 |
-| Agent TCP connection behaviour and guest clock after QMP `snapshot-load` | AT2 |
-| Changing DPI scale without signing out | AT2 |
+| After QMP `snapshot-load`, a connection to the agent that was open before the load stays open on the host and never answers again (no reply to `ping` within 12 s, no close); a new connection receives `hello` at once. The guest clock continues from the snapshot's time, behind the host by the snapshot's age (17 s to 53 s in the runs), until it is set. `vm.snapshot.restore` drops its agent connection, connects again and sets the clock: 5 s to 11 s for the whole op with 6 GiB of guest memory, guest clock within 1.1 s of the host afterwards. Runtime port forwards keep working. Measured with Windows 11 ARM64 on an NVMe disk, which needs `qemu-patches/0002` for the load itself | AT2 |
+| A DPI scale change through `SPI_SETLOGICALDPIOVERRIDE` applies without signing out on Windows 11 ARM64: the taskbar is redrawn at the new scale at once, a DPI-aware process started afterwards reads the new system DPI (120 after 125 %), and `GetDpiForWindow` of windows that were already open reports it too. `HKCU\Control Panel\Desktop\WindowMetrics\AppliedDPI` keeps the sign-in value | AT2 |
 | Encoding video from `alcovectl serve` without a window server session | AT5 |
 | Installing a proxy CA and system proxy from the agent so that the target app's HTTP stack honours them | AT7 |
 | Whether UI Automation can read windows of processes at a higher integrity level than the agent | AT4 |
