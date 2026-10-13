@@ -98,7 +98,7 @@ final class ControlStateTests: XCTestCase {
         let other = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 80, "hostPort": 8081])
         XCTAssertTrue(other.contains("something else"), other)
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
-        XCTAssertEqual(list["forwards"], [])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
     }
 
     func testForwardListMergesConfigAndRuntime() async throws {
@@ -108,6 +108,7 @@ final class ControlStateTests: XCTestCase {
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
         XCTAssertEqual(list["forwards"], [
             ["hostPort": 2222, "guestPort": 22, "kind": "config"],
+            ["hostPort": 40000, "guestPort": 7645, "kind": "agent"],
             ["hostPort": 13389, "guestPort": 3389, "kind": "runtime"],
         ])
     }
@@ -120,7 +121,7 @@ final class ControlStateTests: XCTestCase {
         let lines = await t.monitorLines
         XCTAssertEqual(lines.last, "hostfwd_remove net0 tcp:127.0.0.1:13389")
         let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
-        XCTAssertEqual(list["forwards"], [])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
     }
 
     func testForwardsForgottenWhenStopped() async throws {
@@ -129,14 +130,57 @@ final class ControlStateTests: XCTestCase {
         _ = try await h.handle(op: "vm.stop", params: ["name": "Win"])
         _ = try await h.handle(op: "vm.start", params: ["name": "Win"])
         var list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
-        XCTAssertEqual(list["forwards"], [])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
 
         _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 22, "hostPort": 12222])
         await t.setState(.stopped)
         _ = await failure(h, "vm.forward.list", ["name": "Win"])
         await t.setState(.running)
         list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
-        XCTAssertEqual(list["forwards"], [])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+    }
+
+    func testForwardsForgottenAfterEngineRestart() async throws {
+        let (h, t) = setup()
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
+        await t.setInstance(2)
+        let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+    }
+
+    func testForwardRemoveRejectsNonRuntimePorts() async throws {
+        let (h, t) = setup()
+        await t.setForwards([VMConfig.PortForward(proto: .tcp, hostPort: 2222, guestPort: 22)])
+        for port in [2222, 40000, 5555] {
+            let message = await failure(h, "vm.forward.remove", ["name": "Win", "hostPort": .int(Int64(port))])
+            XCTAssertEqual(message, "no runtime forward on host port \(port) in 'Win'; call vm.forward.list (forwards from the VM configuration cannot be removed while it runs)")
+        }
+        let lines = await t.monitorLines
+        XCTAssertEqual(lines, [])
+    }
+
+    func testForwardAddRefusesReservedPorts() async throws {
+        let (h, t) = setup()
+        await t.setForwards([VMConfig.PortForward(proto: .tcp, hostPort: 2222, guestPort: 22)])
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389])
+        for port in [2222, 40000, 13389] {
+            let message = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 80, "hostPort": .int(Int64(port))])
+            XCTAssertEqual(message, "host port \(port) is taken; pass hostPort: 0 to let Alcove choose")
+        }
+        let lines = await t.monitorLines
+        XCTAssertEqual(lines.count, 1)
+    }
+
+    func testForwardPortsOutOfRange() async throws {
+        let (h, t) = setup()
+        let guest = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 70000])
+        XCTAssertEqual(guest, "guestPort must be between 1 and 65535")
+        let host = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 80, "hostPort": 70000])
+        XCTAssertEqual(host, "hostPort must be between 1 and 65535")
+        let remove = await failure(h, "vm.forward.remove", ["name": "Win", "hostPort": 0])
+        XCTAssertEqual(remove, "hostPort must be between 1 and 65535")
+        let lines = await t.monitorLines
+        XCTAssertEqual(lines, [])
     }
 
     func testSetNetworkCallsTarget() async throws {

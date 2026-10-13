@@ -21,6 +21,8 @@ actor FakeTarget: VMTarget {
     var monitorLines: [String] = []
     var linkCalls: [Bool] = []
     var forwards: [VMConfig.PortForward] = []
+    var instance = 1
+    var agentPort = 40_000
     var restoreHook: (@Sendable (FakeTarget) async -> Void)?
 
     init(name: String, state: VMController.State, png: Data) { self.name = name; self.stateValue = state; self.png = png }
@@ -54,6 +56,9 @@ actor FakeTarget: VMTarget {
     }
     func setNetworkLink(up: Bool) async throws { linkCalls.append(up) }
     func staticForwards() async -> [VMConfig.PortForward] { forwards }
+    func engineInstance() async -> Int { instance }
+    func agentHostPort() async -> Int { agentPort }
+    func setInstance(_ i: Int) { instance = i }
     func setSnapshotList(_ l: [VMController.SnapshotInfo]) { snapshotList = l }
     func setMonitorReplies(_ r: [String]) { monitorReplies = r }
     func setForwards(_ f: [VMConfig.PortForward]) { forwards = f }

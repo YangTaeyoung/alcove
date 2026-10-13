@@ -30,6 +30,10 @@ public protocol VMTarget: Sendable {
     func setNetworkLink(up: Bool) async throws
     /// The TCP port forwards of the VM's user-network configuration.
     func staticForwards() async -> [VMConfig.PortForward]
+    /// Identifies the engine process currently (or last) launched for the VM.
+    func engineInstance() async -> Int
+    /// The host port forwarded to the guest agent.
+    func agentHostPort() async -> Int
 }
 
 /// Provides the VMs by name.
@@ -77,9 +81,19 @@ public actor ControllerTarget: VMTarget {
     public func snapshots() async throws -> [VMController.SnapshotInfo] { try await controller.snapshots() }
     public func createSnapshot(named name: String) async throws { try await controller.createSnapshot(named: name) }
     public func restoreSnapshot(named name: String) async throws {
-        await agentClient?.disconnect(); agentClient = nil
-        try await controller.restoreSnapshot(named: name)
+        await dropAgentClient()
+        do { try await controller.restoreSnapshot(named: name) } catch { await dropAgentClient(); throw error }
+        await dropAgentClient()
     }
+
+    /// Forgets the cached agent client synchronously, then disconnects it.
+    private func dropAgentClient() async {
+        let client = agentClient
+        agentClient = nil
+        await client?.disconnect()
+    }
+    public func engineInstance() async -> Int { await controller.engineInstance }
+    public func agentHostPort() async -> Int { await controller.config.agentHostPort }
     public func deleteSnapshot(named name: String) async throws { try await controller.deleteSnapshot(named: name) }
     public func monitorCommand(_ line: String) async throws -> String { try await controller.monitorCommand(line) }
     public func setNetworkLink(up: Bool) async throws { try await controller.setNetworkLink(up: up) }

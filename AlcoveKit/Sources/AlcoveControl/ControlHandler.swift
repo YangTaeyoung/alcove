@@ -41,6 +41,8 @@ public actor ControlHandler {
     private let inputGate = InputGate()
     /// Port forwards added with `vm.forward.add`, per VM name.
     var runtimeForwards: [String: [Forward]] = [:]
+    /// The engine instance each VM's `runtimeForwards` belong to.
+    var forwardInstances: [String: Int] = [:]
 
     var leases = LeaseTable()
     let clock: @Sendable () -> ContinuousClock.Instant
@@ -119,6 +121,7 @@ public actor ControlHandler {
             let t = try await target(params)
             let st = await t.state()
             if !st.isActive {
+                runtimeForwards[t.name] = nil
                 do { try await t.start() } catch { throw ControlError.failed("start failed: \(error)") }
             }
             return ["state": .string(describe(await t.state()))]

@@ -67,26 +67,39 @@ extension ControlHandler {
             do { try await t.deleteSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot delete failed: \(error)") }
             return [:]
         case "vm.forward.add":
-            guard let guestPort = params["guestPort"]?.intValue, (1...65_535).contains(guestPort) else { throw ControlError.missing("guestPort") }
+            let guestPort = try portParameter(params, "guestPort")
             var hostPort = 0
             if let value = params["hostPort"], value != .null {
-                guard let port = value.intValue, (0...65_535).contains(port) else { throw ControlError.missing("hostPort") }
+                guard let port = value.intValue else { throw ControlError.missing("hostPort") }
+                guard (0...65_535).contains(port) else { throw ControlError.failed("hostPort must be between 1 and 65535") }
                 hostPort = port
             }
-            if hostPort == 0 { hostPort = try freeHostPort() }
+            await discardStaleForwards(t)
+            if hostPort == 0 {
+                hostPort = try freeHostPort()
+            } else if try await isReserved(hostPort, in: t) {
+                throw ControlError.failed("host port \(hostPort) is taken; pass hostPort: 0 to let Alcove choose")
+            }
             try await forwardLine(t, "hostfwd_add \(VMController.netdevID) tcp:127.0.0.1:\(hostPort)-:\(guestPort)", hostPort: hostPort)
+            forwardInstances[t.name] = await t.engineInstance()
             runtimeForwards[t.name, default: []].append(Forward(hostPort: hostPort, guestPort: guestPort))
             return ["hostPort": .int(Int64(hostPort)), "guestPort": .int(Int64(guestPort))]
         case "vm.forward.remove":
-            guard let hostPort = params["hostPort"]?.intValue, (1...65_535).contains(hostPort) else { throw ControlError.missing("hostPort") }
+            let hostPort = try portParameter(params, "hostPort")
+            await discardStaleForwards(t)
+            guard runtimeForwards[t.name]?.contains(where: { $0.hostPort == hostPort }) == true else {
+                throw ControlError.failed("no runtime forward on host port \(hostPort) in '\(t.name)'; call vm.forward.list (forwards from the VM configuration cannot be removed while it runs)")
+            }
             try await forwardLine(t, "hostfwd_remove \(VMController.netdevID) tcp:127.0.0.1:\(hostPort)", hostPort: hostPort)
             runtimeForwards[t.name]?.removeAll { $0.hostPort == hostPort }
             return [:]
         case "vm.forward.list":
+            await discardStaleForwards(t)
             var rows: [JSON] = []
             for f in await t.staticForwards() {
                 rows.append(["hostPort": .int(Int64(f.hostPort)), "guestPort": .int(Int64(f.guestPort)), "kind": "config"])
             }
+            rows.append(["hostPort": .int(Int64(await t.agentHostPort())), "guestPort": .int(Int64(VMConfig.agentGuestPort)), "kind": "agent"])
             for f in runtimeForwards[t.name] ?? [] {
                 rows.append(["hostPort": .int(Int64(f.hostPort)), "guestPort": .int(Int64(f.guestPort)), "kind": "runtime"])
             }
@@ -98,6 +111,28 @@ extension ControlHandler {
         default:
             throw ControlError.unknownOp(op)
         }
+    }
+
+    /// Drops the runtime forwards remembered for an engine process other than the current one.
+    private func discardStaleForwards(_ t: VMTarget) async {
+        let instance = await t.engineInstance()
+        if forwardInstances[t.name] != instance {
+            runtimeForwards[t.name] = nil
+            forwardInstances[t.name] = instance
+        }
+    }
+
+    /// Whether `hostPort` is already forwarded by the configuration, the guest agent or a runtime forward.
+    private func isReserved(_ hostPort: Int, in t: VMTarget) async throws -> Bool {
+        if await t.staticForwards().contains(where: { $0.hostPort == hostPort }) { return true }
+        if await t.agentHostPort() == hostPort { return true }
+        return runtimeForwards[t.name]?.contains(where: { $0.hostPort == hostPort }) == true
+    }
+
+    private nonisolated func portParameter(_ params: JSON, _ key: String) throws -> Int {
+        guard let port = params[key]?.intValue else { throw ControlError.missing(key) }
+        guard (1...65_535).contains(port) else { throw ControlError.failed("\(key) must be between 1 and 65535") }
+        return port
     }
 
     private func snapshotList(_ t: VMTarget) async throws -> [VMController.SnapshotInfo] {

@@ -47,6 +47,9 @@ public actor VMController {
     /// The id of the guest's user-mode network backend.
     public static let netdevID = "net0"
 
+    /// Counts the engine processes launched by this controller.
+    public private(set) var engineInstance = 0
+
     public nonisolated let bundle: VMBundle
     public nonisolated let engine: EngineLocator.Engine
     /// The configuration for the next cold start; see `update(config:)`.
@@ -153,6 +156,7 @@ public actor VMController {
             let q = ChildProcess(executable: engine.qemuSystem, arguments: args, logURL: bundle.qemuLogURL)
             try q.start()
             qemu = q
+            engineInstance += 1
             runningConfig = launch
             engineLaunched = true
             expectingExit = false
