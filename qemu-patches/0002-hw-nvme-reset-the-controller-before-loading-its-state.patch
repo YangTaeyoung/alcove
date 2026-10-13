@@ -1,0 +1,30 @@
+diff --git a/hw/nvme/ctrl.c b/hw/nvme/ctrl.c
+index 4893cf7..dce68d7 100644
+--- a/hw/nvme/ctrl.c
++++ b/hw/nvme/ctrl.c
+@@ -10491,10 +10491,25 @@ static bool nvme_ctrl_post_load(void *opaque, int version_id, Error **errp)
+     return true;
+ }
+ 
++/*
++ * Runs before the controller's state is loaded: frees the queues and clears
++ * the AER request pointers, the arrays the stream is loaded into.
++ */
++static int nvme_ctrl_pre_load(void *opaque)
++{
++    NvmeCtrl *n = opaque;
++
++    nvme_ctrl_reset(n, NVME_RESET_CONTROLLER);
++    memset(n->aer_reqs, 0, sizeof(*n->aer_reqs) * (n->params.aerl + 1));
++
++    return 0;
++}
++
+ static const VMStateDescription nvme_vmstate = {
+     .name = "nvme",
+     .minimum_version_id = 1,
+     .version_id = 1,
++    .pre_load = nvme_ctrl_pre_load,
+     .pre_save_errp = nvme_ctrl_pre_save,
+     .post_load_errp = nvme_ctrl_post_load,
+     .fields = (const VMStateField[]) {

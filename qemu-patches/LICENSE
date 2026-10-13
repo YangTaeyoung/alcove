@@ -10,11 +10,15 @@ Patched tag:      v11.1.1 (QEMU_TAG in scripts/build-qemu.sh)
 ui/alcove.c, and modifies five existing QEMU files: meson.build,
 meson_options.txt, qapi/ui.json, qemu-options.hx and ui/meson.build.
 
+0002-hw-nvme-reset-the-controller-before-loading-its-state.patch modifies one
+existing QEMU file, hw/nvme/ctrl.c, whose header reads "This code is licensed
+under the GNU GPL v2 or later."
+
 The new file carries "SPDX-License-Identifier: GPL-2.0-or-later" in its own
 header (0001-ui-add-alcove-display-backend.patch line 136), with the copyright
 line "Copyright (c) 2026 Alcove contributors" (line 134).
 
-None of the five modified files carries any per-file licensing header
+None of the five files modified by 0001 carries any per-file licensing header
 (verified against the v11.1.1 tree). QEMU's own LICENSE, clause 2, covers that
 case: "Source files with no licensing information are released under the GNU
 General Public License, version 2 or (at your option) any later version."

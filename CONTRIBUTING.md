@@ -82,7 +82,8 @@ What the script does, in order:
 3. Makes `build/qemu-src` exactly *tag + `qemu-patches/*.patch`* (see below).
 4. Configures into `build/qemu-build` — `--target-list=aarch64-softmmu`,
    `--enable-hvf --enable-cocoa --enable-slirp --enable-libusb --enable-tpm`,
-   `--enable-png`, and `-Dalcove=enabled` — then `ninja`.
+   `--enable-png`, `--disable-pvg` (no apple-gfx devices) and
+   `-Dalcove=enabled` — then `ninja`.
 5. Prints the version and **verifies the `com.apple.security.hypervisor`
    entitlement** on the binary, exiting non-zero if it is missing. QEMU's own
    install step ad-hoc-signs the binary with it; a copy or re-sign that loses
@@ -153,6 +154,14 @@ an installed guest:
 `git diff` (not `git format-patch`) against the pinned tag. It touches six
 files: `meson.build`, `meson_options.txt`, `qapi/ui.json`, `qemu-options.hx`,
 `ui/meson.build`, and the new `ui/alcove.c`.
+
+`qemu-patches/0002-hw-nvme-reset-the-controller-before-loading-its-state.patch`
+touches `hw/nvme/ctrl.c`: the NVMe controller frees its queues and clears its
+AER request pointers before its state is loaded, so `snapshot-load` works on a
+machine whose guest has used the controller. With more than one patch in the
+series, export each with a pathspec, e.g.
+`git -C build/qemu-src diff --cached HEAD -- hw/nvme/ctrl.c` for this one and
+`-- . ':(exclude)hw/nvme/ctrl.c'` for the display backend.
 
 `build-qemu.sh` applies the series with `git apply --index`, so after a build
 the patched files are **staged** in `build/qemu-src`. The loop is:

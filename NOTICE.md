@@ -18,7 +18,9 @@ redistributed by this repository.
 `qemu-patches/0001-ui-add-alcove-display-backend.patch` adds `ui/alcove.c`
 (844 lines) and modifies five existing QEMU files — `meson.build`,
 `meson_options.txt`, `qapi/ui.json`, `qemu-options.hx`, `ui/meson.build`.
-`scripts/build-qemu.sh` applies it to QEMU `v11.1.1` (`QEMU_TAG`).
+`qemu-patches/0002-hw-nvme-reset-the-controller-before-loading-its-state.patch`
+modifies `hw/nvme/ctrl.c`. `scripts/build-qemu.sh` applies both to QEMU
+`v11.1.1` (`QEMU_TAG`).
 
 `ui/alcove.c` declares `SPDX-License-Identifier: GPL-2.0-or-later` in its own
 header (patch line 136). None of the five modified files carries a per-file
