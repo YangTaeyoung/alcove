@@ -15,7 +15,7 @@ func eventually(timeout: Duration = .seconds(20), _ condition: @Sendable () asyn
 }
 
 /// Holds callers at `pass` until `open` is called, and counts them.
-private actor Latch {
+actor Latch {
     private var isOpen = false
     private var waiting: [CheckedContinuation<Void, Never>] = []
     private(set) var arrivals = 0

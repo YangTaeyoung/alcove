@@ -1938,6 +1938,35 @@ final class ControlUITests: XCTestCase {
         XCTAssertTrue(free)
     }
 
+    func testAHelperCallCancelledAfterItsTurnCameIsNotSent() async throws {
+        let (h, t, agent) = try await rig(["ui.act": { _, _ in .ok(["node": sendButton]) }])
+        let found = await t.agent(timeout: .zero)
+        let client = try XCTUnwrap(found)
+        let latch = Latch()
+        let far = ContinuousClock.now + .seconds(120)
+        let call = Task { try await h.helperTurn(client, "ui.act", ["ref": "e5", "action": "invoke"], vm: "Win", turnBy: far) { await latch.pass() } }
+        let taken = await eventually { await latch.arrivals == 1 }
+        XCTAssertTrue(taken)
+        let held = try await h.helperGate.acquire("Win", until: .now)
+        XCTAssertFalse(held)
+        call.cancel()
+        await latch.open()
+        do {
+            let reply = try await finished(call)
+            XCTFail(reply == nil ? "the call did not end" : "the cancelled call was sent")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertTrue(agentRequests(agent, "ui.act").isEmpty)
+        let free = try await h.helperGate.acquire("Win", until: .now)
+        XCTAssertTrue(free)
+        await h.helperGate.release("Win")
+
+        let sent = try await h.helperTurn(client, "ui.act", ["ref": "e5", "action": "invoke"], vm: "Win", turnBy: far)
+        XCTAssertEqual(sent["node"], sendButton)
+        XCTAssertEqual(agentRequests(agent, "ui.act").count, 1)
+    }
+
     // MARK: - the gate
 
     func testGateHandsTheLockOverInArrivalOrderAndDropsCancelledWaiters() async throws {
@@ -1960,18 +1989,24 @@ final class ControlUITests: XCTestCase {
         XCTAssertTrue(dQueued)
 
         b.cancel()
-        do { _ = try await b.value; XCTFail("a cancelled waiter got the lock") } catch { XCTAssertTrue(error is CancellationError) }
+        do {
+            let got = try await finished(b)
+            XCTFail(got == nil ? "a cancelled waiter stayed in the queue" : "a cancelled waiter got the lock")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
         let waiting = await gate.waiterCount(for: "Win")
         XCTAssertEqual(waiting, 2)
         XCTAssertEqual(order.value, [])
 
         await gate.release("Win")
-        let cGot = try await c.value
-        XCTAssertTrue(cGot)
+        let cGot = try await finished(c)
+        XCTAssertEqual(cGot, true)
         XCTAssertEqual(order.value, ["c"])
         await gate.release("Win")
-        let dGot = try await d.value
-        XCTAssertTrue(dGot)
+        let dGot = try await finished(d)
+        XCTAssertEqual(dGot, true)
+        XCTAssertEqual(order.value, ["c", "d"])
         await gate.release("Win")
         let free = try await gate.acquire("Win", until: .now)
         XCTAssertTrue(free)
@@ -1983,8 +2018,8 @@ final class ControlUITests: XCTestCase {
         XCTAssertTrue(held)
         let past = try await gate.acquire("Win", until: .now)
         XCTAssertFalse(past)
-        let soon = try await gate.acquire("Win", until: .now + .milliseconds(30))
-        XCTAssertFalse(soon)
+        let soon = try await finished(Task { try await gate.acquire("Win", until: .now + .milliseconds(30)) })
+        XCTAssertEqual(soon, false)
         let waiting = await gate.waiterCount(for: "Win")
         XCTAssertEqual(waiting, 0)
 
