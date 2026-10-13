@@ -417,20 +417,22 @@ enum GuestRecipes {
     }
 
     /// Windows only: prints a JSON array of the `.dmp` files in `dumpFolder`, newest first and by name within one time,
-    /// each `{file, exe, bytes, time}`. `exe` is the image name of a file named `<image>.<pid>.dmp` or
-    /// `<image>(<n>).<pid>.dmp`, otherwise empty. A missing folder prints `[]`. A failure prints one sentence on stderr
+    /// each `{file, exe, bytes, time, now}`. `exe` is the image name of a file named `<image>.<pid>.dmp` or
+    /// `<image>(<n>).<pid>.dmp`, otherwise empty. `time` is the file's last write and `now` the guest's clock when the
+    /// folder was listed, both ISO 8601 UTC. A missing folder prints `[]`. A failure prints one sentence on stderr
     /// and exits with 2.
     static func listDumps(os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         return windowsPrelude + """
         $folder = '\(dumpFolder)'
+        $now = (Get-Date).ToUniversalTime().ToString('o')
         $items = @()
         try {
           if (Test-Path -LiteralPath $folder -PathType Container) {
             $items = @(Get-ChildItem -LiteralPath $folder -File -Filter *.dmp | Where-Object { $_.Extension -ieq '.dmp' } | Sort-Object @{ Expression = 'LastWriteTimeUtc'; Descending = $true }, @{ Expression = 'Name'; Descending = $false } | ForEach-Object {
               $exe = ''
               if ($_.Name -match '^(.+\\.exe)(\\([0-9]+\\))?\\.[0-9]+\\.dmp$') { $exe = $Matches[1] }
-              [pscustomobject][ordered]@{ file = $_.Name; exe = $exe; bytes = [int64]$_.Length; time = $_.LastWriteTimeUtc.ToString('o') }
+              [pscustomobject][ordered]@{ file = $_.Name; exe = $exe; bytes = [int64]$_.Length; time = $_.LastWriteTimeUtc.ToString('o'); now = $now }
             })
           }
         } catch {

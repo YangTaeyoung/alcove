@@ -430,6 +430,12 @@ extension ControlHandler {
     static let windowsOnlyDumps = "crash dumps are only collected on Windows guests"
 
     private func crashDumps(op: String, params: JSON) async throws -> JSON {
+        try await crashDumpsReply(op: op, params: params).result
+    }
+
+    /// The result of `vm.crash_dumps.enable`, `disable` or `list`, and for `list` the guest's clock when it listed the
+    /// dumps, as the first row of the recipe reports it.
+    func crashDumpsReply(op: String, params: JSON) async throws -> (result: JSON, guestNow: String?) {
         var exe = ""
         if op != "vm.crash_dumps.list" {
             exe = try string(params, "exe")
@@ -453,18 +459,19 @@ extension ControlHandler {
         switch op {
         case "vm.crash_dumps.enable":
             let reply = Self.lastJSONObject(result.stdout)
-            return ["folder": .string(reply?["folder"]?.stringValue ?? GuestRecipes.dumpFolder),
-                    "createdKey": .bool(reply?["createdKey"]?.boolValue ?? false)]
+            return (["folder": .string(reply?["folder"]?.stringValue ?? GuestRecipes.dumpFolder),
+                     "createdKey": .bool(reply?["createdKey"]?.boolValue ?? false)], nil)
         case "vm.crash_dumps.disable":
-            return [:]
+            return ([:], nil)
         default:
             guard let rows = Self.dumpItems(result.stdout) else {
                 throw ControlError.failed("the guest printed no crash dump list; run vm.doctor to check the guest shell")
             }
-            return ["dumps": .array(rows.map { item -> JSON in
+            let dumps: JSON = ["dumps": .array(rows.map { item -> JSON in
                 ["file": .string(item["file"]?.stringValue ?? ""), "exe": .string(item["exe"]?.stringValue ?? ""),
                  "bytes": .int(Int64(item["bytes"]?.intValue ?? 0)), "time": .string(item["time"]?.stringValue ?? "")]
             })]
+            return (dumps, rows.first?["now"]?.stringValue)
         }
     }
 

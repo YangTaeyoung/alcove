@@ -428,6 +428,18 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertEqual(r["dumps"]?[0]?["bytes"]?.intValue, 121_632_778)
     }
 
+    func testDumpListRecipePrintsTheGuestClockAndTheResultLeavesItOut() async throws {
+        let (h, agent) = try await setup(stdout: "[{\"file\":\"a.exe.1.dmp\",\"exe\":\"a.exe\",\"bytes\":9,\"time\":\"2026-10-13T09:30:00.0000000Z\",\"now\":\"2026-10-13T09:31:00.0000000Z\"}]")
+        let r = try await h.handle(op: "vm.crash_dumps.list", params: ["name": "Win"])
+        XCTAssertEqual(r["dumps"]?[0]?.objectValue?.keys.sorted(), ["bytes", "exe", "file", "time"])
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("$now = (Get-Date).ToUniversalTime().ToString('o')"), script)
+        XCTAssertTrue(script.contains("time = $_.LastWriteTimeUtc.ToString('o'); now = $now }"), script)
+        let reply = try await h.crashDumpsReply(op: "vm.crash_dumps.list", params: ["name": "Win"])
+        XCTAssertEqual(reply.guestNow, "2026-10-13T09:31:00.0000000Z")
+        XCTAssertEqual(reply.result, r)
+    }
+
     func testDumpListWithoutFolder() async throws {
         let (h, _) = try await setup(stdout: "[]")
         let r = try await h.handle(op: "vm.crash_dumps.list", params: ["name": "Win"])
