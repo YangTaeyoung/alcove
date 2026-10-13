@@ -278,7 +278,7 @@ bootstrap script reports).
 The helper's environment is the agent's without `COR_*`, `COMPlus_*`,
 `DOTNET_*` and `PSModulePath`, and `TEMP`/`TMP` point inside the locked
 folder. Measured on the Windows 11 ARM64 test guest: the first `ui.ping` after
-an agent start answers after 0.59–0.60 s (1.1–1.3 s for the first one after a
+an agent start answers after 0.59–0.60 s (1.1–2.0 s for the first one after a
 boot), of which the compile takes 0.35 s; a helper that was killed is replaced
 in 0.6–0.85 s. The helper, and an app launched through `app.launch`, inherit
 the agent's elevated token. `alcove-agent --install` locks the folders before
