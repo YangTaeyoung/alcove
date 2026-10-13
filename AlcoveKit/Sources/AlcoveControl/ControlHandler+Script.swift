@@ -209,9 +209,14 @@ extension ControlHandler {
             }
             lease = token
         }
+        var failureMaxWidth: Int?
+        if let value = params["maxWidth"], value != .null {
+            guard let width = value.intValue, width >= 1 else { throw ControlError.failed("'maxWidth' must be a whole number of pixels, 1 or more") }
+            failureMaxWidth = width
+        }
         let owner = "script:" + URL(fileURLWithPath: path).lastPathComponent
         let result = await ScriptRunner(handler: self).run(script, vm: vm, variables: variables, lease: lease,
-                                                           owner: owner, snapshot: snapshot, progress: nil)
+                                                           owner: owner, snapshot: snapshot, failureMaxWidth: failureMaxWidth, progress: nil)
         if result.couldNotStart { throw ControlError.failed(result.error ?? "the run could not start") }
 
         var out: [String: JSON] = ["passed": .bool(result.passed), "stepsRun": .int(Int64(result.stepsRun)),

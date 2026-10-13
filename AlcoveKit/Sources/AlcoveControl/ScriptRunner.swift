@@ -70,17 +70,18 @@ struct ScriptRunner: Sendable {
     /// is neither renewed nor released. Without one the runner holds a lease of its own named `owner` for the run.
     /// A `snapshot` is restored first.
     func run(_ script: Script, vm: String?, variables: [String: String], lease: String? = nil, owner: String = "script",
-             snapshot: String? = nil,
+             snapshot: String? = nil, failureMaxWidth: Int? = nil,
              progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?) async -> ScriptResult {
         let secrets = script.variables.merging(variables) { _, override in override }
             .filter { ScriptReport.isSecret($0.key) }.map(\.value)
         return await ControlHandler.$scriptSecrets.withValue(secrets) {
-            await runScript(script, vm: vm, variables: variables, lease: lease, owner: owner, snapshot: snapshot, progress: progress)
+            await runScript(script, vm: vm, variables: variables, lease: lease, owner: owner, snapshot: snapshot,
+                            failureMaxWidth: failureMaxWidth, progress: progress)
         }
     }
 
     private func runScript(_ script: Script, vm: String?, variables: [String: String], lease: String?, owner: String, snapshot: String?,
-                           progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?) async -> ScriptResult {
+                           failureMaxWidth: Int?, progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?) async -> ScriptResult {
         let clock = ContinuousClock()
         let started = clock.now
         var result = ScriptResult(passed: false, stepsRun: 0, failedStep: nil, error: nil, stepResults: [], seconds: 0)
@@ -118,7 +119,7 @@ struct ScriptRunner: Sendable {
         var leaseLost = false
         let failure = await execute(resolved, vm: name, token: token, holdsOwnLease: acquired, snapshot: snapshot,
                                     progress: progress, leaseLost: &leaseLost, into: &result)
-        if failure != nil, !Task.isCancelled, result.failedStep != nil, let shot = await failureScreenshot(vm: name) {
+        if failure != nil, !Task.isCancelled, result.failedStep != nil, let shot = await failureScreenshot(vm: name, maxWidth: failureMaxWidth) {
             result.failureImage = shot.png
             result.failureWidth = shot.width
             result.failureHeight = shot.height
@@ -385,8 +386,10 @@ struct ScriptRunner: Sendable {
         return lines.isEmpty ? "" : " (" + lines.joined(separator: "; ") + ")"
     }
 
-    private func failureScreenshot(vm: String) async -> (png: Data, width: Int, height: Int)? {
-        guard let shot = try? await call(.failure, "vm.screenshot", ["name": .string(vm)]),
+    private func failureScreenshot(vm: String, maxWidth: Int?) async -> (png: Data, width: Int, height: Int)? {
+        var params: JSON = ["name": .string(vm)]
+        if let maxWidth { params = ["name": .string(vm), "maxWidth": .int(Int64(maxWidth))] }
+        guard let shot = try? await call(.failure, "vm.screenshot", params),
               let png = shot["png"]?.stringValue.flatMap({ Data(base64Encoded: $0) }),
               let width = shot["sentWidth"]?.intValue, let height = shot["sentHeight"]?.intValue else { return nil }
         return (png, width, height)

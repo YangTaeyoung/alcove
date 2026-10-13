@@ -521,6 +521,18 @@ final class ScriptTests: XCTestCase {
         XCTAssertNil(after)
     }
 
+    func testScriptRunScalesTheFailureScreenshotToMaxWidth() async throws {
+        let rig = try await rig()
+        let path = try scriptFile(steps(["{\"op\": \"vm.mouse.click\", \"params\": {\"x\": 1}}"]))
+        let full = try await rig.handler.handle(op: "script.run", params: ["path": .string(path)])
+        XCTAssertEqual(full["failure"]?["width"]?.intValue, 800)
+        let scaled = try await rig.handler.handle(op: "script.run", params: ["path": .string(path), "maxWidth": 400])
+        XCTAssertEqual(scaled["failure"]?["width"]?.intValue, 400)
+        XCTAssertEqual(scaled["failure"]?["height"]?.intValue, 300)
+        do { _ = try await rig.handler.handle(op: "script.run", params: ["path": .string(path), "maxWidth": 0]); XCTFail() }
+        catch { XCTAssertEqual("\(error)", "'maxWidth' must be a whole number of pixels, 1 or more") }
+    }
+
     func testScriptRunOpResult() async throws {
         let rig = try await rig()
         let path = try scriptFile(steps([exec("one", label: "first"), "{\"label\": \"boom\", \"op\": \"vm.mouse.click\", \"params\": {\"x\": 1}}"],
