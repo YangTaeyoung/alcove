@@ -19,14 +19,11 @@ func agentRequests(_ agent: FakeAgent, _ op: String) -> [JSON] {
 }
 
 /// A handler over a running VM "Win" whose agent is an `AgentClient` connected to `agent`.
-/// The teardown of `test` disconnects the client and then stops `agent`.
+/// The teardown of `test` stops `agent`.
 func handlerWithAgent(_ agent: FakeAgent, in test: XCTestCase) async throws -> (ControlHandler, FakeTarget) {
     _ = agent.start()
+    test.addTeardownBlock { agent.stop() }
     let client = AgentClient()
-    test.addTeardownBlock {
-        await client.disconnect()
-        agent.stop()
-    }
     try await client.connect(port: agent.port, expectedToken: nil)
     let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
     await t.setAgent(client)

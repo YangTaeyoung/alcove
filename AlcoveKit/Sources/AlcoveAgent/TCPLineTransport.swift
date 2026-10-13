@@ -39,7 +39,7 @@ final class TCPLineTransport: @unchecked Sendable {
         readSource = source
     }
 
-    deinit { close() }
+    deinit { finish("closed") }
 
     func send(_ data: Data) {
         queue.async { [self] in
