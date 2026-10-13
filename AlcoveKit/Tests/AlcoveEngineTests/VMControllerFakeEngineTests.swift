@@ -32,7 +32,9 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try fm.createDirectory(at: root.appendingPathComponent("pc-bios"), withIntermediateDirectories: true)
         let wrapper = "#!/bin/sh\nFAKE_QEMU_MODE='\(mode)' exec /usr/bin/env python3 '\(script.path)' \"$@\"\n"
         fm.createFile(atPath: root.appendingPathComponent("qemu-system-aarch64").path, contents: Data(wrapper.utf8), attributes: [.posixPermissions: 0o755])
-        let img = "#!/bin/sh\ncase \"$1\" in create) printf 'QFI' > \"$5\";; info) echo '{\"snapshots\": []}';; esac\n"
+        // create -q -f qcow2 FILE SIZE | create -q -f qcow2 -F qcow2 -b BACKING FILE | info ...
+        let img = "#!/bin/sh\ncase \"$1\" in\ncreate) out=\"$5\"; if [ \"$5\" = -F ]; then for out; do :; done; fi; printf 'QFI' > \"$out\";;\n"
+            + "info) echo '{\"snapshots\": []}';;\nesac\n"
         fm.createFile(atPath: root.appendingPathComponent("qemu-img").path, contents: Data(img.utf8), attributes: [.posixPermissions: 0o755])
         fm.createFile(atPath: root.appendingPathComponent("pc-bios/edk2-aarch64-code.fd").path, contents: Data(count: 16))
         return EngineLocator.Engine(qemuSystem: root.appendingPathComponent("qemu-system-aarch64").path,
@@ -277,6 +279,122 @@ final class VMControllerFakeEngineTests: XCTestCase {
         let r = await vm.runningConfig; XCTAssertEqual(r?.cdroms[0].path, iso.path)
         try await vm.changeMedium(cdromID: "cd0", isoPath: nil)
         c = await vm.config; XCTAssertNil(c.cdroms[0].path)
+        try await vm.shutdown(force: true)
+    }
+
+    private func launched(_ vm: VMController) -> Bool {
+        FileManager.default.fileExists(atPath: vm.bundle.runURL.appendingPathComponent("fake-argv.json").path)
+    }
+
+    private func ephemeralFiles(_ vm: VMController) -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: vm.bundle.runURL.path)) ?? []).filter { $0.hasPrefix("ephemeral-") }.sorted()
+    }
+
+    func testTemplateRefusesToStart() async throws {
+        let vm = try makeVM()
+        let clone = try vm.bundle.cloneLinked(named: "Clone", engine: vm.engine)
+        do {
+            try await vm.start()
+            XCTFail("a template with clones started")
+        } catch {
+            XCTAssertEqual(error as? VMController.ControllerError,
+                           .engineDidNotStart("'Fake' is a template with clones (Clone); delete the clones first or start a clone"))
+        }
+        await XCTAssertThrowsErrorAsync(try await vm.start(discardChanges: true))
+        var s = await vm.state; XCTAssertEqual(s, .stopped)
+        XCTAssertFalse(launched(vm))
+
+        let cloned = VMController(bundle: clone, config: try clone.loadConfig(), engine: vm.engine)
+        controllers.append(cloned)
+        try await cloned.start()
+        s = await cloned.state; XCTAssertEqual(s, .running)
+        try await cloned.shutdown(force: true)
+
+        try clone.deleteClone()
+        try await vm.start()
+        s = await vm.state; XCTAssertEqual(s, .running)
+        try await vm.shutdown(force: true)
+    }
+
+    func testEphemeralOverlayRemovedOnStop() async throws {
+        let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
+        let run = vm.bundle.runURL
+        try await vm.start(discardChanges: true)
+        var ephemeral = await vm.isEphemeral; XCTAssertTrue(ephemeral)
+        XCTAssertEqual(ephemeralFiles(vm), ["ephemeral-disk0.qcow2", "ephemeral-disk1.qcow2", "ephemeral-efi-vars.fd"])
+        XCTAssertEqual(try Data(contentsOf: run.appendingPathComponent("ephemeral-efi-vars.fd")), try Data(contentsOf: vm.bundle.efiVarsURL))
+        var a = try argv(vm)
+        XCTAssertTrue(a.contains("driver=file,node-name=disk0-file,filename=\(run.path)/ephemeral-disk0.qcow2,discard=unmap"))
+        XCTAssertTrue(a.contains("driver=file,node-name=disk1-file,filename=\(run.path)/ephemeral-disk1.qcow2,discard=unmap"))
+        XCTAssertTrue(a.contains("if=pflash,format=raw,file=\(run.path)/ephemeral-efi-vars.fd"))
+
+        try await vm.shutdown(force: true)
+        XCTAssertEqual(ephemeralFiles(vm), [])
+        ephemeral = await vm.isEphemeral; XCTAssertFalse(ephemeral)
+
+        try await vm.start()
+        ephemeral = await vm.isEphemeral; XCTAssertFalse(ephemeral)
+        XCTAssertEqual(ephemeralFiles(vm), [])
+        a = try argv(vm)
+        XCTAssertTrue(a.contains("driver=file,node-name=disk0-file,filename=\(vm.bundle.url.path)/disk0.qcow2,discard=unmap"))
+        XCTAssertTrue(a.contains("if=pflash,format=raw,file=\(vm.bundle.efiVarsURL.path)"))
+        try await vm.shutdown(force: true)
+    }
+
+    func testEphemeralOverlayRemovedWhenTheGuestPowersOff() async throws {
+        let vm = try makeVM()
+        try await vm.start(discardChanges: true)
+        try await vm.shutdown(force: false, gracePeriod: .seconds(5))
+        let s = await vm.state; XCTAssertEqual(s, .stopped)
+        XCTAssertEqual(ephemeralFiles(vm), [])
+        let ephemeral = await vm.isEphemeral; XCTAssertFalse(ephemeral)
+    }
+
+    func testEphemeralFailedStartLeavesNoOverlay() async throws {
+        let vm = try makeVM(mode: "bad-status")
+        await XCTAssertThrowsErrorAsync(try await vm.start(discardChanges: true))
+        let s = await vm.state
+        guard case .failed = s else { return XCTFail("\(s)") }
+        XCTAssertTrue(launched(vm))
+        XCTAssertEqual(ephemeralFiles(vm), [])
+        let ephemeral = await vm.isEphemeral; XCTAssertFalse(ephemeral)
+    }
+
+    func testEphemeralRefusesSuspend() async throws {
+        let vm = try makeVM()
+        try await vm.start(discardChanges: true)
+        do {
+            try await vm.suspendToDisk()
+            XCTFail("a session that discards changes was suspended")
+        } catch {
+            XCTAssertEqual(error as? VMController.ControllerError,
+                           .engineDidNotStart("this session discards changes and cannot be suspended; stop it instead"))
+        }
+        let s = await vm.state; XCTAssertEqual(s, .running)
+        XCTAssertFalse(vm.bundle.isSuspended)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vm.bundle.suspendConfigURL.path))
+        try await vm.pause(); try await vm.resume()
+        try await vm.shutdown(force: true)
+    }
+
+    func testSuspendedBundleRefusesDiscardChanges() async throws {
+        let vm = try makeVM()
+        try await vm.start()
+        try await vm.suspendToDisk()
+        try FileManager.default.removeItem(at: vm.bundle.runURL.appendingPathComponent("fake-argv.json"))
+        do {
+            try await vm.start(discardChanges: true)
+            XCTFail("a suspended session was started discarding changes")
+        } catch {
+            guard case .engineDidNotStart(let message)? = error as? VMController.ControllerError else { return XCTFail("\(error)") }
+            XCTAssertTrue(message.contains("suspended session"), message)
+        }
+        var s = await vm.state; XCTAssertEqual(s, .stopped)
+        XCTAssertTrue(vm.bundle.isSuspended)
+        XCTAssertFalse(launched(vm))
+        try await vm.start()
+        s = await vm.state; XCTAssertEqual(s, .running)
+        XCTAssertTrue(try argv(vm).contains("-incoming"))
         try await vm.shutdown(force: true)
     }
 

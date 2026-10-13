@@ -16,8 +16,14 @@ public struct QEMUCommandBuilder: Sendable {
         /// Boot from the first CD-ROM this time (firmware order is not
         /// overridable on `virt`; kept for the app's boot menu logic).
         public var bootFromCDROM: Bool
-        public init(incomingStatePath: String? = nil, bootFromCDROM: Bool = false) {
+        /// Image files to attach instead of the bundle's, keyed by disk id.
+        public var diskPathOverrides: [String: String]
+        /// UEFI variable store to use instead of the bundle's.
+        public var efiVarsPath: String?
+        public init(incomingStatePath: String? = nil, bootFromCDROM: Bool = false,
+                    diskPathOverrides: [String: String] = [:], efiVarsPath: String? = nil) {
             self.incomingStatePath = incomingStatePath; self.bootFromCDROM = bootFromCDROM
+            self.diskPathOverrides = diskPathOverrides; self.efiVarsPath = efiVarsPath
         }
     }
 
@@ -47,7 +53,7 @@ public struct QEMUCommandBuilder: Sendable {
         a += ["-smp", "\(config.cpuCount)", "-m", "\(config.memoryMiB)"]
         a += ["-nodefaults", "-no-user-config"]
         a += ["-drive", "if=pflash,format=raw,readonly=on,file=\(esc(engine.firmwareCode))"]
-        a += ["-drive", "if=pflash,format=raw,file=\(esc(bundle.efiVarsURL.path))"]
+        a += ["-drive", "if=pflash,format=raw,file=\(esc(options.efiVarsPath ?? bundle.efiVarsURL.path))"]
 
         // display, input
         switch config.display {
@@ -59,7 +65,7 @@ public struct QEMUCommandBuilder: Sendable {
 
         // disks: named nodes so QMP snapshot commands can address them
         for (i, disk) in config.disks.enumerated() {
-            let file = esc(bundle.diskURL(disk).path)
+            let file = esc(options.diskPathOverrides[disk.id] ?? bundle.diskURL(disk).path)
             let boot = (options.bootFromCDROM ? 20 : 1) + i
             a += ["-blockdev", "driver=file,node-name=\(disk.id)-file,filename=\(file),discard=unmap"]
             a += ["-blockdev", "driver=qcow2,node-name=\(disk.id),file=\(disk.id)-file,discard=unmap"]

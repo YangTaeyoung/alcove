@@ -139,4 +139,136 @@ final class VMBundleAndLocatorTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("Broken.alcovevm").path))
     }
+
+    // MARK: - linked clones (real qemu-img)
+
+    private func realEngine() throws -> EngineLocator.Engine {
+        let engine = try? EngineLocator.standard().locate()
+        try XCTSkipIf(engine == nil, "engine not built; run scripts/build-qemu.sh")
+        return engine!
+    }
+
+    private func makeTemplate(_ engine: EngineLocator.Engine, name: String = "Template") throws -> (VMBundle, VMConfig) {
+        var config = VMConfig.defaults(name: name, guestOS: .linux, installISO: "/isos/x.iso")
+        config.disks[0].sizeGiB = 1
+        config.network = .user(portForwards: [.init(hostPort: 2222, guestPort: 22)])
+        config.usbPassthrough = [.init(vendorID: 0x05ac, productID: 0x12a8)]
+        config.sharedFolders = [.init(hostPath: "/Users/me", tag: "home")]
+        return (try VMBundle.create(config, in: tmp, engine: engine), config)
+    }
+
+    private func imageInfo(_ url: URL, _ engine: EngineLocator.Engine) throws -> [String: Any] {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: engine.qemuImg)
+        p.arguments = ["info", "--output=json", url.path]
+        let out = Pipe()
+        p.standardOutput = out
+        try p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    private func listedClones(_ bundle: VMBundle) throws -> [String] {
+        try JSONDecoder().decode([String].self, from: Data(contentsOf: bundle.clonesURL))
+    }
+
+    func testCloneLinkedCreatesOverlay() throws {
+        let engine = try realEngine()
+        let (template, config) = try makeTemplate(engine)
+        let clone = try template.cloneLinked(named: "Clone", engine: engine)
+        XCTAssertEqual(clone.url.path, tmp.appendingPathComponent("Clone.alcovevm").path)
+        let info = try imageInfo(clone.diskURL(config.disks[0]), engine)
+        XCTAssertEqual(info["backing-filename"] as? String, template.diskURL(config.disks[0]).path)
+        XCTAssertEqual(info["backing-filename-format"] as? String, "qcow2")
+        XCTAssertEqual(info["virtual-size"] as? Int, 1 << 30)
+        XCTAssertEqual(try Data(contentsOf: clone.efiVarsURL), try Data(contentsOf: template.efiVarsURL))
+
+        let c = try clone.loadConfig()
+        XCTAssertEqual(c.name, "Clone")
+        XCTAssertEqual(c.cloneOf, "Template")
+        XCTAssertNotEqual(c.agentToken, config.agentToken)
+        XCTAssertNotEqual(c.agentHostPort, config.agentHostPort)
+        XCTAssertEqual(c.agentHostPort, VMConfig.agentPort(for: c.agentToken))
+        XCTAssertNotEqual(c.macAddress, config.macAddress)
+        XCTAssertEqual(c.network, .user(portForwards: []))
+        XCTAssertEqual(c.cdroms, [])
+        XCTAssertEqual(c.usbPassthrough, [])
+        XCTAssertEqual(c.sharedFolders, config.sharedFolders)
+        XCTAssertEqual(c.disks, config.disks)
+        XCTAssertEqual(c.cpuCount, config.cpuCount); XCTAssertEqual(c.memoryMiB, config.memoryMiB)
+        XCTAssertEqual(c.display, config.display); XCTAssertEqual(c.guestOS, config.guestOS)
+        XCTAssertFalse(c.tpm)
+        XCTAssertNil(try template.loadConfig().cloneOf)
+    }
+
+    func testCloneOfTemplateWithoutNetworkHasNoNetwork() throws {
+        let engine = try realEngine()
+        let (template, _) = try makeTemplate(engine)
+        var config = try template.loadConfig()
+        config.network = .none
+        try template.save(config)
+        XCTAssertEqual(try template.cloneLinked(named: "Offline", engine: engine).loadConfig().network, VMConfig.Network.none)
+    }
+
+    func testCloneRegisteredAndPruned() throws {
+        let engine = try realEngine()
+        let fm = FileManager.default
+        let (template, _) = try makeTemplate(engine)
+        XCTAssertEqual(template.liveClones(), [])
+        XCTAssertFalse(fm.fileExists(atPath: template.clonesURL.path))
+
+        let first = try template.cloneLinked(named: "First", engine: engine)
+        let second = try template.cloneLinked(named: "Second", engine: engine)
+        XCTAssertEqual(template.liveClones().map(\.path), [first.url.path, second.url.path])
+        XCTAssertEqual(try listedClones(template), [first.url.path, second.url.path])
+
+        try fm.removeItem(at: first.url)
+        XCTAssertEqual(template.liveClones().map(\.path), [second.url.path])
+        XCTAssertEqual(try listedClones(template), [second.url.path])
+
+        try second.deleteClone()
+        XCTAssertFalse(fm.fileExists(atPath: second.url.path))
+        XCTAssertFalse(fm.fileExists(atPath: template.clonesURL.path))
+        XCTAssertEqual(template.liveClones(), [])
+    }
+
+    func testCloneRefusals() throws {
+        let engine = try realEngine()
+        let fm = FileManager.default
+        let (template, _) = try makeTemplate(engine)
+        let clone = try template.cloneLinked(named: "Clone", engine: engine)
+
+        XCTAssertThrowsError(try template.cloneLinked(named: "Clone", engine: engine)) {
+            XCTAssertEqual($0 as? VMBundle.CloneError, .nameExists("Clone"))
+            XCTAssertEqual("\($0)", "a VM named 'Clone' already exists; choose another name")
+        }
+        XCTAssertThrowsError(try clone.cloneLinked(named: "Grandchild", engine: engine)) {
+            XCTAssertEqual($0 as? VMBundle.CloneError, .sourceIsClone("Clone", template: "Template"))
+            XCTAssertEqual("\($0)", "'Clone' is a clone of 'Template'; clone 'Template' instead")
+        }
+        XCTAssertThrowsError(try template.cloneLinked(named: "a/b", engine: engine)) {
+            XCTAssertEqual($0 as? VMBundle.CloneError, .invalidName("a/b"))
+        }
+
+        try Data("state".utf8).write(to: template.suspendStateURL)
+        XCTAssertThrowsError(try template.cloneLinked(named: "FromSuspended", engine: engine)) {
+            XCTAssertEqual($0 as? VMBundle.CloneError, .sourceSuspended("Template"))
+        }
+        try template.discardSuspendState()
+
+        var withTPM = try template.loadConfig()
+        withTPM.tpm = true
+        try template.save(withTPM)
+        XCTAssertThrowsError(try template.cloneLinked(named: "WithTPM", engine: engine)) {
+            XCTAssertEqual("\($0)", "cannot clone a VM with a TPM")
+        }
+
+        XCTAssertThrowsError(try template.deleteClone()) {
+            XCTAssertEqual("\($0)", "'Template' is not a clone; delete it in the Alcove app")
+        }
+        XCTAssertEqual(VMBundle.list(in: tmp).map(\.url.lastPathComponent), ["Clone.alcovevm", "Template.alcovevm"])
+        XCTAssertEqual(try listedClones(template), [clone.url.path])
+        XCTAssertTrue(fm.fileExists(atPath: template.configURL.path))
+    }
 }

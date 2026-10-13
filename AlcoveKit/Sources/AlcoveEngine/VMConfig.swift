@@ -107,18 +107,21 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public var agentToken: String
     /// Host loopback port forwarded to the guest agent (guest port 7645).
     public var agentHostPort: Int
+    /// Name of the template this VM was cloned from; nil for a VM that is not a clone.
+    public var cloneOf: String?
 
     public init(schemaVersion: Int = VMConfig.currentSchemaVersion, name: String, guestOS: GuestOS, cpuCount: Int,
                 memoryMiB: Int, disks: [Disk], cdroms: [CDROM] = [], network: Network = .user(portForwards: []),
                 display: DisplayDevice, tpm: Bool = false, usbPassthrough: [USBSelector] = [],
                 sharedFolders: [SharedFolder] = [], macAddress: String = VMConfig.randomMAC(), createdAt: Date = Date(),
-                agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil) {
+                agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil, cloneOf: String? = nil) {
         self.schemaVersion = schemaVersion; self.name = name; self.guestOS = guestOS; self.cpuCount = cpuCount
         self.memoryMiB = memoryMiB; self.disks = disks; self.cdroms = cdroms; self.network = network
         self.display = display; self.tpm = tpm; self.usbPassthrough = usbPassthrough
         self.sharedFolders = sharedFolders; self.macAddress = macAddress; self.createdAt = createdAt
         self.agentToken = agentToken
         self.agentHostPort = agentHostPort ?? VMConfig.agentPort(for: agentToken)
+        self.cloneOf = cloneOf
     }
 
     /// Guest port the agent listens on.
@@ -217,7 +220,7 @@ extension VMConfig {
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, name, guestOS, cpuCount, memoryMiB, disks, cdroms, network, display, tpm,
-             usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort
+             usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort, cloneOf
     }
 
     public init(from decoder: Decoder) throws {
@@ -239,5 +242,6 @@ extension VMConfig {
         let token = try c.decodeIfPresent(String.self, forKey: .agentToken) ?? UUID().uuidString.lowercased()
         agentToken = token
         agentHostPort = try c.decodeIfPresent(Int.self, forKey: .agentHostPort) ?? VMConfig.agentPort(for: token)
+        cloneOf = try c.decodeIfPresent(String.self, forKey: .cloneOf)
     }
 }

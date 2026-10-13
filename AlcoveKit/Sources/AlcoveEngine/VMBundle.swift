@@ -101,9 +101,19 @@ public struct VMBundle: Sendable, Equatable {
 
     /// `qemu-img create -f qcow2 <file> <size>G`
     public func createDisk(_ disk: VMConfig.Disk, engine: EngineLocator.Engine) throws {
+        try VMBundle.qemuImg(["create", "-q", "-f", "qcow2", diskURL(disk).path, "\(disk.sizeGiB)G"], engine: engine)
+    }
+
+    /// `qemu-img create -f qcow2 -F qcow2 -b <backing> <overlay>`
+    public static func createOverlay(at overlay: URL, backing: URL, engine: EngineLocator.Engine) throws {
+        try qemuImg(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", backing.path, overlay.path], engine: engine)
+    }
+
+    /// Runs `qemu-img` with `arguments`; a non-zero exit throws `qemuImgFailed` with its error output.
+    private static func qemuImg(_ arguments: [String], engine: EngineLocator.Engine) throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: engine.qemuImg)
-        p.arguments = ["create", "-q", "-f", "qcow2", diskURL(disk).path, "\(disk.sizeGiB)G"]
+        p.arguments = arguments
         let err = Pipe()
         p.standardError = err
         p.standardOutput = FileHandle.nullDevice
@@ -140,5 +150,120 @@ public struct VMBundle: Sendable, Equatable {
         return items.filter { $0.pathExtension == pathExtension && fm.fileExists(atPath: $0.appendingPathComponent("config.json").path) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             .map(VMBundle.init(url:))
+    }
+}
+
+// MARK: - linked clones and sessions that discard changes
+
+extension VMBundle {
+    public enum CloneError: Error, Equatable, Sendable, CustomStringConvertible {
+        case sourceRunning(String)
+        case sourceSuspended(String)
+        case sourceIsClone(String, template: String)
+        case sourceHasTPM
+        case invalidName(String)
+        case nameExists(String)
+        case notAClone(String)
+        case cloneRunning(String)
+
+        public var description: String {
+            switch self {
+            case .sourceRunning(let n): return "'\(n)' is running; stop it before cloning it"
+            case .sourceSuspended(let n): return "'\(n)' has a suspended session; resume and shut it down, or discard the suspended state, before cloning it"
+            case .sourceIsClone(let n, let template): return "'\(n)' is a clone of '\(template)'; clone '\(template)' instead"
+            case .sourceHasTPM: return "cannot clone a VM with a TPM"
+            case .invalidName(let n): return "'\(n)' cannot be used as a VM name; choose a non-empty name without '/', ':' or ','"
+            case .nameExists(let n): return "a VM named '\(n)' already exists; choose another name"
+            case .notAClone(let n): return "'\(n)' is not a clone; delete it in the Alcove app"
+            case .cloneRunning(let n): return "'\(n)' is running; stop it before deleting it"
+            }
+        }
+    }
+
+    /// JSON array of the absolute paths of the bundles cloned from this one.
+    public var clonesURL: URL { url.appendingPathComponent("clones.json") }
+    /// Whether an engine process holds this bundle's pidfile lock.
+    public var isRunning: Bool { VMController.pidfileLockHolder(pidFileURL.path) != nil }
+    /// The disk image a session that discards changes writes to in place of `diskURL(disk)`.
+    public func ephemeralDiskURL(_ disk: VMConfig.Disk) -> URL { runURL.appendingPathComponent("ephemeral-\(disk.id).qcow2") }
+    /// The UEFI variable store a session that discards changes writes to in place of `efiVarsURL`.
+    public var ephemeralEFIVarsURL: URL { runURL.appendingPathComponent("ephemeral-efi-vars.fd") }
+
+    /// Bundles listed in clones.json that still exist; rewrites the file without the missing ones.
+    public func liveClones(fileManager fm: FileManager = .default) -> [URL] {
+        let listed = (try? JSONDecoder().decode([String].self, from: Data(contentsOf: clonesURL))) ?? []
+        let live = listed.filter { fm.fileExists(atPath: VMBundle(url: URL(fileURLWithPath: $0)).configURL.path) }
+        if live.count != listed.count { try? writeClones(live, fileManager: fm) }
+        return live.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Writes `paths` to clones.json; an empty list removes the file.
+    private func writeClones(_ paths: [String], fileManager fm: FileManager) throws {
+        guard !paths.isEmpty else {
+            if fm.fileExists(atPath: clonesURL.path) { try fm.removeItem(at: clonesURL) }
+            return
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
+        try encoder.encode(paths).write(to: clonesURL, options: .atomic)
+    }
+
+    /// New bundle next to this one whose disks are qcow2 overlays backed by this bundle's disks,
+    /// with a copy of the UEFI variables, a fresh token, MAC and agent port, no CD-ROMs, USB
+    /// passthrough or static forwards, and `cloneOf` set. The clone is added to `clones.json`.
+    /// The overlays reference the template's disk files by absolute path.
+    public func cloneLinked(named newName: String, engine: EngineLocator.Engine, fileManager fm: FileManager = .default) throws -> VMBundle {
+        let source = try loadConfig()
+        if let template = source.cloneOf { throw CloneError.sourceIsClone(source.name, template: template) }
+        guard !source.tpm else { throw CloneError.sourceHasTPM }
+        guard !isRunning else { throw CloneError.sourceRunning(source.name) }
+        guard !isSuspended else { throw CloneError.sourceSuspended(source.name) }
+
+        var token = UUID().uuidString.lowercased()
+        while VMConfig.agentPort(for: token) == source.agentHostPort { token = UUID().uuidString.lowercased() }
+        var network = VMConfig.Network.user(portForwards: [])
+        if case .none = source.network { network = .none }
+        let config = VMConfig(name: newName, guestOS: source.guestOS, cpuCount: source.cpuCount, memoryMiB: source.memoryMiB,
+                              disks: source.disks, network: network, display: source.display,
+                              sharedFolders: source.sharedFolders, agentToken: token, cloneOf: source.name)
+        do {
+            try config.validate()
+        } catch VMConfig.ValidationError.emptyName, VMConfig.ValidationError.invalidName {
+            throw CloneError.invalidName(newName)
+        }
+        let clone = VMBundle(url: url.deletingLastPathComponent().appendingPathComponent(newName).appendingPathExtension(VMBundle.pathExtension))
+        guard !fm.fileExists(atPath: clone.url.path) else { throw CloneError.nameExists(newName) }
+
+        do {
+            try fm.createDirectory(at: clone.runURL, withIntermediateDirectories: true)
+            try clone.save(config)
+            for disk in source.disks {
+                try VMBundle.createOverlay(at: clone.diskURL(disk), backing: diskURL(disk), engine: engine)
+            }
+            try fm.copyItem(at: efiVarsURL, to: clone.efiVarsURL)
+            try writeClones(liveClones(fileManager: fm).map(\.path) + [clone.url.path], fileManager: fm)
+        } catch {
+            try? fm.removeItem(at: clone.url)
+            throw error
+        }
+        return clone
+    }
+
+    /// Removes this clone's bundle directory, its socket directory and its entry in the template's `clones.json`.
+    public func deleteClone(fileManager fm: FileManager = .default) throws {
+        let config = try loadConfig()
+        guard let template = config.cloneOf else { throw CloneError.notAClone(config.name) }
+        guard !isRunning else { throw CloneError.cloneRunning(config.name) }
+        try fm.removeItem(at: url)
+        try? fm.removeItem(atPath: socketDirectory)
+        let templateURL = url.deletingLastPathComponent().appendingPathComponent(template).appendingPathExtension(VMBundle.pathExtension)
+        _ = VMBundle(url: templateURL).liveClones(fileManager: fm)
+    }
+
+    /// Removes the overlays and the UEFI variable copy of a session that discards changes.
+    public func removeEphemeralFiles(fileManager fm: FileManager = .default) {
+        for name in (try? fm.contentsOfDirectory(atPath: runURL.path)) ?? [] where name.hasPrefix("ephemeral-") {
+            try? fm.removeItem(at: runURL.appendingPathComponent(name))
+        }
     }
 }

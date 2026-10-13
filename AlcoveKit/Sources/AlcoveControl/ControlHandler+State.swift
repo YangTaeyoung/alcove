@@ -2,8 +2,33 @@ import Foundation
 import AlcoveEngine
 import AlcoveQMP
 
-/// Snapshots, runtime port forwards, the network link, leases and the guest resolution.
+/// Snapshots, runtime port forwards, the network link, leases, the guest resolution and clones.
 extension ControlHandler {
+    /// `vm.clone` and `vm.delete`, through a registry that conforms to `VMProvisioning`.
+    func provision(op: String, params: JSON) async throws -> JSON {
+        let name = try string(params, "name")
+        guard let provisioning = registry as? VMProvisioning else {
+            throw ControlError.failed("this control host cannot clone or delete VMs")
+        }
+        guard await registry.target(named: name) != nil else { throw ControlError.noSuchVM(name) }
+        do {
+            if op == "vm.clone" {
+                let newName = try string(params, "newName")
+                try await provisioning.cloneVM(named: name, as: newName)
+                return ["name": .string(newName)]
+            }
+            try await provisioning.deleteVM(named: name)
+        } catch let error as ControlError {
+            throw error
+        } catch let error as VMBundle.CloneError {
+            throw ControlError.failed(error.description)
+        } catch {
+            throw ControlError.failed("\(op == "vm.clone" ? "clone" : "delete") failed: \(error)")
+        }
+        forget(vm: name)
+        return [:]
+    }
+
     func leaseOrResolution(op: String, params: JSON) async throws -> JSON {
         switch op {
         case "vm.lease.acquire":

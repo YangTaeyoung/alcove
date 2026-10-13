@@ -58,6 +58,8 @@ public actor VMController {
     /// operations (snapshots, media changes) address this machine, not `config`,
     /// which may already hold edits for the next start.
     public private(set) var runningConfig: VMConfig?
+    /// True while the engine runs on overlays that are removed when it stops (`start(discardChanges: true)`).
+    public private(set) var isEphemeral = false
     public private(set) var state: State = .stopped { didSet { if state != oldValue { stateContinuation.yield(state) } } }
     /// State changes, starting with the current state on subscription of a fresh stream is not
     /// provided; read `state` first, then observe.
@@ -123,17 +125,33 @@ public actor VMController {
 
     /// Launch the engine and wait until the guest is running (or resumed from disk).
     public func start() async throws {
-        try await start(bootFromCDROM: false)
+        try await start(bootFromCDROM: false, discardChanges: false)
     }
 
     /// `bootFromCDROM` asks the firmware to try the CD-ROMs first. Ignored when
     /// resuming a suspended session, which must relaunch exactly as it was saved.
     public func start(bootFromCDROM: Bool) async throws {
+        try await start(bootFromCDROM: bootFromCDROM, discardChanges: false)
+    }
+
+    /// `discardChanges` runs the session on qcow2 overlays of the disks and a copy of the
+    /// UEFI variables in `run/`; `teardown()` removes them. A template with clones and a
+    /// suspended bundle asked to discard changes are refused before anything is launched.
+    public func start(bootFromCDROM: Bool = false, discardChanges: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
+        let clones = bundle.liveClones().map { $0.deletingPathExtension().lastPathComponent }
+        guard clones.isEmpty else {
+            throw ControllerError.engineDidNotStart(
+                "'\(config.name)' is a template with clones (\(clones.joined(separator: ", "))); delete the clones first or start a clone")
+        }
+        let resuming = bundle.isSuspended
+        guard !(resuming && discardChanges) else {
+            throw ControllerError.engineDidNotStart(
+                "'\(config.name)' has a suspended session; resume it or discard the suspended state before starting a session that discards changes")
+        }
         generation += 1
         let gen = generation
         state = .starting
-        let resuming = bundle.isSuspended
         var engineLaunched = false
         do {
             try config.validate()
@@ -162,8 +180,17 @@ public actor VMController {
             let display = try DisplayConnection(socketPath: bundle.displaySocketPath)
             self.display = display
             if drainsDisplayMessages { VMController.drain(display) }
-            let options = QEMUCommandBuilder.Options(incomingStatePath: resuming ? bundle.suspendStateURL.path : nil,
+            var options = QEMUCommandBuilder.Options(incomingStatePath: resuming ? bundle.suspendStateURL.path : nil,
                                                      bootFromCDROM: resuming ? false : bootFromCDROM)
+            if discardChanges {
+                isEphemeral = true
+                for disk in launch.disks {
+                    try VMBundle.createOverlay(at: bundle.ephemeralDiskURL(disk), backing: bundle.diskURL(disk), engine: engine)
+                    options.diskPathOverrides[disk.id] = bundle.ephemeralDiskURL(disk).path
+                }
+                try FileManager.default.copyItem(at: bundle.efiVarsURL, to: bundle.ephemeralEFIVarsURL)
+                options.efiVarsPath = bundle.ephemeralEFIVarsURL.path
+            }
             let args = QEMUCommandBuilder(engine: engine).arguments(for: launch, bundle: bundle, options: options)
             let q = ChildProcess(executable: engine.qemuSystem, arguments: args, logURL: bundle.qemuLogURL)
             try q.start()
@@ -293,6 +320,9 @@ public actor VMController {
         guard state == .running || state == .paused, let qmp, let q = qemu, let launched = runningConfig else {
             throw ControllerError.notRunning
         }
+        guard !isEphemeral else {
+            throw ControllerError.engineDidNotStart("this session discards changes and cannot be suspended; stop it instead")
+        }
         let gen = generation
         let previous = state
         state = .suspending
@@ -332,7 +362,7 @@ public actor VMController {
         guard let disk = (runningConfig ?? config).disks.first else { return [] }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: engine.qemuImg)
-        p.arguments = ["info", "-U", "--output=json", bundle.diskURL(disk).path]
+        p.arguments = ["info", "-U", "--output=json", (isEphemeral ? bundle.ephemeralDiskURL(disk) : bundle.diskURL(disk)).path]
         let out = Pipe(), err = Pipe()
         p.standardOutput = out; p.standardError = err
         try p.run()
@@ -547,6 +577,10 @@ public actor VMController {
         if let q = qemu, q.isRunning { q.kill() }
         qemu = nil
         runningConfig = nil
+        if isEphemeral {
+            isEphemeral = false
+            bundle.removeEphemeralFiles()
+        }
         if let t = swtpm {
             swtpm = nil
             t.terminate()

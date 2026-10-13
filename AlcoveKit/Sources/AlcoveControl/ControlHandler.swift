@@ -74,6 +74,7 @@ public actor ControlHandler {
     /// Every op name the dispatcher accepts.
     static let knownOps: [String] = [
         "hello", "vm.list", "vm.status", "vm.start", "vm.stop", "vm.pause", "vm.resume", "vm.screenshot",
+        "vm.clone", "vm.delete",
         "vm.mouse.move", "vm.mouse.click", "vm.mouse.drag", "vm.mouse.scroll", "vm.mouse.down", "vm.mouse.up",
         "vm.key.press", "vm.key.down", "vm.key.up", "vm.type", "vm.batch",
         "vm.exec", "vm.exec.start", "vm.exec.read", "vm.exec.write", "vm.exec.kill", "vm.exec.list",
@@ -137,12 +138,24 @@ public actor ControlHandler {
             return await status(of: try await target(params), quick: false)
         case "vm.start":
             let t = try await target(params)
-            let st = await t.state()
-            if !st.isActive {
+            let discard = params["discardChanges"]?.boolValue ?? false
+            if await t.state().isActive {
+                if discard {
+                    throw ControlError.failed("VM '\(t.name)' is already running; stop it first to start a session that discards changes")
+                }
+            } else {
                 runtimeForwards[t.name] = nil
-                do { try await t.start() } catch { throw ControlError.failed("start failed: \(error)") }
+                do {
+                    try await t.start(discardChanges: discard)
+                } catch VMController.ControllerError.engineDidNotStart(let reason) {
+                    throw ControlError.failed("start failed: \(reason)")
+                } catch {
+                    throw ControlError.failed("start failed: \(error)")
+                }
             }
-            return ["state": .string(describe(await t.state()))]
+            return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral())]
+        case "vm.clone", "vm.delete":
+            return try await provision(op: op, params: params)
         case "vm.stop":
             let t = try await target(params)
             if await t.state().isActive {
@@ -226,6 +239,14 @@ public actor ControlHandler {
         return t
     }
 
+    /// Drops the lease, the runtime forwards and the cached frame size of `vm`.
+    func forget(vm: String) {
+        leases.forget(vm: vm)
+        runtimeForwards[vm] = nil
+        forwardInstances[vm] = nil
+        lastSize[vm] = nil
+    }
+
     func running(_ params: JSON) async throws -> VMTarget {
         let t = try await target(params)
         let st = await t.state()
@@ -273,6 +294,8 @@ public actor ControlHandler {
         if let (w, h) = lastSize[t.name] { obj["width"] = .int(Int64(w)); obj["height"] = .int(Int64(h)) }
         if case .failed(let msg) = st { obj["error"] = .string(msg) }
         if let lease = leases.active(vm: t.name, now: clock()) { obj["leasedBy"] = .string(lease.owner) }
+        if let template = await t.cloneOf() { obj["cloneOf"] = .string(template) }
+        if await t.isEphemeral() { obj["ephemeral"] = true }
         if !quick, st == .running || st == .paused {
             if lastSize[t.name] == nil, let frame = try? await screenshot(t) {
                 obj["width"] = .int(Int64(frame.width)); obj["height"] = .int(Int64(frame.height))

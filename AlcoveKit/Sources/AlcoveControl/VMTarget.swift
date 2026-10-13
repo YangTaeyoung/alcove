@@ -10,7 +10,14 @@ public protocol VMTarget: Sendable {
     func guestOS() async -> VMConfig.GuestOS
     func state() async -> VMController.State
     func isSuspended() async -> Bool
+    /// Same as `start(discardChanges: false)`.
     func start() async throws
+    /// Starts the VM; with `discardChanges` the session's disk and firmware writes are dropped when it stops.
+    func start(discardChanges: Bool) async throws
+    /// Whether the running session discards its changes when it stops.
+    func isEphemeral() async -> Bool
+    /// The template this VM was cloned from; nil when it is not a clone.
+    func cloneOf() async -> String?
     func stop(force: Bool) async throws
     func pause() async throws
     func resume() async throws
@@ -50,6 +57,14 @@ public protocol VMRegistry: Sendable {
     func target(named name: String) async -> VMTarget?
 }
 
+/// A registry that can also create linked clones and delete them.
+public protocol VMProvisioning: Sendable {
+    /// Creates the linked clone `newName` of the stopped VM `name`.
+    func cloneVM(named name: String, as newName: String) async throws
+    /// Deletes the stopped clone `name`.
+    func deleteVM(named name: String) async throws
+}
+
 /// Adapts a `VMController` (plus a lazily connected agent) to `VMTarget`.
 public actor ControllerTarget: VMTarget {
     public nonisolated let name: String
@@ -67,6 +82,9 @@ public actor ControllerTarget: VMTarget {
     public func state() async -> VMController.State { await controller.state }
     public func isSuspended() async -> Bool { controller.bundle.isSuspended }
     public func start() async throws { try await controller.start() }
+    public func start(discardChanges: Bool) async throws { try await controller.start(discardChanges: discardChanges) }
+    public func isEphemeral() async -> Bool { await controller.isEphemeral }
+    public func cloneOf() async -> String? { await controller.config.cloneOf }
     public func stop(force: Bool) async throws {
         await agentClient?.disconnect(); agentClient = nil
         try await controller.shutdown(force: force)

@@ -96,3 +96,29 @@ actor AppVMRegistry: VMRegistry {
         targets = targets.filter { liveIDs.contains($0.key) }
     }
 }
+
+/// Clones and deletes bundles in the app's VM directory, then has `AppModel` re-scan it.
+extension AppVMRegistry: VMProvisioning {
+    func cloneVM(named name: String, as newName: String) async throws {
+        let (bundle, controller) = try await session(named: name)
+        guard await !controller.state.isActive else { throw VMBundle.CloneError.sourceRunning(name) }
+        _ = try bundle.cloneLinked(named: newName, engine: controller.engine)
+        await MainActor.run { AppModel.shared.reload() }
+    }
+
+    func deleteVM(named name: String) async throws {
+        let (bundle, controller) = try await session(named: name)
+        guard await !controller.state.isActive else { throw VMBundle.CloneError.cloneRunning(name) }
+        try bundle.deleteClone()
+        await MainActor.run { AppModel.shared.reload() }
+    }
+
+    /// The bundle and controller of the session called `name`.
+    private func session(named name: String) async throws -> (VMBundle, VMController) {
+        let found: (VMBundle, VMController)? = await MainActor.run {
+            AppModel.shared.sessions.first { $0.name == name }.map { ($0.bundle, $0.controller) }
+        }
+        guard let found else { throw ControlHandler.ControlError.noSuchVM(name) }
+        return found
+    }
+}

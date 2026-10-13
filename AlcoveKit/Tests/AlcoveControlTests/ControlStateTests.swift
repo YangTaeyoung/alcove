@@ -209,4 +209,185 @@ final class ControlStateTests: XCTestCase {
             XCTAssertEqual(message, "VM 'Win' is stopped; call vm.start first", op)
         }
     }
+
+    // MARK: - clones and sessions that discard changes
+
+    func testCloneAndDeleteGoThroughProvisioning() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        let registry = FakeProvisioningRegistry(targets: ["Win": t])
+        let h = ControlHandler(registry: registry, hostKind: "test")
+
+        let cloned = try await h.handle(op: "vm.clone", params: ["name": "Win", "newName": "Copy"])
+        XCTAssertEqual(cloned, ["name": "Copy"])
+        let missingName = await failure(h, "vm.clone", ["name": "Win"])
+        XCTAssertEqual(missingName, "missing or invalid parameter 'newName'")
+        let unknown = await failure(h, "vm.clone", ["name": "Nope", "newName": "Copy"])
+        XCTAssertEqual(unknown, "no VM named 'Nope'; call vm.list")
+        let unknownDelete = await failure(h, "vm.delete", ["name": "Nope"])
+        XCTAssertEqual(unknownDelete, "no VM named 'Nope'; call vm.list")
+
+        let lease = try await h.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "agent-a"])
+        let token = try XCTUnwrap(lease["lease"]?.stringValue)
+        _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 3389, "hostPort": 13389, "lease": .string(token)])
+        let leased = await failure(h, "vm.delete", ["name": "Win"])
+        XCTAssertTrue(leased.hasPrefix("VM 'Win' is leased by agent-a"), leased)
+        let leasedClone = await failure(h, "vm.clone", ["name": "Win", "newName": "Other"])
+        XCTAssertTrue(leasedClone.hasPrefix("VM 'Win' is leased by agent-a"), leasedClone)
+
+        let deleted = try await h.handle(op: "vm.delete", params: ["name": "Win", "lease": .string(token)])
+        XCTAssertEqual(deleted, [:])
+        let calls = await registry.calls
+        XCTAssertEqual(calls, ["clone:Win->Copy", "delete:Win"])
+
+        let row = try await h.handle(op: "vm.list", params: [:])
+        XCTAssertNil(row["vms"]?[0]?["leasedBy"])
+        XCTAssertNil(row["vms"]?[0]?["width"])
+        let forwards = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(forwards["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+    }
+
+    func testProvisioningErrorsAreReported() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        let registry = FakeProvisioningRegistry(targets: ["Win": t])
+        let h = ControlHandler(registry: registry, hostKind: "test")
+        _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
+        await registry.setFailure(VMBundle.CloneError.sourceRunning("Win"))
+        let clone = await failure(h, "vm.clone", ["name": "Win", "newName": "Copy"])
+        XCTAssertEqual(clone, "'Win' is running; stop it before cloning it")
+        await registry.setFailure(VMBundle.CloneError.cloneRunning("Win"))
+        let delete = await failure(h, "vm.delete", ["name": "Win"])
+        XCTAssertEqual(delete, "'Win' is running; stop it before deleting it")
+        let row = try await h.handle(op: "vm.list", params: [:])
+        XCTAssertEqual(row["vms"]?[0]?["width"]?.intValue, 800)
+    }
+
+    func testCloneUnsupportedRegistry() async throws {
+        let (h, _) = setup()
+        let clone = await failure(h, "vm.clone", ["name": "Win", "newName": "Copy"])
+        XCTAssertEqual(clone, "this control host cannot clone or delete VMs")
+        let delete = await failure(h, "vm.delete", ["name": "Win"])
+        XCTAssertEqual(delete, "this control host cannot clone or delete VMs")
+    }
+
+    /// A bundle directory with a config, a disk file and UEFI variables, made without an engine.
+    private func writeBundle(_ config: VMConfig, in directory: URL) throws -> VMBundle {
+        let bundle = VMBundle(url: directory.appendingPathComponent(config.name).appendingPathExtension(VMBundle.pathExtension))
+        try FileManager.default.createDirectory(at: bundle.runURL, withIntermediateDirectories: true)
+        try bundle.save(config)
+        for disk in config.disks { try Data("QFI".utf8).write(to: bundle.diskURL(disk)) }
+        try Data(count: 32).write(to: bundle.efiVarsURL)
+        return bundle
+    }
+
+    /// A temp VM directory and a stand-in engine: `qemu-system-aarch64` only answers `-display help`,
+    /// `qemu-img` writes a stub file at its last argument.
+    private func headless() throws -> (ControlHandler, URL) {
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("alcove-ctl-\(UUID().uuidString.prefix(8))")
+        addTeardownBlock { try? FileManager.default.removeItem(at: tmp) }
+        let vms = tmp.appendingPathComponent("vms"), root = tmp.appendingPathComponent("engine")
+        try fm.createDirectory(at: vms, withIntermediateDirectories: true)
+        try fm.createDirectory(at: root.appendingPathComponent("pc-bios"), withIntermediateDirectories: true)
+        let scripts = ["qemu-system-aarch64": "#!/bin/sh\necho 'Available display backend types:'\necho alcove\n",
+                       "qemu-img": "#!/bin/sh\nfor out; do :; done\nprintf 'QFI' > \"$out\"\n"]
+        for (name, source) in scripts {
+            fm.createFile(atPath: root.appendingPathComponent(name).path, contents: Data(source.utf8), attributes: [.posixPermissions: 0o755])
+        }
+        fm.createFile(atPath: root.appendingPathComponent("pc-bios/edk2-aarch64-code.fd").path, contents: Data(count: 16))
+        let engine = try EngineLocator(roots: [root.path]).locate()
+        return (ControlHandler(registry: HeadlessRegistry(directory: vms, engine: engine), hostKind: "headless"), vms)
+    }
+
+    func testDeleteRefusesNonClone() async throws {
+        let (h, vms) = try headless()
+        let plain = try writeBundle(VMConfig.defaults(name: "Plain", guestOS: .linux), in: vms)
+        let message = await failure(h, "vm.delete", ["name": "Plain"])
+        XCTAssertEqual(message, "'Plain' is not a clone; delete it in the Alcove app")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: plain.configURL.path))
+        let list = try await h.handle(op: "vm.list", params: [:])
+        XCTAssertEqual(list["vms"]?[0]?["name"]?.stringValue, "Plain")
+        XCTAssertNil(list["vms"]?[0]?["cloneOf"])
+        XCTAssertNil(list["vms"]?[0]?["ephemeral"])
+    }
+
+    func testHeadlessCloneAndDelete() async throws {
+        let (h, vms) = try headless()
+        let template = try writeBundle(VMConfig.defaults(name: "Base", guestOS: .linux), in: vms)
+        let cloned = try await h.handle(op: "vm.clone", params: ["name": "Base", "newName": "Copy"])
+        XCTAssertEqual(cloned, ["name": "Copy"])
+        let copy = VMBundle(url: vms.appendingPathComponent("Copy.alcovevm"))
+        XCTAssertEqual(try copy.loadConfig().cloneOf, "Base")
+        XCTAssertEqual(template.liveClones().map(\.lastPathComponent), ["Copy.alcovevm"])
+
+        let list = try await h.handle(op: "vm.list", params: [:])
+        XCTAssertEqual(list["vms"]?[0]?["name"]?.stringValue, "Base")
+        XCTAssertNil(list["vms"]?[0]?["cloneOf"])
+        XCTAssertEqual(list["vms"]?[1]?["name"]?.stringValue, "Copy")
+        XCTAssertEqual(list["vms"]?[1]?["cloneOf"]?.stringValue, "Base")
+
+        let again = await failure(h, "vm.clone", ["name": "Base", "newName": "Copy"])
+        XCTAssertEqual(again, "a VM named 'Copy' already exists; choose another name")
+        let ofClone = await failure(h, "vm.clone", ["name": "Copy", "newName": "Third"])
+        XCTAssertEqual(ofClone, "'Copy' is a clone of 'Base'; clone 'Base' instead")
+        let start = await failure(h, "vm.start", ["name": "Base"])
+        XCTAssertEqual(start, "start failed: 'Base' is a template with clones (Copy); delete the clones first or start a clone")
+
+        let deleted = try await h.handle(op: "vm.delete", params: ["name": "Copy"])
+        XCTAssertEqual(deleted, [:])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.url.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
+        let gone = await failure(h, "vm.status", ["name": "Copy"])
+        XCTAssertEqual(gone, "no VM named 'Copy'; call vm.list")
+    }
+
+    func testStartDiscardChangesReportsEphemeral() async throws {
+        let (h, t) = setup(state: .stopped)
+        let started = try await h.handle(op: "vm.start", params: ["name": "Win", "discardChanges": true])
+        XCTAssertEqual(started, ["state": "running", "ephemeral": true])
+        var discards = await t.startDiscard
+        XCTAssertEqual(discards, [true])
+        let status = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(status["ephemeral"]?.boolValue, true)
+        XCTAssertNil(status["cloneOf"])
+        let list = try await h.handle(op: "vm.list", params: [:])
+        XCTAssertEqual(list["vms"]?[0]?["ephemeral"]?.boolValue, true)
+
+        let again = await failure(h, "vm.start", ["name": "Win", "discardChanges": true])
+        XCTAssertEqual(again, "VM 'Win' is already running; stop it first to start a session that discards changes")
+        let plain = try await h.handle(op: "vm.start", params: ["name": "Win"])
+        XCTAssertEqual(plain, ["state": "running", "ephemeral": true])
+        discards = await t.startDiscard
+        XCTAssertEqual(discards, [true])
+
+        _ = try await h.handle(op: "vm.stop", params: ["name": "Win"])
+        await t.setCloneOf("Base")
+        let kept = try await h.handle(op: "vm.start", params: ["name": "Win", "discardChanges": false])
+        XCTAssertEqual(kept, ["state": "running", "ephemeral": false])
+        discards = await t.startDiscard
+        XCTAssertEqual(discards, [true, false])
+        let after = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertNil(after["ephemeral"])
+        XCTAssertEqual(after["cloneOf"]?.stringValue, "Base")
+    }
+}
+
+/// A registry over fake targets that records clone and delete requests, or fails them with `failure`.
+actor FakeProvisioningRegistry: VMRegistry, VMProvisioning {
+    let targets: [String: FakeTarget]
+    var calls: [String] = []
+    var failure: Error?
+
+    init(targets: [String: FakeTarget]) { self.targets = targets }
+    func names() async -> [String] { targets.keys.sorted() }
+    func target(named name: String) async -> VMTarget? { targets[name] }
+    func setFailure(_ error: Error?) { failure = error }
+    func cloneVM(named name: String, as newName: String) async throws {
+        if let failure { throw failure }
+        calls.append("clone:\(name)->\(newName)")
+    }
+    func deleteVM(named name: String) async throws {
+        if let failure { throw failure }
+        calls.append("delete:\(name)")
+    }
 }

@@ -71,6 +71,20 @@ final class QEMUCommandBuilderTests: XCTestCase {
         XCTAssertFalse(joined.contains("-netdev"))
     }
 
+    func testDiskPathOverrides() {
+        var c = VMConfig.defaults(name: "O", guestOS: .linux)
+        c.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 8, bus: .virtioBlk))
+        let a = args(c, .init(diskPathOverrides: ["disk0": "/vms/Test.alcovevm/run/ephemeral-disk0.qcow2"],
+                              efiVarsPath: "/vms/a, b/ephemeral-efi-vars.fd"))
+        XCTAssertTrue(a.contains("driver=file,node-name=disk0-file,filename=/vms/Test.alcovevm/run/ephemeral-disk0.qcow2,discard=unmap"))
+        XCTAssertTrue(a.contains("driver=file,node-name=disk1-file,filename=/vms/Test.alcovevm/disk1.qcow2,discard=unmap"))
+        XCTAssertTrue(a.contains("if=pflash,format=raw,file=/vms/a,, b/ephemeral-efi-vars.fd"))
+        XCTAssertFalse(a.contains { $0.contains("/vms/Test.alcovevm/disk0.qcow2") || $0.contains("/vms/Test.alcovevm/efi-vars.fd") })
+        let plain = args(c)
+        XCTAssertTrue(plain.contains("driver=file,node-name=disk0-file,filename=/vms/Test.alcovevm/disk0.qcow2,discard=unmap"))
+        XCTAssertTrue(plain.contains("if=pflash,format=raw,file=/vms/Test.alcovevm/efi-vars.fd"))
+    }
+
     /// Every device needs its own boot index; QEMU refuses a duplicate
     /// ("The bootindex 10 has already been used", system/bootdevice.c).
     func testEveryCDROMAndDiskGetsADistinctBootIndex() {

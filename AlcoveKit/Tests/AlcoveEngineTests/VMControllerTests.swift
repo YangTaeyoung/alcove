@@ -113,6 +113,49 @@ final class VMControllerTests: XCTestCase {
         try await vm.shutdown(force: true)
     }
 
+    func testDiscardChangesSessionKeepsSnapshotsInTheOverlay() async throws {
+        let vm = try makeVM()
+        let overlay = vm.bundle.runURL.appendingPathComponent("ephemeral-disk0.qcow2")
+        try await vm.start(discardChanges: true)
+        var s = await vm.state; XCTAssertEqual(s, .running)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlay.path))
+        try await vm.createSnapshot(named: "scratch")
+        var list = try await vm.snapshots()
+        XCTAssertEqual(list.map(\.name), ["scratch"])
+        try await vm.restoreSnapshot(named: "scratch")
+        try await vm.shutdown(force: true)
+        s = await vm.state; XCTAssertEqual(s, .stopped)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: overlay.path))
+        list = try await vm.snapshots()
+        XCTAssertTrue(list.isEmpty)
+        try await vm.start()
+        s = await vm.state; XCTAssertEqual(s, .running)
+        try await vm.shutdown(force: true)
+    }
+
+    func testCloneRunsOnItsOverlayAndTheTemplateStaysUntouched() async throws {
+        let template = try makeVM()
+        let bundle = try template.bundle.cloneLinked(named: "Clone", engine: engine)
+        let clone = VMController(bundle: bundle, config: try bundle.loadConfig(), engine: engine)
+        await XCTAssertThrowsErrorAsync(try await template.start())
+
+        try await clone.start(discardChanges: true)
+        var s = await clone.state; XCTAssertEqual(s, .running)
+        try await clone.createSnapshot(named: "scratch")
+        try await clone.shutdown(force: true)
+        var list = try await clone.snapshots()
+        XCTAssertTrue(list.isEmpty)
+
+        try await clone.start()
+        s = await clone.state; XCTAssertEqual(s, .running)
+        try await clone.createSnapshot(named: "kept")
+        try await clone.shutdown(force: true)
+        list = try await clone.snapshots()
+        XCTAssertEqual(list.map(\.name), ["kept"])
+        let base = try await template.snapshots()
+        XCTAssertTrue(base.isEmpty)
+    }
+
     func testFailureIsReportedWithLogExactlyOnce() async throws {
         let vm = try makeVM()
         let log = StateLog()

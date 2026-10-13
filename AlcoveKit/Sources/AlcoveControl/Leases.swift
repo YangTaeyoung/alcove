@@ -41,6 +41,9 @@ struct LeaseTable {
         leases[vm] = nil
     }
 
+    /// Removes the lease of `vm`, whoever holds it.
+    mutating func forget(vm: String) { leases[vm] = nil }
+
     /// nil when the op may run.
     mutating func refusal(vm: String, token: String?, now: ContinuousClock.Instant) -> String? {
         guard let current = active(vm: vm, now: now), token != current.token else { return nil }

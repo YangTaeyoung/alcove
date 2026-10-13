@@ -29,6 +29,9 @@ actor FakeTarget: VMTarget {
     var instance = 1
     var agentPort = 40_000
     var restoreHook: (@Sendable (FakeTarget) async -> Void)?
+    var ephemeral = false
+    var cloneOfValue: String?
+    var startDiscard: [Bool] = []
 
     init(name: String, state: VMController.State, png: Data) { self.name = name; self.stateValue = state; self.png = png }
     var os: VMConfig.GuestOS = .windows
@@ -36,8 +39,15 @@ actor FakeTarget: VMTarget {
     func setOS(_ value: VMConfig.GuestOS) { os = value }
     func state() async -> VMController.State { stateValue }
     func isSuspended() async -> Bool { false }
-    func start() async throws { startCount += 1; stateValue = .running }
-    func stop(force: Bool) async throws { stopCount += 1; stateValue = .stopped }
+    func start() async throws { try await start(discardChanges: false) }
+    func start(discardChanges: Bool) async throws {
+        startCount += 1; startDiscard.append(discardChanges)
+        ephemeral = discardChanges; stateValue = .running
+    }
+    func stop(force: Bool) async throws { stopCount += 1; stateValue = .stopped; ephemeral = false }
+    func isEphemeral() async -> Bool { ephemeral }
+    func cloneOf() async -> String? { cloneOfValue }
+    func setCloneOf(_ template: String?) { cloneOfValue = template }
     func pause() async throws { stateValue = .paused }
     func resume() async throws { stateValue = .running }
     func screenshotPNG() async throws -> Data { png }

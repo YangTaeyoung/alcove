@@ -71,6 +71,17 @@ final class VMConfigTests: XCTestCase {
         XCTAssertEqual(try VMConfig.decode(try c.encoded()).agentToken, c.agentToken)
     }
 
+    func testCloneOfRoundTripsAndIsOmittedWhenNil() throws {
+        var c = VMConfig.defaults(name: "C", guestOS: .linux)
+        XCTAssertNil(c.cloneOf)
+        let plain = try c.encoded()
+        XCTAssertFalse(String(decoding: plain, as: UTF8.self).contains("cloneOf"))
+        XCTAssertNil(try VMConfig.decode(plain).cloneOf)
+        XCTAssertFalse(VMConfig.needsMigration(plain))
+        c.cloneOf = "Template"
+        XCTAssertEqual(try VMConfig.decode(try c.encoded()).cloneOf, "Template")
+    }
+
     func testRandomMACIsLocallyAdministeredUnicast() {
         for _ in 0..<20 {
             let m = VMConfig.randomMAC()
