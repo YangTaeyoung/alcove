@@ -15,6 +15,14 @@ public struct SyncResult: Sendable, Equatable {
     public let bytes: Int
 }
 
+/// A guest entry that is not a folder at a path where a synced directory has one.
+public struct SyncObstacle: Error, Equatable, Sendable {
+    /// The entry's path in the guest.
+    public let guestPath: String
+    /// Whether the agent listed the entry as a link.
+    public let isLink: Bool
+}
+
 private let transferPiece = 256 * 1024
 
 private func hex(_ digest: SHA256.Digest) -> String {
@@ -153,9 +161,10 @@ extension AgentClient {
     }
 
     /// Upload the files of `directory` whose size or digest differ from the guest copy; optionally delete guest files without a local counterpart.
-    /// A file whose path below the directory is in `preserving` is neither uploaded nor deleted.
+    /// A file whose path below the directory is in `preserving` is neither uploaded nor deleted. With `refusingObstacles`,
+    /// a guest entry that is not a folder where `directory` has one throws `SyncObstacle` before any file is sent.
     public func syncDirectory(_ directory: URL, toGuestPath path: String, deleteExtras: Bool, preserving: Set<String> = [],
-                              timeout: Duration = .seconds(3600)) async throws -> SyncResult {
+                              refusingObstacles: Bool = false, timeout: Duration = .seconds(3600)) async throws -> SyncResult {
         let windows = path.contains("\\")
         let key: (String) -> String = { windows ? foldedName($0) : $0 }
         let kept = Set(preserving.map(key))
@@ -170,8 +179,16 @@ extension AgentClient {
             if listing["truncated"]?.boolValue == true {
                 throw AgentError.remote("'\(path)' has more than 5000 entries in the guest; sync a smaller directory")
             }
+            var folders: Set<String> = []
+            for file in local {
+                var parts = file.name.split(separator: "/").dropLast()
+                while !parts.isEmpty, folders.insert(key(parts.joined(separator: "/"))).inserted { parts.removeLast() }
+            }
             for entry in listing["entries"]?.arrayValue ?? [] where entry["dir"]?.boolValue != true {
                 guard let name = entry["name"]?.stringValue, !kept.contains(key(name)) else { continue }
+                if refusingObstacles, folders.contains(key(name)) {
+                    throw SyncObstacle(guestPath: joinGuestPath(path, name), isLink: entry["link"]?.boolValue == true)
+                }
                 remote[key(name)] = (name, entry["size"]?.intValue ?? -1, entry["sha256"]?.stringValue?.lowercased() ?? "")
             }
         }

@@ -84,6 +84,11 @@ public final class FakeFS: @unchecked Sendable {
     private var writtenPaths: [String] = []
     public var corruptWrites = false
     public var caseInsensitive = false
+    /// Paths that are links to folders elsewhere: `fs.stat` answers for them as for a folder, `fs.list` lists one as a
+    /// single entry that is not a folder and lists nothing below it.
+    public var links: Set<String> = []
+    /// Whether `fs.stat` and `fs.list` mark a link with `link`.
+    public var reportsLinks = true
 
     public init() {}
 
@@ -112,6 +117,11 @@ public final class FakeFS: @unchecked Sendable {
 
     private static func separator(for path: String) -> String { path.contains("\\") ? "\\" : "/" }
 
+    private func isLink(_ path: String) -> Bool { links.contains { fold($0) == fold(path) } }
+
+    /// The fields that say an entry is a link, when links are reported.
+    private var linkFields: [String: JSON] { reportsLinks ? ["link": true] : [:] }
+
     private func reply(_ m: JSON, _ fields: [String: JSON]) -> JSON {
         var o = fields; o["t"] = "res"; o["id"] = m["id"] ?? .null; o["ok"] = true
         return .object(o)
@@ -125,22 +135,39 @@ public final class FakeFS: @unchecked Sendable {
         switch m["op"]?.stringValue {
         case "fs.stat":
             let sep = Self.separator(for: path)
+            if isLink(path) {
+                var f: [String: JSON] = ["exists": true, "dir": true, "size": 0, "path": .string(path)]
+                for (k, v) in linkFields { f[k] = v }
+                return reply(m, f)
+            }
             if let data = store[key(for: path)] {
                 var f: [String: JSON] = ["exists": true, "dir": false, "size": .int(Int64(data.count)), "path": .string(path)]
                 if m["sha256"]?.boolValue == true { f["sha256"] = .string(sha256Hex(data)) }
                 return reply(m, f)
             }
-            if store.keys.contains(where: { fold($0).hasPrefix(fold(path + sep)) }) { return reply(m, ["exists": true, "dir": true, "size": 0, "path": .string(path)]) }
+            if store.keys.contains(where: { fold($0).hasPrefix(fold(path + sep)) }) || links.contains(where: { fold($0).hasPrefix(fold(path + sep)) }) {
+                return reply(m, ["exists": true, "dir": true, "size": 0, "path": .string(path)])
+            }
             return reply(m, ["exists": false])
         case "fs.list":
             let sep = Self.separator(for: path)
             let prefix = path + sep
-            let found = store.filter { fold($0.key).hasPrefix(fold(prefix)) }
-            if found.isEmpty { return fail(m, "'\(path)' does not exist") }
-            let entries: [JSON] = found.keys.sorted().map { key in
+            if isLink(path) { return reply(m, ["entries": [], "truncated": false]) }
+            let below = links.filter { fold($0).hasPrefix(fold(prefix)) }
+            let found = store.filter { entry in
+                fold(entry.key).hasPrefix(fold(prefix)) && !below.contains { fold(entry.key).hasPrefix(fold($0 + sep)) }
+            }
+            if found.isEmpty && below.isEmpty { return fail(m, "'\(path)' does not exist") }
+            var entries: [JSON] = found.keys.sorted().map { key in
                 let name = String(key.dropFirst(prefix.count)).replacingOccurrences(of: sep, with: "/")
                 let data = found[key]!
                 return ["name": .string(name), "dir": false, "size": .int(Int64(data.count)), "mtime": "2026-01-01T00:00:00Z", "sha256": .string(sha256Hex(data))]
+            }
+            for link in below.sorted() {
+                let name = String(link.dropFirst(prefix.count)).replacingOccurrences(of: sep, with: "/")
+                var row: [String: JSON] = ["name": .string(name), "dir": false, "size": 0, "mtime": "2026-01-01T00:00:00Z"]
+                for (k, v) in linkFields { row[k] = v }
+                entries.append(.object(row))
             }
             return reply(m, ["entries": .array(entries), "truncated": false])
         case "fs.read":
