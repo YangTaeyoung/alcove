@@ -57,9 +57,6 @@ public actor ControllerTarget: VMTarget {
     private var agentClient: AgentClient?
     private var agentGeneration = 0
     private let frameSource = FrameSource()
-    /// When true, the target consumes the display message stream of every connection it sees.
-    public private(set) var drainsDisplay = false
-    private weak var drainedConnection: DisplayConnection?
 
     public init(name: String, controller: VMController) {
         self.name = name
@@ -67,15 +64,9 @@ public actor ControllerTarget: VMTarget {
     }
 
     public func guestOS() async -> VMConfig.GuestOS { await controller.config.guestOS }
-    public func state() async -> VMController.State {
-        await drainDisplayIfNeeded()
-        return await controller.state
-    }
+    public func state() async -> VMController.State { await controller.state }
     public func isSuspended() async -> Bool { controller.bundle.isSuspended }
-    public func start() async throws {
-        try await controller.start()
-        await drainDisplayIfNeeded()
-    }
+    public func start() async throws { try await controller.start() }
     public func stop(force: Bool) async throws {
         await agentClient?.disconnect(); agentClient = nil
         try await controller.shutdown(force: force)
@@ -83,21 +74,7 @@ public actor ControllerTarget: VMTarget {
     public func pause() async throws { try await controller.pause() }
     public func resume() async throws { try await controller.resume() }
 
-    /// Makes the target consume display messages (for hosts without an app that reads them).
-    public func enableDisplayDrain() async {
-        drainsDisplay = true
-        await drainDisplayIfNeeded()
-    }
-
-    /// Starts consuming the current display connection's messages once per connection.
-    private func drainDisplayIfNeeded() async {
-        guard drainsDisplay, let display = await controller.display, display !== drainedConnection else { return }
-        drainedConnection = display
-        Task.detached { for await _ in display.messages {} }
-    }
-
     public func frame() async throws -> Frame {
-        await drainDisplayIfNeeded()
         if ProcessInfo.processInfo.environment["ALCOVE_FRAME_SOURCE"] != "screendump",
            let frame = frameSource.frame(for: await controller.display?.currentSurface) {
             return frame
@@ -114,7 +91,6 @@ public actor ControllerTarget: VMTarget {
     }
 
     public func sendDisplay(_ message: ToQEMU) async -> Bool {
-        await drainDisplayIfNeeded()
         guard let display = await controller.display else { return false }
         display.send(message)
         return true

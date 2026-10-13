@@ -9,6 +9,9 @@ public struct Frame: Sendable, Equatable {
     public let height: Int
     public let pixels: Data
 
+    /// Largest width or height accepted when decoding an image.
+    public static let maxDimension = 16384
+
     public init(width: Int, height: Int, pixels: Data) {
         precondition(width > 0 && height > 0 && pixels.count == width * height * 4)
         self.width = width
@@ -20,7 +23,7 @@ public struct Frame: Sendable, Equatable {
     public init?(png: Data) {
         guard let source = CGImageSourceCreateWithData(png as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
-              image.width > 0, image.height > 0,
+              (1...Frame.maxDimension).contains(image.width), (1...Frame.maxDimension).contains(image.height),
               let frame = Frame.render(image, width: image.width, height: image.height, quality: .none) else { return nil }
         self = frame
     }

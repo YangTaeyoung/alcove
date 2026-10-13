@@ -46,7 +46,9 @@ public enum FromQEMU: Sendable, Equatable {
 
         /// The geometry is usable by this library (format known, sizes consistent).
         public var isValid: Bool {
-            fmt == "bgra8" && w > 0 && h > 0 && stride >= w * 4 && size >= stride * h
+            guard fmt == "bgra8", (1...16384).contains(w), (1...16384).contains(h),
+                  (w * 4...262_144).contains(stride), size <= 1 << 30 else { return false }
+            return stride * h <= size
         }
     }
 

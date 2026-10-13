@@ -91,6 +91,29 @@ final class DisplayConnectionTests: XCTestCase {
         XCTAssertNil(conn.currentSurface)
     }
 
+    func testSurfaceValidityHasCapsAndNoOverflow() {
+        func surface(w: Int, h: Int, stride: Int, size: Int) -> FromQEMU.SurfaceSwitch {
+            .init(con: 0, w: w, h: h, stride: stride, fmt: "bgra8", shm: "/x", size: size)
+        }
+        XCTAssertTrue(surface(w: 4, h: 2, stride: 16, size: 32).isValid)
+        XCTAssertFalse(surface(w: 4, h: 2, stride: 16, size: 31).isValid)
+        XCTAssertFalse(surface(w: Int.max, h: 2, stride: 16, size: 32).isValid)
+        XCTAssertFalse(surface(w: 4, h: Int.max, stride: 16, size: Int.max).isValid)
+        XCTAssertFalse(surface(w: 4, h: 2, stride: Int.max, size: Int.max).isValid)
+        XCTAssertFalse(surface(w: 4, h: 2, stride: 16, size: Int.max).isValid)
+        XCTAssertFalse(surface(w: -4, h: 2, stride: 16, size: 32).isValid)
+        XCTAssertFalse(surface(w: 4, h: -2, stride: 16, size: 32).isValid)
+        XCTAssertFalse(surface(w: 4, h: 2, stride: -16, size: 32).isValid)
+        XCTAssertFalse(surface(w: 4, h: 2, stride: 16, size: -1).isValid)
+        XCTAssertFalse(surface(w: 16385, h: 1, stride: 65540, size: 65540).isValid)
+        XCTAssertFalse(surface(w: 1, h: 16385, stride: 4, size: 65540).isValid)
+        XCTAssertFalse(surface(w: 4, h: 1, stride: 262_145, size: 262_145).isValid)
+        XCTAssertFalse(surface(w: 4, h: 4, stride: 262_144, size: (1 << 30) + 1).isValid)
+        XCTAssertTrue(surface(w: 16384, h: 16384, stride: 65536, size: 1 << 30).isValid)
+        XCTAssertTrue(surface(w: 1, h: 4096, stride: 262_144, size: 1 << 30).isValid)
+        XCTAssertFalse(surface(w: 1, h: 4096, stride: 262_144, size: (1 << 30) - 1).isValid)
+    }
+
     func testCloseFinishesStreamAndRemovesSocket() async throws {
         let path = tempSocketPath()
         let ended = expectation(description: "end")

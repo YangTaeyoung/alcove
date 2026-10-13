@@ -66,6 +66,17 @@ public actor VMController {
 
     /// Live display connection while the VM is active.
     public private(set) var display: DisplayConnection?
+    /// When set, each display connection created by `start` has its message stream consumed
+    /// for as long as the connection lives (hosts without an app that reads it).
+    public private(set) var drainsDisplayMessages = false
+    public func setDrainsDisplayMessages(_ on: Bool) { drainsDisplayMessages = on }
+
+    /// Consumes and discards the messages of `connection` until its stream ends.
+    @discardableResult
+    static func drain(_ connection: DisplayConnection) -> Task<Void, Never> {
+        Task.detached { for await _ in connection.messages {} }
+    }
+
     /// Live QMP client while the VM is active.
     public private(set) var qmp: QMPClient?
 
@@ -150,6 +161,7 @@ public actor VMController {
             }
             let display = try DisplayConnection(socketPath: bundle.displaySocketPath)
             self.display = display
+            if drainsDisplayMessages { VMController.drain(display) }
             let options = QEMUCommandBuilder.Options(incomingStatePath: resuming ? bundle.suspendStateURL.path : nil,
                                                      bootFromCDROM: resuming ? false : bootFromCDROM)
             let args = QEMUCommandBuilder(engine: engine).arguments(for: launch, bundle: bundle, options: options)
