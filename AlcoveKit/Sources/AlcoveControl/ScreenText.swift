@@ -13,14 +13,9 @@ struct TextMatch: Sendable, Equatable {
 enum ScreenText {
     static let defaultLanguages = ["ko-KR", "en-US"]
 
-    /// Areas with no side longer than this are enlarged before recognition.
-    static let upscaleUpToSide = 1600
+    /// Frames narrower than this are enlarged before recognition.
+    static let upscaleBelowWidth = 400
     static let upscaleFactor = 2
-
-    /// The factor by which an area of `width` x `height` pixels is enlarged before recognition.
-    static func enlargement(width: Int, height: Int) -> Int {
-        max(width, height) <= upscaleUpToSide ? upscaleFactor : 1
-    }
 
     /// The pixel rectangle (top-left origin) of a Vision bounding box in an image of `width` x `height` pixels
     /// that shows the area enlarged by `scale`, cut to the area.
@@ -50,8 +45,9 @@ enum ScreenText {
         request.recognitionLanguages = languages
 
         guard var image = frame.cgImage() else { throw ControlHandler.ControlError.failed("the frame cannot be read for text recognition") }
-        let factor = enlargement(width: frame.width, height: frame.height)
-        if factor > 1 {
+        var factor = 1
+        if frame.width < upscaleBelowWidth {
+            factor = upscaleFactor
             guard let enlarged = enlarge(image, by: factor) else { throw ControlHandler.ControlError.failed("the frame cannot be enlarged for text recognition") }
             image = enlarged
         }
