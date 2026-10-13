@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""Checks the agent's win.* and ui.* read operations against a running Windows VM.
+
+Talks docs/agent-protocol.md directly on the forwarded agent port and drives
+Notepad and File Explorer in the guest. Needs the agent installed with
+--allow-exec (scripts/test/install-agent.py) and no Notepad running. Each
+check prints `PASS <n> <title>` or `FAIL <n>: <reason>`; the script exits 1
+when a check failed. Files go under C:\\alcove-e2e\\uia. However the run ends,
+a second connection kills the Notepad the script started, puts Notepad's saved
+tabs back as they were, closes the File Explorer window the script opened and
+deletes that directory.
+
+Usage: uia-helper-check.py [--agent-port N] [--only N[,N...]] [--kill-helper]
+
+--kill-helper ends the running UI helper process first, twice, and requires
+that a ref of the first replacement is unknown to the second; the checks then
+run against the helper the agent started for the next operation.
+"""
+import argparse, base64, json, ntpath, re, select, socket, sys, time
+
+BASE = r"C:\alcove-e2e\uia"
+NOTE_NAME = "alcove-uia-check.txt"
+NOTE = BASE + "\\" + NOTE_NAME
+NOTE_TEXT = 'first line\r\n둘째 줄 "quoted"'
+SHOWN_TEXT = 'first line\n둘째 줄 "quoted"'
+NOTEPAD_STATE = "~/AppData/Local/Packages/Microsoft.WindowsNotepad_8wekyb3d8bbwe/LocalState"
+FOLDER = r"C:\Windows\System32"
+FOLDER_ITEM = "notepad.exe"
+ITEM_NAMES = (FOLDER_ITEM, ntpath.splitext(FOLDER_ITEM)[0])
+REF = re.compile(r"e[1-9][0-9]*")
+WINDOW_ID = re.compile(r"0x[0-9a-f]+")
+FRAME_PS = ("$v = Get-CimInstance Win32_VideoController | Where-Object { $_.CurrentHorizontalResolution } | Select-Object -First 1; "
+            '"frame=$($v.CurrentHorizontalResolution)x$($v.CurrentVerticalResolution)"')
+NODE_KEYS = {"ref", "depth", "role", "name", "x", "y", "w", "h", "flags"}
+NODE_FLAGS = {"focused", "disabled", "offscreen", "selected", "checked", "expanded", "collapsed", "password"}
+WINDOW_KEYS = {"id", "title", "pid", "process", "class", "x", "y", "w", "h", "state", "foreground", "responding", "modal"}
+
+
+class Failure(Exception):
+    pass
+
+
+def expect(cond, reason):
+    if not cond:
+        raise Failure(reason)
+
+
+class Agent:
+    def __init__(self, port):
+        self.s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.buf = b""
+        self.next_id = 0
+        self.hello = self._next(10)
+        expect(self.hello and self.hello.get("t") == "hello", f"expected hello, got {self.hello!r}")
+        self.send({"t": "welcome", "v": 1})
+
+    def send(self, m):
+        self.s.sendall((json.dumps(m) + "\n").encode())
+
+    def _next(self, timeout):
+        """Returns the next message, or None when the timeout passes."""
+        end = time.time() + timeout
+        while b"\n" not in self.buf:
+            left = end - time.time()
+            if left <= 0 or not select.select([self.s], [], [], left)[0]:
+                return None
+            chunk = self.s.recv(1 << 20)
+            if not chunk:
+                raise Failure("the agent closed the connection")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def ask(self, op, timeout=150, **params):
+        """Sends a request and returns its reply as the agent sent it; answers pings while waiting."""
+        self.next_id += 1
+        rid = self.next_id
+        self.send({"t": "req", "id": rid, "op": op, **params})
+        end = time.time() + timeout
+        while True:
+            m = self._next(max(0, end - time.time()))
+            expect(m is not None, f"no reply to {op} within {timeout} s")
+            if m.get("t") == "ping":
+                self.send({"t": "pong"})
+            elif m.get("t") == "res" and m.get("id") == rid:
+                return m
+
+    def call(self, op, timeout=150, **params):
+        """Sends a request and returns its result; a failed reply fails the check."""
+        res = self.ask(op, timeout, **params)
+        expect(res.get("ok") is True, f"{op} failed: {res.get('error')}")
+        return res
+
+
+def check_node(n, where):
+    """Fails unless n has the fields and value types of a node object."""
+    expect(isinstance(n, dict) and NODE_KEYS <= set(n), f"{where}: node lacks fields: {n!r}")
+    expect(set(n) <= NODE_KEYS | {"value", "aid"}, f"{where}: node has unknown fields: {n!r}")
+    expect(isinstance(n["ref"], str) and REF.fullmatch(n["ref"]), f"{where}: ref is {n['ref']!r}")
+    expect(all(type(n[k]) is int for k in ("depth", "x", "y", "w", "h")), f"{where}: depth or rectangle is not whole numbers: {n!r}")
+    expect(isinstance(n["role"], str) and n["role"] and not n["role"].startswith("ControlType."), f"{where}: role is {n['role']!r}")
+    expect(isinstance(n["name"], str), f"{where}: name is {n['name']!r}")
+    expect(isinstance(n["flags"], list) and set(n["flags"]) <= NODE_FLAGS, f"{where}: flags are {n['flags']!r}")
+
+
+def check_window(w, where):
+    """Fails unless w has the fields and value types of a window object."""
+    expect(isinstance(w, dict) and set(w) == WINDOW_KEYS, f"{where}: window fields are {sorted(w) if isinstance(w, dict) else w!r}")
+    expect(isinstance(w["id"], str) and WINDOW_ID.fullmatch(w["id"]), f"{where}: id is {w['id']!r}")
+    expect(all(type(w[k]) is int for k in ("pid", "x", "y", "w", "h")), f"{where}: pid or rectangle is not whole numbers: {w!r}")
+    expect(all(isinstance(w[k], str) for k in ("title", "process", "class")), f"{where}: title, process or class is not text: {w!r}")
+    expect(w["state"] in ("normal", "minimized", "maximized"), f"{where}: state is {w['state']!r}")
+    expect(all(type(w[k]) is bool for k in ("foreground", "responding", "modal")), f"{where}: foreground, responding or modal is not a boolean: {w!r}")
+
+
+class Run:
+    def __init__(self, agent):
+        self.a = agent
+        self.frame = None
+        self.notepad_started = False
+        self.notepad_state = None
+        self.notepad_window = None
+        self.document = None
+        self.document_role = None
+        self.explorer_before = None
+
+    def windows(self):
+        return self.a.call("win.list")["windows"]
+
+    def wait_window(self, pick, what, timeout=30):
+        """Polls win.list until pick(window) is true for one window and returns it."""
+        end = time.time() + timeout
+        while True:
+            found = [w for w in self.windows() if pick(w)]
+            if found:
+                return found[0]
+            expect(time.time() < end, f"no {what} appeared in win.list within {timeout} s")
+            time.sleep(0.3)
+
+    def read_file(self, path):
+        data, off = b"", 0
+        while True:
+            r = self.a.call("fs.read", path=path, offset=off)
+            piece = base64.b64decode(r["data"])
+            data, off = data + piece, off + len(piece)
+            if r["eof"] or not piece:
+                return data
+
+    def snapshot(self, root):
+        """Returns {relative name: bytes} of the files under root, or None when root does not exist."""
+        if not self.a.call("fs.stat", path=root)["exists"]:
+            return None
+        entries = self.a.call("fs.list", path=root, recursive=True)["entries"]
+        return {e["name"]: self.read_file(root + "/" + e["name"]) for e in entries if not e["dir"]}
+
+
+def restore(a, root, before):
+    """Makes the files under root equal to the snapshot `before`."""
+    if before is None:
+        return
+    entries = a.call("fs.list", path=root, recursive=True)["entries"]
+    now = {e["name"] for e in entries if not e["dir"]}
+    for name in now - set(before):
+        a.call("fs.delete", path=root + "/" + name)
+    for name, data in before.items():
+        a.call("fs.write", path=root + "/" + name, truncate=True, mkdirs=True, data=base64.b64encode(data).decode())
+
+
+def explorer_windows(a):
+    return {w["id"] for w in a.call("win.list")["windows"] if w["class"] == "CabinetWClass"}
+
+
+def close_explorer(a, ids):
+    """Closes the File Explorer windows with the given window ids."""
+    if not ids:
+        return
+    handles = ",".join(str(int(i, 16)) for i in ids)
+    a.call("exec.run", cmd=f"$ids = @({handles}); (New-Object -ComObject Shell.Application).Windows() | "
+                           "Where-Object { $ids -contains [int64]$_.HWND } | ForEach-Object { $_.Quit() }")
+    end = time.time() + 10
+    while explorer_windows(a) & set(ids) and time.time() < end:
+        time.sleep(0.3)
+
+
+def by_identity(nodes):
+    """Returns {(role, name, automation id): ref} for the nodes whose triple occurs once."""
+    seen = {}
+    for n in nodes:
+        seen.setdefault((n["role"], n["name"], n.get("aid")), []).append(n["ref"])
+    return {k: refs[0] for k, refs in seen.items() if len(refs) == 1}
+
+
+CHECKS = []
+
+
+def check(title):
+    def add(fn):
+        CHECKS.append((len(CHECKS) + 1, title, fn))
+        return fn
+    return add
+
+
+@check("win.list shows the Notepad window with its rectangle inside the frame")
+def _(a, run):
+    expect(a.call("proc.list", name="notepad")["procs"] == [], "notepad.exe runs already; close it in the guest before this check")
+    out = a.call("exec.run", cmd=FRAME_PS)["stdout"]
+    m = re.search(r"frame=(\d+)x(\d+)", out)
+    expect(m, f"the guest did not report its frame size: {out!r}")
+    run.frame = (int(m.group(1)), int(m.group(2)))
+    run.notepad_state = run.snapshot(NOTEPAD_STATE)
+    a.call("fs.write", path=NOTE, mkdirs=True, truncate=True, data=base64.b64encode(NOTE_TEXT.encode()).decode())
+    run.notepad_started = True
+    a.call("exec.start", shell="none", argv=["notepad.exe", NOTE])
+    w = run.wait_window(lambda w: NOTE_NAME in w["title"], f"window with {NOTE_NAME} in its title")
+    for each in run.windows():
+        check_window(each, "win.list")
+    expect(w["process"].lower() == "notepad.exe" and w["pid"] > 0 and w["class"], f"process, pid or class are wrong: {w!r}")
+    expect(w["state"] != "minimized" and w["responding"] is True and w["modal"] is False, f"state, responding or modal are wrong: {w!r}")
+    fw, fh = run.frame
+    expect(w["w"] > 0 and w["h"] > 0, f"the rectangle is empty: {w!r}")
+    expect(w["x"] >= 0 and w["y"] >= 0 and w["x"] + w["w"] <= fw and w["y"] + w["h"] <= fh,
+           f"the rectangle {w['x']},{w['y']} {w['w']}x{w['h']} is not inside the {fw}x{fh} frame")
+    run.notepad_window = w
+    return f"{w['id']} {w['title']!r} at {w['x']},{w['y']} {w['w']}x{w['h']} in {fw}x{fh}, foreground {w['foreground']}"
+
+
+@check("ui.tree of Notepad has a document node, at most 300 nodes and the same refs on a second call")
+def _(a, run):
+    expect(run.notepad_window, "check 1 did not find the Notepad window")
+    wid = run.notepad_window["id"]
+    end = time.time() + 15
+    while True:
+        r = a.call("ui.tree", window=wid)
+        docs = [n for n in r["nodes"] if n["role"] in ("Document", "Edit")]
+        if docs or time.time() > end:
+            break
+        time.sleep(0.5)
+    expect(docs, f"no Document or Edit node among roles {sorted({n['role'] for n in r['nodes']})}")
+    nodes = r["nodes"]
+    for n in nodes:
+        check_node(n, "ui.tree")
+    expect(len(nodes) <= 300 and r["truncated"] is False, f"{len(nodes)} nodes, truncated {r['truncated']!r}")
+    refs = [n["ref"] for n in nodes]
+    expect(len(set(refs)) == len(refs), "a ref occurs twice in one tree")
+    expect(nodes[0]["depth"] == 0 and all(n["depth"] >= 1 for n in nodes[1:]), "the first node is not the only one at depth 0")
+    expect(all(b["depth"] <= a_["depth"] + 1 for a_, b in zip(nodes, nodes[1:])), "a node is more than one level below the node before it")
+    check_window(r["window"], "ui.tree window")
+    expect(r["window"]["id"] == wid, f"ui.tree reports window {r['window']['id']}, asked for {wid}")
+    again = a.call("ui.tree", window=wid)["nodes"]
+    first, second = by_identity(nodes), by_identity(again)
+    moved = [(k, first[k], second[k]) for k in first if k in second and first[k] != second[k]]
+    expect(len(first) > 5 and not moved, f"{len(first)} elements compared, changed refs between two calls: {moved[:3]!r}")
+    same_doc = [n for n in again if n["ref"] == docs[0]["ref"]]
+    expect(same_doc and same_doc[0]["role"] == docs[0]["role"], f"the second tree lacks {docs[0]['ref']} as {docs[0]['role']}")
+    run.document, run.document_role = docs[0]["ref"], docs[0]["role"]
+    return f"{len(nodes)} nodes, {docs[0]['role']} {docs[0]['name']!r} is {run.document}"
+
+
+@check("ui.text returns the document text and a slice of it")
+def _(a, run):
+    expect(run.document, "check 2 did not find the document node")
+    r = a.call("ui.text", ref=run.document)
+    expect(r["text"] == SHOWN_TEXT, f"text is {r['text']!r}, expected {SHOWN_TEXT!r}")
+    expect(r["total"] == len(SHOWN_TEXT) and r["source"] == "text", f"total {r['total']!r}, source {r['source']!r}")
+    part = a.call("ui.text", ref=run.document, offset=6, length=4)
+    expect(part["text"] == "line" and part["total"] == len(SHOWN_TEXT), f"offset 6 length 4 gave {part['text']!r}, total {part['total']!r}")
+    tail = a.call("ui.text", ref=run.document, offset=11)
+    expect(tail["text"] == SHOWN_TEXT[11:], f"offset 11 gave {tail['text']!r}")
+    by_selector = a.call("ui.text", window=run.notepad_window["id"], role=run.document_role.lower())
+    expect(by_selector["text"] == SHOWN_TEXT, f"the selector form gave {by_selector['text']!r}")
+    return f"{r['total']} characters from source {r['source']}"
+
+
+@check("ui.find finds the File menu item and ui.rect reports it clickable inside the window")
+def _(a, run):
+    expect(run.notepad_window, "check 1 did not find the Notepad window")
+    wid = run.notepad_window["id"]
+    nodes = a.call("ui.find", window=wid, role="MenuItem", name="File")["nodes"]
+    expect(len(nodes) == 1, f"{len(nodes)} nodes match: {[(n['role'], n['name']) for n in nodes]!r}")
+    item = nodes[0]
+    check_node(item, "ui.find")
+    expect(item["depth"] == 0 and item["role"] == "MenuItem" and item["name"] == "File", f"the node is {item!r}")
+    r = a.call("ui.rect", ref=item["ref"])
+    check_node(r["node"], "ui.rect")
+    expect(r["node"]["ref"] == item["ref"], f"ui.rect answered for {r['node']['ref']}, asked for {item['ref']}")
+    expect(r["clickable"] is True, f"clickable is {r['clickable']!r}: {r.get('blocked')!r}")
+    w = next((w for w in run.windows() if w["id"] == wid), None)
+    expect(w, f"window {wid} left win.list")
+    n = r["node"]
+    expect(n["x"] <= r["cx"] < n["x"] + n["w"] and n["y"] <= r["cy"] < n["y"] + n["h"], f"centre {r['cx']},{r['cy']} is outside the node {n!r}")
+    expect(w["x"] <= r["cx"] < w["x"] + w["w"] and w["y"] <= r["cy"] < w["y"] + w["h"],
+           f"centre {r['cx']},{r['cy']} is outside the window {w['x']},{w['y']} {w['w']}x{w['h']}")
+    by_selector = a.call("ui.rect", window=NOTE_NAME, role="menuitem", name="File")
+    expect(by_selector["node"]["ref"] == item["ref"] and (by_selector["cx"], by_selector["cy"]) == (r["cx"], r["cy"]),
+           f"the selector form with a title part gave {by_selector!r}")
+    none = a.ask("ui.rect", window=wid, role="MenuItem", name="No Such Menu")
+    want = 'no element matches {"window":"' + wid + '","role":"MenuItem","name":"No Such Menu"}; call ui.tree to see what exists'
+    expect(none.get("ok") is False and none.get("error") == want, f"a selector without a match answered {none!r}")
+    return f"{item['ref']} centre {r['cx']},{r['cy']}"
+
+
+@check("a ref of the closed Notepad answers that the element no longer exists")
+def _(a, run):
+    expect(run.document, "check 2 did not find the document node")
+    wid = run.notepad_window["id"]
+    a.call("proc.kill", name="notepad.exe", tree=True)
+    end = time.time() + 15
+    while any(w["id"] == wid for w in run.windows()):
+        expect(time.time() < end, f"window {wid} is still in win.list 15 s after Notepad was killed")
+        time.sleep(0.3)
+    r = a.ask("ui.text", ref=run.document)
+    want = f"element {run.document} no longer exists; call ui.tree again"
+    expect(r.get("ok") is False and r.get("error") == want, f"ui.text answered {r!r}")
+    r = a.ask("ui.tree", window=wid)
+    expect(r.get("ok") is False and "win.list" in r.get("error", ""), f"ui.tree of the closed window answered {r!r}")
+    return want
+
+
+@check("ui.tree of File Explorer stops at max within 30 s and ui.find matches a part of a name")
+def _(a, run):
+    run.explorer_before = explorer_windows(a)
+    a.call("exec.start", shell="none", argv=["explorer.exe", f"/select,{FOLDER}\\{FOLDER_ITEM}"])
+    folder = ntpath.basename(FOLDER)
+    w = run.wait_window(lambda w: w["class"] == "CabinetWClass" and w["id"] not in run.explorer_before and folder in w["title"],
+                        f"File Explorer window with {folder} in its title")
+    end = time.time() + 30
+    while True:
+        found = a.call("ui.find", window=folder, nameContains="notepad", limit=5)["nodes"]
+        items = [n for n in found if n["role"] == "ListItem" and n["name"] in ITEM_NAMES]
+        if (items and "selected" in items[0]["flags"]) or time.time() > end:
+            break
+        time.sleep(0.5)
+    expect(1 <= len(found) <= 5, f"ui.find returned {len(found)} nodes for nameContains 'notepad' with limit 5")
+    for n in found:
+        check_node(n, "ui.find")
+    expect(all("notepad" in n["name"].lower() and n["depth"] == 0 for n in found), f"a node does not match: {[n['name'] for n in found]!r}")
+    expect(len(items) == 1, f"no single ListItem named {' or '.join(ITEM_NAMES)}: {[(n['role'], n['name']) for n in found]!r}")
+    expect("selected" in items[0]["flags"], f"the item File Explorer was opened to select lacks the selected flag: {items[0]!r}")
+    shown = a.call("ui.rect", ref=items[0]["ref"], scroll=True)
+    expect(shown["clickable"] is True and "offscreen" not in shown["node"]["flags"],
+           f"after ui.rect with scroll the item is not clickable: {shown!r}")
+    expect(w["x"] <= shown["cx"] < w["x"] + w["w"] and w["y"] <= shown["cy"] < w["y"] + w["h"],
+           f"after ui.rect with scroll the centre {shown['cx']},{shown['cy']} is outside the window {w['x']},{w['y']} {w['w']}x{w['h']}")
+    row = a.call("ui.text", ref=items[0]["ref"], mode="descendants")
+    expect(row["source"] == "descendants" and row["text"].split("\n")[0] in ITEM_NAMES and "Application" in row["text"].split("\n"),
+           f"the text below the item is {row!r}")
+
+    t0 = time.time()
+    r = a.call("ui.tree", window=w["id"], max=2000, filter="all")
+    whole_s = time.time() - t0
+    whole = len(r["nodes"])
+    expect(r["truncated"] is False and whole > 110, f"the whole tree has {whole} nodes, truncated {r['truncated']!r}")
+    limit = 100
+    t0 = time.time()
+    r = a.call("ui.tree", window=w["id"], max=limit, filter="all")
+    cut_s = time.time() - t0
+    expect(r["truncated"] is True and len(r["nodes"]) == limit, f"max {limit} gave {len(r['nodes'])} nodes, truncated {r['truncated']!r}")
+    expect(cut_s < 30 and whole_s < 30, f"ui.tree took {cut_s:.1f} s with max {limit} and {whole_s:.1f} s for the whole tree")
+    for n in r["nodes"]:
+        check_node(n, "ui.tree")
+    r = a.call("ui.tree", window=w["id"], max=2000)
+    expect(r["truncated"] is False and len(r["nodes"]) < whole, f"filter interactive gave {len(r['nodes'])} of {whole} nodes")
+    return (f"{whole} nodes with filter all in {whole_s:.2f} s, {len(r['nodes'])} with interactive; max {limit} answered in {cut_s:.2f} s; "
+            f"found {[(n['role'], n['name'], n['flags']) for n in found]!r}")
+
+
+@check("ui.focused returns the focused node and its window")
+def _(a, run):
+    r = a.call("ui.focused")
+    check_node(r["node"], "ui.focused")
+    check_window(r["window"], "ui.focused window")
+    expect(r["node"]["depth"] == 0, f"depth is {r['node']['depth']!r}")
+    expect("focused" in r["node"]["flags"], f"the node lacks the focused flag: {r['node']!r}")
+    listed = [w for w in run.windows() if w["id"] == r["window"]["id"]]
+    expect(not listed or listed[0]["foreground"] is True, f"the focused element is in window {r['window']['id']}, which win.list does not show in the foreground")
+    root = a.call("ui.tree", root=r["node"]["ref"], depth=0)
+    expect([n["ref"] for n in root["nodes"]] == [r["node"]["ref"]], f"ui.tree with the focused ref as root gave {root['nodes']!r}")
+    return f"{r['node']['role']} {r['node']['name']!r} in {r['window']['title']!r}"
+
+
+def cleanup(port, run):
+    """On a new connection: ends the Notepad the run started, restores Notepad's
+    saved tabs, closes the File Explorer windows the run opened and deletes BASE
+    and its parent when that is empty."""
+    try:
+        a = Agent(port)
+    except (Failure, OSError, ValueError) as e:
+        print(f"cleanup did not run: {e}; Notepad, a File Explorer window and {BASE} may remain in the guest", file=sys.stderr)
+        return
+    steps = []
+    if run.notepad_started:
+        steps.append(lambda: a.call("proc.kill", name="notepad.exe", tree=True))
+        steps.append(lambda: wait_gone(a, "notepad"))
+        steps.append(lambda: restore(a, NOTEPAD_STATE, run.notepad_state))
+    if run.explorer_before is not None:
+        steps.append(lambda: close_explorer(a, explorer_windows(a) - run.explorer_before))
+    steps.append(lambda: a.call("fs.delete", path=BASE, recursive=True))
+    steps.append(lambda: a.ask("fs.delete", path=ntpath.dirname(BASE)))
+    for step in steps:
+        try:
+            step()
+        except (Failure, OSError, ValueError, KeyError) as e:
+            print(f"a cleanup step failed: {e}", file=sys.stderr)
+
+
+def wait_gone(a, name, timeout=10):
+    end = time.time() + timeout
+    while a.call("proc.list", name=name)["procs"] and time.time() < end:
+        time.sleep(0.3)
+
+
+def kill_helper(a):
+    """Ends the running helper process and returns its pid."""
+    pid = a.call("ui.ping")["pid"]
+    a.call("proc.kill", pid=pid)
+    end = time.time() + 10
+    while any(p["pid"] == pid for p in a.call("proc.list", name="powershell")["procs"]):
+        expect(time.time() < end, f"helper process {pid} still runs 10 s after proc.kill")
+        time.sleep(0.2)
+    return pid
+
+
+def first_ref(a):
+    """Returns the ref the helper gives the root element of the first listed window."""
+    wid = a.call("win.list")["windows"][0]["id"]
+    return a.call("ui.tree", window=wid, depth=0)["nodes"][0]["ref"]
+
+
+def restart_helper(a):
+    """Kills the helper twice and returns the pid of the last killed one and how
+    long the first answer of its replacement took. The ref taken from the helper
+    in between must be unknown to the helper after it."""
+    kill_helper(a)
+    old = first_ref(a)
+    killed = kill_helper(a)
+    t0 = time.time()
+    a.call("ui.ping")
+    took = time.time() - t0
+    new = first_ref(a)
+    r = a.ask("ui.rect", ref=old)
+    want = f"element {old} no longer exists; call ui.tree again"
+    expect(r.get("ok") is False and r.get("error") == want,
+           f"ref {old} of a killed helper answers {r!r} in the helper that gave out {new}")
+    return killed, took
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--agent-port", type=int, default=7646)
+    ap.add_argument("--only", default="", help="comma-separated check numbers")
+    ap.add_argument("--kill-helper", action="store_true", help="end the running UI helper before the checks")
+    args = ap.parse_args()
+    only = {int(n) for n in args.only.split(",") if n}
+
+    try:
+        a = Agent(args.agent_port)
+    except (OSError, Failure) as e:
+        print(f"FAIL 0: cannot talk to the agent on port {args.agent_port}: {e}; run scripts/test/install-agent.py")
+        sys.exit(1)
+    caps = a.hello.get("caps", [])
+    if a.hello.get("proto") != 2 or any(c not in caps for c in ("rpc", "jobs", "proc", "fs", "ui")):
+        print(f"FAIL 0: the agent reports proto {a.hello.get('proto')!r} and caps {caps!r}; run scripts/test/install-agent.py")
+        sys.exit(1)
+    try:
+        killed, took = restart_helper(a) if args.kill_helper else (None, None)
+        t0 = time.time()
+        ping = a.call("ui.ping")
+        took = time.time() - t0 if took is None else took
+    except (Failure, OSError, ValueError, KeyError) as e:
+        print(f"FAIL 0: {e}")
+        sys.exit(1)
+    if killed is not None and ping["pid"] == killed:
+        print(f"FAIL 0: helper process {killed} answers after it was killed")
+        sys.exit(1)
+    print(f"helper pid {ping['pid']}" + (f" (started after pid {killed} was killed)" if killed is not None else "")
+          + f", session {ping['session']}, {ping['integrity']} integrity, first answer after {took:.2f} s", flush=True)
+
+    run = Run(a)
+    failed = False
+    try:
+        for n, title, fn in CHECKS:
+            if only and n not in only:
+                continue
+            try:
+                note = fn(a, run)
+            except Failure as e:
+                reason = str(e)
+            except (KeyError, TypeError, IndexError) as e:
+                reason = f"a reply lacks an expected field ({type(e).__name__}: {e})"
+            except (OSError, ValueError) as e:
+                reason = f"the connection to the agent broke ({type(e).__name__}: {e})"
+            else:
+                print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
+                continue
+            failed = True
+            print(f"FAIL {n}: {reason}", flush=True)
+    finally:
+        cleanup(args.agent_port, run)
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
