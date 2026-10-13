@@ -26,17 +26,23 @@ func procList(req proto.Message) (proto.Message, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot list processes: %v", err)
 	}
-	filter := strings.ToLower(req.String("name"))
+	return proto.Message{"procs": procListEntries(procs, req.String("name"))}, nil
+}
+
+// procListEntries builds the proc.list reply entries for the processes whose
+// name contains filter, each command line cut to procListCmdChars characters.
+func procListEntries(procs []procInfo, filter string) []any {
+	filter = strings.ToLower(filter)
 	out := []any{}
 	for _, p := range procs {
 		if filter != "" && !strings.Contains(strings.ToLower(p.Name), filter) {
 			continue
 		}
 		out = append(out, map[string]any{
-			"pid": p.PID, "ppid": p.PPID, "name": p.Name, "path": p.Path, "cmd": p.Cmd, "mem_kb": p.MemKB,
+			"pid": p.PID, "ppid": p.PPID, "name": p.Name, "path": p.Path, "cmd": cutChars(p.Cmd, procListCmdChars), "mem_kb": p.MemKB,
 		})
 	}
-	return proto.Message{"procs": out}, nil
+	return out
 }
 
 func procKill(req proto.Message) (proto.Message, error) {

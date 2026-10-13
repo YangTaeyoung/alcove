@@ -153,7 +153,7 @@ func (s *Server) handle(c net.Conn) {
 			if err != nil {
 				lg.Printf("clipboard.get: %v", err)
 			}
-			send(proto.Message{"t": "clipboard.text", "text": text})
+			send(proto.Message{"t": "clipboard.text", "text": cutUTF8Bytes(text, clipboardMaxBytes)})
 		case "clipboard.set":
 			if err := s.opt.Clipboard.SetText(m.String("text")); err != nil {
 				lg.Printf("clipboard.set: %v", err)
@@ -290,7 +290,7 @@ func (s *Server) watchClipboard(send func(proto.Message), done chan struct{}) {
 		if err != nil || text == "" {
 			continue
 		}
-		send(proto.Message{"t": "clipboard.changed", "text": text})
+		send(proto.Message{"t": "clipboard.changed", "text": cutUTF8Bytes(text, clipboardMaxBytes)})
 	}
 }
 
@@ -302,7 +302,10 @@ func runShell(cmd string) (string, int) {
 	hideWindow(c)
 	// The child's input is a pipe at end-of-file.
 	c.Stdin = strings.NewReader("")
-	out, err := c.CombinedOutput()
+	combined := newRing(runStreamBytes)
+	c.Stdout, c.Stderr = combined, combined
+	err = c.Run()
+	out, _ := combined.snapshot()
 	code := 0
 	if err != nil {
 		code = 1
@@ -310,5 +313,5 @@ func runShell(cmd string) (string, int) {
 			code = ee.ExitCode()
 		}
 	}
-	return string(out), code
+	return tailUTF8(out, runStreamBytes), code
 }

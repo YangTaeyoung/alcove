@@ -345,7 +345,7 @@ func (s *Server) execList(proto.Message) (proto.Message, error) {
 			"job":     j.id,
 			"pid":     j.processID(),
 			"state":   "running",
-			"cmd":     j.cmdline,
+			"cmd":     cutChars(j.cmdline, execListCmdChars),
 			"started": j.started.Format(time.RFC3339),
 		}
 		if exited {
