@@ -76,8 +76,9 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   started with `--allow-exec`. `ping`, `win.*` and `ui.*` do not need it.
 - `ev` messages are not replies. They go to every open connection. The events
   are `job.exited` ([Jobs](#jobs-execstart-execread-execwrite-execkill-execlist)),
-  `process.exited` ([App launch](#app-launch-applaunch)) and the window events
-  ([Window events](#window-events)).
+  `process.exited` ([App launch](#app-launch-applaunch)), the window events
+  ([Window events](#window-events)) and `events.dropped` (a connection's event
+  queue overflowed; `count` is how many events were dropped).
 
 ### Operations
 
@@ -107,7 +108,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `ui.find` | selector fields, `limit` (default 20, cap 2000) | `nodes` (depth 0); `truncated: true` when the search ended early |
 | `ui.text` | `ref` or selector fields, `mode` (`auto` default, `pattern`, `descendants`), `offset`, `length` (default and cap 200000; 0 returns `total` alone) | `text`, `total`, `source` (`text`, `value`, `name`, `descendants`) |
 | `ui.rect` | `ref` or selector fields, `scroll` (bool) | `node`, `cx`, `cy`, `clickable`; `blocked` (a sentence, when not clickable) |
-| `ui.act` | `ref` or selector fields, `action` (`invoke`, `toggle`, `expand`, `collapse`, `select`, `set_value`, `focus`, `scroll_into_view`), `value` (for `set_value`) | `node`; `unresponsive: true` or `gone: true` when the node could not be read after the action |
+| `ui.act` | `ref` or selector fields, `action` (`invoke`, `toggle`, `expand`, `collapse`, `select`, `set_value`, `focus`, `scroll_into_view`), `value` (for `set_value`) | `node`; `unresponsive: true`, `gone: true` or `pending: true` when the node could not be read after the action |
 | `ui.focused` | — | `node`, `window` |
 | `ui.ping` | — | `pong`, `pid`, `session`, `integrity`, `dpi`, `clr`, `refs` |
 
@@ -185,13 +186,18 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 
 - `path` is the program. A bare file name that is not on the search path is
   looked up under `HKCU` and `HKLM`
-  `SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\<name>` (`.exe` added
-  when the name has no extension), so `msedge.exe` starts Edge.
+  `SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\<name>` and the 32-bit
+  view `SOFTWARE\WOW6432Node\…\App Paths\<name>` (`.exe` added when the name
+  has no extension), so `msedge.exe` starts Edge; a `REG_EXPAND_SZ` value has
+  its `%VAR%` references expanded.
 - The program starts directly with `args` as its arguments and with a normal
   window. Without `cwd` it runs in the directory of the program file; `cwd`
   resolves like the `cwd` of `exec.run`. `env` adds variables to the agent's
-  environment. Its standard input, output and error are the null device, so a
-  console program that reads its input ends at once.
+  environment; a name given there replaces one of the same name
+  (case-insensitive on Windows), and an empty name or one that contains `=`
+  answers `env names cannot be empty or contain '='`. Its standard input,
+  output and error are the null device, so a console program that reads its
+  input ends at once.
 - A program that cannot be started answers
   `cannot start '<path>': <system error>; check the path with fs.stat`.
 - When the process ends the agent sends
@@ -199,13 +205,16 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   `code` is the unsigned exit code: a process killed by `proc.kill` reports
   1, a fail-fast crash 3221227010 (`0xC0000602`). For a launcher that hands
   over to another process (`notepad.exe`, `calc.exe`, `msedge.exe` when Edge
-  already runs) the event names the launcher and arrives within a second.
-  The process is not a job, and it keeps running when the agent restarts;
-  `process.exited` is then not sent.
+  already runs) the event names the launcher and arrives within a second, so
+  `process.exited` can arrive before the `app.launch` reply. The process is
+  not a job, and it keeps running when the agent restarts; `process.exited`
+  is then not sent.
 - With `wait_window_ms` above 0 on an agent with the `ui` capability, the
   agent lists the windows before the start and then every 150 ms:
-  - candidates are the titled windows that were not listed before the start;
-  - a candidate of the started process or one of its descendants is chosen;
+  - candidates are the titled windows that were not listed before the start
+    and not already claimed by another in-flight or finished `app.launch`;
+  - a candidate of the started process or one of its descendants is chosen,
+    and beats a candidate of any other process whatever their sizes;
   - when the started process has exited, or 2 s after the start, a candidate
     of any process is chosen;
   - of several candidates the one with the largest rectangle is chosen, after
@@ -228,25 +237,41 @@ Framework UI Automation) as a child process in its own session and passes
 these operations to it. Other agents answer
 `UI Automation is only available on Windows guests`.
 
-**Helper process.** The agent starts the helper when a connection opens and
-again with the next operation after the helper ended. Its files are in
+**Helper process.** The agent starts the helper on the first `win.*` or
+`ui.*` operation, and again on the next operation after the helper ended; it
+does not start on connect, so a wait for a window event must be preceded by
+`ui.ping` (and `app.launch` with `wait_window_ms: 0` does not start it). The
+helper runs in the agent's logon session. Its files are in
 `C:\ProgramData\Alcove\uia`: `bootstrap.ps1`, `helper.cs`,
 `helper-<first 16 hex digits of the SHA-256 of helper.cs>.dll`, `helper.log`
-and `helper.log.1` (1 MiB each). The agent gives that directory the owner
+and `helper.log.1` (1 MiB each), and a `tmp` folder the compile uses. That
+folder and its parent `C:\ProgramData\Alcove` are given the owner
 Administrators and the access list "Administrators and SYSTEM: full control"
-without inheritance from its parent (`icacls`: `BUILTIN\Administrators:(OI)(CI)(F)`,
-`NT AUTHORITY\SYSTEM:(OI)(CI)(F)`) on every start; when it finds another
-owner or list it sets this one, deletes the scripts and compiled helpers in
-the directory and writes them again. When the list cannot be set, the helper
-is compiled in memory for that start, nothing is loaded from or stored in a
-compiled file, and `helper.log` says so. A start takes 0.25–0.35 s with a
-compiled helper and 0.5–1 s with a compile.
+with inheritance removed, through `SetNamedSecurityInfo` (`icacls` reads it
+back as `BUILTIN\Administrators:(OI)(CI)(F)` and
+`NT AUTHORITY\SYSTEM:(OI)(CI)(F)`). The lock is applied at install and
+re-checked at agent start and at every helper start; the parent keeps the
+agent's logs, the uia folder keeps only its logs, and a reparse point in
+either folder is removed rather than followed (the agent also refuses to open
+a log file that is a reparse point). When a folder cannot be locked the helper
+does not start:
+`the UI helper folder <dir> could not be locked (<reason>); fix its owner and access list, then retry`
+(a reparse point at the folder path gives `<dir> is a reparse point; remove it`
+as the reason). The helper's environment is the agent's without `COR_*`,
+`COMPlus_*`, `DOTNET_*` and `PSModulePath`, and `TEMP`/`TMP` point inside the
+locked folder. A start takes 0.25–0.35 s with a compiled helper and 0.5–1 s
+with a compile. The helper, and an app launched through `app.launch`, inherit
+the agent's elevated token.
 
 **One request at a time.** The agent hands requests to the helper one by one
 in the order they arrived. An operation's time limit (20 s; 30 s for
 `ui.tree` and `ui.text`) starts when the helper receives it. Waiting for a
 turn is limited to 60 s and then answers
-`the UI helper is busy with '<op>'; retry`; the helper keeps running. A
+`the UI helper is busy with '<op>'; retry` (`<op>` is the helper operation
+holding the helper); the helper keeps running. Each request is cancelled when
+its connection closes: one still waiting for its turn leaves the queue without
+reaching the helper (`the request was cancelled`), while one already handed to
+the helper runs to its end. A
 request the helper does not answer within its limit answers
 `UI helper did not answer '<op>' within <n> s; it was restarted`: the helper
 is killed, requests that waited behind it run in the next helper, and every
@@ -283,7 +308,9 @@ child window), `"0xzz" is not a window id; ids look like 0x1a2b3c and come from 
 `no window is in the foreground; pass a window id from win.list`,
 `pass a window id, a title part, or foreground` (empty string). A window that
 does not handle messages answers the `ui.*` operations addressed to it with
-`window <id> "<title>" is not responding; wait for it or end its process with proc.kill`.
+`window <id> "<title>" is not responding; wait and retry, or end its process with proc.kill when win.list still shows responding false after 10 s`.
+A window of a higher integrity level, which denies the probe message rather
+than being hung, is not reported as not responding.
 
 **`win.action`.** `window` is required.
 
@@ -303,10 +330,19 @@ does not handle messages answers the `ui.*` operations addressed to it with
   final size (the fixture app answers `resize` to 100×100 with 506×393), and
   a position outside the screen is accepted.
 - `close` posts `WM_CLOSE` and waits up to 2 s. `closed` says whether the
-  window is gone; `window` is then `null`, otherwise the window as it is.
+  window is gone; `window` is then `null`, otherwise the window as it is. A
+  shell window (class `Progman`, `WorkerW`, `Shell_TrayWnd` or
+  `Shell_SecondaryTrayWnd`) is refused: `window <id> is part of the Windows shell and is not closed`.
+  A window the helper cannot post to answers
+  `window <id> belongs to a process the helper cannot send to`.
+- A show-state change (`minimize`, `maximize`, `restore`) that does not take
+  within 2 s answers `window <id> "<title>" <what> within 2 s; the app may not allow it`
+  when the window still answers messages, and the
+  `… check responding in win.list, then retry or end its process with proc.kill`
+  form only when the window is hung.
 - Errors: `action must be one of focus, minimize, maximize, restore, close, move, resize`,
   `pass window: a window id from win.list, a title part, or foreground`,
-  `move needs x and y`, `resize needs w and h`, `w and h must be 1 or more`.
+  `move needs x and y`, `resize needs w and h`, `pass w and h of at least 1`.
 
 **Node object.**
 
@@ -359,10 +395,12 @@ the value, then the names (for edits and documents, the values) of the text,
 list item, edit and document elements below the element joined by newlines,
 then the element's name. `pattern` uses the text pattern alone
 (`the element has no text pattern; use mode auto or descendants`). A password
-field answers `the element is a password field; its text is not read` in
-every mode, and the text of descendants leaves out password fields and what
-is below them. The document text of a Chromium page shows a password field as
-bullets.
+field, or an element below one, answers
+`the element is a password field; its text is not read; it cannot be read through UI Automation`
+in every mode; a failed password-property read counts as a password field; and
+`ui.tree`, `ui.find` and the descendant text of `ui.text` do not list what is
+below a password field. The document text of a Chromium page shows a password
+field as bullets.
 
 **`ui.rect`**: `cx`, `cy` are the centre of the element's rectangle;
 `clickable` is false with a `blocked` sentence when the rectangle is empty,
@@ -378,7 +416,7 @@ view first when it has a scroll-item pattern.
 | `toggle` | `TogglePattern.Toggle` |
 | `expand`, `collapse` | `ExpandCollapsePattern` |
 | `select` | `SelectionItemPattern.Select` |
-| `set_value` | `ValuePattern.SetValue(value)`; a read-only element answers `the element is read-only; its value cannot be set` |
+| `set_value` | `ValuePattern.SetValue(value)`; a read-only element answers `the element is read-only; its value cannot be set; type into another element or change it in the app` |
 | `focus` | brings the element's window to the foreground as `win.action focus` does, then `SetFocus` |
 | `scroll_into_view` | `ScrollItemPattern.ScrollIntoView` |
 
@@ -387,12 +425,16 @@ view first when it has a scroll-item pattern.
   does).
 - The call counts as done when it returned or when the element's window
   stopped taking input because it opened a modal window. A call that has not
-  returned after 1.5 s is left running; when the window then does not handle
-  a message within 0.5 s the reply carries the node as it was before the
-  action and `unresponsive: true` (a button that makes its window hang
-  answers after about 2.1 s).
+  returned after 1.5 s is left running; the reply then carries the node as it
+  was before the action and, when the window no longer handles a message
+  within 0.5 s, `unresponsive: true` (a button that makes its window hang
+  answers after about 2.1 s), otherwise `pending: true`.
 - When the element is gone after the action the reply carries the node as it
   was before and `gone: true`.
+- A disabled element is refused before the call:
+  `the element is disabled; wait until it is enabled`. More than eight `ui.act`
+  calls still running in one app answer
+  `<n> earlier ui.act calls are still running in the app; wait for them or end its process with proc.kill`.
 - Errors: `the element does not support toggle; it supports invoke, focus; click it through the display for anything else`
   (the list names what the element supports), `the element is disabled; wait until it is enabled`,
   `set_value needs value`,
@@ -424,7 +466,14 @@ agent sends one event per difference, each with the window object:
   comparison. In one comparison the order is closed, opened (with
   `dialog.opened`), title, foreground.
 - The first comparison of a helper process sends nothing; changes while no
-  helper runs are not reported.
+  helper runs are not reported. Events flow only while the helper runs, so a
+  client that wants them sends `ui.ping` first to start it.
+- `window.title` and `window.foreground` are capped at one per window per
+  second, carrying the latest title or state.
+- Each connection has a bounded event queue. When it is full (a client that
+  does not read) events are dropped and counted, and once the connection
+  catches up the agent sends `{"t":"ev","name":"events.dropped","count":<n>}`;
+  a connection whose write stalls for 30 s is closed.
 - A window that gets its title after it was shown is reported as opened at
   that moment. Short-lived system windows are reported like any other
   (`PopupHost` of class `Xaml_WindowedPopupClass` from the shell, the `Ghost`
@@ -527,3 +576,6 @@ reply can be several megabytes long. What bounds each reply the agent writes:
 - The helper serves no request while a UI Automation call into an
   unresponsive application waits; windows the system already reports as not
   responding are refused before the call.
+- A connection that does not read its events loses them: the agent drops the
+  overflow and reports the count with an `events.dropped` event once the
+  connection reads again.
