@@ -73,6 +73,34 @@ final class ScreenTextTests: XCTestCase {
         XCTAssertEqual(top, Frame.Rect(x: 100, y: 0, w: 200, h: 13))
     }
 
+    func testABoxWithoutWidthOrHeightAtTheRightOrBottomEdgeStaysInside() {
+        let right = ScreenText.pixelRect(of: CGRect(x: 1, y: 0.5, width: 0, height: 0.125), width: 1280, height: 800, scale: 1)
+        XCTAssertEqual(right, Frame.Rect(x: 1279, y: 300, w: 1, h: 100))
+        let bottom = ScreenText.pixelRect(of: CGRect(x: 0.25, y: 0, width: 0.5, height: 0), width: 400, height: 200, scale: 1)
+        XCTAssertEqual(bottom, Frame.Rect(x: 100, y: 199, w: 200, h: 1))
+        let corner = ScreenText.pixelRect(of: CGRect(x: 1, y: 0, width: 0, height: 0), width: 2560, height: 1600, scale: 2)
+        XCTAssertEqual(corner, Frame.Rect(x: 1279, y: 799, w: 1, h: 1))
+    }
+
+    func testFindTextAddsTheRegionOriginToLineRectangles() async throws {
+        WaitTiming.recognizer = { frame, _ in
+            [TextMatch(text: "Edge", rect: Frame.Rect(x: frame.width - 1, y: frame.height - 1, w: 1, h: 1), confidence: 1),
+             TextMatch(text: "Send", rect: Frame.Rect(x: 10, y: 20, w: 30, h: 12), confidence: 1)]
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 1280, height: 800).frame)
+        let r = try await h.handle(op: "vm.find_text", params: [
+            "name": "Win", "languages": ["en-US"], "region": ["x": 500, "y": 350, "w": 400, "h": 200],
+        ])
+        let rows = try XCTUnwrap(r["matches"]?.arrayValue)
+        XCTAssertEqual(rows.count, 2)
+        let send = try XCTUnwrap(rows.first { $0["text"]?.stringValue == "Send" })
+        XCTAssertEqual([send["x"]?.intValue, send["y"]?.intValue, send["w"]?.intValue, send["h"]?.intValue], [510, 370, 30, 12])
+        XCTAssertEqual([send["cx"]?.intValue, send["cy"]?.intValue], [525, 376])
+        let edge = try XCTUnwrap(rows.first { $0["text"]?.stringValue == "Edge" })
+        XCTAssertEqual([edge["x"]?.intValue, edge["y"]?.intValue, edge["w"]?.intValue, edge["h"]?.intValue], [899, 549, 1, 1])
+    }
+
     func testLinesComeTopToBottomThenLeftToRight() throws {
         let drawn = drawText([("Lower row", 100, 400), ("Upper right", 600, 100), ("Upper left", 100, 104)])
         let lines = try ScreenText.recognize(drawn.frame, languages: ["en-US"])

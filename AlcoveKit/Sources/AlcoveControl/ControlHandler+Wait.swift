@@ -8,6 +8,8 @@ extension ControlHandler {
     private static let tailLines = 400
     private static let logLineLimit = 500
     private static let jobBufferLimit = 64 * 1024
+    /// Characters of a failed port check's output that its sentence quotes.
+    private static let portOutputLimit = 200
 
     /// What one evaluation of a condition found.
     private enum Verdict: Sendable {
@@ -596,8 +598,10 @@ extension ControlHandler {
             let out = (r["stdout"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard code == 0, !out.isEmpty else {
                 let err = (r["stderr"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let reason = err.isEmpty ? "the guest command exited with code \(code) and printed nothing; run vm.doctor to check the guest shell" : err
-                throw ControlError.failed("the port check failed: \(reason)")
+                let printed = err.isEmpty ? out : err
+                let line = printed.split(whereSeparator: \.isNewline).first.map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
+                let what = line.isEmpty ? " and printed nothing" : ": \(line.prefix(ControlHandler.portOutputLimit))"
+                throw ControlError.failed("the port check failed: the guest command exited with code \(code)\(what); run vm.doctor to check the guest shell")
             }
             return out == "1" ? .holds(nil) : .pending
         case .logMatches(let path, let pattern):

@@ -60,6 +60,7 @@ final class WaitTests: XCTestCase {
         WaitTiming.reportedSilence = .milliseconds(500)
         WaitTiming.jobByteBudget = 4 * 1024 * 1024
         WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) }
+        WaitTiming.supportedLanguages = { try ScreenText.supportedLanguages.get() }
     }
 
     /// A running VM "Win" serving `frames`, with no guest tools.
@@ -209,6 +210,16 @@ final class WaitTests: XCTestCase {
         let r = try await waitFor(h, [["type": "text_visible", "text": "install", "region": ["x": 0, "y": 400, "w": 800, "h": 200]]], timeout: 10)
         XCTAssertEqual(r["matched"]?.intValue, 0)
         XCTAssertLessThanOrEqual(abs((r["detail"]?["y"]?.intValue ?? -999) - drawn.rects[1].y), 12, "\(String(describing: r["detail"]))")
+    }
+
+    func testTextVisibleAddsTheRegionOriginToTheMatchRectangle() async throws {
+        WaitTiming.recognizer = { frame, _ in
+            [TextMatch(text: "Edge", rect: Frame.Rect(x: frame.width - 1, y: frame.height - 1, w: 1, h: 1), confidence: 1)]
+        }
+        let (h, _) = await screenRig(frames: [solid(1280, 800, 10)])
+        let r = try await waitFor(h, [["type": "text_visible", "text": "edge", "languages": ["en-US"],
+                                       "region": ["x": 500, "y": 350, "w": 400, "h": 200]]], timeout: 10)
+        XCTAssertEqual(r["detail"], ["text": "Edge", "x": 899, "y": 549, "w": 1, "h": 1, "cx": 899, "cy": 549])
     }
 
     func testTextVisibleWithRegex() async throws {
@@ -463,7 +474,31 @@ final class WaitTests: XCTestCase {
         let (h2, _) = try await agentRig(failing)
         let timedOut = try await waitFor(h2, [["type": "port_listening", "port": 22]], timeout: 1)
         XCTAssertEqual(timedOut["matched"]?.intValue, -1)
-        XCTAssertTrue(timedOut["problems"]?[0]?["error"]?.stringValue?.contains("ss is not installed in the guest") ?? false, "\(timedOut)")
+        XCTAssertEqual(timedOut["problems"]?[0]?["error"]?.stringValue,
+                       "the port check failed: the guest command exited with code 127: ss is not installed in the guest; run vm.doctor to check the guest shell")
+    }
+
+    func testAPortCheckThatFailsQuotesTheFirstLineOfItsOutput() async throws {
+        let long = String(repeating: "x", count: 250)
+        let replies: [(code: Int, stdout: String, stderr: String, sentence: String)] = [
+            (3, "netstat: unknown option\r\nusage: netstat\r\n", "", "the guest command exited with code 3: netstat: unknown option"),
+            (1, "\r\n  \r\nlate line\r\n", "", "the guest command exited with code 1: late line"),
+            (0, "", "warning: profile not loaded\nsecond line\n", "the guest command exited with code 0: warning: profile not loaded"),
+            (2, "on stdout\n", "on stderr\n", "the guest command exited with code 2: on stderr"),
+            (5, long + "\n", "", "the guest command exited with code 5: " + String(repeating: "x", count: 200)),
+        ]
+        for reply in replies {
+            let agent = FakeAgent()
+            agent.handler = { m, _ in
+                guard m["op"]?.stringValue == "exec.run" else { return [] }
+                return [agentReply(m, ["code": .int(Int64(reply.code)), "stdout": .string(reply.stdout), "stderr": .string(reply.stderr)])]
+            }
+            let (h, _) = try await agentRig(agent)
+            let r = try await waitFor(h, [["type": "port_listening", "port": 22]], timeout: 1)
+            XCTAssertEqual(r["matched"]?.intValue, -1)
+            XCTAssertEqual(r["problems"]?[0]?["error"]?.stringValue,
+                           "the port check failed: \(reply.sentence); run vm.doctor to check the guest shell")
+        }
     }
 
     func testAPortCheckThatPrintsNothingNamesTheNextStep() async throws {
@@ -966,6 +1001,33 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(calls.value, 0)
         let frames = await t.frameCalls
         XCTAssertEqual(frames, 0)
+    }
+
+    func testALanguageListThatCannotBeReadIsReportedWithTheConditionIndex() async throws {
+        WaitTiming.supportedLanguages = {
+            throw NSError(domain: "Vision", code: 9, userInfo: [NSLocalizedDescriptionKey: "the language list is unavailable"])
+        }
+        let (h, t) = await screenRig(frames: [solid(64, 64, 10)])
+        let message = await failure(h, ["name": "Win", "timeout": 2, "conditions": [
+            ["type": "screen_idle", "seconds": 100], ["type": "text_gone", "text": "a", "languages": ["en-US"]],
+        ]])
+        XCTAssertEqual(message, "condition 1: the language list is unavailable")
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 0)
+    }
+
+    func testTheSupportedLanguagesAreReadUntilOneReadSucceeds() throws {
+        struct Unavailable: Error {}
+        let reads = LockedBox(0)
+        let list = ScreenText.LanguageList {
+            reads.value += 1
+            if reads.value == 1 { throw Unavailable() }
+            return ["en-US", "ko-KR"]
+        }
+        XCTAssertThrowsError(try list.get())
+        XCTAssertEqual(try list.get(), ["en-US", "ko-KR"])
+        XCTAssertEqual(try list.get(), ["en-US", "ko-KR"])
+        XCTAssertEqual(reads.value, 2)
     }
 
     func testInvalidRegularExpressions() async throws {

@@ -20,6 +20,8 @@ enum WaitTiming {
     nonisolated(unsafe) static var jobByteBudget = 4 * 1024 * 1024
     /// Text recognition on a frame.
     nonisolated(unsafe) static var recognizer: @Sendable (Frame, [String]) throws -> [TextMatch] = { try ScreenText.recognize($0, languages: $1) }
+    /// The recognition languages a `languages` parameter may name.
+    nonisolated(unsafe) static var supportedLanguages: @Sendable () throws -> [String] = { try ScreenText.supportedLanguages.get() }
 }
 
 /// How long the guest agent has left the calls of one agent condition of a wait without an answer.
@@ -199,7 +201,7 @@ enum WaitCondition: Sendable {
                 languages = items.compactMap(\.stringValue)
             }
             do { try ScreenText.validate(languages: languages) }
-            catch let error as ControlHandler.ControlError { throw fail(error.description) }
+            catch { throw fail(ControlHandler.failureReason(error, fallback: "the recognition languages cannot be checked")) }
             return WaitText(query: query, expression: expression, region: try region(), languages: languages)
         }
 

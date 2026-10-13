@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import Synchronization
 import Vision
 
 /// One recognized line of text with its rectangle in guest pixels.
@@ -18,19 +19,41 @@ enum ScreenText {
     static let upscaleFactor = 2
 
     /// The pixel rectangle (top-left origin) of a Vision bounding box in an image of `width` x `height` pixels
-    /// that shows the area enlarged by `scale`, cut to the area.
+    /// that shows the area enlarged by `scale`, cut to the area: at least one pixel wide and high, and inside it.
     static func pixelRect(of box: CGRect, width: Double, height: Double, scale: Double) -> Frame.Rect {
         let areaWidth = width / scale, areaHeight = height / scale
-        let left = max(0, (box.minX * areaWidth).rounded(.down))
+        let left = min(max(0, (box.minX * areaWidth).rounded(.down)), areaWidth - 1)
         let right = min(areaWidth, (box.maxX * areaWidth).rounded(.up))
-        let top = max(0, ((1 - box.maxY) * areaHeight).rounded(.down))
+        let top = min(max(0, ((1 - box.maxY) * areaHeight).rounded(.down)), areaHeight - 1)
         let bottom = min(areaHeight, ((1 - box.minY) * areaHeight).rounded(.up))
         return Frame.Rect(x: Int(left), y: Int(top), w: max(1, Int(right - left)), h: max(1, Int(bottom - top)))
     }
 
+    /// A list of language codes that is read until one read succeeds and kept from then on.
+    final class LanguageList: Sendable {
+        private let known = Mutex<[String]?>(nil)
+        private let read: @Sendable () throws -> [String]
+
+        init(read: @escaping @Sendable () throws -> [String]) { self.read = read }
+
+        func get() throws -> [String] {
+            if let known = known.withLock({ $0 }) { return known }
+            let fresh = try read()
+            known.withLock { $0 = fresh }
+            return fresh
+        }
+    }
+
+    /// The languages Vision recognizes at the accurate level.
+    static let supportedLanguages = LanguageList {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        return try request.supportedRecognitionLanguages()
+    }
+
     /// Throws when Vision does not support one of `languages`.
     static func validate(languages: [String]) throws {
-        let supported = try VNRecognizeTextRequest().supportedRecognitionLanguages()
+        let supported = try WaitTiming.supportedLanguages()
         for language in languages where !supported.contains(language) {
             throw ControlHandler.ControlError.failed("language '\(language)' is not supported; supported: \(supported.joined(separator: ", "))")
         }
