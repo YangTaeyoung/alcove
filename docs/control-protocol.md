@@ -4,10 +4,10 @@ Version 1. Lets automation on the Mac — the `alcove-mcp` server for Claude
 Code and other agents, `alcovectl`, scripts — drive VMs: list and start them,
 take screenshots, move the mouse, click, type, press keys, run shell commands
 and background jobs in the guest, list and kill guest processes, exchange
-clipboard text, copy, sync, read and write guest files, take and restore
-snapshots, forward ports, cut the guest's network link, lease a VM, change
-guest settings, diagnose a VM, and create linked clones and sessions that
-discard their changes.
+clipboard text, copy, sync, read and write guest files, read the text on the
+screen, wait for conditions, take and restore snapshots, forward ports, cut
+the guest's network link, lease a VM, change guest settings, diagnose a VM,
+and create linked clones and sessions that discard their changes.
 
 The same server runs inside the Alcove app (which owns the VMs while it is
 running) and inside `alcovectl serve` (headless, when the app is not running).
@@ -115,7 +115,12 @@ Combos use `+`. Names are case-insensitive.
 ## Screenshots
 
 `vm.screenshot` reads the current guest frame and returns it, optionally
-cropped and shrunk.
+cropped and shrunk. Every op that reads the screen (`vm.screenshot`,
+`vm.find_text`, `vm.wait_idle`, `vm.wait_for`, the observations and the
+recordings) copies the frame from the display's shared framebuffer; while no
+surface is mapped it asks the engine for a `screendump` instead.
+`ALCOVE_FRAME_SOURCE=screendump` in the environment of the server process
+makes it use the `screendump` always.
 
 - `region` `{x, y, w, h}` (guest pixels, `w` and `h` above 0) crops to the part
   inside the frame; a region partly outside is cut to the frame, one fully
@@ -179,9 +184,14 @@ without `name` (a `name` that differs from the batch's VM is refused).
 Allowed `op` values: the action ops (`vm.mouse.move`, `.click`, `.drag`,
 `.scroll`, `.down`, `.up`, `vm.key.press`, `.down`, `.up`, `vm.type`),
 `vm.wait_idle`, `vm.wait_for` and `sleep` (`ms`, a whole number from 1 to
-10000). Any other `op` is refused. The whole batch is validated before
-anything runs; refusals name the step as `step <i>: ...`. Step indices count
-from 0 everywhere: in refusals, in `results` and in `failedStep`.
+10000). Any other `op` is refused. Before anything runs the server checks
+that every step is an object with an allowed `op`, that no step names another
+VM and that every `sleep` has its `ms`; a refusal names the step as
+`step <i>: ...` and no step runs. The parameters of an op are checked when its
+step runs: a step with a missing or wrong parameter (an unknown key name, a
+`vm.type` without `text`, a `vm.wait_for` with an unknown condition type) is a
+failing step as described below. Step indices count from 0 everywhere: in
+refusals, in `results` and in `failedStep`.
 
 Each step runs with `observe` `none`; `observe`, `settleMs` and
 `settleTimeoutMs` on the batch itself ask for one observation after the last
@@ -205,15 +215,24 @@ run; steps before it keep their effect.
   recognized line.
 - `region` is as for `vm.screenshot`.
 - `languages` is a non-empty array of recognition languages, default
-  `["ko-KR", "en-US"]`; an unsupported one is refused before any
-  recognition and answers
+  `["ko-KR", "en-US"]`. Any other value answers
+  `languages must be an array of language codes such as ["en-US","ko-KR"]`;
+  an unsupported language is refused before any recognition and answers
   `language '<l>' is not supported; supported: ...`.
+- The first language selects the recognizer. With `ko-KR` first, Hangul is
+  read well and small Latin text with mistakes (`Alcove OCR check` in 11-point
+  Consolas at 100 % scale came back as `Alcove OR check`); with `en-US` first
+  or alone, Latin text is read well and Hangul not at all. Pass `["en-US"]`
+  when the text looked for has Latin letters only.
 - The result is `{matches, lines}`. `matches` lists the matching lines in
   reading order (top to bottom, then left to right) as `{text, x, y, w, h, cx,
   cy, confidence}`: the rectangle in guest pixels of the whole frame, its centre
   (`cx`, `cy`, the point to click) and a confidence from 0 to 1 with two
-  decimals. `lines` is the number of lines recognized in the area before the
-  filter. Frames narrower than 400 pixels are enlarged twofold for recognition.
+  decimals. Every rectangle lies inside the searched area. `lines` is the
+  number of lines recognized in the area before the filter. Areas narrower
+  than 400 pixels are enlarged twofold for recognition.
+- The first recognition with a recognizer after the server starts loads it and
+  can take tens of seconds; later ones take a fraction of a second.
 - When the Vision request itself fails (`text recognition failed: <reason>`),
   the op waits 150 ms and tries once more on the same frame; a second failure
   answers `text recognition failed twice; call vm.find_text again or use
@@ -238,6 +257,10 @@ lane that takes no input gate. Conditions are numbered from 0.
 | `port_listening` | `port` (1 to 65535) | a TCP port listens in the guest | none |
 | `log_matches` | `path`, `pattern` | one of the last 400 lines of the guest file matches the regular expression | the line, cut to 500 characters |
 | `job_output_matches` | `job`, `pattern` | the stdout or stderr of the job (last 64 KiB of each, read from the start) matches the regular expression, with `^` and `$` matching at line breaks | none |
+
+`languages` of `text_visible` and `text_gone` is as for `vm.find_text`; an
+unsupported language is refused before the wait starts
+(`condition <i>: language '<l>' is not supported; supported: ...`).
 
 `process_exited` with a `pid` that does not exist holds at once, because the
 condition is "no such process". `screen_idle` compares each sample with the
@@ -268,7 +291,14 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   out) does not end the wait: the condition is tried again at its next period.
   `problems` appears only when `matched` is `-1` and lists
   `{condition, type, error, failures}` for each condition whose latest
-  evaluations failed, `failures` being the number in a row. Errors that make the
+  evaluations failed, `failures` being the number in a row. A text recognition
+  that is still running at the timeout and one second after its start is
+  given up: the wait ends and the condition is listed with `text recognition
+  did not finish within the timeout; call vm.wait_for again with a longer
+  timeout`. A port check whose guest command fails is listed with `the port
+  check failed: <what the command printed>`, or, when it printed nothing,
+  `the port check failed: the guest command exited with code <n> and printed
+  nothing; run vm.doctor to check the guest shell`. Errors that make the
   condition meaningless end the wait with an error instead: a guest-tools
   connection that is lost or too old, a `region` outside the frame
   (`condition <i>: region is outside the <W>x<H> frame`), an unknown job, a
