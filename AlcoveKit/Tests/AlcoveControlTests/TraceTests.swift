@@ -24,7 +24,7 @@ final class TraceTests: XCTestCase {
     }
 
     private func start(_ h: ControlHandler, _ extra: [String: JSON] = [:]) async throws -> URL {
-        var params: [String: JSON] = ["name": "Win"]
+        var params: [String: JSON] = ["name": "Win", "video": false]
         for (k, v) in extra { params[k] = v }
         let r = try await h.handle(op: "vm.record.start", params: .object(params))
         return URL(fileURLWithPath: try XCTUnwrap(r["dir"]?.stringValue))
@@ -252,6 +252,18 @@ final class TraceTests: XCTestCase {
         XCTAssertEqual(again, "'Win' is not recording")
     }
 
+    func testStopSummaryCarriesVideoFields() async throws {
+        let (h, _, clock) = setup()
+        let dir = try await start(h, ["video": true])
+        try await Task.sleep(for: .milliseconds(300))
+        clock.advance(.milliseconds(500))
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["video"]?.stringValue, dir.appendingPathComponent("video.mp4").path)
+        XCTAssertEqual(try XCTUnwrap(stop["videoSeconds"]?.doubleValue), 0.5, accuracy: 0.1)
+        XCTAssertEqual(stop["droppedFrames"]?.intValue, 0)
+        XCTAssertEqual(stop["writeErrors"]?.intValue, 0)
+    }
+
     func testStartParameters() async throws {
         let (h, _, _) = setup()
         let relative = await failure(h, "vm.record.start", ["name": "Win", "dir": "relative/path"])
@@ -408,7 +420,7 @@ final class TraceTests: XCTestCase {
         let (h, _, _) = setup()
         let slow = SlowFinishSink()
         await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in slow }))
-        _ = try await start(h)
+        _ = try await start(h, ["video": true])
         let retire = Task { try await h.handle(op: "vm.stop", params: ["name": "Win"]) }
         await slow.gate.waitUntilWaiting()
         let stopTask = Task { try await h.handle(op: "vm.record.stop", params: ["name": "Win"]) }

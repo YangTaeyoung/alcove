@@ -3,8 +3,22 @@ import AlcoveQMP
 
 /// Receives the frames of a recording and turns them into `video.mp4`.
 protocol VideoSink: Sendable {
+    /// Adds `frame` at `time` after the start of the recording.
     func append(frame: Frame, at time: Duration)
+    /// Completes the file; no frame is appended afterwards.
     func finish() async
+    /// Frames the encoder could not take.
+    var droppedFrames: Int { get }
+    /// Seconds of video appended.
+    var appendedSeconds: Double { get }
+    /// A sentence describing why the video could not be written; nil when it can.
+    var errorMessage: String? { get }
+}
+
+extension VideoSink {
+    var droppedFrames: Int { 0 }
+    var appendedSeconds: Double { 0 }
+    var errorMessage: String? { nil }
 }
 
 /// A sink that discards everything.
@@ -25,12 +39,17 @@ actor Recording {
         let ops: Int
         let writeErrors: Int
         let lastWriteError: String?
+        /// Seconds of video appended; nil without a video file.
+        let videoSeconds: Double?
+        let droppedFrames: Int?
 
         var json: JSON {
             var obj: [String: JSON] = ["dir": .string(dir), "trace": .string(trace), "frames": .int(Int64(frames)),
                                        "seconds": .double(seconds), "ops": .int(Int64(ops)), "writeErrors": .int(Int64(writeErrors))]
             if let lastWriteError { obj["lastWriteError"] = .string(lastWriteError) }
             if let video { obj["video"] = .string(video) }
+            if let videoSeconds { obj["videoSeconds"] = .double(videoSeconds) }
+            if let droppedFrames { obj["droppedFrames"] = .int(Int64(droppedFrames)) }
             return .object(obj)
         }
     }
@@ -60,6 +79,9 @@ actor Recording {
     private var lastWriteError: String?
     private var consecutiveLineFailures = 0
     private var timer: Task<Void, Never>?
+    private var sampler: Task<Void, Never>?
+    private var lastVideoFrame: Frame?
+    private var lastVideoAt = Duration.zero
     private var finishing: Task<Summary, Never>?
 
     init(vm: String, directory: URL, fps: Int, video: Bool, maxSeconds: Int, frames: @escaping @Sendable () async -> Frame?,
@@ -81,7 +103,10 @@ actor Recording {
 
     var isActive: Bool { finishing == nil }
 
-    /// Creates the recording directory and starts the `maxSeconds` timer.
+    /// Longest stretch without an encoded frame while the screen does not change.
+    static let videoKeepAlive = Duration.seconds(2)
+
+    /// Creates the recording directory, starts the `maxSeconds` timer and, with video, the frame sampler.
     func start() async throws {
         writer = try await openWriter(directory)
         startedAt = wallClock()
@@ -93,6 +118,30 @@ actor Recording {
             guard !Task.isCancelled else { return }
             _ = await self?.stop()
         }
+        if video {
+            let interval = Duration.seconds(1.0 / Double(fps))
+            sampler = Task { [weak self] in
+                while !Task.isCancelled {
+                    await self?.sample()
+                    try? await Task.sleep(for: interval)
+                }
+            }
+        }
+    }
+
+    /// Reads one frame and encodes it unless it repeats the previous one.
+    private func sample() async {
+        guard isActive, let frame = await framesSource() else { return }
+        guard isActive, !Task.isCancelled else { return }
+        appendVideo(frame, force: false)
+    }
+
+    private func appendVideo(_ frame: Frame, force: Bool) {
+        let elapsed = startedInstant.duration(to: clock())
+        if !force, let last = lastVideoFrame, last == frame, elapsed - lastVideoAt < Recording.videoKeepAlive { return }
+        sink.append(frame: frame, at: elapsed)
+        lastVideoFrame = frame
+        lastVideoAt = elapsed
     }
 
     /// The current guest frame; nil when none can be captured.
@@ -161,12 +210,23 @@ actor Recording {
         let seconds = elapsedSeconds
         writer?.close()
         writer = nil
+        if let sampler {
+            sampler.cancel()
+            await sampler.value
+            self.sampler = nil
+        }
+        if video, let last = await framesSource() ?? lastVideoFrame { appendVideo(last, force: true) }
         await sink.finish()
+        if let message = sink.errorMessage { noteWriteError(message) }
         let videoURL = directory.appendingPathComponent("video.mp4")
-        return Summary(dir: directory.path, video: FileManager.default.fileExists(atPath: videoURL.path) ? videoURL.path : nil,
+        let size = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int) ?? nil
+        let hasVideo = video && (size ?? 0) > 0
+        return Summary(dir: directory.path, video: hasVideo ? videoURL.path : nil,
                        trace: directory.appendingPathComponent(TraceWriter.traceName).path, frames: frameCount,
                        seconds: (seconds * 10).rounded() / 10, ops: lineCount,
-                       writeErrors: writeErrors, lastWriteError: lastWriteError)
+                       writeErrors: writeErrors, lastWriteError: lastWriteError,
+                       videoSeconds: hasVideo ? (sink.appendedSeconds * 10).rounded() / 10 : nil,
+                       droppedFrames: hasVideo ? sink.droppedFrames : nil)
     }
 
     private static func requestParams(_ params: JSON) -> JSON {

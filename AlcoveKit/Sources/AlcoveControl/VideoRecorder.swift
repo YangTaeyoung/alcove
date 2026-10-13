@@ -1,0 +1,191 @@
+import Foundation
+import AVFoundation
+import CoreGraphics
+import CoreMedia
+import CoreVideo
+
+/// Writes frames as an H.264 MP4 file.
+///
+/// The output size is fixed by the first frame: rounded down to even numbers and scaled down so the longer side is at most
+/// `maxLongSide`. Frames of another size are drawn aspect-fit on black.
+///
+/// Isolation: the AVFoundation objects and every stored property after `lock` are read and written only while `lock` is held,
+/// so the class is safe to call from any thread.
+final class VideoRecorder: VideoSink, @unchecked Sendable {
+    static let maxLongSide = 1920
+    static let timeScale: CMTimeScale = 600
+
+    let url: URL
+    let fps: Int
+
+    private let lock = NSLock()
+    private var writer: AVAssetWriter?
+    private var input: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var width = 0
+    private var height = 0
+    private var firstTime = CMTime.invalid
+    private var lastTime = CMTime.invalid
+    private var finished = false
+    private var failure: String?
+    private var dropped = 0
+
+    init(url: URL, fps: Int) {
+        self.url = url
+        self.fps = fps
+    }
+
+    /// The size of the video for a first frame of `width` x `height`.
+    static func fittedSize(width: Int, height: Int) -> (width: Int, height: Int) {
+        var w = Double(width), h = Double(height)
+        let longer = max(w, h)
+        if longer > Double(maxLongSide) {
+            let scale = Double(maxLongSide) / longer
+            w = (w * scale).rounded(.down)
+            h = (h * scale).rounded(.down)
+        }
+        return (max(2, Int(w) & ~1), max(2, Int(h) & ~1))
+    }
+
+    /// Frames not appended because the encoder was not ready for them.
+    var droppedFrames: Int { lock.withLock { dropped } }
+
+    /// Seconds between the first and the last appended frame.
+    var appendedSeconds: Double {
+        lock.withLock { firstTime.isValid && lastTime.isValid ? CMTimeGetSeconds(CMTimeSubtract(lastTime, firstTime)) : 0 }
+    }
+
+    /// A sentence describing why the video could not be written; nil while it can.
+    var errorMessage: String? { lock.withLock { failure } }
+
+    /// Encodes `frame` at `time` after the start of the recording; a frame not later than the previous one is dropped.
+    func append(frame: Frame, at time: Duration) {
+        lock.withLock {
+            guard !finished, failure == nil else { return }
+            let seconds = Double(time.components.seconds) + Double(time.components.attoseconds) / 1e18
+            let presentation = CMTime(seconds: max(0, seconds), preferredTimescale: VideoRecorder.timeScale)
+            if writer == nil, !open(firstFrame: frame, at: presentation) { return }
+            guard let writer, let input, let adaptor else { return }
+            if lastTime.isValid, CMTimeCompare(presentation, lastTime) <= 0 { return }
+            guard writer.status == .writing else {
+                failure = describe(writer.error)
+                return
+            }
+            guard input.isReadyForMoreMediaData else { dropped += 1; return }
+            guard let buffer = makeBuffer(adaptor), render(frame, into: buffer) else {
+                dropped += 1
+                return
+            }
+            if adaptor.append(buffer, withPresentationTime: presentation) {
+                lastTime = presentation
+            } else {
+                failure = describe(writer.error)
+            }
+        }
+    }
+
+    /// Completes the file; later calls do nothing, and later frames are ignored.
+    func finish() async {
+        let pending: (AVAssetWriter, AVAssetWriterInput, CMTime)? = lock.withLock {
+            guard !finished else { return nil }
+            finished = true
+            guard let writer, let input, writer.status == .writing else { return nil }
+            input.markAsFinished()
+            return (writer, input, lastTime)
+        }
+        guard let (writer, _, last) = pending else { return }
+        writer.endSession(atSourceTime: last)
+        await writer.finishWriting()
+        lock.withLock {
+            if writer.status == .failed, failure == nil { failure = describe(writer.error) }
+        }
+    }
+
+    // Callers hold `lock`.
+    private func open(firstFrame frame: Frame, at time: CMTime) -> Bool {
+        let size = VideoRecorder.fittedSize(width: frame.width, height: frame.height)
+        do {
+            try? FileManager.default.removeItem(at: url)
+            let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+            writer.movieTimeScale = VideoRecorder.timeScale
+            let settings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: size.width,
+                AVVideoHeightKey: size.height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoExpectedSourceFrameRateKey: fps,
+                    AVVideoAverageBitRateKey: max(500_000, size.width * size.height * 2),
+                    AVVideoMaxKeyFrameIntervalDurationKey: 2,
+                ] as [String: Any],
+            ]
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+            input.expectsMediaDataInRealTime = true
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: size.width,
+                kCVPixelBufferHeightKey as String: size.height,
+            ])
+            guard writer.canAdd(input) else {
+                failure = "the video encoder does not accept the screen size \(size.width)x\(size.height); the trace is unaffected"
+                return false
+            }
+            writer.add(input)
+            guard writer.startWriting() else {
+                failure = describe(writer.error)
+                return false
+            }
+            writer.startSession(atSourceTime: time)
+            self.writer = writer
+            self.input = input
+            self.adaptor = adaptor
+            width = size.width
+            height = size.height
+            firstTime = time
+            return true
+        } catch {
+            failure = describe(error)
+            return false
+        }
+    }
+
+    private func describe(_ error: Error?) -> String {
+        "the video could not be written (\(error?.localizedDescription ?? "unknown error")); the trace is unaffected"
+    }
+
+    private func makeBuffer(_ adaptor: AVAssetWriterInputPixelBufferAdaptor) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        if let pool = adaptor.pixelBufferPool {
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+        } else {
+            CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &buffer)
+        }
+        return buffer
+    }
+
+    private func render(_ frame: Frame, into buffer: CVPixelBuffer) -> Bool {
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return false }
+        let stride = CVPixelBufferGetBytesPerRow(buffer)
+        if frame.width == width, frame.height == height {
+            frame.pixels.withUnsafeBytes { source in
+                for row in 0..<height {
+                    memcpy(base + row * stride, source.baseAddress! + row * width * 4, width * 4)
+                }
+            }
+            return true
+        }
+        guard let image = frame.cgImage(),
+              let context = CGContext(data: base, width: width, height: height, bitsPerComponent: 8, bytesPerRow: stride,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        else { return false }
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let scale = min(Double(width) / Double(frame.width), Double(height) / Double(frame.height))
+        let w = Double(frame.width) * scale, h = Double(frame.height) * scale
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: (Double(width) - w) / 2, y: (Double(height) - h) / 2, width: w, height: h))
+        return true
+    }
+}

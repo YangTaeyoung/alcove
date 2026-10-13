@@ -19,7 +19,7 @@ struct RecordingTable {
 /// Replaceable parts of a new recording.
 struct RecordingSeams: Sendable {
     var openWriter: @Sendable (URL) async throws -> TraceStore = { try TraceWriter(directory: $0) }
-    var makeSink: @Sendable (URL, Int) -> VideoSink = { _, _ in NoVideoSink() }
+    var makeSink: @Sendable (URL, Int) -> VideoSink = { VideoRecorder(url: $0.appendingPathComponent("video.mp4"), fps: $1) }
 }
 
 /// `vm.record.*` and the trace of every other op of a recorded VM.
