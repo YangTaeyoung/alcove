@@ -40,6 +40,7 @@ public final class DisplayConnection: @unchecked Sendable {
     private var writeSource: DispatchSourceWrite?
     private var splitter = LineSplitter()
     private var outbox = Data()
+    private var surface: FromQEMU.SurfaceSwitch?
     private var finished = false
     private var endReason: EndReason?
     private let onEnd: (@Sendable (EndReason) -> Void)?
@@ -106,6 +107,9 @@ public final class DisplayConnection: @unchecked Sendable {
     /// Whether QEMU is currently connected.
     public var isConnected: Bool { onQueue { clientFD >= 0 } }
 
+    /// The latest valid `switch` for console 0; nil before the first one and after the connection ends.
+    public var currentSurface: FromQEMU.SurfaceSwitch? { onQueue { surface } }
+
     /// Queue a message for QEMU. Safe from any thread; drops silently once closed.
     public func send(_ message: ToQEMU) {
         let line = message.encodedLine
@@ -170,7 +174,9 @@ public final class DisplayConnection: @unchecked Sendable {
                 }
                 for line in lines {
                     do {
-                        continuation.yield(try FromQEMU.decode(line))
+                        let message = try FromQEMU.decode(line)
+                        if case .switchSurface(let s) = message, s.con == 0, s.isValid { surface = s }
+                        continuation.yield(message)
                     } catch {
                         // tolerate garbage on a single line; keep the connection
                         continue
@@ -216,6 +222,7 @@ public final class DisplayConnection: @unchecked Sendable {
         guard !finished else { return }
         finished = true
         endReason = reason
+        surface = nil
         listenSource?.cancel(); listenSource = nil
         readSource?.cancel(); readSource = nil
         writeSource?.cancel(); writeSource = nil

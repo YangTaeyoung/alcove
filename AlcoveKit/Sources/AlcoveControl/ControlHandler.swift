@@ -150,13 +150,7 @@ public actor ControlHandler {
             return ["state": .string(describe(await t.state()))]
         case "vm.screenshot":
             let t = try await running(params)
-            var png = try await screenshot(t)
-            let (w, h) = lastSize[t.name] ?? (0, 0)
-            if let maxWidth = params["maxWidth"]?.intValue, maxWidth > 0, maxWidth < w {
-                png = PNGInfo.downscale(png, maxWidth: maxWidth)
-            }
-            return ["png": .string(png.base64EncodedString()), "width": .int(Int64(w)), "height": .int(Int64(h)),
-                    "sentWidth": .int(Int64(PNGInfo.size(of: png)?.width ?? w)), "sentHeight": .int(Int64(PNGInfo.size(of: png)?.height ?? h))]
+            return try await screenshotResult(t, params)
         case "vm.mouse.move":
             let t = try await running(params)
             try await move(t, x: try int(params, "x"), y: try int(params, "y"))
@@ -249,16 +243,16 @@ public actor ControlHandler {
             return try await guest(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
-            // than 0.5% of thumbnail pixels changing between samples
+            // than 0.5% of the frame's tiles changing between samples 250 ms apart
             let t = try await running(params)
             let stable = Duration.seconds(params["seconds"]?.intValue ?? 2)
             let deadline = ContinuousClock.now + .seconds(params["timeout"]?.intValue ?? 30)
-            var last = PNGInfo.thumbnail(try await screenshot(t)) ?? []
+            var last = try await screenshot(t)
             var since = ContinuousClock.now
             while ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(500))
-                let now = PNGInfo.thumbnail(try await screenshot(t)) ?? []
-                if PNGInfo.changedFraction(last, now) < 0.005 {
+                try await Task.sleep(for: .milliseconds(250))
+                let now = try await screenshot(t)
+                if FrameDiff.between(last, now).fraction < 0.005 {
                     if ContinuousClock.now - since >= stable { return ["idle": true] }
                 } else {
                     since = ContinuousClock.now
@@ -336,8 +330,8 @@ public actor ControlHandler {
         if case .failed(let msg) = st { obj["error"] = .string(msg) }
         if let lease = leases.active(vm: t.name, now: clock()) { obj["leasedBy"] = .string(lease.owner) }
         if !quick, st == .running || st == .paused {
-            if lastSize[t.name] == nil, let png = try? await screenshot(t), let (w, h) = PNGInfo.size(of: png) {
-                obj["width"] = .int(Int64(w)); obj["height"] = .int(Int64(h))
+            if lastSize[t.name] == nil, let frame = try? await screenshot(t) {
+                obj["width"] = .int(Int64(frame.width)); obj["height"] = .int(Int64(frame.height))
             }
             if let agent = await t.agent(timeout: .seconds(2)), let hello = await agent.hello {
                 obj["tools"] = true
@@ -349,11 +343,59 @@ public actor ControlHandler {
         return .object(obj)
     }
 
-    func screenshot(_ t: VMTarget) async throws -> Data {
-        let png: Data
-        do { png = try await t.screenshotPNG() } catch { throw ControlError.failed("screenshot failed: \(error)") }
-        if let (w, h) = PNGInfo.size(of: png) { lastSize[t.name] = (w, h) }
-        return png
+    func screenshot(_ t: VMTarget) async throws -> Frame {
+        let frame: Frame
+        do { frame = try await t.frame() } catch { throw ControlError.failed("screenshot failed: \(error)") }
+        lastSize[t.name] = (frame.width, frame.height)
+        return frame
+    }
+
+    private func screenshotResult(_ t: VMTarget, _ params: JSON) async throws -> JSON {
+        var region: Frame.Rect?
+        if let value = params["region"] {
+            guard let x = value["x"]?.intValue, let y = value["y"]?.intValue,
+                  let w = value["w"]?.intValue, let h = value["h"]?.intValue, w > 0, h > 0 else {
+                throw ControlError.failed("region needs integer x, y, w, h with w and h above 0")
+            }
+            region = Frame.Rect(x: x, y: y, w: w, h: h)
+        }
+        var scale = 1.0
+        if let value = params["scale"] {
+            guard let s = value.doubleValue, (0.1...1).contains(s) else { throw ControlError.failed("scale must be between 0.1 and 1") }
+            scale = s
+        }
+        var quality = 0.8
+        if let value = params["quality"] {
+            guard let q = value.doubleValue, (0.1...1).contains(q) else { throw ControlError.failed("quality must be between 0.1 and 1") }
+            quality = q
+        }
+        var format = Frame.Format.png
+        if let value = params["format"] {
+            guard let f = value.stringValue.flatMap(Frame.Format.init(rawValue:)) else { throw ControlError.failed("format must be 'png' or 'jpeg'") }
+            format = f
+        }
+
+        let frame = try await screenshot(t)
+        var area = frame.bounds
+        if let region {
+            guard let clamped = frame.clamp(region) else {
+                throw ControlError.failed("region is outside the \(frame.width)x\(frame.height) frame")
+            }
+            area = clamped
+        }
+        let cropped = area == frame.bounds ? frame : frame.crop(area)
+        var factor = scale
+        if let maxWidth = params["maxWidth"]?.intValue, maxWidth > 0, maxWidth < Int((Double(cropped.width) * scale).rounded()) {
+            factor = Double(maxWidth) / Double(cropped.width)
+        }
+        let image = cropped.scaled(by: factor)
+        let key = format == .png ? "png" : "jpeg"
+        return [key: .string(image.encoded(format, quality: quality).base64EncodedString()),
+                "mime": .string(format == .png ? "image/png" : "image/jpeg"),
+                "width": .int(Int64(frame.width)), "height": .int(Int64(frame.height)),
+                "sentWidth": .int(Int64(image.width)), "sentHeight": .int(Int64(image.height)),
+                "x": .int(Int64(area.x)), "y": .int(Int64(area.y)),
+                "scale": .double(Double(image.width) / Double(area.w))]
     }
 
     private func move(_ t: VMTarget, x: Int, y: Int) async throws {

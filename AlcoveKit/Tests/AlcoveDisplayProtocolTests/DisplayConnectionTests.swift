@@ -66,6 +66,31 @@ final class DisplayConnectionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: path))
     }
 
+    func testCurrentSurfaceTracksSwitch() async throws {
+        let path = tempSocketPath()
+        let conn = try DisplayConnection(socketPath: path)
+        XCTAssertNil(conn.currentSurface)
+        let backend = try FakeBackend(path: path)
+        var it = conn.messages.makeAsyncIterator()
+
+        backend.send("{\"t\":\"switch\",\"con\":0,\"w\":4,\"h\":2,\"stride\":16,\"fmt\":\"bgra8\",\"shm\":\"/a\",\"size\":4096}\n")
+        _ = await it.next()
+        let first = FromQEMU.SurfaceSwitch(con: 0, w: 4, h: 2, stride: 16, fmt: "bgra8", shm: "/a", size: 4096)
+        XCTAssertEqual(conn.currentSurface, first)
+
+        backend.send("{\"t\":\"switch\",\"con\":0,\"w\":4,\"h\":2,\"stride\":16,\"fmt\":\"rgb565\",\"shm\":\"/b\",\"size\":4096}\n")
+        _ = await it.next()
+        XCTAssertEqual(conn.currentSurface, first)
+
+        backend.send("{\"t\":\"switch\",\"con\":1,\"w\":4,\"h\":2,\"stride\":16,\"fmt\":\"bgra8\",\"shm\":\"/c\",\"size\":4096}\n")
+        _ = await it.next()
+        XCTAssertEqual(conn.currentSurface, first)
+
+        backend.close()
+        _ = await it.next()
+        XCTAssertNil(conn.currentSurface)
+    }
+
     func testCloseFinishesStreamAndRemovesSocket() async throws {
         let path = tempSocketPath()
         let ended = expectation(description: "end")

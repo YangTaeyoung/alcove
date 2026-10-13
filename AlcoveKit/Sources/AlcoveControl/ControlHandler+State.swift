@@ -28,13 +28,15 @@ extension ControlHandler {
         }
         let t = try await running(params)
         let agent = try await tools(t)
-        let before = PNGInfo.size(of: try await screenshot(t)).map { [$0.width, $0.height] }
+        let first = try await screenshot(t)
+        let before = [first.width, first.height]
         await agent.setResolution(width: width, height: height)
         let deadline = ContinuousClock.now + .seconds(8)
-        var size = before ?? [0, 0]
+        var size = before
         while true {
             try await Task.sleep(for: .milliseconds(500))
-            if let s = PNGInfo.size(of: try await screenshot(t)) { size = [s.width, s.height] }
+            let now = try await screenshot(t)
+            size = [now.width, now.height]
             if size != before || size == [width, height] || ContinuousClock.now >= deadline { break }
         }
         return ["width": .int(Int64(size[0])), "height": .int(Int64(size[1]))]

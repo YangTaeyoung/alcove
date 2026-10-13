@@ -21,6 +21,7 @@ public actor HeadlessRegistry: VMRegistry {
         guard let bundle = VMBundle.list(in: directory).first(where: { (try? $0.loadConfig())?.name == name }),
               let config = try? bundle.loadConfig() else { return nil }
         let t = ControllerTarget(name: name, controller: VMController(bundle: bundle, config: config, engine: engine))
+        await t.enableDisplayDrain()
         targets[name] = t
         return t
     }

@@ -182,8 +182,8 @@ extension ControlHandler {
         rows.append(check("state", running, describe(state), hint: state == .paused ? "call vm.resume" : "call vm.start"))
         guard running else { return ["checks": .array(rows)] }
 
-        if let png = try? await screenshot(t), let size = PNGInfo.size(of: png) {
-            rows.append(check("display", true, "\(size.width)x\(size.height)"))
+        if let frame = try? await screenshot(t) {
+            rows.append(check("display", true, "\(frame.width)x\(frame.height)"))
         } else {
             rows.append(check("display", false, "no frame available", hint: "wait for the guest to start drawing, then retry"))
         }

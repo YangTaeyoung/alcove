@@ -36,6 +36,10 @@ actor FakeTarget: VMTarget {
     func pause() async throws { stateValue = .paused }
     func resume() async throws { stateValue = .running }
     func screenshotPNG() async throws -> Data { png }
+    func frame() async throws -> Frame {
+        guard let f = Frame(png: png) else { throw NSError(domain: "FakeTarget", code: 1) }
+        return f
+    }
     @discardableResult func sendDisplay(_ message: ToQEMU) async -> Bool { sent.append(message); return true }
     func agent(timeout: Duration) async -> AgentClient? {
         if agentWait > .zero {
@@ -126,7 +130,7 @@ final class ControlHandlerTests: XCTestCase {
         XCTAssertEqual(r["width"]?.intValue, 1600); XCTAssertEqual(r["height"]?.intValue, 1000)
         XCTAssertEqual(r["sentWidth"]?.intValue, 400); XCTAssertEqual(r["sentHeight"]?.intValue, 250)
         let png = Data(base64Encoded: r["png"]!.stringValue!)!
-        XCTAssertEqual(PNGInfo.size(of: png)?.width, 400)
+        XCTAssertEqual(Frame(png: png)?.width, 400)
         let full = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
         XCTAssertEqual(full["sentWidth"]?.intValue, 1600)
     }
@@ -190,13 +194,66 @@ final class ControlHandlerTests: XCTestCase {
         }
     }
 
-    func testChangedFractionIgnoresSmallChanges() {
-        let a = PNGInfo.thumbnail(makePNG(width: 800, height: 600, gray: 10))!
-        let b = PNGInfo.thumbnail(makePNG(width: 800, height: 600, gray: 12))!   // tiny colour drift everywhere
-        XCTAssertEqual(PNGInfo.changedFraction(a, b), 0)
-        let c = PNGInfo.thumbnail(makePNG(width: 800, height: 600, gray: 200))!
-        XCTAssertGreaterThan(PNGInfo.changedFraction(a, c), 0.9)
-        XCTAssertEqual(PNGInfo.changedFraction(a, []), 1)
+    func testScreenshotRegionAndScale() async throws {
+        let (h, _) = setup(size: (1600, 1000))
+        let r = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": ["x": 100, "y": 200, "w": 400, "h": 300], "scale": 0.5])
+        XCTAssertEqual(r["width"]?.intValue, 1600); XCTAssertEqual(r["height"]?.intValue, 1000)
+        XCTAssertEqual(r["x"]?.intValue, 100); XCTAssertEqual(r["y"]?.intValue, 200)
+        XCTAssertEqual(r["sentWidth"]?.intValue, 200); XCTAssertEqual(r["sentHeight"]?.intValue, 150)
+        XCTAssertEqual(r["scale"]?.doubleValue, 0.5)
+        XCTAssertEqual(r["mime"]?.stringValue, "image/png")
+        let png = Data(base64Encoded: r["png"]!.stringValue!)!
+        XCTAssertEqual(Frame(png: png)?.width, 200)
+
+        let capped = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": ["x": 100, "y": 200, "w": 400, "h": 300], "scale": 0.5, "maxWidth": 100])
+        XCTAssertEqual(capped["sentWidth"]?.intValue, 100)
+        XCTAssertEqual(capped["scale"]?.doubleValue, 0.25)
+
+        let clamped = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": ["x": 1500, "y": 900, "w": 400, "h": 400]])
+        XCTAssertEqual(clamped["x"]?.intValue, 1500); XCTAssertEqual(clamped["sentWidth"]?.intValue, 100)
+        XCTAssertEqual(clamped["sentHeight"]?.intValue, 100); XCTAssertEqual(clamped["scale"]?.doubleValue, 1)
+
+        let full = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
+        XCTAssertEqual(full["x"]?.intValue, 0); XCTAssertEqual(full["y"]?.intValue, 0)
+        XCTAssertEqual(full["scale"]?.doubleValue, 1)
+    }
+
+    func testScreenshotRegionOutside() async throws {
+        let (h, _) = setup(size: (800, 600))
+        do {
+            _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": ["x": 900, "y": 0, "w": 10, "h": 10]])
+            XCTFail()
+        } catch let e as ControlHandler.ControlError { XCTAssertTrue(e.description.contains("region is outside the 800x600 frame"), e.description) }
+        for region: JSON in [["x": 0, "y": 0, "w": 0, "h": 5], ["x": 0, "y": 0, "w": 5], "full"] {
+            do {
+                _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": region])
+                XCTFail()
+            } catch let e as ControlHandler.ControlError { XCTAssertTrue(e.description.contains("region needs integer x, y, w, h with w and h above 0"), e.description) }
+        }
+    }
+
+    func testScreenshotParameterErrors() async throws {
+        let (h, _) = setup()
+        let cases: [(JSON, String)] = [
+            (["scale": 1.5], "scale must be between 0.1 and 1"), (["scale": 0.05], "scale must be between 0.1 and 1"),
+            (["quality": 2], "quality must be between 0.1 and 1"), (["format": "gif"], "format must be 'png' or 'jpeg'"),
+        ]
+        for (extra, message) in cases {
+            var params: JSON = ["name": "Win"]
+            if case .object(let o) = extra { for (k, v) in o { if case .object(var p) = params { p[k] = v; params = .object(p) } } }
+            do { _ = try await h.handle(op: "vm.screenshot", params: params); XCTFail(message) }
+            catch let e as ControlHandler.ControlError { XCTAssertTrue(e.description.contains(message), e.description) }
+        }
+    }
+
+    func testScreenshotJPEG() async throws {
+        let (h, _) = setup(size: (400, 300))
+        let r = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "format": "jpeg", "quality": 0.5])
+        XCTAssertNil(r["png"])
+        XCTAssertEqual(r["mime"]?.stringValue, "image/jpeg")
+        let jpeg = Data(base64Encoded: r["jpeg"]!.stringValue!)!
+        XCTAssertEqual(Array(jpeg.prefix(2)), [0xFF, 0xD8])
+        XCTAssertEqual(r["sentWidth"]?.intValue, 400)
     }
 
     func testWaitIdle() async throws {
