@@ -305,7 +305,7 @@ Rules:
 
 - [ ] **Step 1: Write failing tests** in `toolkit.test.ts` (`node:test`, `node:assert/strict`): `selectedToolsets(undefined)` is all eight; `"core, files"` → those two; `"bogus"` throws naming the valid sets; `clip` keeps short strings and appends the hint line when cutting; a `registrar` with only `core` enabled registers a `core` tool and skips a `shell` tool (use a stub object with a `registerTool` recorder).
 - [ ] **Step 2: Run** `cd mcp && npm run build && npm test` — fails.
-- [ ] **Step 3: Implement.** Update `scripts/test/mcp-smoke.py` so `--list-only` expects the 30 tool names and also passes with `ALCOVE_MCP_TOOLSETS=core` expecting 16.
+- [ ] **Step 3: Implement.** Update `scripts/test/mcp-smoke.py` so `--list-only` expects the 29 tool names and also passes with `ALCOVE_MCP_TOOLSETS=core` expecting 16.
 - [ ] **Step 4: Run** `cd mcp && npm run build && npm test && cd .. && python3 scripts/test/mcp-smoke.py --list-only && ALCOVE_MCP_TOOLSETS=core python3 scripts/test/mcp-smoke.py --list-only` — PASS three times.
 - [ ] **Step 5: Commit** `git commit -m "MCP: shell, process and file tools; selectable toolsets"`.
 
