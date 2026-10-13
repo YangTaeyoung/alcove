@@ -574,6 +574,30 @@ the system DPI a newly started DPI-aware process reads on Windows, as a
 percentage of 96. A fact the guest cannot measure reads `not checked on this
 guest` and counts as ok.
 
+## Scripts
+
+`script.run` replays a JSON script of control ops without a model.
+
+Parameters: `path` (script file on the host), `name` (VM; overrides the script's
+`vm`), `variables` (object of strings that override the script's defaults),
+`snapshot` (restored before the first step) and `lease` (the VM's current lease
+token). Without `lease` the run holds a lease of its own (owner
+`script:<file name>`, 600 s, renewed every 200 s) and releases it at the end.
+The op runs in the concurrent lane.
+
+Script format version 1: `{"version": 1, "vm", "variables": {name: text},
+"steps": [{"label", "op", "params", "expect", "timeout"}]}`. `${name}` in any
+string of `params` and `expect` is replaced; `$${` stands for a literal `${`.
+`params` never holds `name` or `lease`. A step may use any control op except
+`vm.lease.*`, `vm.record.*`, `script.*`, `vm.clone` and `vm.delete`. Each
+`expect` entry is a `vm.wait_for` condition; every one must hold within the
+step's `timeout` (default 10 s, 1 to 600). A `vm.wait_for` step fails when it
+matches nothing. The run stops at the first failing step.
+
+Result: `{passed, stepsRun, steps, failedStep?, label?, error?, seconds,
+failure?: {png, width, height}}`. Step numbers start at 1. `failure` is a
+screenshot taken after the failing step.
+
 ## Shell, processes and files
 
 These ops need the guest tools started with `--allow-exec`

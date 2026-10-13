@@ -94,6 +94,7 @@ public actor ControlHandler {
         "vm.lease.acquire", "vm.lease.release", "vm.set_resolution",
         "vm.wait_idle", "vm.wait_for", "vm.set_environment", "vm.doctor", "vm.find_text",
         "vm.record.start", "vm.record.stop", "vm.record.status",
+        "script.run",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -112,6 +113,7 @@ public actor ControlHandler {
     public static func isConcurrent(op: String) -> Bool {
         op.hasPrefix("vm.exec") || op.hasPrefix("vm.process.") || op.hasPrefix("vm.fs.")
             || op == "vm.push_file" || op == "vm.pull_file" || op == "vm.sync_dir" || op == "vm.find_text"
+            || op == "script.run"
     }
 
     /// Whether `op` sends mouse or keyboard input to a guest.
@@ -125,7 +127,11 @@ public actor ControlHandler {
            let refusal = leases.refusal(vm: vm, token: params["lease"]?.stringValue, now: clock()) {
             throw ControlError.failed(refusal)
         }
-        let run: @Sendable () async throws -> JSON = { try await self.recorded(op: op, params: params) { try await self.perform(op: op, params: params) } }
+        let traced = !op.hasPrefix("script.")
+        let run: @Sendable () async throws -> JSON = {
+            if traced { return try await self.recorded(op: op, params: params) { try await self.perform(op: op, params: params) } }
+            return try await self.perform(op: op, params: params)
+        }
         if ControlHandler.isInput(op: op), let vm = params["name"]?.stringValue {
             return try await inputGate.withLock(vm, run)
         }
@@ -223,6 +229,8 @@ public actor ControlHandler {
             return try await waitFor(params)
         case "vm.record.start", "vm.record.stop", "vm.record.status":
             return try await record(op: op, params: params)
+        case "script.run":
+            return try await scriptRun(params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of the frame's tiles changing between samples 250 ms apart
