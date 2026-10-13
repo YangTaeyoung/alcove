@@ -41,6 +41,58 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertGreaterThan(size, 0)
     }
 
+    func testCopyMadeWhileTheFileIsWrittenPlays() async throws {
+        let url = base.appendingPathComponent("growing.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        for i in 0..<25 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
+        let copy = base.appendingPathComponent("copy.mp4")
+        let plays = await eventually(timeout: .seconds(10)) {
+            try? FileManager.default.removeItem(at: copy)
+            guard (try? FileManager.default.copyItem(at: url, to: copy)) != nil else { return false }
+            return await VideoRecorder.isPlayable(copy)
+        }
+        XCTAssertTrue(plays)
+        let partial = try await inspect(copy)
+        XCTAssertEqual(partial.tracks, 1)
+        XCTAssertEqual(partial.size, CGSize(width: 320, height: 240))
+        XCTAssertGreaterThanOrEqual(partial.seconds, 1)
+        XCTAssertLessThanOrEqual(partial.seconds, 4.8)
+
+        recorder.append(frame: frame(320, 240, step: 25), at: .milliseconds(5000)); _ = await recorder.waitUntilReady()
+        await recorder.finish()
+        XCTAssertNil(recorder.errorMessage)
+        let whole = try await inspect(url)
+        XCTAssertEqual(whole.tracks, 1)
+        XCTAssertEqual(whole.seconds, 5.0, accuracy: 0.3)
+    }
+
+    func testFileThatIsNoMovieIsNotPlayable() async throws {
+        let url = base.appendingPathComponent("text.mp4")
+        try Data("not a movie".utf8).write(to: url)
+        let plays = await VideoRecorder.isPlayable(url)
+        XCTAssertFalse(plays)
+        let missing = await VideoRecorder.isPlayable(base.appendingPathComponent("missing.mp4"))
+        XCTAssertFalse(missing)
+    }
+
+    func testFramesWithUnevenTimesAreWrittenWithoutAWriterError() async throws {
+        let url = base.appendingPathComponent("uneven.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        var seconds = 0.0
+        for i in 0..<100 {
+            let tick = Int64(seconds * Double(VideoRecorder.timeScale))
+            seconds += 0.2
+            recorder.append(frame: noisyFrame(1280, 800, step: i), at: .nanoseconds(tick * 1_000_000_000 / Int64(VideoRecorder.timeScale) + 500_000))
+            _ = await recorder.waitUntilReady()
+        }
+        await recorder.finish()
+        XCTAssertNil(recorder.errorMessage)
+        XCTAssertEqual(recorder.droppedFrames, 0)
+        let info = try await inspect(url)
+        XCTAssertEqual(info.size, CGSize(width: 1280, height: 800))
+        XCTAssertEqual(info.seconds, 19.8, accuracy: 0.3)
+    }
+
     func testFramesOfDifferentSizeAreFitted() async throws {
         let url = base.appendingPathComponent("fit.mp4")
         let recorder = VideoRecorder(url: url, fps: 5)
@@ -425,6 +477,25 @@ private final class ProbeSink: VideoSink, @unchecked Sendable {
         }
     }
     func finish() async { lock.withLock { finishedAfterLastAppend = true } }
+}
+
+/// A gray frame with a white square of 200 pixels that moves right as `step` grows and a band of pixel noise that differs for every `step`.
+private func noisyFrame(_ width: Int, _ height: Int, step: Int) -> Frame {
+    var pixels = Data(repeating: 0x40, count: width * height * 4)
+    let blockX = (step * 12) % max(1, width - 200)
+    var seed = UInt32(truncatingIfNeeded: step &* 2_654_435_761)
+    pixels.withUnsafeMutableBytes { raw in
+        for y in height / 4..<min(height, height / 4 + 200) {
+            for x in blockX * 4..<min(width, blockX + 200) * 4 { raw[y * width * 4 + x] = 255 }
+        }
+        for y in height * 5 / 8..<min(height, height * 5 / 8 + 200) {
+            for x in 0..<min(width, 400) * 4 {
+                seed = seed &* 1_664_525 &+ 1_013_904_223
+                raw[y * width * 4 + x] = UInt8(truncatingIfNeeded: seed >> 24)
+            }
+        }
+    }
+    return Frame(width: width, height: height, pixels: pixels)
 }
 
 /// A gray frame with a white block that moves right as `step` grows.

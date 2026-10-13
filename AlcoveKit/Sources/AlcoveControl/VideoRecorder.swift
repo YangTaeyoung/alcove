@@ -4,7 +4,8 @@ import CoreGraphics
 import CoreMedia
 import CoreVideo
 
-/// Writes frames as an H.264 MP4 file.
+/// Writes frames as an H.264 MP4 file in movie fragments of `fragmentInterval`: a copy of the file made while it is
+/// written plays up to its last whole fragment. Frames are encoded in display order.
 ///
 /// The output size is fixed by the first frame: rounded down to even numbers and scaled down so the longer side is at most
 /// `maxLongSide`. Frames of another size are drawn aspect-fit on black.
@@ -15,6 +16,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     static let maxLongSide = 1920
     static let timeScale: CMTimeScale = 600
     static let noFrameMessage = "no frame could be recorded for the video"
+    static let fragmentInterval = CMTime(value: CMTimeValue(timeScale), timescale: timeScale)
 
     let url: URL
     let fps: Int
@@ -56,6 +58,13 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
             h = (h * scale).rounded(.down)
         }
         return (max(2, Int(w) & ~1), max(2, Int(h) & ~1))
+    }
+
+    /// Whether the file at `url` opens as a movie with a video track.
+    static func isPlayable(_ url: URL) async -> Bool {
+        let asset = AVURLAsset(url: url)
+        guard (try? await asset.load(.isPlayable)) == true else { return false }
+        return ((try? await asset.loadTracks(withMediaType: .video))?.count ?? 0) > 0
     }
 
     /// Frames not appended because the encoder was not ready for them.
@@ -186,6 +195,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
         do {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
             writer.movieTimeScale = VideoRecorder.timeScale
+            writer.movieFragmentInterval = VideoRecorder.fragmentInterval
             let settings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: size.width,
@@ -194,6 +204,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                     AVVideoExpectedSourceFrameRateKey: fps,
                     AVVideoAverageBitRateKey: max(500_000, size.width * size.height * 2),
                     AVVideoMaxKeyFrameIntervalDurationKey: 2,
+                    AVVideoAllowFrameReorderingKey: false,
                 ] as [String: Any],
             ]
             let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
