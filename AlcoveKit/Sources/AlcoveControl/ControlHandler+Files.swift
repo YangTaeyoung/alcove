@@ -37,15 +37,7 @@ extension ControlHandler {
                     throw ControlError.failed("file must be the name of a .dmp file listed by vm.crash_dumps.list, without a folder")
                 }
                 let path = try string(params, "path")
-                do {
-                    return try await pull(t, guestPath: GuestRecipes.dumpFolder + "\\" + file, to: path)
-                } catch AgentClient.AgentError.remote("digest mismatch after download") {
-                    throw ControlError.failed("the dump changed while it was pulled; retry in a few seconds")
-                } catch AgentClient.AgentError.remote(let text) where text.contains("being used by another process") {
-                    throw ControlError.failed("the dump '\(file)' is still being written; retry in a few seconds")
-                } catch AgentClient.AgentError.remote(let text) where text.hasSuffix("is not a file in the guest; check the path") {
-                    throw ControlError.failed("\(GuestRecipes.dumpFolder) holds no dump named '\(file)'; list the dumps with vm.crash_dumps.list")
-                }
+                return try await pullDump(t, file: file, to: path)
             case "vm.sync_dir":
                 let path = try string(params, "path")
                 let guestPath = try string(params, "guestPath")
@@ -84,6 +76,11 @@ extension ControlHandler {
     /// The last `tail` lines through `fs.tail`, or up to `length` bytes from `offset` through `fs.read`, decoded as text;
     /// as UTF-16LE when the agent reports that encoding for the file.
     func readText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
+        try await readTextReply(t, params).reply
+    }
+
+    /// The result of `readText` and the number of bytes of the file the agent sent for it.
+    func readTextReply(_ t: VMTarget, _ params: JSON) async throws -> (reply: JSON, bytes: Int) {
         let path = try string(params, "path")
         var range: [String: JSON] = [:]
         try pass(params, "tail", to: &range, as: "lines", type: .integer)
@@ -98,8 +95,9 @@ extension ControlHandler {
             r = try await agent.call("fs.read", ["path": .string(path), "offset": range["offset"] ?? 0, "length": .int(Int64(length))])
         }
         let data = Data(base64Encoded: r["data"]?.stringValue ?? "") ?? Data()
-        return ["text": .string(GuestText.decode(data, utf16: r["encoding"]?.stringValue == "utf-16le")), "size": r["size"] ?? 0,
-                "eof": .bool(range["lines"] != nil || r["eof"]?.boolValue == true)]
+        let reply: JSON = ["text": .string(GuestText.decode(data, utf16: r["encoding"]?.stringValue == "utf-16le")), "size": r["size"] ?? 0,
+                           "eof": .bool(range["lines"] != nil || r["eof"]?.boolValue == true)]
+        return (reply, data.count)
     }
 
     /// Writes `text` as UTF-8 in pieces of at most `filePiece` bytes: the first piece replaces the file unless `append` is set, the rest append.
@@ -121,10 +119,28 @@ extension ControlHandler {
         return ["size": size]
     }
 
-    /// Copies the guest file `guestPath` to the host path `path` and reports its size and SHA-256.
-    private func pull(_ t: VMTarget, guestPath: String, to path: String) async throws -> JSON {
-        let r = try await tools(t).pullFile(guestPath: guestPath, to: URL(fileURLWithPath: path))
+    /// Copies the guest file `guestPath` to the host path `path` and reports its size and SHA-256; `deadline` and
+    /// `maxBytes` bound the pull as `AgentClient.pullFile` describes.
+    private func pull(_ t: VMTarget, guestPath: String, to path: String, deadline: ContinuousClock.Instant? = nil,
+                      maxBytes: Int? = nil) async throws -> JSON {
+        let r = try await tools(t).pullFile(guestPath: guestPath, to: URL(fileURLWithPath: path), deadline: deadline, maxBytes: maxBytes)
         return ["path": .string(path), "bytes": .int(Int64(r.bytes)), "sha256": .string(r.sha256)]
+    }
+
+    /// Copies the dump `file` of the guest's dump folder to the host path `path`, as `pull` does; a dump whose
+    /// content changed during the pull, a dump that is still being written and a name the folder does not hold are
+    /// each reported with their own sentence.
+    func pullDump(_ t: VMTarget, file: String, to path: String, deadline: ContinuousClock.Instant? = nil,
+                  maxBytes: Int? = nil) async throws -> JSON {
+        do {
+            return try await pull(t, guestPath: GuestRecipes.dumpFolder + "\\" + file, to: path, deadline: deadline, maxBytes: maxBytes)
+        } catch AgentClient.AgentError.remote("digest mismatch after download") {
+            throw ControlError.failed("the dump changed while it was pulled; retry in a few seconds")
+        } catch AgentClient.AgentError.remote(let text) where text.contains("being used by another process") {
+            throw ControlError.failed("the dump '\(file)' is still being written; retry in a few seconds")
+        } catch AgentClient.AgentError.remote(let text) where text.hasSuffix("is not a file in the guest; check the path") {
+            throw ControlError.failed("\(GuestRecipes.dumpFolder) holds no dump named '\(file)'; list the dumps with vm.crash_dumps.list")
+        }
     }
 
     private nonisolated func requireHostFile(_ path: String) throws {
