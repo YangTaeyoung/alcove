@@ -1,7 +1,7 @@
 // The replay toolset: scripts saved from a recording and replayed without a model.
 import { z } from "zod";
 import { type ControlClient } from "../control.js";
-import { fail, text, SCRIPT_RUN_TIMEOUT_MS, SCRIPT_SAVE_TIMEOUT_MS, type Registrar, type ToolResult } from "../toolkit.js";
+import { fail, text, SCRIPT_RUN_TIMEOUT_MS, SCRIPT_SAVE_TIMEOUT_MS, MODEL_IMAGE_MAX_WIDTH, type Registrar, type ToolResult } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -18,17 +18,36 @@ export function variablesLine(variables: Record<string, string>): string[] {
   return [`variables: ${names.map((n) => `${n}=${isSecretName(n) ? "<hidden>" : variables[n]}`).join(", ")}`];
 }
 
-/** `s` without the values of the secret variables. */
-export function maskSecrets(s: string, variables: Record<string, string>): string {
-  const values = Object.entries(variables)
+/** A secret value this long is also hidden where it occurs inside a longer string. */
+const MIN_SUBSTRING_SECRET = 8;
+
+/** `value` with `<hidden>` in place of each string that equals the value of a secret variable and of each occurrence of a value of 8 or more characters inside a longer string; other values are kept. */
+export function maskValue<T>(value: T, variables: Record<string, string>): T {
+  const secrets = Object.entries(variables)
     .filter(([n, v]) => isSecretName(n) && v !== "")
     .map(([, v]) => v)
     .sort((a, b) => b.length - a.length);
-  return values.reduce((out, v) => out.split(v).join("<hidden>"), s);
+  if (secrets.length === 0) return value;
+  const walk = (item: unknown): unknown => {
+    if (typeof item === "string") {
+      if (secrets.includes(item)) return "<hidden>";
+      return secrets.filter((v) => v.length >= MIN_SUBSTRING_SECRET).reduce((out, v) => out.split(v).join("<hidden>"), item);
+    }
+    if (Array.isArray(item)) return item.map(walk);
+    if (item && typeof item === "object") return Object.fromEntries(Object.entries(item).map(([k, v]) => [k, walk(v)]));
+    return item;
+  };
+  return walk(value) as T;
+}
+
+/** `s` hidden like `maskValue`. */
+export function maskSecrets(s: string, variables: Record<string, string>): string {
+  return maskValue(s, variables);
 }
 
 /** `ok` or `FAIL`, number, label (the op without one), milliseconds and `[fallback]`, `[alt selector]`, `[positional]`; then the warning and `PASSED` or `FAILED`. */
-export function runLines(reply: Obj, variables: Record<string, string>): string[] {
+export function runLines(unmasked: Obj, variables: Record<string, string>): string[] {
+  const reply = maskValue(unmasked, variables);
   const out: string[] = [];
   for (const entry of (reply.steps as Obj[] | undefined) ?? []) {
     const ok = entry.ok === true;
@@ -50,7 +69,7 @@ export function runLines(reply: Obj, variables: Record<string, string>): string[
       ? `PASSED: ${count} step${count === 1 ? "" : "s"} in ${seconds} s`
       : `FAILED: ${typeof reply.failedStep === "number" ? `step ${reply.failedStep} failed` : "the run stopped"} after ${seconds} s`,
   );
-  return out.map((l) => maskSecrets(l, variables));
+  return out;
 }
 
 /** `saved <path>`, the step count, the skipped trace lines when there are any, then each warning on its own line. */
@@ -107,36 +126,36 @@ export function register(r: Registrar, client: ControlClient): void {
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   }, async (a): Promise<ToolResult> => {
+    const variables = (a.variables ?? {}) as Record<string, string>;
     try {
-      const variables = (a.variables ?? {}) as Record<string, string>;
       const reply = await client.call("script.run", {
         path: a.path,
         ...(a.name !== undefined ? { name: a.name } : {}),
         ...(a.variables !== undefined ? { variables: a.variables } : {}),
         ...(a.snapshot !== undefined ? { snapshot: a.snapshot } : {}),
+        maxWidth: MODEL_IMAGE_MAX_WIDTH,
       }, SCRIPT_RUN_TIMEOUT_MS);
       const failure = reply.failure as Obj | undefined;
       const lines = [...variablesLine(variables), ...runLines(reply, variables)];
-      const structured: Obj = {
+      const structured: Obj = maskValue({
         passed: reply.passed,
         stepsRun: reply.stepsRun,
         seconds: reply.seconds,
         steps: reply.steps,
         ...(reply.failedStep !== undefined ? { failedStep: reply.failedStep } : {}),
-        ...(reply.error !== undefined ? { error: maskSecrets(String(reply.error), variables) } : {}),
+        ...(reply.error !== undefined ? { error: reply.error } : {}),
         ...(reply.warning !== undefined ? { warning: reply.warning } : {}),
         ...(failure ? { failure: { width: failure.width, height: failure.height } } : {}),
-      };
-      const result = text(lines.join("\n"), JSON.parse(maskSecrets(JSON.stringify(structured), jsonEscaped(variables))) as Obj);
+      }, variables);
+      const result = text(lines.join("\n"), structured);
       if (typeof failure?.png === "string") result.content.push({ type: "image", data: failure.png, mimeType: "image/png" });
       return result;
     } catch (e) {
-      return fail(e);
+      const failed = fail(e);
+      const sentence = maskSecrets((failed.content[0] as { text: string }).text, variables);
+      return { ...failed, content: [{ type: "text", text: /^script\.run timed out after /.test(sentence) ? `${sentence}. ${RUN_TIMEOUT_ADVICE}` : sentence }] };
     }
   });
 }
 
-/** The variables with each value as it appears inside a JSON string. */
-function jsonEscaped(variables: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(Object.entries(variables).map(([n, v]) => [n, JSON.stringify(v).slice(1, -1)]));
-}
+const RUN_TIMEOUT_ADVICE = "The run may still be going in the guest and holding the VM's lease; look with alcove_vm_status or alcove_screenshot, wait for it to end, then run the script again.";

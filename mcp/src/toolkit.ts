@@ -94,7 +94,7 @@ export const FIND_TEXT_TIMEOUT_MS = TEXT_TURN_MS + TEXT_READING_MS + CALL_MARGIN
 export const UI_CALL_TIMEOUT_MS = uiCallTimeout(1);
 /** `client.call` timeout in ms of `alcove_deploy`: copy, installer, launch and window wait. */
 export const DEPLOY_TIMEOUT_MS = 5400000;
-/** Longest the steps of one `script.run` are waited for, in ms: two hours. The control op has no limit on the number of steps; each step is held to 600 s of expectations plus its op. */
+/** Longest the steps of one `script.run` are waited for, in ms: two hours. */
 export const SCRIPT_STEPS_BUDGET_MS = 7200000;
 /** `client.call` timeout in ms of `vm.snapshot.restore`. */
 export const SNAPSHOT_RESTORE_MS = 660000;
@@ -102,6 +102,8 @@ export const SNAPSHOT_RESTORE_MS = 660000;
 export const SCREENSHOT_CALL_MS = 60000;
 /** `client.call` timeout in ms of `alcove_script_run`: the optional snapshot restore, the steps, the failure screenshot and the margin. */
 export const SCRIPT_RUN_TIMEOUT_MS = SNAPSHOT_RESTORE_MS + SCRIPT_STEPS_BUDGET_MS + SCREENSHOT_CALL_MS + CALL_MARGIN_MS;
+/** Widest image in pixels that tools return to the model; the control op scales larger screenshots down to it. */
+export const MODEL_IMAGE_MAX_WIDTH = 1280;
 /** `client.call` timeout in ms of `alcove_script_save`, which reads a trace file on the Mac. */
 export const SCRIPT_SAVE_TIMEOUT_MS = 120000;
 

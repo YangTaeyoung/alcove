@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { register, isSecretName, runLines } from "./tools/replay.js";
+import { register, isSecretName, runLines, maskSecrets } from "./tools/replay.js";
 import { CALL_MARGIN_MS, SCRIPT_RUN_TIMEOUT_MS, SCRIPT_STEPS_BUDGET_MS, SNAPSHOT_RESTORE_MS, SCREENSHOT_CALL_MS } from "./toolkit.js";
 import { ControlError } from "./control.js";
 import type { ToolHandler } from "./toolkit.js";
@@ -29,10 +29,10 @@ test("alcove_script_save prints the path, the steps, the skipped lines and each 
 test("alcove_script_run sends path, variables, snapshot and name", async () => {
   const t = rig(register, { passed: true, stepsRun: 1, seconds: 1, steps: [step(1)] });
   await t.run("alcove_script_run", { path: "/s/a.json", variables: { message: "hi" }, snapshot: "clean", name: "Win" });
-  assert.deepEqual(t.calls[0], { op: "script.run", params: { path: "/s/a.json", name: "Win", variables: { message: "hi" }, snapshot: "clean" } });
+  assert.deepEqual(t.calls[0], { op: "script.run", params: { path: "/s/a.json", name: "Win", variables: { message: "hi" }, snapshot: "clean", maxWidth: 1280 } });
   const bare = rig(register, { passed: true, stepsRun: 1, seconds: 1, steps: [step(1)] });
   await bare.run("alcove_script_run", { path: "/s/a.json" });
-  assert.deepEqual(bare.calls[0].params, { path: "/s/a.json" });
+  assert.deepEqual(bare.calls[0].params, { path: "/s/a.json", maxWidth: 1280 });
 });
 
 test("a passed run prints one line per step with its markers and a PASSED line", async () => {
@@ -67,15 +67,15 @@ test("a failed run prints the error and the warning and returns the failure scre
 
 test("variables with secret names are printed as <hidden> and their values are removed from the output", async () => {
   const t = rig(register, {
-    passed: false, stepsRun: 1, failedStep: 1, seconds: 1, error: "step 1 (type hunter2) failed: typed hunter2",
-    steps: [step(1, { label: "type hunter2", ok: false, error: "typed hunter2", result: { text: "hunter2" } })],
+    passed: false, stepsRun: 1, failedStep: 1, seconds: 1, error: "step 1 (type hunter2-long) failed: typed hunter2-long",
+    steps: [step(1, { label: "type hunter2-long", ok: false, error: "typed hunter2-long", result: { text: "hunter2-long" } })],
   });
-  const r = await t.run("alcove_script_run", { path: "/s/a.json", variables: { message: "hello", password: "hunter2" } });
+  const r = await t.run("alcove_script_run", { path: "/s/a.json", variables: { message: "hello", password: "hunter2-long" } });
   assert.equal(textOf(r).split("\n")[0], "variables: message=hello, password=<hidden>");
-  assert.doesNotMatch(textOf(r), /hunter2/);
-  assert.doesNotMatch(JSON.stringify(r.structuredContent), /hunter2/);
+  assert.doesNotMatch(textOf(r), /hunter2-long/);
+  assert.doesNotMatch(JSON.stringify(r.structuredContent), /hunter2-long/);
   assert.match(textOf(r), /typed <hidden>/);
-  assert.deepEqual(t.calls[0].params.variables, { message: "hello", password: "hunter2" });
+  assert.deepEqual(t.calls[0].params.variables, { message: "hello", password: "hunter2-long" });
 });
 
 test("secret variable names", () => {
@@ -112,4 +112,56 @@ test("the replay tools are described for the model", () => {
   const run = t.descriptions.get("alcove_script_run") ?? "";
   for (const phrase of ["dir", "trace", "coordinates kept as a fallback", "whatever is at that position", "never stored", "variables"]) assert.ok(save.includes(phrase), phrase);
   for (const phrase of ["whatever is at that position", "variables", "restores that snapshot", "mouse and keyboard"]) assert.ok(run.includes(phrase), phrase);
+});
+
+test("short secret values hide only whole strings and never break the structured result", async () => {
+  const t = rig(register, {
+    passed: false, stepsRun: 1, failedStep: 1, seconds: 1, error: "step 1 failed: 1 of 11",
+    steps: [step(1, { label: "1", ok: false, error: "1", result: { count: 1, flag: true, text: "11" } })],
+  });
+  const r = await t.run("alcove_script_run", { path: "/s/a.json", variables: { pin_key: "1", other_token: "true" } });
+  assert.notEqual(r.isError, true);
+  assert.equal(textOf(r), [
+    "variables: other_token=<hidden>, pin_key=<hidden>",
+    "FAIL 1 <hidden> 250 ms",
+    "     <hidden>",
+    "error: step 1 failed: 1 of 11",
+    "FAILED: step 1 failed after 1.0 s",
+  ].join("\n"));
+  const steps = r.structuredContent?.steps as Array<Record<string, unknown>>;
+  assert.deepEqual(steps[0].result, { count: 1, flag: true, text: "11" });
+  assert.equal(steps[0].step, 1);
+});
+
+test("a secret of eight characters or more is hidden inside longer strings and inside the structured result", async () => {
+  const t = rig(register, {
+    passed: false, stepsRun: 1, failedStep: 1, seconds: 1, error: "step 1 failed: typed S3cret-value",
+    steps: [step(1, { ok: false, error: "typed S3cret-value", result: { nested: ["S3cret-value", "x S3cret-value y"] } })],
+  });
+  const r = await t.run("alcove_script_run", { path: "/s/a.json", variables: { password: "S3cret-value" } });
+  assert.doesNotMatch(textOf(r), /S3cret/);
+  assert.doesNotMatch(JSON.stringify(r.structuredContent), /S3cret/);
+  assert.deepEqual((r.structuredContent?.steps as Array<Record<string, unknown>>)[0].result, { nested: ["<hidden>", "x <hidden> y"] });
+  assert.equal(maskSecrets("a S3cret-value b", { password: "S3cret-value" }), "a <hidden> b");
+});
+
+test("a control error sentence is returned with secret values hidden", async () => {
+  const client = { call: async () => { throw new ControlError("cannot use S3cret-value here"); } };
+  const handlers = new Map<string, ToolHandler>();
+  register({ tool: (_set, name, _config, handler) => { handlers.set(name, handler); } }, client as never);
+  const r = await handlers.get("alcove_script_run")!({ path: "/x", variables: { password: "S3cret-value" } });
+  assert.equal(r.isError, true);
+  assert.equal(textOf(r), "cannot use <hidden> here");
+});
+
+test("a client timeout says that the run may still be going in the guest", async () => {
+  const client = { call: async () => { throw new ControlError("script.run timed out after 7925s"); } };
+  const handlers = new Map<string, ToolHandler>();
+  register({ tool: (_set, name, _config, handler) => { handlers.set(name, handler); } }, client as never);
+  const r = await handlers.get("alcove_script_run")!({ path: "/x" });
+  assert.equal(r.isError, true);
+  assert.equal(
+    textOf(r),
+    "script.run timed out after 7925s. The run may still be going in the guest and holding the VM's lease; look with alcove_vm_status or alcove_screenshot, wait for it to end, then run the script again.",
+  );
 });
