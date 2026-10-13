@@ -38,7 +38,9 @@ actor FakeTarget: VMTarget {
     func guestOS() async -> VMConfig.GuestOS { os }
     func setOS(_ value: VMConfig.GuestOS) { os = value }
     func state() async -> VMController.State { stateValue }
-    func isSuspended() async -> Bool { false }
+    var suspended = false
+    func isSuspended() async -> Bool { suspended }
+    func setSuspended(_ value: Bool) { suspended = value }
     func start() async throws { try await start(discardChanges: false) }
     /// What `start` and `stop` throw when set.
     var startError: Error?
@@ -48,7 +50,7 @@ actor FakeTarget: VMTarget {
     func start(discardChanges: Bool) async throws {
         if let startError { throw startError }
         startCount += 1; startDiscard.append(discardChanges)
-        ephemeral = discardChanges; stateValue = .running
+        ephemeral = discardChanges; stateValue = .running; suspended = false
     }
     func stop(force: Bool) async throws { if let stopError { throw stopError }; stopCount += 1; stateValue = .stopped; ephemeral = false }
     func isEphemeral() async -> Bool { ephemeral }

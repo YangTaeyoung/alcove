@@ -525,6 +525,53 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(commands(agent), [GuestRecipes.doctorProbe(os: .linux)])
     }
 
+    // MARK: - start of a suspended session
+
+    func testStartOfASuspendedSessionSyncsTheClock() async throws {
+        let (h, t, agent) = try await setup(state: .stopped) { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m)] : []
+        }
+        await t.setSuspended(true)
+        let r = try await h.handle(op: "vm.start", params: ["name": "Win", "waitTools": 0])
+        XCTAssertEqual(r["state"]?.stringValue, "running")
+        XCTAssertEqual(r["ephemeral"]?.boolValue, false)
+        XCTAssertEqual(r["resumed"]?.boolValue, true)
+        XCTAssertEqual(r["tools"]?.boolValue, true)
+        XCTAssertEqual(r["clockSynced"]?.boolValue, true)
+        XCTAssertEqual(commands(agent), [GuestRecipes.setClock(unixSeconds: 1_800_000_000, os: .windows)])
+    }
+
+    func testStartOfASuspendedSessionWithoutToolsDoesNotSyncTheClock() async throws {
+        let (h, t, _) = try await setup(state: .stopped, connected: false)
+        await t.setSuspended(true)
+        let r = try await h.handle(op: "vm.start", params: ["name": "Win", "waitTools": 0])
+        XCTAssertEqual(r["resumed"]?.boolValue, true)
+        XCTAssertEqual(r["tools"]?.boolValue, false)
+        XCTAssertEqual(r["clockSynced"]?.boolValue, false)
+    }
+
+    func testStartOfAStoppedVMRunsNoGuestCommand() async throws {
+        let (h, _, agent) = try await setup(state: .stopped) { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m)] : []
+        }
+        let r = try await h.handle(op: "vm.start", params: ["name": "Win"])
+        XCTAssertEqual(r["state"]?.stringValue, "running")
+        XCTAssertNil(r["resumed"])
+        XCTAssertNil(r["tools"])
+        XCTAssertNil(r["clockSynced"])
+        XCTAssertEqual(commands(agent), [])
+    }
+
+    func testStartOfARunningVMWithASavedSessionFileRunsNoGuestCommand() async throws {
+        let (h, t, agent) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m)] : []
+        }
+        await t.setSuspended(true)
+        let r = try await h.handle(op: "vm.start", params: ["name": "Win"])
+        XCTAssertNil(r["resumed"])
+        XCTAssertEqual(commands(agent), [])
+    }
+
     // MARK: - snapshot restore
 
     func testRestoreSyncsClock() async throws {

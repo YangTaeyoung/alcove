@@ -161,12 +161,20 @@ public actor ControlHandler {
                 }
             } else {
                 runtimeForwards[t.name] = nil
+                let resuming = await t.isSuspended()
                 do {
                     try await t.start(discardChanges: discard)
                 } catch VMController.ControllerError.engineDidNotStart(let reason) {
                     throw ControlError.failed("start failed: \(reason)")
                 } catch {
                     throw ControlError.failed("start failed: \(ControlHandler.failureReason(error, fallback: "the VM did not start; check vm.status"))")
+                }
+                if resuming {
+                    let agent = await t.agent(timeout: .seconds(max(0, params["waitTools"]?.intValue ?? 30)))
+                    var clockSynced = false
+                    if let agent { clockSynced = await syncGuestClock(t, agent: agent) }
+                    return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral()),
+                            "resumed": true, "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced)]
                 }
             }
             return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral())]

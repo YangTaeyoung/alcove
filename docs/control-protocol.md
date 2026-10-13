@@ -58,7 +58,7 @@ affected. The control socket carries no events: a job's exit is seen through
 | `hello` | — | `{version: 1, host: "app"|"headless"}` |
 | `vm.list` | — | `{vms: [{name, guestOS, state, suspended, width?, height?, error?, leasedBy?, cloneOf?, ephemeral?}]}` — see [VM rows](#vm-rows) |
 | `vm.status` | `name` | the VM's row plus, while it is running or paused, `tools: bool` and, with tools, `agentCaps: [...]` |
-| `vm.start` | `name`, `discardChanges?` | `{state, ephemeral}` after the guest is running — see [Starting](#starting) |
+| `vm.start` | `name`, `discardChanges?`, `waitTools?` | `{state, ephemeral}` after the guest is running; `{state, ephemeral, resumed, tools, clockSynced}` when it resumed a session saved to disk — see [Starting](#starting) |
 | `vm.stop` | `name`, `force?` | `{state}` after the engine exited (graceful ACPI first) |
 | `vm.clone` | `name` (the template), `newName` | `{name}` — see [Linked clones](#linked-clones) |
 | `vm.delete` | `name` (a clone) | `{}` — see [Linked clones](#linked-clones) |
@@ -303,6 +303,16 @@ anything, except with `discardChanges: true`, which then
 answers `VM '<vm>' is already running; stop it first to start a session that
 discards changes`. `ephemeral` in the result says whether the running session
 discards its changes.
+
+A VM with a session saved to disk (`suspended: true` in its row) resumes that
+session: the guest continues where it was saved, with its clock at the time of
+the save. The server then connects to the guest tools for up to `waitTools`
+seconds (default 30; below 0 counts as 0) and, when they can run commands,
+sets the guest clock to the host's. The result carries `resumed: true`,
+`tools` (whether they connected) and `clockSynced` (whether the clock was
+set); with `clockSynced: false`, call `vm.set_environment` with `clock:
+"host"` once the tools are connected. A start that boots the VM has none of
+the three fields and does not wait for the guest tools.
 
 `discardChanges` (a boolean, default `false`) starts a session whose disk
 writes go to qcow2 overlays (`run/ephemeral-<disk>.qcow2` in the bundle) and
