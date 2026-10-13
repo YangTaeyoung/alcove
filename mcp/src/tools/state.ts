@@ -108,9 +108,14 @@ export function register(r: Registrar, client: LeasedControlClient): void {
           LONG_MS,
         );
         const tools = res.tools === true;
+        const clock = res.clockSynced === true;
+        const next = tools
+          ? "call alcove_set_environment with clock \"host\""
+          : "call alcove_vm_status until the tools are connected, then alcove_set_environment with clock \"host\"";
         return text(
           `restored '${name}' to snapshot '${snapshot}'; ` +
-            (tools ? "guest tools reconnected; guest clock synced" : "guest tools did not reconnect in time; guest clock not synced"),
+            (tools ? "guest tools reconnected; " : "guest tools did not reconnect in time; ") +
+            (clock ? "guest clock synced" : `guest clock not synced; ${next}`),
         );
       } catch (e) {
         return fail(e);
@@ -158,7 +163,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_delete_vm",
     {
       title: "Delete VM",
-      description: "Permanently delete a VM and its disk.",
+      description: "Permanently delete a stopped linked clone and its disk. A VM that is not a clone is refused.",
       inputSchema: { name: vmName },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
@@ -212,8 +217,11 @@ export function register(r: Registrar, client: LeasedControlClient): void {
       try {
         const lease = client.leases.get(name);
         if (lease === undefined) throw new ControlError(`this session holds no lease on '${name}'; call alcove_lease_acquire first`);
-        await client.call("vm.lease.release", { name, lease });
-        client.leases.clear(name);
+        try {
+          await client.call("vm.lease.release", { name, lease });
+        } finally {
+          client.leases.clear(name);
+        }
         return text(`released the lease on '${name}'`);
       } catch (e) {
         return fail(e);
@@ -270,7 +278,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_port_forward_list",
     {
       title: "List port forwards",
-      description: "List the port forwards of a VM; kind is config (saved with the VM) or runtime (until the VM stops).",
+      description: "List the port forwards of a VM; kind is config (saved with the VM), agent (the forward the guest tools use) or runtime (added with alcove_port_forward_add, until the VM stops).",
       inputSchema: { name: vmName },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -331,7 +339,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     {
       title: "Set guest environment",
       description:
-        "Change guest settings for testing: theme, time zone, clock, locale, keyboard layouts and display scale. Each applied setting reports whether it took effect now, after an app restart or after sign-out.",
+        "Change guest settings for testing: theme, time zone, clock, locale, keyboard layouts and display scale. Each applied setting reports whether it took effect now or for programs started afterwards (app restart).",
       inputSchema: {
         name: vmName,
         theme: z.enum(["dark", "light"]).optional(),
@@ -355,7 +363,8 @@ export function register(r: Registrar, client: LeasedControlClient): void {
         const res = await client.call("vm.set_environment", params, 180000);
         const rows = (res.applied as EnvRow[]) ?? [];
         const lines = rows.map((a) => `${a.setting}: ${a.ok ? "ok" : "FAILED"} — ${a.detail} (takes effect: ${a.takesEffect})`);
-        return text(lines.length ? lines.join("\n") : "no settings given", { applied: rows });
+        const result = text(lines.length ? lines.join("\n") : "no settings given", { applied: rows });
+        return rows.some((a) => !a.ok) ? { ...result, isError: true } : result;
       } catch (e) {
         return fail(e);
       }

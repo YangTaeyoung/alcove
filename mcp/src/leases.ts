@@ -1,5 +1,10 @@
 // Lease tokens held by this server and the control client that attaches them.
-import { ControlClient, type ControlReply } from "./control.js";
+import { ControlClient, ControlError, type ControlReply } from "./control.js";
+
+/** Whether a control error says that a lease token is not the one that holds the VM. */
+export function isLeaseLost(message: string): boolean {
+  return /lease token does not match/.test(message) || /^VM '.*' is leased by /.test(message);
+}
 
 /** Remembers lease tokens per VM and adds `lease` to params of calls that name that VM. */
 export class LeaseBook {
@@ -30,12 +35,20 @@ export class LeaseBook {
   }
 }
 
-/** A ControlClient whose calls carry the lease this session holds for the VM they name. */
+/**
+ * A ControlClient whose calls carry the lease this session holds for the VM they name.
+ * A call that fails with a lease error (`isLeaseLost`) removes the stored lease of the VM it names.
+ */
 export class LeasedControlClient extends ControlClient {
   readonly leases = new LeaseBook();
 
-  override call(op: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<ControlReply> {
-    return super.call(op, this.leases.apply(params), timeoutMs);
+  override async call(op: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<ControlReply> {
+    try {
+      return await super.call(op, this.leases.apply(params), timeoutMs);
+    } catch (e) {
+      if (e instanceof ControlError && typeof params.name === "string" && isLeaseLost(e.message)) this.leases.clear(params.name);
+      throw e;
+    }
   }
 
   /** Releases every held lease, ignoring failures. */
