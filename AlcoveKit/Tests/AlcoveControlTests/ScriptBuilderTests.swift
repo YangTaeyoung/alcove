@@ -497,6 +497,8 @@ final class ScriptBuilderTests: XCTestCase {
             entry(13, "vm.mouse.click", ["x": 190, "y": 112], ["target": user]),
             entry(14, "vm.type", ["text": "bob"]),
             entry(15, "vm.exec", ["command": "x", "env": ["password": "<masked>", "DB_PASSWORD": "<masked>"]], result: ["code": 0]),
+            entry(16, "vm.ui.click", ["selector": byID], result: ["x": 190, "y": 112, "node": secretNode]),
+            entry(17, "vm.type", ["text": "after-selector"]),
         ], vm: "Win", from: nil, to: nil)
         let script = draft.script
         XCTAssertEqual(script.steps.map(\.params), [
@@ -514,15 +516,18 @@ final class ScriptBuilderTests: XCTestCase {
             ["selector": ["window": "Sign in", "role": "Edit", "name": "User"], "fallback": ["x": 190, "y": 112]],
             ["text": "bob"],
             ["command": "x", "env": ["password": "${password9}", "DB_PASSWORD": "${DB_PASSWORD}"]],
+            ["selector": byID],
+            ["text": "${password10}"],
         ])
         XCTAssertEqual(script.steps.map(\.label), [
             "vm.key.press tab", "vm.type into a password field", "vm.type into a password field", "vm.ui.type Edit #pw",
             "vm.ui.action set_value Edit #pw", "vm.ui.type Edit #pw", "vm.ui.action set_value Edit #pw", "vm.type \"<masked>ada\"", "vm.ui.click Edit #pw",
             "vm.type into a password field", "vm.type into a password field", "vm.ui.click Edit \"User\"", "vm.type \"bob\"", "vm.exec x",
+            "vm.ui.click Edit #pw", "vm.type into a password field",
         ])
         XCTAssertEqual(script.variables, [:])
         XCTAssertEqual(draft.required, ["password", "password2", "password3", "password4", "password5", "password6", "password7", "password8",
-                                        "DB_PASSWORD", "password9"])
+                                        "DB_PASSWORD", "password9", "password10"])
         func reads(_ line: String, _ param: String, _ variable: String) -> String {
             "\(line): its \(param) goes into a password field and is not written to the script; the step reads it from the variable '\(variable)', "
                 + "pass it in variables when running the script"
@@ -534,9 +539,10 @@ final class ScriptBuilderTests: XCTestCase {
             reads("seq 11 (vm.type)", "text", "password7"), reads("seq 12 (vm.type)", "text", "password8"),
             "seq 15 (vm.exec): the trace masks the env value 'DB_PASSWORD'; the step reads it from the variable 'DB_PASSWORD', pass it in variables when running the script",
             "seq 15 (vm.exec): the trace masks the env value 'password'; the step reads it from the variable 'password9', pass it in variables when running the script",
+            reads("seq 17 (vm.type)", "text", "password10"),
         ])
         let text = String(decoding: try script.encoded(), as: UTF8.self)
-        for hidden in ["typed-unseen", "typed-seen"] { XCTAssertFalse(text.contains(hidden), hidden) }
+        for hidden in ["typed-unseen", "typed-seen", "after-selector"] { XCTAssertFalse(text.contains(hidden), hidden) }
         XCTAssertThrowsError(try script.resolved(with: [:])) {
             XCTAssertEqual("\($0)", "variable 'password' is not defined; pass it or add a default")
         }
