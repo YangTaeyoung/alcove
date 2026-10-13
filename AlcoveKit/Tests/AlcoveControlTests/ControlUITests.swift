@@ -79,6 +79,11 @@ private actor SwapRegistry: VMRegistry {
     func swap(_ target: FakeTarget) { current = target }
 }
 
+private extension ControlHandler {
+    /// The event sequence number up to which the observations of `vm` have reported its events.
+    func observedEventPosition(of vm: String) -> Int? { observedEvents[vm]?.seq }
+}
+
 final class ControlUITests: XCTestCase {
     override func setUp() {
         WaitTiming.tick = .milliseconds(20)
@@ -2006,6 +2011,57 @@ final class ControlUITests: XCTestCase {
         _ = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
         let afterAFailedRestore = try await waitFor(h, [opened], timeout: 1)
         XCTAssertEqual(afterAFailedRestore["matched"]?.intValue, -1)
+    }
+
+    func testObservationsListNoEventsFromBeforeARestoreOrAnEarlierSession() async throws {
+        let (h, t, agent) = try await rig(["ui.focused": { _, _ in .ok(["node": messageEdit, "window": fixtureWindow]) }])
+        await t.setSnapshotList([VMController.SnapshotInfo(name: "clean", vmStateSize: 1, date: Date())])
+        let click: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20]
+        func send(_ title: String, expecting count: Int) async {
+            agent.sendLine(["t": "ev", "name": "dialog.opened", "window": titled(title)])
+            let arrived = await eventually { await t.events(since: 0).next == count }
+            XCTAssertTrue(arrived)
+        }
+        func observedEvents() async throws -> JSON? {
+            try await h.handle(op: "vm.mouse.click", params: click)["observation"]?["events"]
+        }
+        let first = try await observedEvents()
+        XCTAssertEqual(first, [])
+
+        await send("before the restore", expecting: 1)
+        await t.setRestoreHook { target in
+            agent.sendLine(["t": "ev", "name": "dialog.opened", "window": window("0x61", "while it is restored", x: 0, y: 0, w: 10, h: 10)])
+            _ = await eventually { await target.events(since: 0).next == 2 }
+        }
+        _ = try await h.handle(op: "vm.snapshot.restore", params: ["name": "Win", "snapshot": "clean", "waitTools": 0])
+        let afterTheRestore = try await observedEvents()
+        XCTAssertEqual(afterTheRestore, [])
+        await send("after the restore", expecting: 3)
+        let fresh = try await observedEvents()
+        XCTAssertEqual(fresh, ["dialog.opened \"after the restore\""])
+
+        await t.setRestoreHook(nil)
+        await send("before the failed restore", expecting: 4)
+        await t.setSnapshotError(NSError(domain: "test", code: 1))
+        _ = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
+        let afterAFailedRestore = try await observedEvents()
+        XCTAssertEqual(afterAFailedRestore, [])
+
+        await send("before the stop", expecting: 5)
+        _ = try await h.handle(op: "vm.stop", params: ["name": "Win"])
+        var reported = await h.observedEventPosition(of: "Win")
+        XCTAssertEqual(reported, 5)
+        await send("while stopped", expecting: 6)
+        _ = try await h.handle(op: "vm.start", params: ["name": "Win"])
+        reported = await h.observedEventPosition(of: "Win")
+        XCTAssertEqual(reported, 6)
+        let inTheNewSession = try await observedEvents()
+        XCTAssertEqual(inTheNewSession, [])
+        await send("in the new session", expecting: 7)
+        let now = try await observedEvents()
+        XCTAssertEqual(now, ["dialog.opened \"in the new session\""])
+        let listed = try await h.handle(op: "vm.events", params: ["name": "Win", "since": 0])
+        XCTAssertEqual(listed["events"]?.arrayValue?.count, 7)
     }
 
     func testEventPositionsDoNotKeepAReplacedVMAlive() async throws {

@@ -79,7 +79,8 @@ public actor ControlHandler {
 
     /// Per VM: the newest event sequence number when the latest op that can cause window or process events began.
     var eventBaseline: [String: EventMark] = [:]
-    /// Per VM: the newest event sequence number its latest observation reported.
+    /// Per VM: the event sequence number up to which its observations have reported events; an op of `sessionOps`
+    /// moves it past the events received by then.
     var observedEvents: [String: EventMark] = [:]
     /// The target `handle` looked up for the op running in the current task.
     @TaskLocal static var resolvedTarget: (name: String, target: any VMTarget)?
@@ -328,23 +329,26 @@ public actor ControlHandler {
     }
 
     /// Runs `op`. For an op outside the read-only set the VM is looked up once, here: its newest event sequence number
-    /// at this moment becomes the VM's event baseline when `movesEventBaseline` says so, and `eventSeq` of the result
-    /// unless the op set one itself.
+    /// at this moment becomes the VM's event baseline when `movesEventBaseline` says so, the position of its
+    /// observations for an op of `sessionOps`, and `eventSeq` of the result unless the op set one itself.
     private func performNotingEvents(op: String, params: JSON) async throws -> JSON {
         guard !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
               let t = await registry.target(named: vm) else { return try await perform(op: op, params: params) }
         let seq = await t.events(since: .max).next
         if ControlHandler.movesEventBaseline(op: op) { advanceEventBaseline(of: t, to: seq) }
+        if ControlHandler.sessionOps.contains(op) { advanceObservedEvents(of: t, to: seq) }
         let result = try await ControlHandler.$resolvedTarget.withValue((vm, t)) { try await perform(op: op, params: params) }
         guard var fields = result.objectValue else { return result }
         if fields["eventSeq"] == nil { fields["eventSeq"] = .int(Int64(seq)) }
         return .object(fields)
     }
 
-    /// Moves the event baseline of `t` past every event received so far and returns that position.
+    /// Moves the event baseline of `t` and the position of its observations past every event received so far and
+    /// returns that position.
     func passEvents(of t: VMTarget) async -> Int {
         let seq = await t.events(since: .max).next
         advanceEventBaseline(of: t, to: seq)
+        advanceObservedEvents(of: t, to: seq)
         return seq
     }
 
@@ -362,6 +366,11 @@ public actor ControlHandler {
     /// Moves the event baseline of `t` forward to `seq`; it never moves backwards within one target's sequence.
     func advanceEventBaseline(of t: VMTarget, to seq: Int) {
         eventBaseline[t.name] = advanced(eventBaseline, of: t, to: seq)
+    }
+
+    /// Moves the position up to which the observations of `t` have reported its events forward to `seq`.
+    func advanceObservedEvents(of t: VMTarget, to seq: Int) {
+        observedEvents[t.name] = advanced(observedEvents, of: t, to: seq)
     }
 
     func running(_ params: JSON) async throws -> VMTarget {

@@ -713,7 +713,7 @@ extension ControlHandler {
         let known = observedEvents[t.name] != nil || eventBaseline[t.name] != nil
         let cursor = position(in: observedEvents, of: t) ?? position(in: eventBaseline, of: t) ?? (known ? 0 : .max)
         let batch = await t.events(since: cursor)
-        observedEvents[t.name] = advanced(observedEvents, of: t, to: batch.next)
+        advanceObservedEvents(of: t, to: batch.next)
         observation.events = ControlHandler.eventLines(batch.events)
     }
 
