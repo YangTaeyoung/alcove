@@ -222,7 +222,8 @@ extension ControlHandler {
             if masked { written = ControlHandler.maskingKey(op: op, params: written) }
         }
         await recording.record(op: op, params: written, outcome: outcome, started: started, duration: duration, before: before, after: after,
-                               target: target, script: ControlHandler.scriptCall?.rawValue)
+                               target: target, script: ControlHandler.scriptCall?.rawValue,
+                               secrets: ControlHandler.scriptCall == nil ? [] : ControlHandler.scriptSecrets)
         var stopped = false
         if op == "vm.stop", case .success = outcome { stopped = true }
         if recordings.vmGone.removeValue(forKey: vm) === recording || stopped { await retireRecording(vm, recording) }

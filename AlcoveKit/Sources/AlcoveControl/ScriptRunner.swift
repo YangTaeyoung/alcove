@@ -72,6 +72,15 @@ struct ScriptRunner: Sendable {
     func run(_ script: Script, vm: String?, variables: [String: String], lease: String? = nil, owner: String = "script",
              snapshot: String? = nil,
              progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?) async -> ScriptResult {
+        let secrets = script.variables.merging(variables) { _, override in override }
+            .filter { ScriptReport.isSecret($0.key) }.map(\.value)
+        return await ControlHandler.$scriptSecrets.withValue(secrets) {
+            await runScript(script, vm: vm, variables: variables, lease: lease, owner: owner, snapshot: snapshot, progress: progress)
+        }
+    }
+
+    private func runScript(_ script: Script, vm: String?, variables: [String: String], lease: String?, owner: String, snapshot: String?,
+                           progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?) async -> ScriptResult {
         let clock = ContinuousClock()
         let started = clock.now
         var result = ScriptResult(passed: false, stepsRun: 0, failedStep: nil, error: nil, stepResults: [], seconds: 0)

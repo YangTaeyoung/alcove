@@ -212,7 +212,7 @@ actor Recording {
     /// Appends one trace line and its frames; nothing happens after the recording ended. `target` and `script` are
     /// written to the line when given.
     func record(op: String, params: JSON, outcome: Result<JSON, Error>, started: Date, duration: Duration,
-                before: Frame?, after: Frame?, target: JSON? = nil, script: String? = nil) {
+                before: Frame?, after: Frame?, target: JSON? = nil, script: String? = nil, secrets: [String] = []) {
         guard isActive, let writer else { return }
         seq += 1
         let name = String(format: "%06d", seq)
@@ -222,7 +222,7 @@ actor Recording {
         let entry = TraceEntry(seq: seq, time: started, ms: max(0, Int((started.timeIntervalSince(startedAt) * 1000).rounded())),
                                op: op, params: Recording.requestParams(params), outcome: outcome,
                                durationMs: Int((Recording.seconds(duration) * 1000).rounded()), before: beforePath, after: afterPath,
-                               target: target, script: script)
+                               target: target, script: script, secrets: secrets)
         do {
             try writer.append(entry)
             lineCount += 1

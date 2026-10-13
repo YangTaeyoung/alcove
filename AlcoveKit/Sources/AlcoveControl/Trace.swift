@@ -17,24 +17,26 @@ struct TraceEntry {
     var target: JSON? = nil
     /// The kind of call a script run made this op as; nil for an op a client sent.
     var script: String? = nil
+    /// Values replaced by `TraceSanitizer.mask` in the params, result, error and target of the line.
+    var secrets: [String] = []
 
     /// The sanitized JSON object of the line.
     var json: JSON {
         var obj: [String: JSON] = [
             "seq": .int(Int64(seq)), "time": .string(TraceEntry.format(time)), "ms": .int(Int64(ms)), "op": .string(op),
-            "params": TraceSanitizer.sanitize(params), "durationMs": .int(Int64(durationMs)),
+            "params": TraceSanitizer.sanitize(TraceSanitizer.maskValues(params, secrets: secrets)), "durationMs": .int(Int64(durationMs)),
         ]
         switch outcome {
         case .success(let result):
             obj["ok"] = true
-            obj["result"] = TraceSanitizer.sanitize(result)
+            obj["result"] = TraceSanitizer.sanitize(TraceSanitizer.maskValues(result, secrets: secrets))
         case .failure(let error):
             obj["ok"] = false
-            obj["error"] = TraceSanitizer.sanitize(.string(ControlHandler.failureReason(error, fallback: "the op failed")))
+            obj["error"] = TraceSanitizer.sanitize(TraceSanitizer.maskValues(.string(ControlHandler.failureReason(error, fallback: "the op failed")), secrets: secrets))
         }
         if let before { obj["before"] = .string(before) }
         if let after { obj["after"] = .string(after) }
-        if let target { obj["target"] = TraceSanitizer.sanitize(target) }
+        if let target { obj["target"] = TraceSanitizer.sanitize(TraceSanitizer.maskValues(target, secrets: secrets)) }
         if let script { obj["script"] = .string(script) }
         return .object(obj)
     }
@@ -89,6 +91,29 @@ enum TraceSanitizer {
 
     private static func cut(_ text: String) -> String {
         text.count > maxStringLength ? String(text.prefix(maxStringLength)) + "…" : text
+    }
+
+    /// The shortest secret that is also replaced where it occurs inside a longer string.
+    static let minSubstringSecret = 8
+
+    /// `value` with each string that equals a secret replaced by `mask`, and each occurrence of a secret of at least
+    /// `minSubstringSecret` characters inside a longer string.
+    static func maskValues(_ value: JSON, secrets: [String]) -> JSON {
+        let known = secrets.filter { !$0.isEmpty }.sorted { $0.count > $1.count }
+        guard !known.isEmpty else { return value }
+        func walk(_ item: JSON) -> JSON {
+            switch item {
+            case .string(let text):
+                if known.contains(text) { return .string(mask) }
+                var out = text
+                for secret in known where secret.count >= minSubstringSecret { out = out.replacingOccurrences(of: secret, with: mask) }
+                return .string(out)
+            case .array(let items): return .array(items.map(walk))
+            case .object(let fields): return .object(fields.mapValues(walk))
+            default: return item
+            }
+        }
+        return walk(value)
     }
 
     /// Whether `key` contains one of `secretMarkers`, whatever its case.

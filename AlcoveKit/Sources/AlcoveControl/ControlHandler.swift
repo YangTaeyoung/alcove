@@ -99,6 +99,8 @@ public actor ControlHandler {
     @TaskLocal static var resolvedTarget: (name: String, target: any VMTarget)?
     /// The kind of call a script run is making in the current task; nil outside a script run.
     @TaskLocal static var scriptCall: ScriptCall?
+    /// The values of the secret variables of the script run this task belongs to; trace lines of its calls hold `TraceSanitizer.mask` in their place.
+    @TaskLocal static var scriptSecrets: [String] = []
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
