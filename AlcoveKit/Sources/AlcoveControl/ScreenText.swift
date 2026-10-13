@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreText
 import Synchronization
 import Vision
 
@@ -24,6 +25,29 @@ enum ScreenText {
         if let languages { return try recognizer(frame, languages) }
         let standard = try recognizer(frame, defaultLanguages)
         return merged(standard, latin: try recognizer(frame, latinLanguages))
+    }
+
+    static let warmUpText = "Alcove 한글"
+
+    /// A white frame of 400x64 pixels with `warmUpText` in black.
+    static func warmUpFrame() -> Frame {
+        let width = 400, height = 64
+        var data = Data(count: width * height * 4)
+        data.withUnsafeMutableBytes { buffer in
+            let info = CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+            guard let ctx = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info) else { return }
+            ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            let font = CTFontCreateUIFontForLanguage(.system, 24, nil) ?? CTFontCreateWithName("Helvetica" as CFString, 24, nil)
+            let attributes = [kCTFontAttributeName: font, kCTForegroundColorAttributeName: CGColor(gray: 0, alpha: 1)] as CFDictionary
+            if let text = CFAttributedStringCreate(nil, warmUpText as CFString, attributes) {
+                ctx.textPosition = CGPoint(x: 16, y: 22)
+                CTLineDraw(CTLineCreateWithAttributedString(text), ctx)
+            }
+            for i in stride(from: 3, to: buffer.count, by: 4) { buffer[i] = 255 }
+        }
+        return Frame(width: width, height: height, pixels: data)
     }
 
     /// One reading of an area from two recognitions of it, in reading order. Two lines are partners when their

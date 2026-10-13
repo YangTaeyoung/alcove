@@ -60,7 +60,9 @@ public final class ControlServer: @unchecked Sendable {
         return withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } } == 0
     }
 
-    public func start() throws {
+    /// Binds the socket and starts answering. With `loadingRecognizers`, the warm-up reading is in the recognition
+    /// queue (`RecognitionQueue.warmUp`) before the first connection is accepted.
+    public func start(loadingRecognizers: Bool = false) throws {
         var addr = sockaddr_un()
         let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
         guard socketPath.utf8.count <= maxLen else { throw ServerError.pathTooLong(socketPath) }
@@ -78,6 +80,7 @@ public final class ControlServer: @unchecked Sendable {
         listenFD = fd
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in self?.acceptClients() }
+        if loadingRecognizers { RecognitionQueue.shared.warmUp() }
         source.resume()
         listenSource = source
     }

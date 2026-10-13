@@ -44,12 +44,93 @@ final class ControlServerTests: XCTestCase {
         XCTAssertGreaterThan(shot["png"]!.stringValue!.count, 100)
     }
 
-    private func startServer(_ handler: ControlHandler) throws -> (ControlServer, String) {
+    private func startServer(_ handler: ControlHandler, loadingRecognizers: Bool = false) throws -> (ControlServer, String) {
         let path = "/tmp/alcove-ctl-\(UUID().uuidString.prefix(8)).sock"
         let server = ControlServer(handler: handler, socketPath: path)
-        try server.start()
+        try server.start(loadingRecognizers: loadingRecognizers)
         addTeardownBlock { server.stop() }
         return (server, path)
+    }
+
+    // MARK: - loading the recognizers
+
+    /// The size of the frame and the languages of one recognizer call.
+    private struct Recognition: Equatable {
+        let width: Int, height: Int
+        let languages: [String]
+    }
+
+    /// Replaces the recognizer by one that records its calls and reads nothing, until the test ends.
+    private func recordingRecognizer() -> LockedBox<[Recognition]> {
+        let seen = LockedBox<[Recognition]>([])
+        WaitTiming.recognizer = { frame, languages in
+            seen.value.append(Recognition(width: frame.width, height: frame.height, languages: languages))
+            return []
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        return seen
+    }
+
+    func testAServerStartedWithLoadingRecognizersReadsTheWarmUpFrameWithTheLanguagesOfFindText() async throws {
+        let seen = recordingRecognizer()
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        _ = try startServer(handler, loadingRecognizers: true)
+        await recognitionsEnded()
+        let warmUp = seen.value
+        XCTAssertEqual(warmUp, [Recognition(width: 400, height: 64, languages: ["ko-KR", "en-US"]),
+                                Recognition(width: 400, height: 64, languages: ["en-US"])])
+
+        seen.value = []
+        _ = try await handler.handle(op: "vm.find_text", params: ["name": "Win"])
+        XCTAssertEqual(seen.value.map(\.languages), warmUp.map(\.languages))
+    }
+
+    func testCreatingAHandlerAndStartingAServerWithoutLoadingRecognizersReadsNothing() async throws {
+        let seen = recordingRecognizer()
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        await recognitionsEnded()
+        _ = try startServer(handler)
+        let load = RecognitionQueue.shared.load
+        XCTAssertFalse(load.running)
+        XCTAssertEqual(load.waiting, 0)
+        await recognitionsEnded()
+        XCTAssertEqual(seen.value, [])
+    }
+
+    func testAFindTextDuringTheWarmUpWaitsBehindIt() async throws {
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        let widths = LockedBox<[Int]>([])
+        WaitTiming.recognizer = { frame, _ in
+            widths.value.append(frame.width)
+            gate.pass()
+            return []
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        await recognitionsEnded()
+        _ = try startServer(handler, loadingRecognizers: true)
+        let find = Task { try await handler.handle(op: "vm.find_text", params: ["name": "Win", "languages": ["en-US"]]) }
+        let queued = await eventually { RecognitionQueue.shared.load.waiting == 1 }
+        XCTAssertTrue(queued)
+        XCTAssertEqual(widths.value, [400])
+        gate.open()
+        let found = try await find.value
+        XCTAssertEqual(found["lines"]?.intValue, 0)
+        XCTAssertEqual(widths.value, [400, 400, 320])
+    }
+
+    func testTheWarmUpFrameHoldsTextForBothRecognizers() throws {
+        let frame = ScreenText.warmUpFrame()
+        XCTAssertEqual([frame.width, frame.height], [400, 64])
+        let latin = try ScreenText.recognize(frame, languages: ScreenText.latinLanguages)
+        XCTAssertTrue(latin.contains { $0.text.contains("Alcove") }, "\(latin)")
+        guard try ScreenText.supportedLanguages.get().contains("ko-KR") else { throw XCTSkip("ko-KR is not a supported recognition language on this host") }
+        let standard = try ScreenText.recognize(frame, languages: ScreenText.defaultLanguages)
+        XCTAssertTrue(standard.contains { $0.text.contains("한글") }, "\(standard)")
     }
 
     /// A connected client socket whose reads give up after ten seconds.

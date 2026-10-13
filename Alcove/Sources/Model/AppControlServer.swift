@@ -38,7 +38,7 @@ final class AppControlServer {
         }
         let s = ControlServer(handler: ControlHandler(registry: registry, hostKind: "app"), socketPath: path)
         do {
-            try s.start()
+            try s.start(loadingRecognizers: true)
             server = s
             issue = nil
             startFailure = nil
