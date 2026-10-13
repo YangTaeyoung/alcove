@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"unicode/utf16"
@@ -463,5 +464,81 @@ func TestFsGated(t *testing.T) {
 	res := expect(t, r, "res")
 	if res["ok"] != false || res.String("error") != errExecDisabled {
 		t.Fatalf("res %v", res)
+	}
+}
+
+func TestFsDeleteRefusesHomeRootAndAncestors(t *testing.T) {
+	c, home := fsHome(t)
+	os.MkdirAll(filepath.Join(home, "keep", "sub"), 0o755)
+	os.WriteFile(filepath.Join(home, "keep", "f"), []byte("x"), 0o644)
+
+	targets := []string{"~", ".", home, filepath.Dir(home)}
+	if runtime.GOOS != "windows" {
+		targets = append(targets, "/")
+	}
+	for _, p := range targets {
+		for _, recursive := range []bool{true, false} {
+			res := c.call("fs.delete", proto.Message{"path": p, "recursive": recursive})
+			want := "it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended"
+			if res["ok"] != false || !strings.Contains(res.String("error"), "refusing to delete '") || !strings.HasSuffix(res.String("error"), want) {
+				t.Fatalf("%q recursive=%v: %v", p, recursive, res)
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "keep", "f")); err != nil {
+		t.Fatalf("home content deleted: %v", err)
+	}
+
+	res := c.ok("fs.delete", proto.Message{"path": "keep", "recursive": true})
+	if res["deleted"] != true {
+		t.Fatalf("subdirectory %v", res)
+	}
+	if _, err := os.Stat(home); err != nil {
+		t.Fatalf("home gone: %v", err)
+	}
+}
+
+func TestIsFileSystemRoot(t *testing.T) {
+	cases := []struct {
+		path, volume string
+		sep          byte
+		want         bool
+	}{
+		{"/", "", '/', true},
+		{"/usr", "", '/', false},
+		{`C:\`, "C:", '\\', true},
+		{`C:\Users`, "C:", '\\', false},
+		{`D:\`, "D:", '\\', true},
+		{`\\host\share\`, `\\host\share`, '\\', true},
+		{`\\host\share\dir`, `\\host\share`, '\\', false},
+		{`C:`, "C:", '\\', false},
+	}
+	for _, tc := range cases {
+		if got := isFileSystemRoot(tc.path, tc.volume, tc.sep); got != tc.want {
+			t.Errorf("isFileSystemRoot(%q, %q, %q) = %v, want %v", tc.path, tc.volume, tc.sep, got, tc.want)
+		}
+	}
+}
+
+func TestPathContains(t *testing.T) {
+	cases := []struct {
+		dir, target string
+		sep         byte
+		fold        bool
+		want        bool
+	}{
+		{"/a", "/a", '/', false, true},
+		{"/a", "/a/b/c", '/', false, true},
+		{"/a/b", "/a", '/', false, false},
+		{"/ab", "/a/b", '/', false, false},
+		{"/A", "/a/b", '/', false, false},
+		{`C:\Users`, `c:\users\me`, '\\', true, true},
+		{`C:\`, `C:\Users\me`, '\\', true, true},
+		{`D:\`, `C:\Users\me`, '\\', true, false},
+	}
+	for _, tc := range cases {
+		if got := pathContains(tc.dir, tc.target, tc.sep, tc.fold); got != tc.want {
+			t.Errorf("pathContains(%q, %q) = %v, want %v", tc.dir, tc.target, got, tc.want)
+		}
 	}
 }

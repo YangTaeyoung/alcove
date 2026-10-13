@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -445,10 +446,40 @@ func (s *Server) fsMkdir(req proto.Message) (proto.Message, error) {
 	return proto.Message{"path": path}, nil
 }
 
+// isFileSystemRoot reports whether the cleaned path is the root of its volume:
+// the separator alone, or a volume name followed by the separator.
+func isFileSystemRoot(path, volume string, sep byte) bool {
+	return strings.HasPrefix(path, volume) && path[len(volume):] == string(sep)
+}
+
+// pathContains reports whether target equals dir or lies below it, comparing
+// whole components split on sep; fold ignores letter case.
+func pathContains(dir, target string, sep byte, fold bool) bool {
+	if fold {
+		dir, target = strings.ToLower(dir), strings.ToLower(target)
+	}
+	split := func(p string) []string { return strings.Split(strings.TrimRight(p, string(sep)), string(sep)) }
+	d, t := split(dir), split(target)
+	if len(d) > len(t) {
+		return false
+	}
+	for i := range d {
+		if d[i] != t[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) fsDelete(req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
+	}
+	home := filepath.Clean(s.opt.HomeDir)
+	if s.opt.HomeDir != "" && pathContains(path, home, filepath.Separator, runtime.GOOS == "windows") ||
+		isFileSystemRoot(path, filepath.VolumeName(path), filepath.Separator) {
+		return nil, fmt.Errorf("refusing to delete '%s': it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended", path)
 	}
 	fi, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {

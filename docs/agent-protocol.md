@@ -194,7 +194,9 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   replaces a directory. `fs.mkdir` creates missing parents and succeeds for an
   existing directory.
 - `fs.delete` of a missing path answers `deleted: false`. A directory with
-  entries needs `recursive`.
+  entries needs `recursive`. It refuses, before touching anything, the home
+  directory, a file-system root (`/`, `C:\`) and any ancestor of the home
+  directory, whether or not `recursive` is set.
 - The host transfers a file as `fs.write` pieces to `<path>.alcove-part`,
   compares `fs.stat` with `sha256` against its own digest and then renames;
   downloads use `fs.stat` with `sha256` and `fs.read` pieces.
