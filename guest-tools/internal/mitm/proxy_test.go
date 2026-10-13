@@ -1,0 +1,597 @@
+package mitm
+
+import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func (e *testEnv) get(id int, part string, extra map[string]any) map[string]any {
+	e.t.Helper()
+	p := map[string]any{"id": id, "part": part}
+	for k, v := range extra {
+		p[k] = v
+	}
+	return e.call("get", p)
+}
+
+func TestHTTPSExchangeIsCaptured(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("X-Seen", "yes")
+		w.WriteHeader(201)
+		fmt.Fprintf(w, "echo:%s", b)
+	}))
+	defer up.Close()
+	env := newEnv(t, up)
+	resp, err := env.client.Post(up.URL+"/items?q=1", "text/plain", strings.NewReader("ping"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 201 || string(body) != "echo:ping" || resp.Header.Get("X-Seen") != "yes" {
+		t.Fatalf("got %d %q %v", resp.StatusCode, body, resp.Header)
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	if x["method"] != "POST" || x["url"] != up.URL+"/items?q=1" || int(x["status"].(float64)) != 201 {
+		t.Fatalf("exchange %v", x)
+	}
+	if int(x["reqBytes"].(float64)) != 4 || int(x["resBytes"].(float64)) != 9 {
+		t.Fatalf("byte counts %v", x)
+	}
+	id := idOf(x)
+	if got := env.get(id, "request", nil)["body"]; got != "ping" {
+		t.Fatalf("request body %v", got)
+	}
+	res := env.get(id, "response", nil)
+	if res["body"] != "echo:ping" || res["total"].(float64) != 9 {
+		t.Fatalf("response %v", res)
+	}
+}
+
+func TestPlainHTTPIsCaptured(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "plain") }))
+	defer up.Close()
+	env := newEnv(t)
+	resp, err := env.client.Get(up.URL + "/a/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "plain" {
+		t.Fatalf("body %q", body)
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	if x["url"] != up.URL+"/a/b" || x["method"] != "GET" {
+		t.Fatalf("exchange %v", x)
+	}
+	if env.get(idOf(x), "response", nil)["body"] != "plain" {
+		t.Fatal("response body not captured")
+	}
+}
+
+func TestHTTP2ClientWorks(t *testing.T) {
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "upstream-proto-%d", r.ProtoMajor)
+	}))
+	up.EnableHTTP2 = true
+	up.StartTLS()
+	defer up.Close()
+	env := newEnv(t, up)
+	resp, err := env.client.Get(up.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("client protocol HTTP/%d, want 2", resp.ProtoMajor)
+	}
+	if string(body) != "upstream-proto-2" {
+		t.Fatalf("body %q", body)
+	}
+	env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" && x["status"].(float64) == 200 })
+}
+
+func TestSecretsAreRedactedByDefault(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "s", Value: "abc"})
+		if r.Header.Get("Authorization") != "Bearer abc123" {
+			t.Errorf("upstream got Authorization %q", r.Header.Get("Authorization"))
+		}
+	}))
+	defer up.Close()
+	env := newEnv(t)
+	req, _ := http.NewRequest("GET", up.URL, nil)
+	req.Header.Set("Authorization", "Bearer abc123")
+	req.Header.Set("X-Api-Key", "k")
+	req.Header.Set("X-Other", "visible")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	headers := headerMap(env.get(idOf(x), "request", nil))
+	if headers["Authorization"] != "<redacted 13 chars>" || headers["X-Api-Key"] != "<redacted 1 chars>" || headers["X-Other"] != "visible" {
+		t.Fatalf("request headers %v", headers)
+	}
+	if !strings.HasPrefix(headerMap(env.get(idOf(x), "response", nil))["Set-Cookie"], "<redacted ") {
+		t.Fatal("Set-Cookie was stored in clear")
+	}
+}
+
+func TestSecretsKeptWhenAsked(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer up.Close()
+	env := newEnv(t)
+	env.call("config", map[string]any{"secrets": true})
+	req, _ := http.NewRequest("GET", up.URL, nil)
+	req.Header.Set("Authorization", "Bearer abc123")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	if got := headerMap(env.get(idOf(x), "request", nil))["Authorization"]; got != "Bearer abc123" {
+		t.Fatalf("Authorization %q", got)
+	}
+}
+
+func headerMap(res map[string]any) map[string]string {
+	out := map[string]string{}
+	for _, h := range res["headers"].([]any) {
+		pair := h.([]any)
+		out[pair[0].(string)] = pair[1].(string)
+	}
+	return out
+}
+
+func TestStreamingIsForwardedIncrementally(t *testing.T) {
+	var lastWrite atomic.Int64
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 1; i <= 3; i++ {
+			fmt.Fprintf(w, "data: event-%d\n\n", i)
+			w.(http.Flusher).Flush()
+			if i == 3 {
+				lastWrite.Store(time.Now().UnixNano())
+			}
+			if i < 3 {
+				time.Sleep(150 * time.Millisecond)
+			}
+		}
+	}))
+	defer up.Close()
+	env := newEnv(t, up)
+	resp, err := env.client.Get(up.URL + "/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	line, err := br.ReadString('\n')
+	if err != nil || line != "data: event-1\n" {
+		t.Fatalf("first line %q %v", line, err)
+	}
+	firstSeen := time.Now().UnixNano()
+	if w := lastWrite.Load(); w != 0 && firstSeen >= w {
+		t.Fatal("the first event arrived only after the upstream wrote the last one")
+	}
+	if lastWrite.Load() != 0 {
+		t.Fatal("the upstream had already written every event when the first one arrived")
+	}
+	rest, _ := io.ReadAll(br)
+	if !strings.Contains(string(rest), "event-3") {
+		t.Fatalf("rest %q", rest)
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	body := env.get(idOf(x), "response", nil)["body"].(string)
+	for _, want := range []string{"event-1", "event-2", "event-3"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("capture %q lacks %s", body, want)
+		}
+	}
+}
+
+func fillDeterministic(seed int64, n int) io.Reader {
+	return io.LimitReader(rand.New(rand.NewSource(seed)), int64(n))
+}
+
+func TestLargeBodiesAreForwardedWholeAndCappedInCapture(t *testing.T) {
+	const size = 8 << 20
+	wantReq := sha256.New()
+	io.Copy(wantReq, fillDeterministic(1, size))
+	wantRes := sha256.New()
+	io.Copy(wantRes, fillDeterministic(2, size))
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := sha256.New()
+		n, _ := io.Copy(h, r.Body)
+		w.Header().Set("X-Req-Sha", fmt.Sprintf("%x", h.Sum(nil)))
+		w.Header().Set("X-Req-Len", fmt.Sprint(n))
+		io.Copy(w, fillDeterministic(2, size))
+	}))
+	defer up.Close()
+	env := newEnv(t, up)
+	resp, err := env.client.Post(up.URL+"/big", "application/octet-stream", fillDeterministic(1, size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.New()
+	n, _ := io.Copy(h, resp.Body)
+	resp.Body.Close()
+	if n != size || fmt.Sprintf("%x", h.Sum(nil)) != fmt.Sprintf("%x", wantRes.Sum(nil)) {
+		t.Fatalf("response of %d bytes differs", n)
+	}
+	if resp.Header.Get("X-Req-Sha") != fmt.Sprintf("%x", wantReq.Sum(nil)) || resp.Header.Get("X-Req-Len") != fmt.Sprint(size) {
+		t.Fatalf("upstream saw a different request: %v", resp.Header)
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	if int(x["reqBytes"].(float64)) != size || int(x["resBytes"].(float64)) != size {
+		t.Fatalf("byte counts %v", x)
+	}
+	for _, part := range []string{"request", "response"} {
+		res := env.get(idOf(x), part, map[string]any{"length": 10})
+		if res["bodyTruncated"] != true || int(res["total"].(float64)) != maxBodyBytes {
+			t.Fatalf("%s: %v", part, res)
+		}
+	}
+}
+
+func TestBodiesOffKeepsNoBody(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "secret-ish") }))
+	defer up.Close()
+	env := newEnv(t)
+	env.call("config", map[string]any{"bodies": false})
+	resp, err := env.client.Post(up.URL, "text/plain", strings.NewReader("abc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	res := env.get(idOf(x), "response", nil)
+	if res["body"] != "" || res["total"].(float64) != 0 || int(x["resBytes"].(float64)) != 10 {
+		t.Fatalf("%v %v", x, res)
+	}
+}
+
+func TestGzipBodyIsDecodedForGet(t *testing.T) {
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte(`{"hello":"world"}`))
+	zw.Close()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(gz.Bytes())
+	}))
+	defer up.Close()
+	env := newEnv(t)
+	req, _ := http.NewRequest("GET", up.URL, nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(raw, gz.Bytes()) {
+		t.Fatal("the proxy altered the compressed bytes")
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	res := env.get(idOf(x), "response", nil)
+	if res["body"] != `{"hello":"world"}` || res["encoding"] != "gzip" || int(res["total"].(float64)) != 17 {
+		t.Fatalf("response %v", res)
+	}
+	page := env.get(idOf(x), "response", map[string]any{"offset": 2, "length": 5})
+	if page["body"] != "hello" {
+		t.Fatalf("page %v", page)
+	}
+}
+
+func TestUnsupportedEncodingIsReturnedAsBase64(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		w.Write([]byte("brotli-bytes"))
+	}))
+	defer up.Close()
+	env := newEnv(t)
+	req, _ := http.NewRequest("GET", up.URL, nil)
+	req.Header.Set("Accept-Encoding", "br")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	res := env.get(idOf(x), "response", nil)
+	dec, _ := base64.StdEncoding.DecodeString(res["body"].(string))
+	if res["base64"] != true || res["encoding"] != "br" || string(dec) != "brotli-bytes" {
+		t.Fatalf("response %v", res)
+	}
+}
+
+func TestBinaryBodyIsBase64(t *testing.T) {
+	payload := []byte{0xff, 0xfe, 0x00, 0x01}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(payload) }))
+	defer up.Close()
+	env := newEnv(t)
+	resp, err := env.client.Get(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	res := env.get(idOf(x), "response", nil)
+	dec, _ := base64.StdEncoding.DecodeString(res["body"].(string))
+	if res["base64"] != true || !bytes.Equal(dec, payload) || res["total"].(float64) != 4 {
+		t.Fatalf("response %v", res)
+	}
+}
+
+func TestHostsFilterTunnelsOthers(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "direct") }))
+	defer up.Close()
+	env := newEnv(t, up)
+	env.call("config", map[string]any{"hosts": []any{"*.example.test"}})
+	upRoots := x509.NewCertPool()
+	upRoots.AddCert(up.Certificate())
+	direct := &http.Client{Transport: &http.Transport{
+		Proxy:           http.ProxyURL(mustURL("http://" + env.addr)),
+		TLSClientConfig: &tls.Config{RootCAs: upRoots},
+	}}
+	t.Cleanup(direct.CloseIdleConnections)
+	resp, err := direct.Get(up.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "direct" {
+		t.Fatalf("body %q", body)
+	}
+	if !resp.TLS.PeerCertificates[0].Equal(up.Certificate()) {
+		t.Fatal("the client did not see the upstream's own certificate")
+	}
+	direct.CloseIdleConnections()
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "tunnel" })
+	if x["resBytes"].(float64) == 0 || x["reqBytes"].(float64) == 0 {
+		t.Fatalf("tunnel byte counts %v", x)
+	}
+	for _, e := range env.exchanges(nil) {
+		if e["kind"] == "http" {
+			t.Fatalf("a tunnelled host produced an http row: %v", e)
+		}
+	}
+}
+
+func TestClientRejectingCAIsRecorded(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer up.Close()
+	env := newEnv(t, up)
+	distrustful := env.newClient(false)
+	if resp, err := distrustful.Get(up.URL + "/"); err == nil {
+		resp.Body.Close()
+		t.Fatal("expected a certificate error")
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "tlsError" })
+	if x["error"] == nil || x["error"] == "" || !strings.Contains(x["url"].(string), "127.0.0.1") {
+		t.Fatalf("exchange %v", x)
+	}
+}
+
+func TestUpstreamFailureAnswersBadGateway(t *testing.T) {
+	up := httptest.NewServer(http.NotFoundHandler())
+	addr := up.URL
+	up.Close()
+	env := newEnv(t)
+	resp, err := env.client.Get(addr + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 502 || !strings.Contains(string(body), "upstream") {
+		t.Fatalf("got %d %q", resp.StatusCode, body)
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["status"] == float64(502) })
+	if x["error"] == nil {
+		t.Fatalf("exchange %v", x)
+	}
+}
+
+func TestWebSocketUpgradeIsRefused(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("upstream reached") }))
+	defer up.Close()
+	env := newEnv(t)
+	req, _ := http.NewRequest("GET", up.URL, nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 501 || string(body) != "websocket interception is not supported; exclude this host with the hosts filter" {
+		t.Fatalf("got %d %q", resp.StatusCode, body)
+	}
+	env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" && x["status"] == float64(501) })
+}
+
+func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Hop") != "" || r.Header.Get("Proxy-Authorization") != "" || r.Header.Get("X-Keep") != "k" {
+			t.Errorf("upstream headers %v", r.Header)
+		}
+		w.Header().Set("Connection", "X-Resp-Hop")
+		w.Header().Set("X-Resp-Hop", "v")
+		w.Header().Set("X-Resp-Keep", "v")
+	}))
+	defer up.Close()
+	env := newEnv(t)
+	req, _ := http.NewRequest("GET", up.URL, nil)
+	req.Header.Set("Connection", "X-Hop")
+	req.Header.Set("X-Hop", "1")
+	req.Header.Set("X-Keep", "k")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Header.Get("X-Resp-Hop") != "" || resp.Header.Get("X-Resp-Keep") != "v" {
+		t.Fatalf("response headers %v", resp.Header)
+	}
+}
+
+func TestListFilters(t *testing.T) {
+	env := newEnv(t)
+	add := func(url string, status int) {
+		env.proxy.store.add(&Exchange{Kind: "http", Method: "GET", URL: url, Status: status})
+	}
+	add("https://api.one.com/v1/chat", 200)
+	add("https://api.one.com/v1/models", 404)
+	add("https://other.org/health", 503)
+	add("https://api.one.com/v2/chat", 500)
+	count := func(p map[string]any) int { return len(env.exchanges(p)) }
+	if n := count(nil); n != 4 {
+		t.Fatalf("all: %d", n)
+	}
+	if n := count(map[string]any{"host": "one.com"}); n != 3 {
+		t.Fatalf("host: %d", n)
+	}
+	if n := count(map[string]any{"path": "chat"}); n != 2 {
+		t.Fatalf("path: %d", n)
+	}
+	if n := count(map[string]any{"status": 404}); n != 1 {
+		t.Fatalf("status number: %d", n)
+	}
+	if n := count(map[string]any{"status": "5xx"}); n != 2 {
+		t.Fatalf("status class: %d", n)
+	}
+	if n := count(map[string]any{"since": 2}); n != 2 {
+		t.Fatalf("since: %d", n)
+	}
+	res := env.call("list", map[string]any{"limit": 2})
+	if len(res["exchanges"].([]any)) != 2 || res["next"].(float64) != 2 {
+		t.Fatalf("limit: %v", res)
+	}
+	res = env.call("list", map[string]any{"since": res["next"]})
+	if len(res["exchanges"].([]any)) != 2 || res["next"].(float64) != 4 {
+		t.Fatalf("page two: %v", res)
+	}
+	env.call("clear", nil)
+	if n := count(nil); n != 0 {
+		t.Fatalf("after clear: %d", n)
+	}
+}
+
+func TestStoreDropsOldest(t *testing.T) {
+	s := newStore(3)
+	for i := 0; i < 5; i++ {
+		s.add(&Exchange{URL: "http://h/"})
+	}
+	got := s.list(listFilter{})
+	if len(got) != 3 || got[0].ID != 3 || got[2].ID != 5 {
+		t.Fatalf("kept ids: %v", ids(got))
+	}
+	if _, ok := s.get(1); ok {
+		t.Fatal("oldest exchange is still readable")
+	}
+}
+
+func ids(es []*Exchange) []int64 {
+	var out []int64
+	for _, e := range es {
+		out = append(out, e.ID)
+	}
+	return out
+}
+
+func TestParameterTypeErrorsNameTheParameter(t *testing.T) {
+	env := newEnv(t)
+	cases := []struct {
+		op     string
+		params map[string]any
+		want   string
+	}{
+		{"config", map[string]any{"secrets": "yes"}, "secrets"},
+		{"config", map[string]any{"hosts": "a"}, "hosts"},
+		{"list", map[string]any{"limit": "ten"}, "limit"},
+		{"list", map[string]any{"status": true}, "status"},
+		{"get", map[string]any{"id": "1", "part": "request"}, "id"},
+		{"get", map[string]any{"id": 1, "part": "both"}, "part"},
+		{"get", map[string]any{"id": 99, "part": "request"}, "99"},
+		{"rule.remove", map[string]any{"rule": "x"}, "rule"},
+	}
+	for _, c := range cases {
+		_, err := env.proxy.Handle(c.op, c.params)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s %v: error %v should mention %q", c.op, c.params, err, c.want)
+		}
+	}
+	if _, err := env.proxy.Handle("nope", nil); err == nil || err.Error() != "unknown op 'nope'" {
+		t.Errorf("unknown op error %v", err)
+	}
+}
+
+func mustURL(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+func TestNoGoroutinesRemainAfterClose(t *testing.T) {
+	time.Sleep(100 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	func() {
+		up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "x") }))
+		defer up.Close()
+		ca, _ := LoadOrCreateCA(t.TempDir())
+		p := NewProxy(ca)
+		pool := x509.NewCertPool()
+		pool.AddCert(up.Certificate())
+		p.UpstreamRoots = pool
+		l, _ := net.Listen("tcp", "127.0.0.1:0")
+		done := make(chan struct{})
+		go func() { defer close(done); _ = p.Serve(l) }()
+		pc := x509.NewCertPool()
+		pc.AddCert(ca.Certificate())
+		tr := &http.Transport{Proxy: http.ProxyURL(mustURL("http://" + l.Addr().String())), TLSClientConfig: &tls.Config{RootCAs: pc}}
+		resp, err := (&http.Client{Transport: tr}).Get(up.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		p.Close()
+		<-done
+		tr.CloseIdleConnections()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutines: %d before, %d after Close", before, after)
+	}
+}
