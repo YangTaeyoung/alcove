@@ -697,6 +697,9 @@ func TestCloseReturnsWhileATunnelIsOpen(t *testing.T) {
 }
 
 func TestTunnelEndsWhenTheClientHangsUp(t *testing.T) {
+	old := tunnelIdleAfterHalfClose
+	tunnelIdleAfterHalfClose = 200 * time.Millisecond
+	t.Cleanup(func() { tunnelIdleAfterHalfClose = old })
 	addr := holdingUpstream(t)
 	env := newEnv(t)
 	env.call("config", map[string]any{"hosts": []any{"nomatch.test"}})

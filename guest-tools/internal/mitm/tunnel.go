@@ -8,8 +8,10 @@ import (
 )
 
 // tunnel connects to the upstream authority and copies bytes both ways. When
-// either direction ends, both connections are closed. A tunnel row with the
-// byte counts is recorded when the copy has finished.
+// one direction reaches EOF the peer connection is half-closed and the other
+// direction continues until it ends or stays idle for tunnelIdleAfterHalfClose;
+// a read or write error closes both connections. A tunnel row with the byte
+// counts is recorded when both directions have finished.
 func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 	start := time.Now()
 	ex := &Exchange{
@@ -41,30 +43,64 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 	endPending := p.beginPending(&pendingEntry{time: start, kind: "tunnel", method: "CONNECT", url: authority, req: down2up.Load, res: up2down.Load})
 	defer endPending()
 
+	var ended atomic.Bool
 	done := make(chan struct{}, 2)
-	pipe := func(dst io.Writer, src io.Reader, n *atomic.Int64) {
-		_, _ = io.Copy(dst, &countingReader{r: src, n: n})
+	// pipe copies src to dst. At EOF it half-closes dst and bounds the idle
+	// time of the other direction (otherSrc); any other error closes both.
+	pipe := func(dst net.Conn, src io.Reader, otherSrc net.Conn, n *atomic.Int64) {
+		_, err := io.Copy(dst, &countingReader{r: src, n: n, ended: &ended, conn: srcConn(src, client, up)})
+		if err != nil {
+			up.Close()
+			client.Close()
+		} else {
+			if hc, ok := dst.(interface{ CloseWrite() error }); ok {
+				_ = hc.CloseWrite()
+			} else {
+				dst.Close()
+			}
+			ended.Store(true)
+			_ = otherSrc.SetReadDeadline(time.Now().Add(tunnelIdleAfterHalfClose))
+		}
 		done <- struct{}{}
 	}
-	go pipe(up, client, &down2up)
-	go pipe(client.Conn, up, &up2down)
+	go pipe(up, client, up, &down2up)
+	go pipe(client.Conn, up, client.Conn, &up2down)
+	<-done
 	<-done
 	up.Close()
 	client.Close()
-	<-done
 	ex.ReqBytes = down2up.Load()
 	ex.ResBytes = up2down.Load()
 	ex.Ms = time.Since(start).Milliseconds()
 	p.record(ex)
 }
 
+// countingReader counts bytes read from a tunnel side. Once one direction of
+// the tunnel has ended it refreshes the idle read deadline on every read.
 type countingReader struct {
-	r io.Reader
-	n *atomic.Int64
+	r     io.Reader
+	n     *atomic.Int64
+	ended *atomic.Bool
+	conn  net.Conn
 }
 
 func (c *countingReader) Read(b []byte) (int, error) {
 	n, err := c.r.Read(b)
 	c.n.Add(int64(n))
+	if n > 0 && c.ended.Load() {
+		_ = c.conn.SetReadDeadline(time.Now().Add(tunnelIdleAfterHalfClose))
+	}
 	return n, err
 }
+
+// srcConn returns the connection that src reads from.
+func srcConn(src io.Reader, client *bufConn, up net.Conn) net.Conn {
+	if src == io.Reader(client) {
+		return client.Conn
+	}
+	return up
+}
+
+// tunnelIdleAfterHalfClose bounds the idle time of the remaining direction of a
+// tunnel once the other direction has ended.
+var tunnelIdleAfterHalfClose = 30 * time.Second

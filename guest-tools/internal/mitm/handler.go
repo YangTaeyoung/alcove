@@ -97,9 +97,21 @@ func (p *Proxy) handler(scheme, authority string) http.Handler {
 	})
 }
 
-// drainBody reads the rest of the request body through the capture tee.
-func drainBody(r *http.Request) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxDrainBytes))
+// drainBody reads the rest of the request body through the capture tee, for at
+// most drainTimeout. The exchange records an incomplete body.
+func drainBody(w http.ResponseWriter, r *http.Request, ex *Exchange) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(drainTimeout))
+	_, err := io.Copy(io.Discard, io.LimitReader(r.Body, maxDrainBytes))
+	_ = rc.SetReadDeadline(time.Time{})
+	if err != nil {
+		if ex.Error == "" {
+			ex.Error = "the request body was not received completely"
+		}
+		if r.ProtoMajor == 1 {
+			w.Header().Set("Connection", "close")
+		}
+	}
 }
 
 func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, authority string) {
@@ -154,12 +166,12 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 
 	if untouched {
 		p.forward(w, r, u, ex, resCap)
-		ex.ResHeaders = nil
+		ex.ResHeaders, ex.ResTrailers = nil, nil
 		return
 	}
 
 	if authority != "" && !strings.HasPrefix(r.RequestURI, "/") {
-		drainBody(r)
+		drainBody(w, r, ex)
 		ex.Error = badTargetRefusal
 		respondText(w, ex, resCap, http.StatusBadRequest, badTargetRefusal)
 		return
@@ -180,18 +192,18 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 			}
 		}
 		if act.Drop {
-			drainBody(r)
+			drainBody(w, r, ex)
 			panic(http.ErrAbortHandler)
 		}
 		if act.synthesizes() {
-			drainBody(r)
+			drainBody(w, r, ex)
 			p.synthesize(w, ex, resCap, act)
 			return
 		}
 	}
 
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		drainBody(r)
+		drainBody(w, r, ex)
 		respondText(w, ex, resCap, http.StatusNotImplemented, websocketRefusal)
 		return
 	}
@@ -308,3 +320,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *
 		ex.ResTrailers = headerPairs(resp.Trailer)
 	}
 }
+
+// drainTimeout bounds how long the rest of a request body is awaited before a
+// rule answer or refusal is sent.
+var drainTimeout = 30 * time.Second
