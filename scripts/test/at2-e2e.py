@@ -114,6 +114,7 @@ class Run:
         self.clone_names = [vm + " e2e clone", vm + " e2e clone 2"]
         self.hidden = None
         self.clones_made = []
+        self.cleanup_failed = False
         self.jobs = []
         self.forwards = []
         self.leases = []
@@ -245,7 +246,19 @@ class Run:
         m.initialize("at2-e2e")
         return m
 
+    def cleanup_error(self, what):
+        self.cleanup_failed = True
+        print(f"cleanup failed: {what}", flush=True)
+
     def cleanup(self):
+        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            self.cleanup_steps()
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def cleanup_steps(self):
         for m in self.mcps:
             try:
                 m.close()
@@ -260,7 +273,7 @@ class Run:
             try:
                 os.rename(self.hidden[0], self.hidden[1])
             except OSError as e:
-                print(f"cleanup warning: could not move {self.hidden[0]} back to {self.hidden[1]} ({e}); move it by hand")
+                self.cleanup_error(f"could not move {self.hidden[0]} back to {self.hidden[1]} ({e}); move it by hand")
         if self.hidden:
             try:
                 shutil.rmtree(os.path.dirname(self.hidden[0]))
@@ -270,15 +283,16 @@ class Run:
             with Client(self.c.socket_path) as c:
                 self.restore(c)
         except ControlError as e:
-            print(f"cleanup: the control server failed ({e}); check vm.list for the clones '{self.clone_names[0]}' and '{self.clone_names[1]}', "
-                  f"vm.snapshot.list for '{SNAPSHOT}' and {GUEST} in the guest by hand")
+            self.cleanup_error(f"the control server failed ({e}); check vm.list for the clones '{self.clone_names[0]}' and '{self.clone_names[1]}', "
+                               f"vm.snapshot.list for '{SNAPSHOT}' and {GUEST} in the guest by hand")
 
     def restore(self, c):
         def attempt(op, reply_timeout=120, **params):
             params.setdefault("name", self.vm)
             try:
                 return c.call(op, reply_timeout, **params)
-            except ControlError:
+            except ControlError as e:
+                self.cleanup_error(f"{op} {params!r} answered {e}")
                 return None
 
         for token in self.leases:
@@ -288,7 +302,7 @@ class Run:
             if clone in names and names[clone].get("cloneOf") == self.vm:
                 attempt("vm.stop", 300, name=clone, force=True)
                 if attempt("vm.delete", name=clone) is None:
-                    print(f"cleanup: could not delete the clone '{clone}'; delete it with vm.delete")
+                    self.cleanup_error(f"the clone '{clone}' was not deleted; delete it with vm.delete")
         status = c.call("vm.status", 60, name=self.vm)
         end = time.time() + 10
         while status.get("leasedBy") and time.time() < end:
@@ -301,14 +315,14 @@ class Run:
             status = c.call("vm.status", 60, name=self.vm)
         if status.get("state") != "running":
             if attempt("vm.start", 300) is None:
-                print(f"cleanup: could not start '{self.vm}'; start it with vm.start")
+                self.cleanup_error(f"'{self.vm}' was not started; start it with vm.start")
                 return
         if self.link_down:
             attempt("vm.set_network", up=True)
         end = time.time() + 300
         while not (attempt("vm.status", 60) or {}).get("tools"):
             if time.time() > end:
-                print(f"cleanup: the guest tools of '{self.vm}' are not connected; the guest was not cleaned")
+                self.cleanup_error(f"the guest tools of '{self.vm}' are not connected; the guest was not cleaned")
                 return
             time.sleep(2)
         if self.snapshot_made:
@@ -864,7 +878,7 @@ def main():
 
     signal.signal(signal.SIGTERM, terminate)
     failed = None
-    cleanup_failed = False
+    interrupted = False
     try:
         for n, title, fn in CHECKS:
             if only and n not in only:
@@ -887,13 +901,17 @@ def main():
                 print(failed, flush=True)
                 break
             print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
+    except (KeyboardInterrupt, SystemExit):
+        interrupted = True
+        raise
     finally:
+        if interrupted:
+            print("interrupted; restoring the guest...", flush=True)
         try:
             run.cleanup()
         except Exception as e:
-            cleanup_failed = True
-            print(f"cleanup failed: {type(e).__name__}: {e}", flush=True)
-    if failed or cleanup_failed:
+            run.cleanup_error(f"{type(e).__name__}: {e}")
+    if failed or run.cleanup_failed:
         sys.exit(1)
 
 
