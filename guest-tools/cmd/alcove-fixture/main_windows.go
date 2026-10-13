@@ -19,8 +19,10 @@
 //   - "Hang": the window thread sleeps for 60 s;
 //   - "Fetch": an HTTPS GET of --url on another goroutine, which appends
 //     "Fetch: <status code or error>" to the transcript;
-//   - "Titles": changes the window title every 50 ms for 5 s, then shows
-//     "Alcove Fixture held" for 600 ms and ends with "Alcove Fixture".
+//   - "Titles": changes the window title every 50 ms for 5 s and ends with
+//     "Alcove Fixture";
+//   - two buttons that are both named "Same": each appends "Same 1" or
+//     "Same 2" to the transcript.
 //
 // With --log every action appends one line "<RFC 3339 time> <action> [detail]"
 // to the file; a change of Secret is logged as "secret <length>", without the
@@ -42,7 +44,6 @@ import (
 
 const (
 	windowTitle = "Alcove Fixture"
-	heldTitle   = "Alcove Fixture held"
 	className   = "AlcoveFixtureWindow"
 
 	replyWords    = 30
@@ -68,6 +69,8 @@ const (
 	idHang
 	idFetch
 	idTitles
+	idSame1
+	idSame2
 )
 
 const (
@@ -115,7 +118,6 @@ const (
 	titlesTimer    = 2
 	titlesInterval = 50 // ms
 	titlesTicks    = 100
-	titlesHeld     = 12 // ticks
 )
 
 var (
@@ -199,6 +201,7 @@ type app struct {
 	main, message, secret, transcript, send uintptr
 	labels                                  [4]uintptr
 	buttons                                 [5]uintptr
+	same                                    [2]uintptr
 	dpi                                     int
 	font                                    uintptr
 
@@ -279,13 +282,16 @@ func (a *app) createControls() {
 	}{{"Dialog", idDialog}, {"Crash", idCrash}, {"Hang", idHang}, {"Fetch", idFetch}, {"Titles", idTitles}} {
 		a.buttons[i] = a.child("BUTTON", b.text, wsTabStop, 0, b.id)
 	}
+	a.same[0] = a.child("BUTTON", "Same", wsTabStop, 0, idSame1)
+	a.same[1] = a.child("BUTTON", "Same", wsTabStop, 0, idSame2)
 	sendMessage(a.transcript, emSetLimitText, 0, 0)
 }
 
 func (a *app) children() []uintptr {
 	all := []uintptr{a.message, a.send, a.secret, a.transcript}
 	all = append(all, a.labels[:]...)
-	return append(all, a.buttons[:]...)
+	all = append(all, a.buttons[:]...)
+	return append(all, a.same[:]...)
 }
 
 // applyFont gives every control a font with Hangul glyphs at the window's DPI.
@@ -307,7 +313,8 @@ func move(hwnd uintptr, x, y, w, h int32) {
 }
 
 // layout places the controls in the client area: the two input rows on top,
-// the buttons and the Korean label at the bottom, the transcript between.
+// the buttons at the bottom, above them the Korean label with the two Same
+// buttons to its right, the transcript between.
 func (a *app) layout() {
 	var client rect
 	procGetClientRect.Call(a.main, uintptr(unsafe.Pointer(&client)))
@@ -335,7 +342,11 @@ func (a *app) layout() {
 		transcriptH = a.scale(40)
 	}
 	move(a.transcript, margin, y, width-2*margin, transcriptH)
-	move(a.labels[3], margin, labelY, width-2*margin, a.scale(22))
+	sameW := 2*buttonW + gap
+	move(a.labels[3], margin, labelY, width-2*margin-sameW-gap, a.scale(22))
+	for i, b := range a.same {
+		move(b, width-margin-sameW+int32(i)*(buttonW+gap), labelY, buttonW, a.scale(22))
+	}
 	for i, b := range a.buttons {
 		move(b, margin+int32(i)*(buttonW+gap), bottom, buttonW, buttonH)
 	}
@@ -420,6 +431,12 @@ func (a *app) onCommand(id int) {
 		a.onFetch()
 	case idTitles:
 		a.onTitles()
+	case idSame1:
+		a.log("same", "1")
+		a.appendTranscript("Same 1\r\n")
+	case idSame2:
+		a.log("same", "2")
+		a.appendTranscript("Same 2\r\n")
 	}
 }
 
@@ -434,19 +451,12 @@ func (a *app) onTitles() {
 	procSetTimer.Call(a.main, titlesTimer, titlesInterval, 0)
 }
 
-// onTitlesTimer changes the title once more: to the next numbered title for
-// titlesTicks ticks, then to heldTitle for titlesHeld ticks, then to the base
-// title.
+// onTitlesTimer changes the title once more: to the next numbered title until
+// titlesTicks ticks have passed, then to the base title.
 func (a *app) onTitlesTimer() {
 	a.titlesTick++
-	switch {
-	case a.titlesTick < titlesTicks:
+	if a.titlesTick < titlesTicks {
 		setWindowText(a.main, fmt.Sprintf("Alcove Fixture %d", a.titlesTick))
-		return
-	case a.titlesTick == titlesTicks:
-		setWindowText(a.main, heldTitle)
-		return
-	case a.titlesTick < titlesTicks+titlesHeld:
 		return
 	}
 	procKillTimer.Call(a.main, titlesTimer)
