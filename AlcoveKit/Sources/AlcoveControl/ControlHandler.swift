@@ -513,10 +513,12 @@ public actor ControlHandler {
             factor = Double(maxWidth) / Double(cropped.width)
         }
         var legend: [JSON]?
+        var marksTruncated = false
         if let nodes = view.nodes {
-            let marks = ControlHandler.marks(for: nodes, in: area)
+            let (marks, more) = ControlHandler.marks(for: nodes, in: area)
             cropped = cropped.drawingMarks(marks.map { Frame.Mark(number: $0.number, rect: $0.rect.offset(x: -area.x, y: -area.y)) }, scale: 1 / factor)
             legend = marks.map(\.json)
+            marksTruncated = more || view.nodesTruncated
         }
         let image = cropped.scaled(by: factor)
         let key = format == .png ? "png" : "jpeg"
@@ -531,6 +533,7 @@ public actor ControlHandler {
         ]
         if let window = view.window { out["window"] = window }
         if let legend { out["marks"] = .array(legend) }
+        if marksTruncated { out["marksTruncated"] = true }
         return .object(out)
     }
 }

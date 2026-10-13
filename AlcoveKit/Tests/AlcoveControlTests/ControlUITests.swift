@@ -182,6 +182,21 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(UITreeText.render([]), "")
     }
 
+    func testUITreeTextKeepsOneNodeOnOneLine() {
+        let breaks = "a\u{2028}b\u{2029}c\u{85}d\u{0B}e\u{0C}f\u{1B}g\u{7F}h\u{9F}i\u{0}j"
+        XCTAssertEqual(UITreeText.quoted(breaks), "\"a\\u{2028}b\\u{2029}c\\u{85}d\\u{b}e\\u{c}f\\u{1b}g\\u{7f}h\\u{9f}i\\u{0}j\"")
+        XCTAssertEqual(UITreeText.quoted("é 한글 \u{A0}\u{200B}"), "\"é 한글 \u{A0}\u{200B}\"")
+
+        let long = String(repeating: "가", count: 250)
+        let line = UITreeText.render([node("e1", "Text", long, value: breaks), node("e2", "Text", String(repeating: "x", count: 200))])
+        let lines = line.components(separatedBy: "\n")
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertTrue(lines[0].hasPrefix("[e1] Text \"" + String(repeating: "가", count: 200) + "…\" (0,0 10x10)"), lines[0])
+        XCTAssertTrue(lines[1].hasPrefix("[e2] Text \"" + String(repeating: "x", count: 200) + "\" "), lines[1])
+        XCTAssertNil(line.unicodeScalars.first { $0 != "\n" && ($0.value < 0x20 || (0x7F...0x9F).contains($0.value) || $0.value == 0x2028 || $0.value == 0x2029) })
+        XCTAssertEqual(UITreeText.label(node("e3", "Button", long)), "Button \"" + String(repeating: "가", count: 200) + "…\"")
+    }
+
     // MARK: - windows
 
     func testWindowListAndAction() async throws {
@@ -2068,6 +2083,100 @@ final class ControlUITests: XCTestCase {
         let part = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "marks": true, "region": ["x": 0, "y": 0, "w": 300, "h": 110]])
         XCTAssertEqual(part["marks"]?.arrayValue?.map { $0["ref"]?.stringValue }, ["e4", "e5"])
         XCTAssertEqual(part["marks"]?[1]?["n"]?.intValue, 2)
+    }
+
+    func testScreenshotMarksSayWhenElementsAreLeftOut() async throws {
+        let buttons: [JSON] = (0..<101).map { node("e\(100 + $0)", "Button", "b\($0)", depth: 1, x: 100 + ($0 % 20) * 20, y: 50 + ($0 / 20) * 20, w: 18, h: 18) }
+        let header = node("e90", "HeaderItem", "Name", depth: 1, x: 100, y: 200, w: 60, h: 20)
+        let count = LockedBox(101)
+        let cut = LockedBox(false)
+        let (h, _, _) = try await rig([
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+            "ui.tree": { _, _ in .ok(["window": fixtureWindow, "nodes": .array(Array(buttons.prefix(count.value)) + (count.value < 100 ? [header] : [])),
+                                      "truncated": .bool(cut.value)]) },
+        ])
+        let params: JSON = ["name": "Win", "window": "Alcove", "marks": true]
+        let over = try await h.handle(op: "vm.screenshot", params: params)
+        XCTAssertEqual(over["marks"]?.arrayValue?.count, 100)
+        XCTAssertEqual(over["marks"]?[99]?["n"]?.intValue, 100)
+        XCTAssertEqual(over["marks"]?[99]?["ref"]?.stringValue, "e199")
+        XCTAssertEqual(over["marksTruncated"], true)
+
+        count.value = 100
+        let exact = try await h.handle(op: "vm.screenshot", params: params)
+        XCTAssertEqual(exact["marks"]?.arrayValue?.count, 100)
+        XCTAssertNil(exact["marksTruncated"])
+
+        count.value = 3
+        let few = try await h.handle(op: "vm.screenshot", params: params)
+        XCTAssertEqual(few["marks"]?.arrayValue?.map { $0["role"]?.stringValue }, ["Button", "Button", "Button", "HeaderItem"])
+        XCTAssertNil(few["marksTruncated"])
+        cut.value = true
+        let partial = try await h.handle(op: "vm.screenshot", params: params)
+        XCTAssertEqual(partial["marks"]?.arrayValue?.count, 4)
+        XCTAssertEqual(partial["marksTruncated"], true)
+    }
+
+    func testScreenshotMarksKeepTheirOutlineWhenTheImageIsScaledDown() async throws {
+        let (h, _, _) = try await rig([
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+            "ui.tree": { _, _ in .ok(["window": fixtureWindow, "nodes": [messageEdit, sendButton], "truncated": false]) },
+        ])
+        let plain = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "window": "Alcove", "maxWidth": 200])
+        let marked = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "window": "Alcove", "maxWidth": 200, "marks": true])
+        XCTAssertEqual(marked["sentWidth"]?.intValue, 200)
+        let before = try XCTUnwrap(Frame(png: Data(base64Encoded: plain["png"]?.stringValue ?? "") ?? Data()))
+        let after = try XCTUnwrap(Frame(png: Data(base64Encoded: marked["png"]?.stringValue ?? "") ?? Data()))
+        let color = Frame.markColors[1]
+        let expected = [Int(color.blue), Int(color.green), Int(color.red)]
+        for (x, y) in [(45, 25), (45, 26), (25, 30), (26, 30), (63, 30), (64, 30), (45, 35), (45, 36)] {
+            let pixel = after.pixel(x: x, y: y).prefix(3).map(Int.init)
+            for channel in 0..<3 { XCTAssertLessThanOrEqual(abs(pixel[channel] - expected[channel]), 60, "\(x),\(y): \(pixel)") }
+            let unmarked = before.pixel(x: x, y: y).prefix(3).map(Int.init)
+            XCTAssertGreaterThan(zip(unmarked, expected).map { abs($0 - $1) }.max() ?? 0, 120)
+        }
+        XCTAssertEqual(after.pixel(x: 45, y: 31), before.pixel(x: 45, y: 31))
+    }
+
+    func testDrawingMarksAtTheEdgesAndWithThinOrEmptyRectangles() throws {
+        let base = try XCTUnwrap(Frame(png: makePNG(width: 200, height: 120)))
+        func bgr(_ number: Int) -> [UInt8] {
+            let c = Frame.markColors[(number - 1) % Frame.markColors.count]
+            return [c.blue, c.green, c.red, 255]
+        }
+        let thin = base.drawingMarks([Frame.Mark(number: 1, rect: Frame.Rect(x: 50, y: 30, w: 1, h: 20))])
+        for y in [30, 40, 49] { XCTAssertEqual(thin.pixel(x: 50, y: y), bgr(1), "\(y)") }
+        XCTAssertEqual(thin.pixel(x: 51, y: 40), base.pixel(x: 51, y: 40))
+        let flat = base.drawingMarks([Frame.Mark(number: 2, rect: Frame.Rect(x: 60, y: 70, w: 30, h: 3))])
+        XCTAssertEqual(flat.pixel(x: 75, y: 71), bgr(2))
+
+        XCTAssertEqual(base.drawingMarks([Frame.Mark(number: 3, rect: Frame.Rect(x: 80, y: 80, w: 0, h: 0)),
+                                          Frame.Mark(number: 4, rect: Frame.Rect(x: 80, y: 80, w: 10, h: 0)),
+                                          Frame.Mark(number: 5, rect: Frame.Rect(x: 80, y: 80, w: -4, h: 10))]), base)
+
+        let left = base.drawingMarks([Frame.Mark(number: 3, rect: Frame.Rect(x: -40, y: 40, w: 60, h: 20))])
+        XCTAssertEqual(left.pixel(x: 19, y: 50), bgr(3))
+        XCTAssertEqual(left.pixel(x: 0, y: 36), bgr(3))
+        XCTAssertNotEqual(left.pixel(x: 5, y: 34), base.pixel(x: 5, y: 34))
+
+        let top = base.drawingMarks([Frame.Mark(number: 4, rect: Frame.Rect(x: 100, y: 0, w: 60, h: 40))])
+        XCTAssertEqual(top.pixel(x: 100, y: 0), bgr(4))
+        XCTAssertEqual(top.pixel(x: 103, y: 3), bgr(4))
+        XCTAssertEqual(top.pixel(x: 150, y: 20), base.pixel(x: 150, y: 20))
+
+        let right = base.drawingMarks([Frame.Mark(number: 5, rect: Frame.Rect(x: 196, y: 60, w: 4, h: 20))])
+        XCTAssertNotEqual(right.pixel(x: 192, y: 55), base.pixel(x: 192, y: 55))
+        XCTAssertEqual(right.pixel(x: 199, y: 55), bgr(5))
+
+        let one = base.drawingMarks([Frame.Mark(number: 1, rect: Frame.Rect(x: 40, y: 60, w: 60, h: 30))])
+        let hundred = base.drawingMarks([Frame.Mark(number: 100, rect: Frame.Rect(x: 40, y: 60, w: 60, h: 30))])
+        XCTAssertEqual(hundred.pixel(x: 40, y: 60), bgr(100))
+        XCTAssertEqual(one.pixel(x: 58, y: 55), base.pixel(x: 58, y: 55))
+        XCTAssertEqual(hundred.pixel(x: 41, y: 55), bgr(100))
+        XCTAssertNotEqual(hundred.pixel(x: 58, y: 55), base.pixel(x: 58, y: 55))
+        for frame in [thin, left, top, right, hundred] {
+            for i in stride(from: 3, to: frame.pixels.count, by: 4) where frame.pixels[i] != 255 { XCTFail("alpha at \(i)"); break }
+        }
     }
 
     func testDrawingMarksOutlinesEachRectangle() throws {

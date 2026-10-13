@@ -19,22 +19,34 @@ enum UITreeText {
         return String(repeating: "  ", count: max(0, node["depth"]?.intValue ?? 0)) + parts.joined(separator: " ")
     }
 
-    /// `Role "name"` of a node.
+    /// The most characters of a name a line shows.
+    static let nameLimit = 200
+
+    /// `Role "name"` of a node; a name longer than `nameLimit` characters is cut there and ends with `…`.
     static func label(_ node: JSON) -> String {
-        "\(node["role"]?.stringValue ?? "?") \(quoted(node["name"]?.stringValue ?? ""))"
+        var name = node["name"]?.stringValue ?? ""
+        if name.count > nameLimit { name = String(name.prefix(nameLimit)) + "…" }
+        return "\(node["role"]?.stringValue ?? "?") \(quoted(name))"
     }
 
-    /// `text` in double quotes on one line: backslash, double quote, newline, carriage return and tab are backslash-escaped.
+    /// `text` in double quotes on one line: backslash, double quote, newline, carriage return and tab are backslash-escaped;
+    /// every other scalar below U+0020 or from U+007F to U+009F, and the line and paragraph separators U+2028 and U+2029,
+    /// are written as `\u{hex}`.
     static func quoted(_ text: String) -> String {
         var out = "\""
-        for character in text.unicodeScalars {
-            switch character {
+        for scalar in text.unicodeScalars {
+            switch scalar {
             case "\\": out += "\\\\"
             case "\"": out += "\\\""
             case "\n": out += "\\n"
             case "\r": out += "\\r"
             case "\t": out += "\\t"
-            default: out.unicodeScalars.append(character)
+            default:
+                if scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value) || scalar.value == 0x2028 || scalar.value == 0x2029 {
+                    out += "\\u{" + String(scalar.value, radix: 16) + "}"
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
             }
         }
         return out + "\""

@@ -95,8 +95,10 @@ public struct Frame: Sendable, Equatable {
     ]
 
     /// The frame with each mark drawn as an outlined rectangle and its number in a filled tag: above the
-    /// rectangle's top-left corner, or inside that corner when the tag does not fit above. `scale` multiplies
-    /// the outline width (2 pixels) and the tag's text size (13 pixels). Parts outside the frame are cut off.
+    /// rectangle's top-left corner, or inside that corner when the tag does not fit above, and moved sideways
+    /// into the frame when it would reach past an edge. A rectangle too thin for an outline is filled; one without
+    /// an area is not drawn. `scale` multiplies the outline width (2 pixels) and the tag's text size (13 pixels).
+    /// Parts of a rectangle outside the frame are cut off.
     public func drawingMarks(_ marks: [Mark], scale: Double = 1) -> Frame {
         guard !marks.isEmpty else { return self }
         let line = max(1, (2 * max(1, scale)).rounded())
@@ -109,15 +111,20 @@ public struct Frame: Sendable, Equatable {
         let drawn: Bool = data.withUnsafeMutableBytes { buffer in
             guard let ctx = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
                                       space: space, bitmapInfo: Frame.bitmapInfo) else { return false }
-            for mark in marks {
+            for mark in marks where mark.rect.w > 0 && mark.rect.h > 0 {
                 let rgb = Frame.markColors[((mark.number - 1) % Frame.markColors.count + Frame.markColors.count) % Frame.markColors.count]
                 guard let color = CGColor(colorSpace: space, components: [CGFloat(rgb.red) / 255, CGFloat(rgb.green) / 255, CGFloat(rgb.blue) / 255, 1]) else { continue }
                 let box = CGRect(x: CGFloat(mark.rect.x), y: CGFloat(height - mark.rect.y - mark.rect.h),
                                  width: CGFloat(mark.rect.w), height: CGFloat(mark.rect.h))
                 ctx.setShouldAntialias(false)
-                ctx.setStrokeColor(color)
-                ctx.setLineWidth(CGFloat(line))
-                ctx.stroke(box.insetBy(dx: CGFloat(line) / 2, dy: CGFloat(line) / 2))
+                ctx.setFillColor(color)
+                if box.width <= 2 * CGFloat(line) || box.height <= 2 * CGFloat(line) {
+                    ctx.fill(box)
+                } else {
+                    ctx.setStrokeColor(color)
+                    ctx.setLineWidth(CGFloat(line))
+                    ctx.stroke(box.insetBy(dx: CGFloat(line) / 2, dy: CGFloat(line) / 2))
+                }
 
                 guard let text = CFAttributedStringCreate(nil, "\(mark.number)" as CFString, attributes as CFDictionary) else { continue }
                 let label = CTLineCreateWithAttributedString(text)
@@ -128,16 +135,17 @@ public struct Frame: Sendable, Equatable {
                 if tag.maxY > CGFloat(height) {
                     tag.origin = CGPoint(x: box.minX + CGFloat(line), y: box.maxY - CGFloat(line) - tagHeight)
                 }
-                ctx.setFillColor(color)
+                tag.origin.x = max(0, min(tag.origin.x, CGFloat(width) - tagWidth))
+                tag.origin.y = max(0, min(tag.origin.y, CGFloat(height) - tagHeight))
                 ctx.fill(tag)
                 ctx.setShouldAntialias(true)
                 ctx.textPosition = CGPoint(x: tag.minX + padding, y: tag.minY + padding + descent)
                 CTLineDraw(label, ctx)
             }
+            for i in stride(from: 3, to: buffer.count, by: 4) { buffer[i] = 255 }
             return true
         }
         guard drawn else { return self }
-        for i in stride(from: 3, to: data.count, by: 4) { data[i] = 255 }
         return Frame(width: width, height: height, pixels: data)
     }
 

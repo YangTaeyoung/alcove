@@ -181,6 +181,8 @@ struct UIMark {
 struct ScreenshotView {
     var window: JSON?
     var nodes: [JSON]?
+    /// Whether the agent left elements out of `nodes`.
+    var nodesTruncated = false
 }
 
 extension Frame.Rect {
@@ -199,7 +201,7 @@ extension ControlHandler {
     static let textModes = ["auto", "pattern", "descendants"]
     /// The control types a marked screenshot numbers, in lower case.
     static let markRoles: Set<String> = [
-        "button", "checkbox", "combobox", "edit", "hyperlink", "listitem", "menuitem", "radiobutton", "slider", "spinner",
+        "button", "checkbox", "combobox", "edit", "headeritem", "hyperlink", "listitem", "menuitem", "radiobutton", "slider", "spinner",
         "splitbutton", "tabitem", "treeitem", "dataitem", "document",
     ]
     static let maxMarks = 100
@@ -675,7 +677,9 @@ extension ControlHandler {
         }
         if marks {
             let request: [String: JSON] = ["window": view.window?["id"] ?? "foreground", "filter": "interactive", "max": 300]
-            view.nodes = try await uiCall(agent, "ui.tree", request, vm: t.name, op: op)["nodes"]?.arrayValue ?? []
+            let tree = try await uiCall(agent, "ui.tree", request, vm: t.name, op: op)
+            view.nodes = tree["nodes"]?.arrayValue ?? []
+            view.nodesTruncated = tree["truncated"]?.boolValue ?? false
         }
         return view
     }
@@ -703,16 +707,18 @@ extension ControlHandler {
 
     /// The elements of `nodes` to number: those with a control type in `markRoles`, a rectangle that is not empty and
     /// reaches into `area`, and without the `offscreen` flag; at most `maxMarks`, numbered from 1 in tree order.
-    static func marks(for nodes: [JSON], in area: Frame.Rect) -> [UIMark] {
+    /// `more` says whether further such elements were left without a number.
+    static func marks(for nodes: [JSON], in area: Frame.Rect) -> (marks: [UIMark], more: Bool) {
         var marks: [UIMark] = []
-        for node in nodes where marks.count < maxMarks {
+        for node in nodes {
             guard let role = node["role"]?.stringValue, markRoles.contains(role.lowercased()),
                   let x = node["x"]?.intValue, let y = node["y"]?.intValue, let w = node["w"]?.intValue, let h = node["h"]?.intValue,
                   w > 0, h > 0, !(node["flags"]?.arrayValue ?? []).contains("offscreen") else { continue }
             let rect = Frame.Rect(x: x, y: y, w: w, h: h)
             guard rect.intersects(area) else { continue }
+            guard marks.count < maxMarks else { return (marks, true) }
             marks.append(UIMark(number: marks.count + 1, node: node, rect: rect))
         }
-        return marks
+        return (marks, false)
     }
 }
