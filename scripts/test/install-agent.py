@@ -5,7 +5,9 @@ checks the agent's hello.
 A stopped VM is started through the control socket; a starting VM is awaited.
 The binary is copied over SSH and installed with
 `alcove-agent.exe --install --allow-exec`, which replaces the running copy and
-restarts the scheduled task. The script then requires, in this order:
+restarts the scheduled task. An installer that does not exit with 0 ends the
+script with the line the installer wrote to stderr, or the line it wrote to
+install.log during this run. The script then requires, in this order:
 
 1. the installed file has the SHA-256 of the build,
 2. the agent process at the installed path started after the installer was
@@ -27,16 +29,24 @@ KEY = os.path.expanduser("~/Library/Application Support/Alcove/test_id_ed25519")
 SSH_OPTS = ["-i", KEY, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR"]
 GUEST_COPY = "C:/Users/alcove/alcove-agent.exe"
+GUEST_STDERR = r"C:\Users\alcove\alcove-agent-install.err"
 INSTALLED = r"C:\Program Files\Alcove\alcove-agent.exe"
 GUEST_AGENT_PORT = 7645
 REQUIRED_CAPS = ("rpc", "jobs", "proc", "fs")
 
+INSTALL_LOG = r"C:\ProgramData\Alcove\install.log"
+# Prints the installer's exit code, the first line it wrote to stderr, and the
+# last line of install.log when the installer wrote that file during this run.
 INSTALL_PS = (
     '$before = (Get-Date).ToUniversalTime().Ticks; "before=$before"; '
-    r'$p = Start-Process -FilePath "C:\Users\alcove\alcove-agent.exe" -ArgumentList "--install","--allow-exec" -Wait -PassThru; '
+    r'$p = Start-Process -FilePath "C:\Users\alcove\alcove-agent.exe" -ArgumentList "--install","--allow-exec" -Wait -PassThru '
+    f'-RedirectStandardError "{GUEST_STDERR}"; '
     '"exit=$($p.ExitCode)"; '
+    f'"stderr=$(Get-Content -LiteralPath "{GUEST_STDERR}" -ErrorAction SilentlyContinue | Select-Object -First 1)"; '
+    f'Remove-Item -LiteralPath "{GUEST_STDERR}" -Force -ErrorAction SilentlyContinue; '
     f'"sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath "{INSTALLED}").Hash.ToLower())"; '
-    r'"log=$(Get-Content C:\ProgramData\Alcove\install.log -Tail 1)"'
+    f'$log = Get-Item -LiteralPath "{INSTALL_LOG}" -ErrorAction SilentlyContinue; '
+    'if ($log -and $log.LastWriteTimeUtc.Ticks -ge $before) { "log=$(Get-Content -LiteralPath $log.FullName -Tail 1)" }'
 )
 PROCESS_PS = (
     f'$p = Get-Process alcove-agent -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -eq "{INSTALLED}" }} '
@@ -130,13 +140,23 @@ def ensure_running(vm, ssh_port):
     fail(f"ssh on port {ssh_port} did not answer")
 
 
+def install_failure(got):
+    """Returns the sentence for an installer that did not exit with 0: what it
+    wrote to stderr, else the line it wrote to install.log during this run,
+    else its exit code alone."""
+    said = got.get("stderr") or got.get("log")
+    if said:
+        return f"the installer exited with {got.get('exit', 'no exit code')}: {said}"
+    return f"the installer exited with {got.get('exit', 'no exit code')} and wrote nothing to stderr or install.log"
+
+
 def install(ssh_port, digest):
     """Runs the installer in the guest and returns the guest time taken just before it."""
     r = ssh(ssh_port, "the installer over ssh", INSTALL_PS)
     got = fields(r.stdout)
-    log("install:", ", ".join(f"{k}={got[k]}" for k in ("exit", "sha256", "log") if k in got) or (r.stdout + r.stderr).strip()[:300])
+    log("install:", ", ".join(f"{k}={got[k]}" for k in ("exit", "sha256", "stderr", "log") if got.get(k)) or (r.stdout + r.stderr).strip()[:300])
     if r.returncode != 0 or got.get("exit") != "0":
-        fail("the installer did not exit with 0; read C:\\ProgramData\\Alcove\\install.log in the guest")
+        fail(install_failure(got))
     if got.get("sha256") != digest:
         fail(f"{INSTALLED} has SHA-256 {got.get('sha256')!r}, the build has {digest}")
     if not got.get("before", "").isdigit():
