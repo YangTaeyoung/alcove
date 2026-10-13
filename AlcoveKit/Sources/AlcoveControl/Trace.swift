@@ -86,14 +86,23 @@ enum TraceSanitizer {
     }
 }
 
+/// Where a recording writes its trace lines and frame files.
+protocol TraceStore: Sendable {
+    func append(_ entry: TraceEntry) throws
+    /// Writes `frame` as a frame file named `name` and returns its path relative to the recording directory.
+    func writeFrame(_ frame: Frame, name: String) throws -> String
+    func close()
+}
+
 /// Appends trace lines and frame files below one recording directory.
-final class TraceWriter: @unchecked Sendable {
+final class TraceWriter: TraceStore, @unchecked Sendable {
     enum WriterError: Error, CustomStringConvertible {
-        case closed, unencodable
+        case closed, unencodable, exists
         var description: String {
             switch self {
             case .closed: return "the trace is closed"
             case .unencodable: return "the frame could not be encoded"
+            case .exists: return "the directory already holds a recording"
             }
         }
     }
@@ -105,16 +114,18 @@ final class TraceWriter: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: FileHandle?
 
-    /// Creates the directory, `frames/` and an empty `trace.jsonl`.
+    /// Creates the directory, `frames/` and an empty `trace.jsonl`; throws `WriterError.exists` when `trace.jsonl` is already there.
     init(directory: URL) throws {
         self.directory = directory
         let fm = FileManager.default
         try fm.createDirectory(at: directory.appendingPathComponent(TraceWriter.framesName), withIntermediateDirectories: true)
         let trace = directory.appendingPathComponent(TraceWriter.traceName)
-        guard fm.createFile(atPath: trace.path, contents: nil) else {
+        let descriptor = open(trace.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+        guard descriptor >= 0 else {
+            if errno == EEXIST { throw WriterError.exists }
             throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: trace.path])
         }
-        handle = try FileHandle(forWritingTo: trace)
+        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
     deinit { try? handle?.close() }
@@ -133,7 +144,7 @@ final class TraceWriter: @unchecked Sendable {
         let data = frame.scaled(by: 0.5).encoded(.jpeg, quality: 0.6)
         guard !data.isEmpty else { throw WriterError.unencodable }
         let relative = "\(TraceWriter.framesName)/\(name)"
-        try data.write(to: directory.appendingPathComponent(relative))
+        try data.write(to: directory.appendingPathComponent(relative), options: .atomic)
         return relative
     }
 

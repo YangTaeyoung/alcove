@@ -64,6 +64,7 @@ public actor ControlHandler {
     /// The base directory of new recordings; nil selects `~/Library/Application Support/Alcove/Recordings`.
     let recordingsDirectory: URL?
     var recordings = RecordingTable()
+    var recordingSeams = RecordingSeams()
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 

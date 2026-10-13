@@ -297,6 +297,130 @@ final class TraceTests: XCTestCase {
         XCTAssertEqual(status["recording"]?.boolValue, false)
     }
 
+    // MARK: concurrency and write failures
+
+    func testConcurrentStartsLeaveOneRecording() async throws {
+        let (h, _, _) = setup()
+        let gate = AsyncGate()
+        let first = FirstCallGate()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { dir in
+            if await first.shouldHold() { await gate.wait() }
+            return try TraceWriter(directory: dir)
+        }, makeSink: { _, _ in NoVideoSink() }))
+        let dirA = base.appendingPathComponent("a"), dirB = base.appendingPathComponent("b")
+        let a = Task { try await h.handle(op: "vm.record.start", params: ["name": "Win", "dir": .string(dirA.path)]) }
+        await gate.waitUntilWaiting()
+        let message = await failure(h, "vm.record.start", ["name": "Win", "dir": .string(dirB.path)])
+        XCTAssertEqual(message, "'Win' is already recording to \(dirA.path); call vm.record.stop first")
+        await gate.open()
+        let result = try await a.value
+        XCTAssertEqual(result["dir"]?.stringValue, dirA.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dirB.appendingPathComponent("trace.jsonl").path))
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dirA.path)
+    }
+
+    func testFailedStartReleasesReservation() async throws {
+        let (h, _, _) = setup()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { _ in throw CocoaError(.fileWriteNoPermission) },
+                                                 makeSink: { _, _ in NoVideoSink() }))
+        let message = await failure(h, "vm.record.start", ["name": "Win"])
+        XCTAssertTrue(message.contains("cannot create the recording"), message)
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in NoVideoSink() }))
+        _ = try await start(h)
+    }
+
+    func testTraceFileIsCreatedExclusively() throws {
+        let dir = base.appendingPathComponent("exclusive")
+        _ = try TraceWriter(directory: dir)
+        XCTAssertThrowsError(try TraceWriter(directory: dir)) { error in
+            XCTAssertEqual(error as? TraceWriter.WriterError, .exists)
+        }
+    }
+
+    func testWriteFailuresAreCountedAndReported() async throws {
+        let (h, _, _) = setup()
+        let (plain, _, _) = setup()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { FailingStore(inner: try TraceWriter(directory: $0), failLines: true, failFrames: false) },
+                                                 makeSink: { _, _ in NoVideoSink() }))
+        _ = try await start(h)
+        for _ in 0..<3 {
+            let a = try await plain.handle(op: "vm.status", params: ["name": "Win"])
+            let b = try await h.handle(op: "vm.status", params: ["name": "Win"])
+            XCTAssertEqual(a, b)
+        }
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, true)
+        XCTAssertEqual(status["ops"]?.intValue, 0)
+        XCTAssertEqual(status["writeErrors"]?.intValue, 3)
+        XCTAssertNotNil(status["lastWriteError"]?.stringValue)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["ops"]?.intValue, 0)
+        XCTAssertEqual(stop["writeErrors"]?.intValue, 3)
+        XCTAssertNotNil(stop["lastWriteError"]?.stringValue)
+    }
+
+    func testCleanRecordingReportsZeroWriteErrors() async throws {
+        let (h, _, _) = setup()
+        _ = try await start(h, ["video": false])
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["writeErrors"]?.intValue, 0)
+        XCTAssertNil(status["lastWriteError"])
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["writeErrors"]?.intValue, 0)
+        XCTAssertNil(stop["lastWriteError"])
+    }
+
+    func testFrameWriteFailuresAreCounted() async throws {
+        let (h, _, _) = setup()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { FailingStore(inner: try TraceWriter(directory: $0), failLines: false, failFrames: true) },
+                                                 makeSink: { _, _ in NoVideoSink() }))
+        let dir = try await start(h)
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["frames"]?.intValue, 0)
+        XCTAssertEqual(stop["ops"]?.intValue, 1)
+        XCTAssertEqual(stop["writeErrors"]?.intValue, 2)
+        XCTAssertEqual(try lines(dir).count, 1)
+    }
+
+    func testRecordingEndsAfterTwentyConsecutiveLineFailures() async throws {
+        let (h, _, _) = setup()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { FailingStore(inner: try TraceWriter(directory: $0), failLines: true, failFrames: false) },
+                                                 makeSink: { _, _ in NoVideoSink() }))
+        let dir = try await start(h)
+        for _ in 0..<19 { _ = try await h.handle(op: "vm.status", params: ["name": "Win"]) }
+        let before = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(before["recording"]?.boolValue, true)
+        let result = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(result["name"]?.stringValue, "Win")
+        let after = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(after["recording"]?.boolValue, false)
+        XCTAssertEqual(after["dir"]?.stringValue, dir.path)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["writeErrors"]?.intValue, 20)
+        XCTAssertNotNil(stop["lastWriteError"]?.stringValue)
+        let ok = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(ok["name"]?.stringValue, "Win")
+    }
+
+    func testStopDuringRetirementReturnsSummary() async throws {
+        let (h, _, _) = setup()
+        let slow = SlowFinishSink()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in slow }))
+        _ = try await start(h)
+        let retire = Task { try await h.handle(op: "vm.stop", params: ["name": "Win"]) }
+        await slow.gate.waitUntilWaiting()
+        let stopTask = Task { try await h.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+        try await Task.sleep(for: .milliseconds(100))
+        await slow.gate.open()
+        _ = try await retire.value
+        let stop = try await stopTask.value
+        XCTAssertEqual(stop["ops"]?.intValue, 1)
+        let again = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(again, "'Win' is not recording")
+    }
+
     // MARK: automatic end
 
     func testRecordingStopsWhenVMStops() async throws {
@@ -381,4 +505,50 @@ private final class CountingSink: VideoSink, @unchecked Sendable {
     func append(frame: Frame, at time: Duration) {}
     func finish() async { bump() }
     private func bump() { lock.lock(); count += 1; lock.unlock() }
+}
+
+private actor AsyncGate {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func waitUntilWaiting() async {
+        while waiters.isEmpty { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+    func open() {
+        isOpen = true
+        for waiter in waiters { waiter.resume() }
+        waiters = []
+    }
+}
+
+private actor FirstCallGate {
+    private var calls = 0
+        func shouldHold() -> Bool { calls += 1; return calls == 1 }
+}
+
+private final class FailingStore: TraceStore, @unchecked Sendable {
+    private let inner: TraceWriter
+    private let failLines: Bool
+    private let failFrames: Bool
+    init(inner: TraceWriter, failLines: Bool, failFrames: Bool) {
+        self.inner = inner; self.failLines = failLines; self.failFrames = failFrames
+    }
+    func append(_ entry: TraceEntry) throws {
+        if failLines { throw CocoaError(.fileWriteOutOfSpace) }
+        try inner.append(entry)
+    }
+    func writeFrame(_ frame: Frame, name: String) throws -> String {
+        if failFrames { throw CocoaError(.fileWriteOutOfSpace) }
+        return try inner.writeFrame(frame, name: name)
+    }
+    func close() { inner.close() }
+}
+
+private final class SlowFinishSink: VideoSink, @unchecked Sendable {
+    let gate = AsyncGate()
+    func append(frame: Frame, at time: Duration) {}
+    func finish() async { await gate.wait() }
 }
