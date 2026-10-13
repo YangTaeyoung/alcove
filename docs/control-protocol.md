@@ -307,8 +307,11 @@ discards its changes.
 A VM with a session saved to disk (`suspended: true` in its row) resumes that
 session: the guest continues where it was saved, with its clock at the time of
 the save. The server then connects to the guest tools for up to `waitTools`
-seconds (default 30; below 0 counts as 0) and, when they can run commands,
-sets the guest clock to the host's. The result carries `resumed: true`,
+seconds (default 30; below 0 counts as 0; with `waitTools: 0` it still tries
+once to reach them) and, when they can run commands, sets the guest clock to
+the host's. A guest without a clock recipe (a guest of kind `other`) is not
+waited for: the result has `resumed: true`, `tools` as known at once and
+`clockSynced: false`. The result carries `resumed: true`,
 `tools` (whether they connected) and `clockSynced` (whether the clock was
 set); with `clockSynced: false`, call `vm.set_environment` with `clock:
 "host"` once the tools are connected. A start that boots the VM has none of
@@ -564,7 +567,9 @@ resolution with vm.set_resolution first` or `scale: 125 % was applied, not
 them`. The applied scale is then the guest's stored setting, so a later change
 of resolution keeps it. A guest whose display reports no scale range gives
 `ok: false` with `the guest did not report the scale range of its display;
-sign in to the guest desktop and set dpiScale again`.
+sign in to the guest desktop and set dpiScale again`; when Windows refuses the
+change, `Windows refused the display scale; sign in to the guest desktop and
+set dpiScale again`.
 
 Refusals for values: `theme must be 'dark' or 'light'`, `dpiScale must be
 between 100 and 500`, `clock must be 'host' or an ISO 8601 time such as

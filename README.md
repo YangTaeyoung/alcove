@@ -53,7 +53,7 @@ clipboard and file sharing.
 | **Snapshots and suspend** | qcow2 snapshots with VM state, plus suspend-to-disk that resumes where you left off. |
 | **USB passthrough** | Hot-plug host USB devices into a running guest. |
 | **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell commands and background jobs, processes, clipboard, file push, pull and folder sync, guest file read and write. |
-| **No black boxes** | The engine is a pinned QEMU tag plus one readable patch. Build it yourself in one command. |
+| **No black boxes** | The engine is a pinned QEMU tag plus three readable patches (`qemu-patches/`). Build it yourself in one command. |
 
 Tested on an M3 Pro running macOS 26 with Windows 11 Pro ARM 25H2 and Ubuntu
 24.04 arm64 guests.
