@@ -31,10 +31,13 @@ enum DeployTarget {
         return !reservedNames.contains(stem.trimmingCharacters(in: .whitespaces).uppercased())
     }
 
-    /// Whether a host file or folder called `name` would take the place of the marker in a guest folder.
+    /// Whether a host file or folder called `name` would take the place of the marker in a guest folder. For a
+    /// Windows guest the name is compared without its trailing dots and spaces and without regard to case.
     static func isMarker(_ name: String, windows: Bool) -> Bool {
-        let given = name.precomposedStringWithCanonicalMapping
-        return windows ? given.lowercased() == marker : given == marker
+        var given = name.precomposedStringWithCanonicalMapping
+        guard windows else { return given == marker }
+        while let last = given.last, last == "." || last == " " { given.removeLast() }
+        return given.lowercased() == marker
     }
 
     /// Whether `segment` has a `~` followed by a digit, the form of a Windows short name such as `PROGRA~1`.
@@ -43,16 +46,23 @@ enum DeployTarget {
         return scalars.indices.dropLast().contains { scalars[$0] == "~" && ("0"..."9").contains(scalars[$0 + 1]) }
     }
 
+    /// Whether `name` can be the last segment of the default guest folder: a name Windows can use that does not look
+    /// like a short name.
+    static func isDefaultName(_ name: String) -> Bool { isWindowsName(name) && !looksLikeShortName(name) }
+
     /// The default guest folder for a host file or directory called `name`.
     static func defaultDirectory(named name: String) throws -> String {
         guard isWindowsName(name) else { throw refusal("pass guestDir; '\(name)' cannot be used as a folder name") }
+        guard !looksLikeShortName(name) else {
+            throw refusal("pass guestDir; '\(name)' has the form of a Windows short name and cannot be used as a folder name")
+        }
         return defaultRoot + "\\" + name
     }
 
     /// `requested` written the guest's way, without repeated or trailing separators. Throws for a path that is not absolute,
     /// has a `.` or `..` segment, is a filesystem root, or is a system or profile folder; on Windows also for a device
-    /// path, a server, share or folder name Windows cannot use, a short name, and `defaultRoot` itself. `example` is the
-    /// folder the refusal suggests.
+    /// path, the administrative share of a drive on any server, a server, share or folder name Windows cannot use, a
+    /// short name, and `defaultRoot` itself. `example` is the folder the refusal suggests.
     static func directory(_ requested: String, windows: Bool, example: String) throws -> String {
         func fail(_ reason: String) -> ControlHandler.ControlError { refusal("guestDir '\(requested)' \(reason) such as \(example)") }
         func unusable(_ name: String) -> String { "has the segment '\(name)', which Windows cannot use as a folder name; pass a plain folder path" }
@@ -69,6 +79,9 @@ enum DeployTarget {
                     throw refusal("device paths such as \\\\?\\ cannot be used; pass a drive or share path")
                 }
                 guard parts.count >= 2 else { throw fail(relative) }
+                if isDriveShare(parts[1]) {
+                    throw refusal("administrative shares such as \\\\host\\C$ cannot be used; pass the drive path")
+                }
                 if let bad = parts.prefix(2).first(where: { !isWindowsName($0) }) { throw fail(unusable(bad)) }
                 prefix = "\\\\" + parts[0] + "\\" + parts[1]
                 segments = Array(parts.dropFirst(2))
@@ -103,6 +116,12 @@ enum DeployTarget {
         return "/" + segments.joined(separator: "/")
     }
 
+    /// Whether `share` is the administrative share of a drive: one ASCII letter followed by `$`.
+    private static func isDriveShare(_ share: String) -> Bool {
+        let scalars = Array(share.unicodeScalars)
+        return scalars.count == 2 && scalars[0].isASCII && scalars[0].properties.isAlphabetic && scalars[1] == "$"
+    }
+
     /// Whether the lower-case `segments` below a drive or share name the Windows folder or one below it, a `Program Files`
     /// folder itself, `ProgramData` itself or the agent's folder in it, `Users`, a profile, or a profile's Desktop,
     /// Documents, Downloads or anything in its AppData.
@@ -129,9 +148,20 @@ enum DeployTarget {
         return scalars.count == 2 && scalars[1] == ":" && scalars[0].isASCII && scalars[0].properties.isAlphabetic
     }
 
-    /// Whether the relative guest path `path` has a segment that is not a name Windows can use, such as `.`, `..` or `.. `.
+    /// The segments of the relative guest path `path`, which `/` and `\` separate.
+    private static func segments(of path: String) -> [String] {
+        path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).map(String.init)
+    }
+
+    /// Whether the relative guest path `path` has a `.` or `..` segment.
     static func leavesFolder(_ path: String) -> Bool {
-        path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).contains { !isWindowsName(String($0)) }
+        segments(of: path).contains { $0 == "." || $0 == ".." }
+    }
+
+    /// The first segment of the relative guest path `path` that Windows cannot use as a file or folder name, such as
+    /// `.. `, `x.` or `NUL`; nil when it has none.
+    static func unusableSegment(of path: String) -> String? {
+        segments(of: path).first { !isWindowsName($0) }
     }
 }
 
@@ -168,7 +198,8 @@ extension ControlHandler {
         func path(_ relative: String) -> String { ControlHandler.guestPath(relative, in: guestDir, windows: windows) }
     }
 
-    /// Checks the parameters, the host path and the guest folder, then runs the deploy when no other deploy to the VM is running.
+    /// Checks the parameters, the host path, the names of the host files and the guest folder's path without asking the
+    /// guest, then runs the deploy when no other deploy to the VM is running.
     func deploy(_ params: JSON) async throws -> JSON {
         let given = try string(params, "path")
         guard given.hasPrefix("/") else { throw ControlError.failed("pass an absolute host path") }
@@ -189,6 +220,12 @@ extension ControlHandler {
         }
         let t = try await running(params)
         let windows = await t.guestOS() == .windows
+        if windows {
+            for (field, path) in [("install.file", install?.file), ("launch.exe", launching?.exe)] {
+                guard let path, !DeployTarget.isAbsolute(path), let segment = DeployTarget.unusableSegment(of: path) else { continue }
+                throw ControlError.failed("'\(segment)' in \(field) cannot be used as a file or folder name on Windows")
+            }
+        }
         let names = isDirectory.boolValue ? (try? FileManager.default.contentsOfDirectory(atPath: source.path)) ?? [] : [source.lastPathComponent]
         if names.contains(where: { DeployTarget.isMarker($0, windows: windows) }) {
             throw ControlError.failed("a file named \(DeployTarget.marker) cannot be deployed, vm.deploy keeps its own file under that name; rename the file")
@@ -197,12 +234,16 @@ extension ControlHandler {
             .precomposedStringWithCanonicalMapping
         let guestDir: String
         if let requestedDir {
-            let name = DeployTarget.isWindowsName(base) ? base : "app"
+            let name = (windows ? DeployTarget.isDefaultName(base) : DeployTarget.isWindowsName(base)) ? base : "app"
             guestDir = try DeployTarget.directory(requestedDir, windows: windows, example: windows ? DeployTarget.defaultRoot + "\\" + name : "/opt/" + name)
         } else {
             let fallback = try DeployTarget.defaultDirectory(named: base)
             guard windows else { throw ControlError.failed("pass guestDir; the default \(fallback) only fits Windows guests") }
             guestDir = fallback
+        }
+        if isDirectory.boolValue {
+            do { try AgentClient.checkSyncSource(source, toGuestPath: guestDir, preserving: [DeployTarget.marker]) }
+            catch { throw agentFailure(error, vm: t.name, op: "vm.deploy") }
         }
         let plan = DeployPlan(source: source, isDirectory: isDirectory.boolValue, guestDir: guestDir, windows: windows, killRunning: killRunning,
                               waitMs: waitMs, install: install, launch: launching)
@@ -218,11 +259,13 @@ extension ControlHandler {
         let guestDir = plan.guestDir
         var out: [String: JSON] = ["guestDir": .string(guestDir)]
         do {
-            try await checkFolder(plan, agent)
+            let marked = try await checkFolder(plan, agent)
             if plan.killRunning { try await stopProcesses(plan, agent) }
-            _ = try await agent.call("fs.write", ["path": .string(plan.path(DeployTarget.marker)),
-                                                  "data": .string(Data(DeployTarget.markerText.utf8).base64EncodedString()),
-                                                  "truncate": true, "mkdirs": true])
+            if !marked {
+                _ = try await agent.call("fs.write", ["path": .string(plan.path(DeployTarget.marker)),
+                                                      "data": .string(Data(DeployTarget.markerText.utf8).base64EncodedString()),
+                                                      "truncate": true, "mkdirs": true])
+            }
             if plan.isDirectory {
                 let r = try await agent.syncDirectory(plan.source, toGuestPath: guestDir, deleteExtras: true, preserving: [DeployTarget.marker],
                                                       refusingObstacles: true)
@@ -319,25 +362,33 @@ extension ControlHandler {
     // MARK: - steps
 
     /// Accepts the guest folder when it does not exist, is empty, lies below the default root or holds the deploy marker
-    /// as a file. A folder the agent reports as a link is refused.
-    private func checkFolder(_ plan: DeployPlan, _ agent: AgentClient) async throws {
+    /// as a plain file, and returns whether it holds that marker. A folder the agent reports as a link is refused, and
+    /// so is a marker path that holds a link or a folder; the marker path is read with one `fs.stat` for every folder
+    /// that is not refused before.
+    private func checkFolder(_ plan: DeployPlan, _ agent: AgentClient) async throws -> Bool {
         let guestDir = plan.guestDir
         let found = try await agent.call("fs.stat", ["path": .string(guestDir)])
         guard found["link"]?.boolValue != true else {
             throw ControlError.failed("'\(guestDir)' is a link in the guest; pass the folder it points to")
         }
-        guard found["exists"]?.boolValue == true else { return }
-        guard found["dir"]?.boolValue == true else {
+        let exists = found["exists"]?.boolValue == true
+        guard !exists || found["dir"]?.boolValue == true else {
             throw ControlError.failed("'\(guestDir)' is a file in the guest; pass a folder as guestDir")
         }
-        if plan.windows, DeployTarget.isUnderDefaultRoot(guestDir) { return }
-        let marker = try await agent.call("fs.stat", ["path": .string(plan.path(DeployTarget.marker))])
-        if marker["exists"]?.boolValue == true, marker["dir"]?.boolValue != true, marker["link"]?.boolValue != true { return }
+        let markerPath = plan.path(DeployTarget.marker)
+        let marker = try await agent.call("fs.stat", ["path": .string(markerPath)])
+        guard marker["dir"]?.boolValue != true, marker["link"]?.boolValue != true else {
+            throw ControlError.failed("'\(markerPath)' is not a plain file; remove it or deploy to another folder")
+        }
+        if marker["exists"]?.boolValue == true { return true }
+        guard exists else { return false }
+        if plan.windows, DeployTarget.isUnderDefaultRoot(guestDir) { return false }
         let listing = try await agent.call("fs.list", ["path": .string(guestDir)])
         guard (listing["entries"]?.arrayValue ?? []).isEmpty, listing["truncated"]?.boolValue != true else {
             let hint = plan.windows ? ", or one under \(DeployTarget.defaultRoot)" : ""
             throw ControlError.failed("'\(guestDir)' already holds files that Alcove did not deploy; choose an empty or new folder\(hint)")
         }
+        return false
     }
 
     /// The processes whose executable lies below the guest folder.

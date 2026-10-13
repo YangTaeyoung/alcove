@@ -73,7 +73,25 @@ private func localFiles(in directory: URL) throws -> [(name: String, url: URL)] 
     return result.sorted { $0.name < $1.name }
 }
 
+/// The files of `directory` that a sync to the guest path `path` compares and uploads, without those whose path below
+/// the directory is in `preserving`. Throws when two of them differ only by case and `path` is a Windows path.
+private func syncSource(_ directory: URL, toGuestPath path: String, preserving: Set<String>) throws -> [(name: String, url: URL)] {
+    let windows = path.contains("\\")
+    let kept = Set(preserving.map { windows ? foldedName($0) : $0 })
+    let local = try localFiles(in: directory).filter { !kept.contains(windows ? foldedName($0.name) : $0.name) }
+    if windows, let (a, b) = windowsCaseConflict(in: local.map(\.name)) {
+        throw AgentClient.AgentError.remote("'\(a)' and '\(b)' differ only by case and cannot both exist in a Windows guest folder")
+    }
+    return local
+}
+
 extension AgentClient {
+    /// Throws what `syncDirectory` with the same arguments refuses from the files of `directory` alone, without a
+    /// request to the guest.
+    public static func checkSyncSource(_ directory: URL, toGuestPath path: String, preserving: Set<String> = []) throws {
+        _ = try syncSource(directory, toGuestPath: path, preserving: preserving)
+    }
+
     /// Upload a local file to `path` in the guest through `<path>.alcove-part`, verifying the SHA-256.
     public func pushFile(_ url: URL, toGuestPath path: String, overwrite: Bool, timeout: Duration = .seconds(1800)) async throws -> TransferResult {
         let existing = try await call("fs.stat", ["path": .string(path)], timeout: timeout)
@@ -168,10 +186,7 @@ extension AgentClient {
         let windows = path.contains("\\")
         let key: (String) -> String = { windows ? foldedName($0) : $0 }
         let kept = Set(preserving.map(key))
-        let local = try localFiles(in: directory).filter { !kept.contains(key($0.name)) }
-        if windows, let (a, b) = windowsCaseConflict(in: local.map(\.name)) {
-            throw AgentError.remote("'\(a)' and '\(b)' differ only by case and cannot both exist in a Windows guest folder")
-        }
+        let local = try syncSource(directory, toGuestPath: path, preserving: preserving)
         var remote: [String: (name: String, size: Int, sha256: String)] = [:]
         let root = try await call("fs.stat", ["path": .string(path)], timeout: timeout)
         if root["exists"]?.boolValue == true {
