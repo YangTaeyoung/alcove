@@ -800,6 +800,29 @@ def _(a, run):
     return f"{rounds} helpers started, slowest answer after {slowest:.2f} s, {early} pings reached a helper that was ending"
 
 
+@check("after the foreground goes to the fixture, the desktop and the fixture within a second the last window.foreground names the fixture")
+def _(a, run):
+    wid = running_fixture(a, run)
+    a.call("win.action", window="Program Manager", action="focus")
+    a.pump(1.5)
+    seen = len(a.events)
+    a.call("win.action", window=wid, action="focus")
+    a.pump(0.35)
+    a.call("win.action", window="Program Manager", action="focus")
+    a.pump(0.35)
+    a.call("win.action", window=wid, action="focus")
+    a.pump(2.5)
+    front = [w["id"] for w in run.windows() if w["foreground"]]
+    expect(front == [wid], f"the fixture {wid} is not the foreground window after focus: {front!r}")
+    events = [e for e in a.events[seen:] if e.get("name") == "window.foreground"]
+    named = [e["window"]["title"] or e["window"]["id"] for e in events]
+    expect(events and events[-1]["window"]["id"] == wid, f"the window.foreground events name {named!r} while the fixture is in front")
+    own = [e["at"] for e in events if e["window"]["id"] == wid]
+    gaps = [b - a_ for a_, b in zip(own, own[1:])]
+    expect(all(g >= 0.9 for g in gaps), f"window.foreground events for the fixture arrived {[round(g, 2) for g in gaps]!r} s apart")
+    return f"window.foreground named {named!r}"
+
+
 def find_wer(a, since_ticks):
     """Returns the AppCrash_alcove-fixture report folders created after since_ticks."""
     dirs = ",".join(f"'{d}'" for d in WER_DIRS)
