@@ -95,8 +95,13 @@ public actor AgentClient {
 
     // MARK: - commands
 
-    public func setClipboard(text: String) {
-        send(["t": "clipboard.set", "text": .string(text)])
+    /// Set the guest clipboard text. Throws `.remote` without sending when the message would be longer than the agent reads.
+    public func setClipboard(text: String) throws {
+        let message: JSON = ["t": "clipboard.set", "text": .string(text)]
+        guard fitsAgentLine(message) else {
+            throw AgentError.remote("clipboard text is too large for the guest agent (limit about 700 KB of UTF-8)")
+        }
+        send(message)
     }
 
     /// Read the guest clipboard text.
@@ -114,8 +119,13 @@ public actor AgentClient {
     }
 
     /// Run a shell command in the guest (agents started with --allow-exec only).
+    /// Throws `.remote` without sending when the message would be longer than the agent reads.
     public func exec(_ command: String, timeout: Duration = .seconds(60)) async throws -> (code: Int, output: String) {
-        let r = try await request(["t": "exec", "cmd": .string(command)], waitFor: "exec.result", timeout: timeout)
+        let message: JSON = ["t": "exec", "cmd": .string(command)]
+        guard fitsAgentLine(message) else {
+            throw AgentError.remote("command is too long for this guest agent; write it to a file in the guest and run that")
+        }
+        let r = try await request(message, waitFor: "exec.result", timeout: timeout)
         return (r["code"]?.intValue ?? -1, r["out"]?.stringValue ?? "")
     }
 
@@ -176,6 +186,12 @@ public actor AgentClient {
     }
 
     // MARK: - internals
+
+    /// Whether `message` serialized stays below `maxRequestBytes`, the longest line the agent reads.
+    private nonisolated func fitsAgentLine(_ message: JSON) -> Bool {
+        guard let line = try? message.serialized() else { return false }
+        return line.count < AgentClient.maxRequestBytes
+    }
 
     private func send(_ message: JSON) {
         guard let transport, var data = try? message.serialized() else { return }

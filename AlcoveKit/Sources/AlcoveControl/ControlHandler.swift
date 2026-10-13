@@ -220,7 +220,7 @@ public actor ControlHandler {
             } else {
                 // non-US characters: go through the guest clipboard and paste
                 guard let agent = await t.agent(timeout: .seconds(2)) else { throw ControlError.untypable("this text") }
-                await agent.setClipboard(text: text)
+                do { try await agent.setClipboard(text: text) } catch { throw agentFailure(error, vm: t.name, op: op) }
                 try await Task.sleep(for: .milliseconds(150))
                 try await sendKeys(t, try KeyNames.pressSequence("ctrl+v"), gap: 20, holdBeforeRelease: 0)
             }
@@ -235,7 +235,8 @@ public actor ControlHandler {
         case "vm.clipboard.set":
             let t = try await running(params)
             guard let text = params["text"]?.stringValue else { throw ControlError.missing("text") }
-            await (try await tools(t)).setClipboard(text: text)
+            let agent = try await tools(t)
+            do { try await agent.setClipboard(text: text) } catch { throw agentFailure(error, vm: t.name, op: op) }
             return [:]
         case "vm.push_file", "vm.pull_file", "vm.sync_dir", "vm.fs.list", "vm.fs.read", "vm.fs.write", "vm.fs.delete":
             return try await files(op: op, params: params)

@@ -22,7 +22,7 @@ final class AgentClientTests: XCTestCase {
         XCTAssertEqual(hello?.os, "windows"); XCTAssertEqual(hello?.capabilities, ["clipboard", "files", "exec"])
         let (code, out) = try await client.exec("dir")
         XCTAssertEqual(code, 0); XCTAssertEqual(out, "ran: dir")
-        await client.setClipboard(text: "hi")
+        try await client.setClipboard(text: "hi")
         let clip = try await client.getClipboard()
         XCTAssertEqual(clip, "guest text")
         await client.setResolution(width: 1024, height: 768)
@@ -129,6 +129,47 @@ final class AgentClientTests: XCTestCase {
         try await client.connect(port: agent.port, expectedToken: nil)
         let r = try await client.call("exec.read")
         XCTAssertEqual(r["out"]?.stringValue?.utf8.count, 3 << 20)
+    }
+
+    func testSetClipboardRefusesTextTheAgentCannotRead() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true]] : [] }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        do {
+            try await client.setClipboard(text: String(repeating: "x", count: 1 << 20))
+            XCTFail("expected a refusal")
+        } catch AgentClient.AgentError.remote(let text) {
+            XCTAssertEqual(text, "clipboard text is too large for the guest agent (limit about 700 KB of UTF-8)")
+        }
+        _ = try await client.call("ping")
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "clipboard.set" })
+        try await client.setClipboard(text: String(repeating: "x", count: 700_000))
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(agent.received.filter { $0["t"]?.stringValue == "clipboard.set" }.count, 1)
+    }
+
+    func testExecRefusesACommandTheAgentCannotRead() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.handler = { m, _ in
+            switch m["t"]?.stringValue {
+            case "exec": return [["t": "exec.result", "code": 0, "out": "ok"]]
+            case "req": return [["t": "res", "id": m["id"] ?? .null, "ok": true]]
+            default: return []
+            }
+        }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        do {
+            _ = try await client.exec(String(repeating: "x", count: 1 << 20))
+            XCTFail("expected a refusal")
+        } catch AgentClient.AgentError.remote(let text) {
+            XCTAssertEqual(text, "command is too long for this guest agent; write it to a file in the guest and run that")
+        }
+        _ = try await client.call("ping")
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "exec" })
+        let (code, out) = try await client.exec("echo hi")
+        XCTAssertEqual(code, 0); XCTAssertEqual(out, "ok")
     }
 
     func testCallRefusesARequestLongerThanTheAgentReads() async throws {
