@@ -9,7 +9,7 @@ enum WaitTiming {
     nonisolated(unsafe) static var agentPeriod = Duration.milliseconds(500)
     /// Longest an agent call of one evaluation may take.
     nonisolated(unsafe) static var agentCallTimeout = Duration.seconds(5)
-    /// Shortest time a text recognition gets to finish, also when the wait's timeout passes sooner.
+    /// Longest a wait that reached its timeout waits for the text readings that have not ended, all of them together.
     nonisolated(unsafe) static var recognitionGrace = Duration.seconds(1)
     /// How long a wait's helper call must have gone without an answer, counted from the moment it began to wait for
     /// its turn, before the wait reports it; also how long a sent call must have been unanswered before the wait's
@@ -125,6 +125,14 @@ enum WaitCondition: Sendable {
         case .uiExists, .uiGone, .uiEnabled, .windowTitle, .uiTextStable: return .ui
         case .event: return .event
         default: return .agent
+        }
+    }
+
+    /// The text a `text_visible` or `text_gone` condition looks for.
+    var text: WaitText? {
+        switch self {
+        case .textVisible(let text), .textGone(let text): return text
+        default: return nil
         }
     }
 

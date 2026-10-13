@@ -29,6 +29,13 @@ enum ScreenText {
 
     static let warmUpText = "Alcove 한글"
 
+    /// Calls `recognizer` on `warmUpFrame()` once with each language list of a reading without `languages`. A call
+    /// that throws does not keep the next one from being made.
+    static func warmUp(with recognizer: @Sendable (Frame, [String]) throws -> [TextMatch]) {
+        let frame = warmUpFrame()
+        for languages in [defaultLanguages, latinLanguages] { _ = try? recognizer(frame, languages) }
+    }
+
     /// A white frame of 400x64 pixels with `warmUpText` in black.
     static func warmUpFrame() -> Frame {
         let width = 400, height = 64

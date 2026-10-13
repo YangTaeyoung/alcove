@@ -105,7 +105,6 @@ final class ControlUITests: XCTestCase {
         UITiming.treeFactBudget = .seconds(20)
         UITiming.factBudgetEnd = { try? await Task.sleep(until: $0, clock: .continuous) }
         WaitTiming.reportedSilence = .milliseconds(500)
-        WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) }
     }
 
     /// The jobs the scripted `exec.read` of `quietJob` reports as exited.
@@ -2717,33 +2716,32 @@ final class ControlUITests: XCTestCase {
     }
 
     func testAnAnswerThatArrivedWhileTheLastTickWasBusyIsJudgedAfterTheLoop() async throws {
-        let entered = LockedBox(0)
-        let release = DispatchSemaphore(value: 0)
-        WaitTiming.recognizer = { _, _ in
-            entered.value += 1
-            release.wait()
-            return []
+        let frameReads = LockedBox(0)
+        let held = Latch()
+        addTeardownBlock { await held.open() }
+        let (h, t, agent) = try await rig(["ui.find": { _, _ in .silent }])
+        await t.setFrameHook {
+            frameReads.value += 1
+            if frameReads.value == 2 { await held.pass() }
         }
-        addTeardownBlock { for _ in 0..<64 { release.signal() } }
-        let (h, _, agent) = try await rig(["ui.find": { _, _ in .silent }])
         let wait = Task {
             try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 1, "conditions": [
-                ["type": "ui_gone", "name": "Busy"], ["type": "text_visible", "text": "never shown", "languages": ["en-US"]],
+                ["type": "ui_gone", "name": "Busy"], ["type": "screen_idle", "seconds": 100],
             ]])
         }
-        let reading = await eventually { entered.value == 1 && agentRequests(agent, "ui.find").count == 1 }
+        let reading = await eventually { frameReads.value == 2 && agentRequests(agent, "ui.find").count == 1 }
         XCTAssertTrue(reading)
         agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.find").first), ["nodes": []]))
         let answered = await eventually { (try? await h.helperGate.acquire("Win", until: .now)) == true }
         XCTAssertTrue(answered)
         await h.helperGate.release("Win")
         try await Task.sleep(for: .seconds(1))
-        release.signal()
+        await held.open()
         let r = try await completed(wait)
         XCTAssertEqual(r["matched"]?.intValue, 0)
         XCTAssertEqual(r["type"]?.stringValue, "ui_gone")
         XCTAssertNil(r["problems"])
-        XCTAssertEqual(entered.value, 1)
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 1)
     }
 
     func testACancelledQueuedUIActionIsNeverSent() async throws {

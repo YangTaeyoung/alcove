@@ -56,6 +56,8 @@ public actor ControlHandler {
     let deployGate = InputGate()
     /// Lets one `ui.*` or `win.*` agent call per VM run at a time, in arrival order.
     let helperGate = InputGate()
+    /// Longest `vm.find_text` waits for its turn in the recognition queue.
+    var textTurnLimit = Duration.seconds(60)
     /// Port forwards added with `vm.forward.add`, per VM name.
     var runtimeForwards: [String: [Forward]] = [:]
     /// The engine instance each VM's `runtimeForwards` belong to.
@@ -488,13 +490,14 @@ public actor ControlHandler {
         let cropped = area == frame.bounds ? frame : frame.crop(area)
         let chosen = languages
         try ScreenText.validate(languages: chosen ?? ScreenText.defaultLanguages + ScreenText.latinLanguages)
+        let turnLimit = textTurnLimit
         let lines: [TextMatch]
         do {
-            lines = try await queuedRecognition(of: cropped, languages: chosen)
+            lines = try await queuedRecognition(of: cropped, languages: chosen, turnLimit: turnLimit)
         } catch ControlError.recognitionFailed {
             try await Task.sleep(for: .milliseconds(150))
             do {
-                lines = try await queuedRecognition(of: cropped, languages: chosen)
+                lines = try await queuedRecognition(of: cropped, languages: chosen, turnLimit: turnLimit)
             } catch ControlError.recognitionFailed {
                 throw ControlError.failed("text recognition failed twice; call vm.find_text again or use vm.screenshot")
             }
@@ -510,10 +513,24 @@ public actor ControlHandler {
         return ["matches": .array(rows), "lines": .int(Int64(lines.count))]
     }
 
-    /// The lines the recognition queue reads in `frame`. A cancelled task leaves the queue and throws `CancellationError`.
-    private nonisolated func queuedRecognition(of frame: Frame, languages: [String]?) async throws -> [TextMatch] {
-        guard let outcome = await RecognitionQueue.shared.recognize(frame, languages: languages) else { throw CancellationError() }
-        return try outcome.get()
+    /// The lines the recognition queue reads in `frame`. A reading that has not begun `turnLimit` after this call
+    /// leaves the queue and throws `recognitionBusy`; a cancelled task leaves the queue and throws `CancellationError`.
+    private nonisolated func queuedRecognition(of frame: Frame, languages: [String]?, turnLimit: Duration) async throws -> [TextMatch] {
+        let queue = RecognitionQueue.shared
+        guard let outcome = await queue.recognize(frame, languages: languages, turnBy: .now + turnLimit) else { throw CancellationError() }
+        do {
+            return try outcome.get()
+        } catch let busy as RecognitionQueue.Busy {
+            throw ControlError.failed(ControlHandler.recognitionBusy(running: busy.running))
+        }
+    }
+
+    func setTextTurnLimit(_ limit: Duration) { textTurnLimit = limit }
+
+    /// The answer of `vm.find_text` when another reading, running for `running` so far, kept it from its turn.
+    static func recognitionBusy(running: Duration) -> String {
+        let seconds = (Double(running.components.seconds) + Double(running.components.attoseconds) / 1e18).rounded()
+        return "the text recognition is busy (another reading has been running for \(Int(seconds)) s); retry in a few seconds"
     }
 
     private func screenshotResult(_ t: VMTarget, _ params: JSON) async throws -> JSON {

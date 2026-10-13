@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import AlcoveAgent
 import AlcoveQMP
 
@@ -59,6 +60,46 @@ extension ControlHandler {
         let task: Task<Void, Never>
     }
 
+    /// Whether the recognition queue has begun the reading of one caller.
+    private final class Turn: Sendable {
+        private let begun = Mutex(false)
+
+        var hasBegun: Bool { begun.withLock { $0 } }
+        func begin() { begun.withLock { $0 = true } }
+    }
+
+    /// The lines one reading found in `frame`, which holds the pixels of `area` of a frame of the guest.
+    private struct TextReading: Sendable {
+        let area: Frame.Rect
+        let frame: Frame
+        let lines: [TextMatch]
+    }
+
+    /// One reading the recognition queue was asked for in a task of its own.
+    private struct TextProbe: Sendable {
+        let area: Frame.Rect
+        let frame: Frame
+        let turn: Turn
+        let answer: CallAnswer<Result<[TextMatch], Error>>
+        let task: Task<Void, Never>
+    }
+
+    /// The text readings of one wait by recognition key.
+    private struct TextReadings {
+        /// The readings whose outcome has not been collected.
+        var inFlight: [String: TextProbe] = [:]
+        /// The latest reading of each key that ended with lines.
+        var latest: [String: TextReading] = [:]
+
+        /// Gives up the readings in flight: each leaves the recognition queue; one that runs ends without a caller.
+        func abandon() {
+            for probe in inFlight.values { probe.task.cancel() }
+        }
+    }
+
+    /// A line that contains the text of a text condition, with its rectangle in frame coordinates.
+    private typealias FoundLine = (text: String, x: Int, y: Int, w: Int, h: Int)
+
     /// Per-condition progress between evaluations.
     private struct WaitState {
         var nextDue: ContinuousClock.Instant
@@ -84,9 +125,11 @@ extension ControlHandler {
         var agentSilence = AgentSilence()
         /// The sequence number of the newest guest event this condition has looked at.
         var eventCursor = 0
+        /// Whether a text condition began an evaluation whose reading has not been collected.
+        var awaitsText = false
 
-        /// Whether an evaluation of the condition runs in a task of its own and has not been collected.
-        var isInFlight: Bool { probe != nil || reading != nil }
+        /// Whether an evaluation of the condition has begun and has not been collected.
+        var isInFlight: Bool { probe != nil || reading != nil || awaitsText }
 
         /// Gives up the evaluation in flight: a helper call still waiting for its turn is not sent and a sent one keeps
         /// the helper until the agent answered; agent calls not yet made are not made.
@@ -96,12 +139,13 @@ extension ControlHandler {
         }
     }
 
-    /// Frames and recognitions shared by the conditions of one tick.
+    /// The frame and the text readings shared by the conditions of one tick.
     private struct Tick {
         var frame: Frame?
         var frameError: Error?
-        var recognitionErrors: [String: Error] = [:]
-        var recognitions: [String: (lines: [TextMatch], area: Frame.Rect)] = [:]
+        /// By recognition key: the outcome of a reading collected in this tick, or the latest reading of a key
+        /// whose area has the same pixels in this tick's frame.
+        var readings: [String: Result<TextReading, Error>] = [:]
     }
 
     func waitFor(_ params: JSON) async throws -> JSON {
@@ -156,7 +200,11 @@ extension ControlHandler {
         var matched = -1
         var type: String?
         var detail: JSON?
-        defer { for state in states { state.abandon() } }
+        var texts = TextReadings()
+        defer {
+            for state in states { state.abandon() }
+            texts.abandon()
+        }
 
         /// Takes in what an evaluation of condition `index` brought: a failure is counted, an answer clears the count.
         /// True when the answer ends the wait. Cancellation, a hard failure and a lost agent are thrown.
@@ -199,10 +247,11 @@ extension ControlHandler {
             let tickStart = clock.now
             let tickEnd = min(tickStart + WaitTiming.tick, deadline)
             var tick = Tick()
+            await collectTexts(&texts, into: &tick, until: tickStart)
             for (index, condition) in conditions.enumerated() where states[index].isInFlight || states[index].nextDue <= tickStart {
                 let outcome: Result<Verdict, Error>
                 do {
-                    outcome = .success(try await evaluate(condition, index: index, state: &states[index], tick: &tick, vm: t,
+                    outcome = .success(try await evaluate(condition, index: index, state: &states[index], tick: &tick, texts: &texts, vm: t,
                                                           now: tickStart, agent: agent, clock: clock, tickEnd: tickEnd, deadline: deadline))
                 } catch {
                     outcome = .failure(error)
@@ -216,8 +265,18 @@ extension ControlHandler {
             try await Task.sleep(until: tickEnd, clock: clock)
         }
         if !settled {
-            for index in conditions.indices {
-                guard let outcome = await collect(conditions[index], state: &states[index], until: clock.now) else { continue }
+            var last = Tick()
+            await collectTexts(&texts, into: &last, until: deadline + WaitTiming.recognitionGrace)
+            try Task.checkCancellation()
+            for (index, condition) in conditions.enumerated() {
+                let outcome: Result<Verdict, Error>
+                if let text = condition.text {
+                    guard let reading = last.readings[text.recognitionKey] else { continue }
+                    outcome = reading.map { ControlHandler.textVerdict(condition, ControlHandler.lines(of: text, in: $0)) }
+                } else {
+                    guard let collected = await collect(condition, state: &states[index], until: clock.now) else { continue }
+                    outcome = collected
+                }
                 if try settle(outcome, index) { break }
             }
         }
@@ -235,7 +294,8 @@ extension ControlHandler {
                 if states[index].failures > 0, let error = states[index].lastError {
                     problem["error"] = .string(error)
                     problem["failures"] = .int(Int64(states[index].failures))
-                } else if let silence = await helperSilence(states[index], now: ending) ?? agentSilence(states[index], now: ending) {
+                } else if let silence = await helperSilence(states[index], now: ending) ?? agentSilence(states[index], now: ending)
+                            ?? textSilence(conditions[index], texts) {
                     problem["error"] = .string(silence)
                 } else {
                     continue
@@ -251,6 +311,7 @@ extension ControlHandler {
             }
             state.abandon()
         }
+        texts.abandon()
         if options.level != .none, let first {
             try await addObservation(to: &out, t, after: "vm.wait_for", before: first, options, helperTaken: helperTaken)
         }
@@ -285,16 +346,28 @@ extension ControlHandler {
         state.agentSilence.sentence(inFlight: state.reading.map { ($0.openCall.op, $0.started) }, now: now)
     }
 
+    static let unfinishedRecognition = "the text recognition did not finish within the timeout; call vm.wait_for again"
+    static let unstartedRecognition = "the text recognition was waiting behind other recognitions and did not start; call vm.wait_for again"
+
+    /// Why a text condition without a recorded failure got no lines: the reading of its recognition key is in flight,
+    /// and the recognition queue has begun it or has it waiting for its turn. Nil when none is in flight.
+    private func textSilence(_ condition: WaitCondition, _ texts: TextReadings) -> String? {
+        guard let text = condition.text, let probe = texts.inFlight[text.recognitionKey] else { return nil }
+        return probe.turn.hasBegun ? ControlHandler.unfinishedRecognition : ControlHandler.unstartedRecognition
+    }
+
     private func outside(_ index: Int, _ frame: Frame) -> ControlError {
         .failed("condition \(index): region is outside the \(frame.width)x\(frame.height) frame")
     }
 
-    /// One evaluation of a condition in the tick that began at `now`. A screen, text or event condition is read here
-    /// and is due again one period after `now`; an agent or UI condition takes one `step`.
-    private func evaluate(_ condition: WaitCondition, index: Int, state: inout WaitState, tick: inout Tick, vm t: VMTarget,
-                          now: ContinuousClock.Instant, agent: AgentClient?, clock: ContinuousClock,
+    /// One evaluation of a condition in the tick that began at `now`. A screen or event condition is read here and is
+    /// due again one period after `now`. A text condition takes the reading of its recognition key (`textLines`) and
+    /// is due again one period after the tick in which it began to wait for one. An agent or UI condition takes one
+    /// `step`.
+    private func evaluate(_ condition: WaitCondition, index: Int, state: inout WaitState, tick: inout Tick, texts: inout TextReadings,
+                          vm t: VMTarget, now: ContinuousClock.Instant, agent: AgentClient?, clock: ContinuousClock,
                           tickEnd: ContinuousClock.Instant, deadline: ContinuousClock.Instant) async throws -> Verdict {
-        if condition.kind != .ui, condition.kind != .agent { state.nextDue = now + condition.period }
+        if condition.kind == .screen || condition.kind == .event { state.nextDue = now + condition.period }
         switch condition {
         case .screenIdle(let seconds):
             let frame = try await tickFrame(&tick, t)
@@ -307,14 +380,15 @@ extension ControlHandler {
             guard let reference = state.reference, let rect = state.referenceRect else { return .pending }
             guard let area = frame.clamp(rect), area == rect else { return .holds(nil) }
             return FrameDiff.between(reference, frame.crop(area)).changedTiles > 0 ? .holds(nil) : .pending
-        case .textVisible(let text):
-            let matches = try await recognize(text, index: index, tick: &tick, vm: t, clock: clock, deadline: deadline)
-            guard let first = matches.first else { return .pending }
-            return .holds(["text": .string(first.text), "x": .int(Int64(first.x)), "y": .int(Int64(first.y)),
-                           "w": .int(Int64(first.w)), "h": .int(Int64(first.h)),
-                           "cx": .int(Int64(first.x + first.w / 2)), "cy": .int(Int64(first.y + first.h / 2))])
-        case .textGone(let text):
-            return try await recognize(text, index: index, tick: &tick, vm: t, clock: clock, deadline: deadline).isEmpty ? .holds(nil) : .pending
+        case .textVisible(let text), .textGone(let text):
+            if !state.awaitsText { state.nextDue = now + condition.period }
+            state.awaitsText = false
+            guard let lines = try await textLines(text, index: index, tick: &tick, texts: &texts, vm: t, clock: clock,
+                                                  tickEnd: tickEnd, deadline: deadline) else {
+                state.awaitsText = true
+                return .unanswered
+            }
+            return ControlHandler.textVerdict(condition, lines)
         case .event(let name, let titleContains, _):
             guard let agent else { throw ControlError.noTools(t.name) }
             let batch = await t.events(since: state.eventCursor)
@@ -420,50 +494,81 @@ extension ControlHandler {
         }
     }
 
-    /// The lines of this tick's frame that contain `text`, in frame coordinates. Throws when the recognition has not
-    /// ended at `deadline` and `WaitTiming.recognitionGrace` after the wait asked for it, whichever comes later.
-    private func recognize(_ text: WaitText, index: Int, tick: inout Tick, vm t: VMTarget, clock: ContinuousClock,
-                           deadline: ContinuousClock.Instant) async throws -> [(text: String, x: Int, y: Int, w: Int, h: Int)] {
-        let frame = try await tickFrame(&tick, t)
+    /// The lines that contain `text` in the reading of its recognition key, or nil while that reading has not ended.
+    ///
+    /// The reading is the one `tick` holds for the key, else the one in flight, which is not looked at here. Without
+    /// either, the area of this tick's frame is cut out: when it has the pixels of the key's latest reading, that
+    /// reading is taken and no recognition is asked for; otherwise, before `deadline`, a reading is started and
+    /// waited for until `tickEnd` at most. A cancelled task starts none and throws `CancellationError`.
+    private func textLines(_ text: WaitText, index: Int, tick: inout Tick, texts: inout TextReadings, vm t: VMTarget, clock: ContinuousClock,
+                           tickEnd: ContinuousClock.Instant, deadline: ContinuousClock.Instant) async throws -> [FoundLine]? {
         let key = text.recognitionKey
-        let found: (lines: [TextMatch], area: Frame.Rect)
-        if let error = tick.recognitionErrors[key] {
-            throw error
-        } else if let cached = tick.recognitions[key] {
-            found = cached
-        } else {
+        if tick.readings[key] == nil, texts.inFlight[key] == nil {
+            let frame = try await tickFrame(&tick, t)
             var area = frame.bounds
             if let region = text.region {
                 guard let clamped = frame.clamp(region) else { throw outside(index, frame) }
                 area = clamped
             }
             let cropped = area == frame.bounds ? frame : frame.crop(area)
-            let lines: [TextMatch]
-            do {
-                guard let done = try await recognition(of: cropped, languages: text.languages, clock: clock, deadline: deadline) else {
-                    throw ControlError.failed("text recognition did not finish within the timeout; call vm.wait_for again with a longer timeout")
-                }
-                lines = done
-            } catch {
-                tick.recognitionErrors[key] = error
-                throw error
+            if let latest = texts.latest[key], latest.frame == cropped {
+                tick.readings[key] = .success(latest)
+            } else {
+                guard clock.now < deadline else { return nil }
+                try Task.checkCancellation()
+                texts.inFlight[key] = startTextReading(of: cropped, area: area, languages: text.languages)
+                await collectText(key, &texts, into: &tick, until: tickEnd)
             }
-            found = (lines, area)
-            tick.recognitions[key] = found
         }
-        let matches = found.lines.filter { line in
+        guard let reading = try tick.readings[key]?.get() else { return nil }
+        return ControlHandler.lines(of: text, in: reading)
+    }
+
+    /// The lines of `reading` that contain `text`, with their rectangles in frame coordinates.
+    private static func lines(of text: WaitText, in reading: TextReading) -> [FoundLine] {
+        let matches = reading.lines.filter { line in
             if let expression = text.expression { return expression.firstMatch(in: line.text, range: NSRange(line.text.startIndex..., in: line.text)) != nil }
             return line.text.range(of: text.query, options: .caseInsensitive) != nil
         }
-        return matches.map { ($0.text, $0.rect.x + found.area.x, $0.rect.y + found.area.y, $0.rect.w, $0.rect.h) }
+        return matches.map { ($0.text, $0.rect.x + reading.area.x, $0.rect.y + reading.area.y, $0.rect.w, $0.rect.h) }
     }
 
-    /// The lines the recognition queue reads in `frame`, or nil when it has not answered at `deadline` and
-    /// `WaitTiming.recognitionGrace` after this call, whichever comes later; the wait then leaves the queue.
-    private func recognition(of frame: Frame, languages: [String]?, clock: ContinuousClock,
-                             deadline: ContinuousClock.Instant) async throws -> [TextMatch]? {
-        let limit = max(deadline, clock.now + WaitTiming.recognitionGrace)
-        return try await RecognitionQueue.shared.recognize(frame, languages: languages, until: limit)?.get()
+    /// What the lines that contain its text mean for a text condition.
+    private static func textVerdict(_ condition: WaitCondition, _ lines: [FoundLine]) -> Verdict {
+        if case .textGone = condition { return lines.isEmpty ? .holds(nil) : .pending }
+        guard let first = lines.first else { return .pending }
+        return .holds(["text": .string(first.text), "x": .int(Int64(first.x)), "y": .int(Int64(first.y)),
+                       "w": .int(Int64(first.w)), "h": .int(Int64(first.h)),
+                       "cx": .int(Int64(first.x + first.w / 2)), "cy": .int(Int64(first.y + first.h / 2))])
+    }
+
+    /// Asks the recognition queue for the lines of `frame`, the pixels of `area`, in a task of its own and returns
+    /// at once.
+    private nonisolated func startTextReading(of frame: Frame, area: Frame.Rect, languages: [String]?) -> TextProbe {
+        let answer = CallAnswer<Result<[TextMatch], Error>>()
+        let turn = Turn()
+        let recognizer = WaitTiming.recognizer
+        let task = Task {
+            let outcome = await RecognitionQueue.shared.recognize(frame, languages: languages, recognizer: recognizer, began: { turn.begin() })
+            if let outcome { await answer.finish(outcome) }
+        }
+        return TextProbe(area: area, frame: frame, turn: turn, answer: answer, task: task)
+    }
+
+    /// Moves the outcome of the reading in flight for `key` into `tick` once the reading ended; waits for that until
+    /// `limit` at most, and only looks when `limit` has passed. A reading that ended with lines becomes the latest
+    /// of its key.
+    private func collectText(_ key: String, _ texts: inout TextReadings, into tick: inout Tick, until limit: ContinuousClock.Instant) async {
+        guard let probe = texts.inFlight[key], let outcome = await probe.answer.outcome(until: limit) else { return }
+        texts.inFlight[key] = nil
+        let reading = outcome.result.map { TextReading(area: probe.area, frame: probe.frame, lines: $0) }
+        if case .success(let done) = reading { texts.latest[key] = done }
+        tick.readings[key] = reading
+    }
+
+    /// `collectText` for every reading in flight, with one `limit` for all of them.
+    private func collectTexts(_ texts: inout TextReadings, into tick: inout Tick, until limit: ContinuousClock.Instant) async {
+        for key in texts.inFlight.keys.sorted() { await collectText(key, &texts, into: &tick, until: limit) }
     }
 
     // MARK: - agent conditions
