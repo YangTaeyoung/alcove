@@ -6,8 +6,8 @@ sends welcome, then req/res with ids. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py). Each check prints
 `PASS <n> <title>`; the first failing check prints `FAIL <n>: <reason>` and the
 script exits 1. Files go under C:\\alcove-e2e\\rpc. However the run ends, a
-second connection kills the jobs and GUI programs the script started and
-deletes that directory.
+second connection kills the jobs the script started, which include the
+Character Map windows it opened, and deletes that directory.
 
 Usage: agent-rpc-windows.py [--agent-port N] [--only N[,N...]]
 """
@@ -116,18 +116,12 @@ class Run:
     def __init__(self, agent):
         self.a = agent
         self.jobs = []
-        self.images = []
         self.markers = []
 
     def start(self, **params):
         r = self.a.call("exec.start", **params)
         self.jobs.append(r["job"])
         return r["job"], r["pid"]
-
-    def start_gui(self, image, argv):
-        """Starts a GUI program as a job; cleanup kills every process with that image name."""
-        self.images.append(image)
-        return self.start(shell="none", argv=argv)
 
     def read_until(self, job, done, timeout=30):
         """Polls exec.read with advancing offsets until done(out, err, last reply)."""
@@ -151,17 +145,15 @@ class Run:
         return self.a.call("proc.list", **({"name": name} if name else {}))["procs"]
 
     def cleanup(self, port):
-        """On a new connection: kills the started jobs, the registered images and
-        the PowerShell processes whose command line holds a registered marker,
-        then deletes BASE and its parent when that is empty."""
+        """On a new connection: kills the started jobs and the PowerShell
+        processes whose command line holds a registered marker, then deletes
+        BASE and its parent when that is empty."""
         try:
             a = Agent(port)
         except (Failure, OSError, ValueError) as e:
-            print(f"cleanup did not run: {e}; jobs {self.jobs}, programs {self.images} and {BASE} may remain in the guest",
-                  file=sys.stderr)
+            print(f"cleanup did not run: {e}; jobs {self.jobs} and {BASE} may remain in the guest", file=sys.stderr)
             return
         steps = [("exec.kill", {"job": job}) for job in self.jobs]
-        steps += [("proc.kill", {"name": image, "tree": True}) for image in self.images]
         if self.markers:
             try:
                 for p in a.call("proc.list", name="powershell")["procs"]:
@@ -343,25 +335,21 @@ def _(a, run):
     expect(len(run.procs("alcove-agent")) >= 1, "proc.list name=alcove-agent returned nothing")
     expect(run.procs("no-such-process-name") == [], "proc.list with an unknown name returned processes")
 
-    gui = None
-    for image, argv in (("notepad.exe", ["notepad.exe"]), ("charmap.exe", ["C:\\Windows\\System32\\charmap.exe"])):
-        stem = image[:-4]
-        expect(run.procs(stem) == [], f"{image} runs already; close it in the guest before this check")
-        run.start_gui(image, argv)
-        end = time.time() + 10
-        while time.time() < end and not run.procs(stem):
-            time.sleep(0.5)
-        if run.procs(stem):
-            gui = image
-            break
-    expect(gui is not None, "neither notepad.exe nor charmap.exe appeared in proc.list after exec.start")
+    gui = "charmap.exe"
+    expect(run.procs("charmap") == [], f"{gui} runs already; close it in the guest before this check")
+    _job, pid = run.start(shell="none", argv=["C:\\Windows\\System32\\" + gui])
+    end = time.time() + 10
+    while time.time() < end and not run.procs("charmap"):
+        time.sleep(0.5)
+    started = run.procs("charmap")
+    expect([p["pid"] for p in started] == [pid], f"proc.list shows {started!r} after exec.start returned pid {pid}")
     r = a.call("proc.kill", name=gui, tree=True)
-    expect(r["killed"] >= 1, f"killed is {r['killed']!r}")
-    left = run.procs(gui[:-4])
+    expect(r["killed"] == 1, f"killed is {r['killed']!r}")
+    left = run.procs("charmap")
     expect(left == [], f"{gui} survived proc.kill: {left!r}")
     r = a.call("proc.kill", name=gui, tree=True)
     expect(r["killed"] == 0, f"proc.kill of an absent name reported killed={r['killed']!r}")
-    return f"GUI process: {gui}"
+    return f"GUI process: {gui} pid {pid}"
 
 
 @check("fs operations write, hash, rename, read, list, tail and delete")
@@ -469,7 +457,7 @@ def _(a, run):
 @check("exec.start with shell none shows the window of a GUI program")
 def _(a, run):
     expect(run.procs("charmap") == [], "charmap.exe runs already; close it in the guest before this check")
-    _job, pid = run.start_gui("charmap.exe", ["C:\\Windows\\System32\\charmap.exe"])
+    _job, pid = run.start(shell="none", argv=["C:\\Windows\\System32\\charmap.exe"])
     query = f"$p = Get-Process -Id {pid}; \"hwnd=$($p.MainWindowHandle) title=$($p.MainWindowTitle)\""
     end = time.time() + 10
     while True:

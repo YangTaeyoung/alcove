@@ -5,10 +5,14 @@ Talks docs/agent-protocol.md directly on the forwarded agent port and drives
 Notepad and File Explorer in the guest. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py) and no Notepad running. Each
 check prints `PASS <n> <title>` or `FAIL <n>: <reason>`; the script exits 1
-when a check failed. Files go under C:\\alcove-e2e\\uia. However the run ends,
-a second connection kills the Notepad the script started, puts Notepad's saved
-tabs back as they were, closes the File Explorer window the script opened and
-deletes that directory.
+when a check failed. Files go under C:\\alcove-e2e\\uia.
+
+Before Notepad starts, the files of its saved tabs are copied to a temporary
+directory on the host, whose path is printed. However the run ends, a second
+connection ends the Notepad processes the script started, puts Notepad's
+saved tabs back, closes the File Explorer window the script opened and
+deletes the files it wrote. The host copy is deleted after the tabs were
+put back; when that fails it stays and the script prints how to restore them.
 
 Usage: uia-helper-check.py [--agent-port N] [--only N[,N...]] [--kill-helper]
 
@@ -16,7 +20,9 @@ Usage: uia-helper-check.py [--agent-port N] [--only N[,N...]] [--kill-helper]
 that a ref of the first replacement is unknown to the second; the checks then
 run against the helper the agent started for the next operation.
 """
-import argparse, base64, json, ntpath, re, select, socket, sys, time
+import argparse, base64, json, ntpath, os, re, select, shutil, signal, socket, sys, tempfile, time
+
+E2E = r"C:\alcove-e2e"
 
 BASE = r"C:\alcove-e2e\uia"
 NOTE_NAME = "alcove-uia-check.txt"
@@ -117,12 +123,14 @@ class Run:
     def __init__(self, agent):
         self.a = agent
         self.frame = None
-        self.notepad_started = False
+        self.notepad_before = None
         self.notepad_state = None
+        self.notepad_copy = None
         self.notepad_window = None
         self.document = None
         self.document_role = None
         self.explorer_before = None
+        self.explorer_window = None
 
     def windows(self):
         return self.a.call("win.list")["windows"]
@@ -147,23 +155,38 @@ class Run:
                 return data
 
     def snapshot(self, root):
-        """Returns {relative name: bytes} of the files under root, or None when root does not exist."""
+        """Copies the files under root to a new temporary directory on the host and
+        returns (the directory, the relative names), or (the directory, None) when
+        root does not exist in the guest."""
+        copy = tempfile.mkdtemp(prefix="alcove-notepad-state-")
         if not self.a.call("fs.stat", path=root)["exists"]:
-            return None
+            return copy, None
         entries = self.a.call("fs.list", path=root, recursive=True)["entries"]
-        return {e["name"]: self.read_file(root + "/" + e["name"]) for e in entries if not e["dir"]}
+        names = [e["name"] for e in entries if not e["dir"]]
+        for name in names:
+            target = os.path.join(copy, *name.split("/"))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(self.read_file(root + "/" + name))
+        return copy, names
+
+    def notepad_pids(self):
+        return {p["pid"] for p in self.a.call("proc.list", name="notepad")["procs"]}
 
 
-def restore(a, root, before):
-    """Makes the files under root equal to the snapshot `before`."""
-    if before is None:
+def restore(a, root, copy, names):
+    """Makes the files under root equal to the host copy: writes the copied files
+    and deletes every other file; with names None it deletes root."""
+    if names is None:
+        a.call("fs.delete", path=root, recursive=True)
         return
     entries = a.call("fs.list", path=root, recursive=True)["entries"]
     now = {e["name"] for e in entries if not e["dir"]}
-    for name in now - set(before):
+    for name in now - set(names):
         a.call("fs.delete", path=root + "/" + name)
-    for name, data in before.items():
-        a.call("fs.write", path=root + "/" + name, truncate=True, mkdirs=True, data=base64.b64encode(data).decode())
+    for name in names:
+        with open(os.path.join(copy, *name.split("/")), "rb") as f:
+            a.call("fs.write", path=root + "/" + name, truncate=True, mkdirs=True, data=base64.b64encode(f.read()).decode())
 
 
 def explorer_windows(a):
@@ -207,9 +230,10 @@ def _(a, run):
     m = re.search(r"frame=(\d+)x(\d+)", out)
     expect(m, f"the guest did not report its frame size: {out!r}")
     run.frame = (int(m.group(1)), int(m.group(2)))
-    run.notepad_state = run.snapshot(NOTEPAD_STATE)
+    run.notepad_copy, run.notepad_state = run.snapshot(NOTEPAD_STATE)
+    print(f"Notepad's saved tabs are copied to {run.notepad_copy} on the host", flush=True)
     a.call("fs.write", path=NOTE, mkdirs=True, truncate=True, data=base64.b64encode(NOTE_TEXT.encode()).decode())
-    run.notepad_started = True
+    run.notepad_before = run.notepad_pids()
     a.call("exec.start", shell="none", argv=["notepad.exe", NOTE])
     w = run.wait_window(lambda w: NOTE_NAME in w["title"], f"window with {NOTE_NAME} in its title")
     for each in run.windows():
@@ -303,7 +327,7 @@ def _(a, run):
 def _(a, run):
     expect(run.document, "check 2 did not find the document node")
     wid = run.notepad_window["id"]
-    a.call("proc.kill", name="notepad.exe", tree=True)
+    a.call("proc.kill", pid=run.notepad_window["pid"])
     end = time.time() + 15
     while any(w["id"] == wid for w in run.windows()):
         expect(time.time() < end, f"window {wid} is still in win.list 15 s after Notepad was killed")
@@ -323,9 +347,10 @@ def _(a, run):
     folder = ntpath.basename(FOLDER)
     w = run.wait_window(lambda w: w["class"] == "CabinetWClass" and w["id"] not in run.explorer_before and folder in w["title"],
                         f"File Explorer window with {folder} in its title")
+    run.explorer_window = w["id"]
     end = time.time() + 30
     while True:
-        found = a.call("ui.find", window=folder, nameContains="notepad", limit=5)["nodes"]
+        found = a.call("ui.find", window=w["id"], nameContains="notepad", limit=5)["nodes"]
         items = [n for n in found if n["role"] == "ListItem" and n["name"] in ITEM_NAMES]
         if (items and "selected" in items[0]["flags"]) or time.time() > end:
             break
@@ -378,35 +403,67 @@ def _(a, run):
     return f"{r['node']['role']} {r['node']['name']!r} in {r['window']['title']!r}"
 
 
+def wait_gone(a, pids, timeout=15):
+    """Waits until none of the Notepad processes in pids runs; returns the ones that still do."""
+    end = time.time() + timeout
+    while True:
+        left = {p["pid"] for p in a.call("proc.list", name="notepad")["procs"]} & pids
+        if not left or time.time() > end:
+            return left
+        time.sleep(0.3)
+
+
+def restore_notepad(a, run):
+    """Ends the Notepad processes the run started and puts the saved tabs back.
+    Returns a sentence that says what went wrong, or None."""
+    by_hand = (f"end Notepad in the guest, then make {NOTEPAD_STATE} equal to the copy in {run.notepad_copy} "
+               "(delete the files that are not in the copy" + ("" if run.notepad_state is not None else "; the folder did not exist before the run") + ")")
+    try:
+        started = {p["pid"] for p in a.call("proc.list", name="notepad")["procs"]} - run.notepad_before
+        for pid in started:
+            a.ask("proc.kill", pid=pid)
+        left = wait_gone(a, started)
+        if left:
+            return f"Notepad processes {sorted(left)} still run, so Notepad's saved tabs were not put back; {by_hand}"
+        restore(a, NOTEPAD_STATE, run.notepad_copy, run.notepad_state)
+    except Exception as e:
+        return f"Notepad's saved tabs were not put back ({type(e).__name__}: {e}); {by_hand}"
+    shutil.rmtree(run.notepad_copy, ignore_errors=True)
+    return None
+
+
 def cleanup(port, run):
-    """On a new connection: ends the Notepad the run started, restores Notepad's
-    saved tabs, closes the File Explorer windows the run opened and deletes BASE
-    and its parent when that is empty."""
+    """On a new connection: ends the Notepad processes the run started, puts
+    Notepad's saved tabs back, closes the File Explorer windows the run opened
+    and deletes the files it wrote. Returns the sentences that say what could
+    not be cleaned up."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    problems = []
     try:
         a = Agent(port)
-    except (Failure, OSError, ValueError) as e:
-        print(f"cleanup did not run: {e}; Notepad, a File Explorer window and {BASE} may remain in the guest", file=sys.stderr)
-        return
+    except Exception as e:
+        problems.append(f"cleanup did not run: {e}; Notepad, a File Explorer window and files under {E2E} may remain in the guest")
+        if run.notepad_copy:
+            problems.append(f"Notepad's saved tabs as they were before the run are in {run.notepad_copy} on the host")
+        return problems
+
     steps = []
-    if run.notepad_started:
-        steps.append(lambda: a.call("proc.kill", name="notepad.exe", tree=True))
-        steps.append(lambda: wait_gone(a, "notepad"))
-        steps.append(lambda: restore(a, NOTEPAD_STATE, run.notepad_state))
     if run.explorer_before is not None:
-        steps.append(lambda: close_explorer(a, explorer_windows(a) - run.explorer_before))
-    steps.append(lambda: a.call("fs.delete", path=BASE, recursive=True))
-    steps.append(lambda: a.ask("fs.delete", path=ntpath.dirname(BASE)))
-    for step in steps:
+        steps.append(("closing File Explorer", lambda: close_explorer(a, explorer_windows(a) - run.explorer_before)))
+    steps.append((f"deleting {BASE}", lambda: a.call("fs.delete", path=BASE, recursive=True)))
+    steps.append((f"deleting {E2E}", lambda: a.ask("fs.delete", path=E2E)))
+    if run.notepad_before is not None:
+        problem = restore_notepad(a, run)
+        if problem:
+            problems.append(problem)
+    elif run.notepad_copy:
+        shutil.rmtree(run.notepad_copy, ignore_errors=True)
+    for what, step in steps:
         try:
             step()
-        except (Failure, OSError, ValueError, KeyError) as e:
-            print(f"a cleanup step failed: {e}", file=sys.stderr)
-
-
-def wait_gone(a, name, timeout=10):
-    end = time.time() + timeout
-    while a.call("proc.list", name=name)["procs"] and time.time() < end:
-        time.sleep(0.3)
+        except Exception as e:
+            problems.append(f"{what} failed ({type(e).__name__}: {e})")
+    return problems
 
 
 def kill_helper(a):
@@ -477,6 +534,10 @@ def main():
 
     run = Run(a)
     failed = False
+
+    def terminate(*_):
+        raise SystemExit(1)
+    signal.signal(signal.SIGTERM, terminate)
     try:
         for n, title, fn in CHECKS:
             if only and n not in only:
@@ -495,7 +556,9 @@ def main():
             failed = True
             print(f"FAIL {n}: {reason}", flush=True)
     finally:
-        cleanup(args.agent_port, run)
+        for problem in cleanup(args.agent_port, run):
+            failed = True
+            print(f"FAIL cleanup: {problem}", flush=True)
     sys.exit(1 if failed else 0)
 
 
