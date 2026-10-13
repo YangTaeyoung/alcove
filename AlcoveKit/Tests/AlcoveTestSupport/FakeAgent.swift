@@ -83,12 +83,21 @@ public final class FakeFS: @unchecked Sendable {
     private var store: [String: Data] = [:]
     private var writtenPaths: [String] = []
     public var corruptWrites = false
+    public var caseInsensitive = false
 
     public init() {}
 
+    private func fold(_ path: String) -> String { caseInsensitive ? path.lowercased() : path }
+
+    private func key(for path: String) -> String {
+        guard caseInsensitive else { return path }
+        let folded = fold(path)
+        return store.keys.first { fold($0) == folded } ?? path
+    }
+
     public subscript(path: String) -> Data? {
-        get { lock.lock(); defer { lock.unlock() }; return store[path] }
-        set { lock.lock(); defer { lock.unlock() }; store[path] = newValue }
+        get { lock.lock(); defer { lock.unlock() }; return store[key(for: path)] }
+        set { lock.lock(); defer { lock.unlock() }; store[key(for: path)] = newValue }
     }
 
     public func paths() -> [String] { lock.lock(); defer { lock.unlock() }; return store.keys.sorted() }
@@ -116,17 +125,17 @@ public final class FakeFS: @unchecked Sendable {
         switch m["op"]?.stringValue {
         case "fs.stat":
             let sep = Self.separator(for: path)
-            if let data = store[path] {
+            if let data = store[key(for: path)] {
                 var f: [String: JSON] = ["exists": true, "dir": false, "size": .int(Int64(data.count)), "path": .string(path)]
                 if m["sha256"]?.boolValue == true { f["sha256"] = .string(sha256Hex(data)) }
                 return reply(m, f)
             }
-            if store.keys.contains(where: { $0.hasPrefix(path + sep) }) { return reply(m, ["exists": true, "dir": true, "size": 0, "path": .string(path)]) }
+            if store.keys.contains(where: { fold($0).hasPrefix(fold(path + sep)) }) { return reply(m, ["exists": true, "dir": true, "size": 0, "path": .string(path)]) }
             return reply(m, ["exists": false])
         case "fs.list":
             let sep = Self.separator(for: path)
             let prefix = path + sep
-            let found = store.filter { $0.key.hasPrefix(prefix) }
+            let found = store.filter { fold($0.key).hasPrefix(fold(prefix)) }
             if found.isEmpty { return fail(m, "'\(path)' does not exist") }
             let entries: [JSON] = found.keys.sorted().map { key in
                 let name = String(key.dropFirst(prefix.count)).replacingOccurrences(of: sep, with: "/")
@@ -135,28 +144,31 @@ public final class FakeFS: @unchecked Sendable {
             }
             return reply(m, ["entries": .array(entries), "truncated": false])
         case "fs.read":
-            guard let data = store[path] else { return fail(m, "'\(path)' does not exist") }
+            guard let data = store[key(for: path)] else { return fail(m, "'\(path)' does not exist") }
             let offset = min(m["offset"]?.intValue ?? 0, data.count)
             let end = min(offset + (m["length"]?.intValue ?? 262144), data.count)
             return reply(m, ["data": .string(data[offset..<end].base64EncodedString()), "size": .int(Int64(data.count)), "eof": .bool(end >= data.count)])
         case "fs.write":
             var piece = Data(base64Encoded: m["data"]?.stringValue ?? "") ?? Data()
             if corruptWrites, !piece.isEmpty { piece[piece.startIndex] ^= 0xFF }
-            var data = m["truncate"]?.boolValue == true ? Data() : (store[path] ?? Data())
+            let target = key(for: path)
+            var data = m["truncate"]?.boolValue == true ? Data() : (store[target] ?? Data())
             let offset = m["offset"]?.intValue ?? 0
             if data.count < offset { data.append(Data(count: offset - data.count)) }
             data.replaceSubrange(offset..<min(offset + piece.count, data.count), with: piece)
-            store[path] = data
+            store[target] = data
             writtenPaths.append(path)
             return reply(m, ["size": .int(Int64(data.count))])
         case "fs.rename":
             let from = m["from"]?.stringValue ?? "", to = m["to"]?.stringValue ?? ""
-            guard let data = store[from] else { return fail(m, "'\(from)' does not exist") }
-            if store[to] != nil, m["overwrite"]?.boolValue != true { return fail(m, "'\(to)' exists; pass overwrite") }
-            store[to] = data; store[from] = nil
+            guard let data = store[key(for: from)] else { return fail(m, "'\(from)' does not exist") }
+            let existing = key(for: to)
+            if store[existing] != nil, m["overwrite"]?.boolValue != true { return fail(m, "'\(to)' exists; pass overwrite") }
+            store[existing] = nil; store[key(for: from)] = nil
+            store[to] = data
             return reply(m, ["path": .string(to)])
         case "fs.delete":
-            let existed = store.removeValue(forKey: path) != nil
+            let existed = store.removeValue(forKey: key(for: path)) != nil
             return reply(m, ["deleted": .bool(existed)])
         default:
             return fail(m, "unknown op '\(m["op"]?.stringValue ?? "")'; update alcove-agent")

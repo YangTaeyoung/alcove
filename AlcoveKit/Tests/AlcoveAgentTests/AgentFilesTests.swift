@@ -120,4 +120,86 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertTrue(fs.written().contains("C:\\e2e\\in\\sub\\b.bin.alcove-part"))
         XCTAssertNotNil(fs["C:\\e2e\\in\\sub\\b.bin"])
     }
+
+    private func caseTree(_ files: [String: String]) throws -> URL {
+        let root = try tempDir()
+        for (name, text) in files {
+            let url = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: url)
+        }
+        return root
+    }
+
+    func testSyncWindowsCaseDifferenceWithSameContentKeepsFile() async throws {
+        let root = try caseTree(["README.txt": "same"])
+        let fs = FakeFS()
+        fs.caseInsensitive = true
+        fs["C:\\g\\Readme.txt"] = Data("same".utf8)
+        let (_, client) = try await connected(fs)
+        let r = try await client.syncDirectory(root, toGuestPath: "C:\\g", deleteExtras: true)
+        XCTAssertEqual(r.sent, [])
+        XCTAssertEqual(r.skipped, 1)
+        XCTAssertEqual(r.deleted, [])
+        XCTAssertEqual(fs["C:\\g\\README.txt"], Data("same".utf8))
+    }
+
+    func testSyncWindowsCaseDifferenceWithNewContentUploadsAndKeepsFile() async throws {
+        let root = try caseTree(["README.txt": "new text"])
+        let fs = FakeFS()
+        fs.caseInsensitive = true
+        fs["C:\\g\\Readme.txt"] = Data("old".utf8)
+        let (_, client) = try await connected(fs)
+        let r = try await client.syncDirectory(root, toGuestPath: "C:\\g", deleteExtras: true)
+        XCTAssertEqual(r.sent, ["README.txt"])
+        XCTAssertEqual(r.deleted, [])
+        XCTAssertEqual(fs["C:\\g\\README.txt"], Data("new text".utf8))
+    }
+
+    func testSyncWindowsNestedDirectoryCaseDifference() async throws {
+        let root = try caseTree(["Docs/a.txt": "one"])
+        let fs = FakeFS()
+        fs.caseInsensitive = true
+        fs["C:\\g\\docs\\a.txt"] = Data("one".utf8)
+        let (_, client) = try await connected(fs)
+        let r = try await client.syncDirectory(root, toGuestPath: "C:\\g", deleteExtras: true)
+        XCTAssertEqual(r.sent, [])
+        XCTAssertEqual(r.skipped, 1)
+        XCTAssertEqual(r.deleted, [])
+        XCTAssertEqual(fs["C:\\g\\Docs\\a.txt"], Data("one".utf8))
+    }
+
+    func testSyncWindowsRejectsLocalNamesDifferingOnlyByCase() async throws {
+        let root = try caseTree(["a.txt": "1", "A.txt": "2"])
+        try XCTSkipUnless(FileManager.default.contentsOfDirectory(atPath: root.path).count == 2, "case-insensitive local volume")
+        let fs = FakeFS()
+        let (agent, client) = try await connected(fs)
+        let before = agent.receivedCount()
+        do { _ = try await client.syncDirectory(root, toGuestPath: "C:\\g", deleteExtras: false); XCTFail("expected error") }
+        catch AgentClient.AgentError.remote(let text) {
+            XCTAssertEqual(text, "'A.txt' and 'a.txt' differ only by case and cannot both exist in a Windows guest folder")
+        }
+        XCTAssertEqual(agent.receivedCount(), before)
+        XCTAssertEqual(fs.paths(), [])
+    }
+
+    func testSyncNonWindowsPathKeepsCaseSensitiveNames() async throws {
+        let root = try caseTree(["A.txt": "upper"])
+        try XCTSkipUnless(FileManager.default.contentsOfDirectory(atPath: root.path) == ["A.txt"])
+        let fs = FakeFS()
+        fs["/g/a.txt"] = Data("upper".utf8)
+        let (_, client) = try await connected(fs)
+        let r = try await client.syncDirectory(root, toGuestPath: "/g", deleteExtras: true)
+        XCTAssertEqual(r.sent, ["A.txt"])
+        XCTAssertEqual(r.deleted, ["a.txt"])
+        XCTAssertEqual(fs["/g/A.txt"], Data("upper".utf8))
+        XCTAssertNil(fs["/g/a.txt"])
+    }
+
+    func testWindowsCaseConflictFindsNamesDifferingOnlyByCase() {
+        XCTAssertNil(windowsCaseConflict(in: ["a.txt", "b.txt", "sub/a.txt"]))
+        let pair = windowsCaseConflict(in: ["A.txt", "b.txt", "a.txt"])
+        XCTAssertEqual(pair?.0, "A.txt")
+        XCTAssertEqual(pair?.1, "a.txt")
+    }
 }

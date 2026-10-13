@@ -29,6 +29,18 @@ private func joinGuestPath(_ base: String, _ relative: String) -> String {
     return root + separator + tail
 }
 
+private func foldedName(_ name: String) -> String { name.precomposedStringWithCanonicalMapping.lowercased() }
+
+func windowsCaseConflict(in names: [String]) -> (String, String)? {
+    var seen: [String: String] = [:]
+    for name in names {
+        let folded = foldedName(name)
+        if let first = seen[folded] { return (first, name) }
+        seen[folded] = name
+    }
+    return nil
+}
+
 private func localDigest(of url: URL) throws -> String {
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
@@ -132,7 +144,12 @@ extension AgentClient {
     /// Upload the files of `directory` whose size or digest differ from the guest copy; optionally delete guest files without a local counterpart.
     public func syncDirectory(_ directory: URL, toGuestPath path: String, deleteExtras: Bool, timeout: Duration = .seconds(3600)) async throws -> SyncResult {
         let local = try localFiles(in: directory)
-        var remote: [String: (size: Int, sha256: String)] = [:]
+        let windows = path.contains("\\")
+        let key: (String) -> String = { windows ? foldedName($0) : $0 }
+        if windows, let (a, b) = windowsCaseConflict(in: local.map(\.name)) {
+            throw AgentError.remote("'\(a)' and '\(b)' differ only by case and cannot both exist in a Windows guest folder")
+        }
+        var remote: [String: (name: String, size: Int, sha256: String)] = [:]
         let root = try await call("fs.stat", ["path": .string(path)], timeout: timeout)
         if root["exists"]?.boolValue == true {
             let listing = try await call("fs.list", ["path": .string(path), "recursive": .bool(true), "sha256": .bool(true)], timeout: timeout)
@@ -141,7 +158,7 @@ extension AgentClient {
             }
             for entry in listing["entries"]?.arrayValue ?? [] where entry["dir"]?.boolValue != true {
                 guard let name = entry["name"]?.stringValue else { continue }
-                remote[name] = (entry["size"]?.intValue ?? -1, entry["sha256"]?.stringValue?.lowercased() ?? "")
+                remote[key(name)] = (name, entry["size"]?.intValue ?? -1, entry["sha256"]?.stringValue?.lowercased() ?? "")
             }
         }
         var sent: [String] = []
@@ -149,7 +166,7 @@ extension AgentClient {
         var bytes = 0
         for file in local {
             let size = (try FileManager.default.attributesOfItem(atPath: file.url.path)[.size] as? Int) ?? -1
-            if let guest = remote[file.name], guest.size == size, guest.sha256 == (try localDigest(of: file.url)) {
+            if let guest = remote[key(file.name)], guest.size == size, guest.sha256 == (try localDigest(of: file.url)) {
                 skipped += 1
                 continue
             }
@@ -159,8 +176,9 @@ extension AgentClient {
         }
         var deleted: [String] = []
         if deleteExtras {
-            let names = Set(local.map(\.name))
-            for name in remote.keys.sorted() where !names.contains(name) {
+            let names = Set(local.map { key($0.name) })
+            for (folded, entry) in remote.sorted(by: { $0.value.name < $1.value.name }) where !names.contains(folded) {
+                let name = entry.name
                 _ = try await call("fs.delete", ["path": .string(joinGuestPath(path, name)), "recursive": .bool(false)], timeout: timeout)
                 deleted.append(name)
             }
