@@ -651,9 +651,9 @@ def main():
             run.cleanup()
         except Exception as e:
             run.cleanup_error(f"{type(e).__name__}: {e}")
-        if run.cleanup_failed:
+        if interrupted and run.cleanup_failed:
             sys.exit(1)
-    if failed:
+    if failed or run.cleanup_failed:
         sys.exit(1)
 
 
