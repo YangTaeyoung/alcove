@@ -68,10 +68,24 @@ def main():
     tools = m.request("tools/list")["tools"]
     names = sorted(t["name"] for t in tools)
     print("tools:", ", ".join(names))
-    expected = {"alcove_list_vms", "alcove_screenshot", "alcove_click", "alcove_type", "alcove_press_keys", "alcove_exec", "alcove_start_vm", "alcove_stop_vm"}
+    core = {
+        "alcove_list_vms", "alcove_vm_status", "alcove_start_vm", "alcove_stop_vm", "alcove_screenshot", "alcove_click",
+        "alcove_move_mouse", "alcove_drag", "alcove_scroll", "alcove_type", "alcove_press_keys", "alcove_exec",
+        "alcove_get_clipboard", "alcove_set_clipboard", "alcove_push_file", "alcove_wait_idle",
+    }
+    shell = {
+        "alcove_exec_start", "alcove_exec_read", "alcove_exec_write", "alcove_exec_kill", "alcove_exec_list",
+        "alcove_process_list", "alcove_process_kill",
+    }
+    files = {"alcove_pull_file", "alcove_sync_dir", "alcove_fs_list", "alcove_fs_read", "alcove_fs_write", "alcove_fs_delete"}
+    toolsets = {"core": core, "shell": shell, "files": files}
+    selected = [s.strip() for s in env.get("ALCOVE_MCP_TOOLSETS", "").split(",") if s.strip()]
+    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files
     missing = expected - set(names)
-    if missing:
-        raise SystemExit(f"missing tools: {missing}")
+    extra = set(names) - expected
+    if missing or extra:
+        raise SystemExit(f"tool list mismatch: missing {sorted(missing)}, unexpected {sorted(extra)}")
+    print(f"{len(names)} tools as expected")
     for t in tools:
         assert t["inputSchema"]["type"] == "object", t["name"]
         assert t["description"], t["name"]
