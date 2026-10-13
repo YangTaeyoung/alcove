@@ -476,25 +476,76 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertEqual(script.steps.map(\.params), [["command": "one"], ["conditions": [exists]], ["snapshot": "clean"]])
     }
 
-    func testPasswordFieldValuesAreNotWritten() throws {
+    func testPasswordTextBecomesAVariable() async throws {
         let secret = target("Sign in", "Edit", "", id: "pw", byID: (1, 0), password: true)
+        let user = target("Sign in", "Edit", "User", byName: (1, 0))
+        let secretNode = node("e7", "Edit", "", aid: "pw", flags: ["password"])
+        let byID: JSON = ["window": "Sign in", "role": "Edit", "automationId": "pw"]
         let draft = ScriptBuilder.draft(trace: [
-            entry(1, "vm.mouse.click", ["x": 190, "y": 112], ["target": secret]),
-            entry(2, "vm.type", ["text": "hunter2"]),
-            entry(3, "vm.ui.type", ["ref": "e7", "text": "s3cret"], result: ["node": node("e7", "Edit", "", flags: ["password"], value: "shown-value")],
-                  ["target": secret]),
-            entry(4, "vm.type", ["text": "again"]),
-            entry(5, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("Sign in", "Edit", "User", byName: (1, 0))]),
-            entry(6, "vm.type", ["text": "ada"]),
+            entry(1, "vm.key.press", ["keys": "tab"]),
+            entry(2, "vm.type", ["text": "<masked>"], ["target": secret]),
+            entry(3, "vm.type", ["text": "<masked>"], ["target": secret]),
+            entry(4, "vm.ui.type", ["ref": "e7", "text": "<masked>", "clear": true], result: ["node": secretNode], ["target": secret]),
+            entry(5, "vm.ui.action", ["ref": "e7", "action": "set_value", "value": "<masked>"], result: ["node": secretNode], ["target": secret]),
+            entry(6, "vm.ui.type", ["selector": byID, "text": "<masked>"], result: ["node": secretNode]),
+            entry(7, "vm.ui.action", ["selector": byID, "action": "set_value", "value": "<masked>"], result: ["node": secretNode]),
+            entry(8, "vm.type", ["text": "<masked>"], ["target": user]),
+            entry(9, "vm.type", ["text": "ada"], ["target": user]),
+            entry(10, "vm.mouse.click", ["x": 190, "y": 112], ["target": secret]),
+            entry(11, "vm.type", ["text": "typed-unseen"]),
+            entry(12, "vm.type", ["text": "typed-seen"], ["target": secret]),
+            entry(13, "vm.mouse.click", ["x": 190, "y": 112], ["target": user]),
+            entry(14, "vm.type", ["text": "bob"]),
+            entry(15, "vm.exec", ["command": "x", "env": ["password": "<masked>", "DB_PASSWORD": "<masked>"]], result: ["code": 0]),
         ], vm: "Win", from: nil, to: nil)
         let script = draft.script
-        XCTAssertEqual(script.steps[0].params, ["selector": ["window": "Sign in", "role": "Edit", "automationId": "pw"], "fallback": ["x": 190, "y": 112]])
-        XCTAssertEqual(script.steps[1].params, ["text": "hunter2"])
-        XCTAssertEqual(script.steps[2].params, ["selector": ["window": "Sign in", "role": "Edit", "automationId": "pw"], "text": "s3cret"])
-        XCTAssertEqual(script.steps.map(\.label), ["vm.ui.click Edit #pw", "vm.type into a password field", "vm.ui.type Edit #pw",
-                                                   "vm.type into a password field", "vm.ui.click Edit \"User\"", "vm.type \"ada\""])
+        XCTAssertEqual(script.steps.map(\.params), [
+            ["keys": "tab"],
+            ["text": "${password}"],
+            ["text": "${password2}"],
+            ["selector": byID, "text": "${password3}", "clear": true],
+            ["selector": byID, "action": "set_value", "value": "${password4}"],
+            ["selector": byID, "text": "${password5}"],
+            ["selector": byID, "action": "set_value", "value": "${password6}"],
+            ["text": "<masked>ada"],
+            ["selector": byID, "fallback": ["x": 190, "y": 112]],
+            ["text": "${password7}"],
+            ["text": "${password8}"],
+            ["selector": ["window": "Sign in", "role": "Edit", "name": "User"], "fallback": ["x": 190, "y": 112]],
+            ["text": "bob"],
+            ["command": "x", "env": ["password": "${password9}", "DB_PASSWORD": "${DB_PASSWORD}"]],
+        ])
+        XCTAssertEqual(script.steps.map(\.label), [
+            "vm.key.press tab", "vm.type into a password field", "vm.type into a password field", "vm.ui.type Edit #pw",
+            "vm.ui.action set_value Edit #pw", "vm.ui.type Edit #pw", "vm.ui.action set_value Edit #pw", "vm.type \"<masked>ada\"", "vm.ui.click Edit #pw",
+            "vm.type into a password field", "vm.type into a password field", "vm.ui.click Edit \"User\"", "vm.type \"bob\"", "vm.exec x",
+        ])
+        XCTAssertEqual(script.variables, [:])
+        XCTAssertEqual(draft.required, ["password", "password2", "password3", "password4", "password5", "password6", "password7", "password8",
+                                        "DB_PASSWORD", "password9"])
+        func reads(_ line: String, _ param: String, _ variable: String) -> String {
+            "\(line): its \(param) goes into a password field and is not written to the script; the step reads it from the variable '\(variable)', "
+                + "pass it in variables when running the script"
+        }
+        XCTAssertEqual(draft.warnings, [
+            reads("seq 2 (vm.type)", "text", "password"), reads("seq 3 (vm.type)", "text", "password2"),
+            reads("seq 4 (vm.ui.type)", "text", "password3"), reads("seq 5 (vm.ui.action)", "value", "password4"),
+            reads("seq 6 (vm.ui.type)", "text", "password5"), reads("seq 7 (vm.ui.action)", "value", "password6"),
+            reads("seq 11 (vm.type)", "text", "password7"), reads("seq 12 (vm.type)", "text", "password8"),
+            "seq 15 (vm.exec): the trace masks the env value 'DB_PASSWORD'; the step reads it from the variable 'DB_PASSWORD', pass it in variables when running the script",
+            "seq 15 (vm.exec): the trace masks the env value 'password'; the step reads it from the variable 'password9', pass it in variables when running the script",
+        ])
         let text = String(decoding: try script.encoded(), as: UTF8.self)
-        for hidden in ["shown-value", "\"password\""] { XCTAssertFalse(text.contains(hidden), hidden) }
+        for hidden in ["typed-unseen", "typed-seen"] { XCTAssertFalse(text.contains(hidden), hidden) }
+        XCTAssertThrowsError(try script.resolved(with: [:])) {
+            XCTAssertEqual("\($0)", "variable 'password' is not defined; pass it or add a default")
+        }
+        XCTAssertNoThrow(try script.resolved(with: Dictionary(uniqueKeysWithValues: draft.required.map { ($0, "x") })))
+
+        let h = handler()
+        let run = await ScriptRunner(handler: h).run(script, vm: nil, variables: [:], progress: nil)
+        XCTAssertEqual(run.stepsRun, 0)
+        XCTAssertEqual(run.error, "variable 'password' is not defined; pass it or add a default")
     }
 
     func testMaskedEnvValuesBecomeVariables() throws {
@@ -1267,6 +1318,55 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertNil(facts(["node": ["name": "Send"], "window": window]))
         XCTAssertNil(facts(["node": .null, "window": window]))
         XCTAssertNil(facts(["window": window]))
+    }
+
+    func testPasswordTextIsMaskedInTheTrace() async throws {
+        let secretAt = at("Edit", "", id: "pw", flags: ["enabled", "focused", "password"], byID: (1, 0))
+        let userAt = at("Edit", "User", id: "user", x: 250, byID: (1, 0), byName: (1, 0))
+        let secretNode = node("e7", "Edit", "", aid: "pw", flags: ["password"])
+        let userNode = node("e3", "Edit", "User", aid: "user")
+        let focused = LockedBox(secretAt)
+        let answers = LockedBox<[String: Reply]>([
+            "ui.at": .by { $0["ref"] == "e3" ? .ok(userAt) : $0["ref"] == "e7" ? .ok(secretAt) : .ok(focused.value) },
+            "ui.rect": .by { $0["ref"] == "e3" ? .ok(["node": userNode, "cx": 290, "cy": 112, "clickable": true])
+                                               : .ok(["node": secretNode, "cx": 190, "cy": 112, "clickable": true]) },
+            "ui.act": .ok(["node": secretNode]),
+        ])
+        let (h, t, _) = try await rig(answers)
+        let dir = try await startRecording(h)
+        let byID: JSON = ["window": "Alcove Fixture", "role": "Edit", "automationId": "pw"]
+        _ = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "tab"])
+        _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": "hunter2"])
+        let keys = await t.sent.count
+        XCTAssertEqual(keys, 16)
+        _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "ref": "e7", "text": "s3cret"])
+        _ = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e7", "action": "set_value", "value": "pa55"])
+        _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "selector": byID, "text": "by-selector"])
+        _ = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "selector": byID, "action": "set_value", "value": "by-action"])
+        _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "ref": "e3", "text": "ada"])
+        focused.value = userAt
+        _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": "bob"])
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.map { $0["params"]?["text"] ?? $0["params"]?["value"] }, [nil, "<masked>", "<masked>", "<masked>", "<masked>", "<masked>", "ada", "bob"])
+        XCTAssertEqual(rows.map { $0["target"]?["password"] }, [nil, true, true, true, nil, nil, nil, nil])
+        XCTAssertEqual(rows.map { $0["ok"] }, Array(repeating: true, count: 8))
+        let trace = try String(contentsOf: dir.appendingPathComponent("trace.jsonl"), encoding: .utf8)
+        for typed in ["hunter2", "s3cret", "pa55", "by-selector", "by-action"] { XCTAssertFalse(trace.contains(typed), typed) }
+
+        let out = try tempDir().appendingPathComponent("flow.json")
+        let saved = try await h.handle(op: "script.save", params: ["dir": .string(dir.path), "path": .string(out.path)])
+        XCTAssertEqual(saved["steps"], 8)
+        let script = try Script.parse(try Data(contentsOf: out))
+        XCTAssertEqual(script.steps.map { $0.params["text"] ?? $0.params["value"] },
+                       [nil, "${password}", "${password2}", "${password3}", "${password4}", "${password5}", "ada", "bob"])
+        XCTAssertEqual(script.variables, [:])
+        let before = await t.sent.count
+        let refused = await failure(h, "script.run", ["path": .string(out.path)])
+        XCTAssertEqual(refused, "variable 'password' is not defined; pass it or add a default")
+        let after = await t.sent.count
+        XCTAssertEqual(after, before)
     }
 
     func testATargetQuestionIsWaitedForFromItsSendAndKeepsTheHelperUntilItsAnswer() async throws {

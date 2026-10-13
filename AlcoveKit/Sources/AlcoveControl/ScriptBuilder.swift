@@ -45,10 +45,13 @@ enum ScriptBuilder {
     /// - A step whose entry shows a foreground window title with another stable part than the entries before it
     ///   showed last expects a window with that part in its title.
     /// - An env value the trace masks becomes a variable named after its key.
-    /// The warnings hold a sentence for every entry left out, every selector that lost its window, every variable and
-    /// every step that names a job id or a pid.
-    /// Every step has the label `<op> <what it acts on>`; the label of a `vm.type` step that follows a click or UI op
-    /// on a password field does not show the text.
+    /// - The `text` of a `vm.ui.type` and the `value` of a `vm.ui.action` whose `target` or result node is a password
+    ///   element, and the `text` of a `vm.type` when the latest entry that says what it was aimed at was aimed at a
+    ///   password element, become a variable each: `password`, `password2`, and so on. Such a `vm.type` step is not merged.
+    /// No variable has a default. The warnings hold a sentence for every entry left out, every selector that lost its
+    /// window, every variable and every step that names a job id or a pid.
+    /// Every step has the label `<op> <what it acts on>`; the label of a `vm.type` step whose text is a variable does
+    /// not show it.
     static func draft(trace: [JSON], vm: String, from: Int?, to: Int?) -> Draft {
         var assembly = Assembly(from: from, to: to)
         for entry in trace { assembly.add(entry) }
@@ -64,7 +67,10 @@ enum ScriptBuilder {
         private var warnings: [String] = []
         private var required: [String] = []
         private var foreground: String?
-        private var intoPassword = false
+        /// Whether the latest entry that says what it was aimed at was aimed at a password element.
+        private var passwordAimed = false
+        /// The variable each masked env key is read from.
+        private var envVariables: [String: String] = [:]
         /// Whether an entry was left out with a warning since the latest step was added.
         private var leftOut = false
         /// The VM the first entry with a VM name names.
@@ -81,10 +87,55 @@ enum ScriptBuilder {
             let steps = pending.map { item -> Script.Step in
                 var step = item.step
                 if let text = item.text { step.params["text"] = .string(Script.escape(text)) }
+                if let secret = item.secret { step.params[secret.param] = .string("${\(secret.variable)}") }
                 step.label = label(item)
                 return step
             }
             return Draft(script: Script(vm: vm, variables: [:], steps: steps), warnings: warnings, sources: pending.map(\.seq), required: required)
+        }
+
+        /// A variable no step reads yet, which becomes one of `required`: `preferred`, or `preferred` followed by the
+        /// lowest number from 2 that no variable has.
+        private mutating func newVariable(_ preferred: String) -> String {
+            var name = preferred
+            var number = 1
+            while required.contains(name) {
+                number += 1
+                name = "\(preferred)\(number)"
+            }
+            required.append(name)
+            return name
+        }
+
+        /// `fields` as a step holds them: every string with `${` escaped, and the variable of its key in place of an
+        /// env value the trace masks, with a warning for each.
+        private mutating func prepared(_ fields: [String: JSON], inEnv: Bool, line: String) -> [String: JSON] {
+            var out: [String: JSON] = [:]
+            for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
+                if inEnv, value == .string(TraceSanitizer.mask), TraceSanitizer.isSecret(key), !key.contains("}") {
+                    let variable = envVariables[key] ?? newVariable(key)
+                    envVariables[key] = variable
+                    out[key] = .string("${\(variable)}")
+                    warnings.append("\(line): the trace masks the env value '\(key)'; the step reads it from the variable '\(variable)', pass it in variables when running the script")
+                    continue
+                }
+                switch value {
+                case .string(let text): out[key] = .string(Script.escape(text))
+                case .object(let inner): out[key] = .object(prepared(inner, inEnv: key == "env", line: line))
+                case .array(let items): out[key] = .array(items.map { prepared(item: $0, line: line) })
+                default: out[key] = value
+                }
+            }
+            return out
+        }
+
+        private mutating func prepared(item: JSON, line: String) -> JSON {
+            switch item {
+            case .string(let text): return .string(Script.escape(text))
+            case .object(let inner): return .object(prepared(inner, inEnv: false, line: line))
+            case .array(let items): return .array(items.map { prepared(item: $0, line: line) })
+            default: return item
+            }
         }
 
         /// Adds the warning that the entry `line` names is left out, for `reason`.
@@ -134,7 +185,7 @@ enum ScriptBuilder {
                 if let conditions = params["conditions"] { item.step.params["conditions"] = withoutCursors(conditions) }
             case "vm.mouse.click", "vm.mouse.drag":
                 let facts = entry["target"]
-                intoPassword = facts?["password"]?.boolValue == true
+                passwordAimed = facts?["password"]?.boolValue == true
                 item.element = describe(target: facts)
                 if op == "vm.mouse.click", params["hold"] == nil, let x = params["x"]?.intValue, let y = params["y"]?.intValue,
                    replaysAtCentre(facts, x: x, y: y), let found = selectors(for: facts) {
@@ -147,7 +198,7 @@ enum ScriptBuilder {
                 }
             case "vm.ui.click", "vm.ui.type", "vm.ui.action":
                 guard let ref = params["ref"], ref != .null else {
-                    intoPassword = false
+                    passwordAimed = ControlHandler.isPasswordNode(entry["result"]?["node"])
                     if var given = params["selector"]?.objectValue, let window = given["window"]?.stringValue, isWindowID(window) {
                         given["window"] = nil
                         item.step.params["selector"] = .object(given)
@@ -156,7 +207,7 @@ enum ScriptBuilder {
                     break
                 }
                 let facts = entry["target"]
-                intoPassword = facts?["password"]?.boolValue == true
+                passwordAimed = facts?["password"]?.boolValue == true
                 item.element = describe(target: facts)
                 item.step.params["ref"] = nil
                 if let found = selectors(for: facts) {
@@ -179,7 +230,7 @@ enum ScriptBuilder {
                     item.step.params["window"] = .string(title)
                 }
             case "vm.type":
-                item.hidesText = intoPassword
+                if let facts = entry["target"] { passwordAimed = facts["password"]?.boolValue == true }
                 item.text = params["text"]?.stringValue
             default:
                 break
@@ -192,13 +243,20 @@ enum ScriptBuilder {
             if let id = sessionID(op: op, params: params) {
                 warnings.append("\(line): its \(id) belongs to the recorded session and a replay gets another one; change the step by hand")
             }
+            if let param = ControlHandler.writtenTextParam(op: op), item.step.params[param]?.stringValue != nil,
+               op == "vm.type" ? passwordAimed : entry["target"]?["password"]?.boolValue == true || ControlHandler.isPasswordNode(entry["result"]?["node"]) {
+                let variable = newVariable("password")
+                item.secret = (param, variable)
+                item.text = nil
+                warnings.append("\(line): its \(param) goes into a password field and is not written to the script; the step reads it from the variable '\(variable)', pass it in variables when running the script")
+            }
             item.subject = subject(of: item.step, element: item.element)
-            item.step.params = prepared(item.step.params, inEnv: false, line: line, warnings: &warnings, required: &required)
+            item.step.params = prepared(item.step.params, inEnv: false, line: line)
             if let shown, let previous = foreground, shown != previous {
                 item.step.expect = [["type": "window_title", "contains": .string(Script.escape(shown))]]
             }
             if !leftOut, let text = item.text, let last = pending.last, let before = last.text, last.step.op == "vm.type", last.step.expect.isEmpty,
-               last.hidesText == item.hidesText, last.step.params.filter({ $0.key != "text" }) == item.step.params.filter({ $0.key != "text" }) {
+               last.step.params.filter({ $0.key != "text" }) == item.step.params.filter({ $0.key != "text" }) {
                 pending[pending.count - 1].text = before + text
                 pending[pending.count - 1].step.expect = item.step.expect
                 return
@@ -266,10 +324,10 @@ enum ScriptBuilder {
         /// The `seq` of the trace line the step is made from.
         var seq: Int
         var step: Script.Step
-        /// The typed text of a `vm.type` step, unescaped.
+        /// The typed text of a `vm.type` step, unescaped; nil when the step reads it from a variable.
         var text: String?
-        /// Whether the label leaves the typed text out.
-        var hidesText = false
+        /// The param that goes into a password field, and the variable the step reads it from.
+        var secret: (param: String, variable: String)?
         /// How the label names the element of the entry's `target`.
         var element: String?
         /// What the label names after the op.
@@ -367,38 +425,6 @@ enum ScriptBuilder {
         return nil
     }
 
-    /// `fields` as a step holds them: every string with `${` escaped, and `${<key>}` in place of an env value the trace
-    /// masks. `warnings` gains a sentence per masked value, in key order; `required` gains the key of each masked value
-    /// it does not hold yet.
-    private static func prepared(_ fields: [String: JSON], inEnv: Bool, line: String, warnings: inout [String],
-                                 required: inout [String]) -> [String: JSON] {
-        var out: [String: JSON] = [:]
-        for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
-            if inEnv, value == .string(TraceSanitizer.mask), TraceSanitizer.isSecret(key), !key.contains("}") {
-                out[key] = .string("${\(key)}")
-                if !required.contains(key) { required.append(key) }
-                warnings.append("\(line): the trace masks the env value '\(key)'; the step reads it from the variable '\(key)', pass it in variables when running the script")
-                continue
-            }
-            switch value {
-            case .string(let text): out[key] = .string(Script.escape(text))
-            case .object(let inner): out[key] = .object(prepared(inner, inEnv: key == "env", line: line, warnings: &warnings, required: &required))
-            case .array(let items): out[key] = .array(items.map { prepared(item: $0, line: line, warnings: &warnings, required: &required) })
-            default: out[key] = value
-            }
-        }
-        return out
-    }
-
-    private static func prepared(item: JSON, line: String, warnings: inout [String], required: inout [String]) -> JSON {
-        switch item {
-        case .string(let text): return .string(Script.escape(text))
-        case .object(let inner): return .object(prepared(inner, inEnv: false, line: line, warnings: &warnings, required: &required))
-        case .array(let items): return .array(items.map { prepared(item: $0, line: line, warnings: &warnings, required: &required) })
-        default: return item
-        }
-    }
-
     // MARK: - labels
 
     /// `<op> <subject>`, cut at `labelLimit` characters; the op alone without a subject. The subject of a `vm.type`
@@ -406,7 +432,7 @@ enum ScriptBuilder {
     private static func label(_ item: Pending) -> String {
         var subject = item.subject
         if item.step.op == "vm.type" {
-            subject = item.hidesText ? "into a password field" : item.text.map { UITreeText.quoted(short($0)) }
+            subject = item.secret != nil ? "into a password field" : item.text.map { UITreeText.quoted(short($0)) }
         }
         let full = [item.step.op, subject ?? ""].filter { !$0.isEmpty }.joined(separator: " ")
         return full.count > labelLimit ? String(full.prefix(labelLimit)) + "…" : full

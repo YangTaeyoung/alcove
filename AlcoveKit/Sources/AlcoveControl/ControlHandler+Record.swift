@@ -90,13 +90,35 @@ extension ControlHandler {
         if let x = node["x"]?.intValue, let y = node["y"]?.intValue, let w = node["w"]?.intValue, let h = node["h"]?.intValue {
             facts["rect"] = ["x": .int(Int64(x)), "y": .int(Int64(y)), "w": .int(Int64(w)), "h": .int(Int64(h))]
         }
-        if (node["flags"]?.arrayValue ?? []).contains("password") { facts["password"] = true }
+        if isPasswordNode(node) { facts["password"] = true }
         for key in ["byAutomationId", "byName"] {
             guard let matches = reply[key]?["matches"]?.intValue, let index = reply[key]?["index"]?.intValue,
                   matches >= 1, (0..<matches).contains(index) else { continue }
             facts[key] = ["matches": .int(Int64(matches)), "index": .int(Int64(index))]
         }
         return .object(facts)
+    }
+
+    /// Whether the helper node `node` has the `password` flag.
+    static func isPasswordNode(_ node: JSON?) -> Bool {
+        (node?["flags"]?.arrayValue ?? []).contains("password")
+    }
+
+    /// The param of `op` that holds the text the op writes into its element: `text` of `vm.type` and `vm.ui.type`,
+    /// `value` of `vm.ui.action`; nil for any other op.
+    static func writtenTextParam(op: String) -> String? {
+        switch op {
+        case "vm.type", "vm.ui.type": return "text"
+        case "vm.ui.action": return "value"
+        default: return nil
+        }
+    }
+
+    /// `params` of `op` with `TraceSanitizer.mask` in place of the string in its `writtenTextParam`.
+    static func maskingWrittenText(op: String, params: JSON) -> JSON {
+        guard let key = writtenTextParam(op: op), var fields = params.objectValue, fields[key]?.stringValue != nil else { return params }
+        fields[key] = .string(TraceSanitizer.mask)
+        return .object(fields)
     }
 
     /// Whether the agent connection `agent` of `vm` has not answered that it does not know the op `ui.at`.
@@ -131,8 +153,9 @@ extension ControlHandler {
 
     /// Runs `run` and adds the op, its outcome and its frames to the VM's recording; without one it only runs `run`.
     /// Before an op with a `targetQuestion` runs, the element it is aimed at is asked for and written to the line as
-    /// `target`; the op then runs against the VM looked up for that question. The line of a call made by a script run
-    /// holds the kind of call as `script`.
+    /// `target`; the op then runs against the VM looked up for that question. When that element, or the `node` of the
+    /// op's result, is a password element, the line holds the op's params as `maskingWrittenText` gives them. The line
+    /// of a call made by a script run holds the kind of call as `script`.
     func recorded(op: String, params: JSON, run: @Sendable () async throws -> JSON) async throws -> JSON {
         guard !op.hasPrefix("vm.record."), let vm = params["name"]?.stringValue, let recording = await liveRecording(vm) else {
             return try await run()
@@ -159,7 +182,11 @@ extension ControlHandler {
         }
         let duration = t0.duration(to: clock())
         let after = framed ? await recording.capture() : nil
-        await recording.record(op: op, params: params, outcome: outcome, started: started, duration: duration, before: before, after: after,
+        var written = params
+        if target?["password"]?.boolValue == true || ControlHandler.isPasswordNode((try? outcome.get())?["node"]) {
+            written = ControlHandler.maskingWrittenText(op: op, params: params)
+        }
+        await recording.record(op: op, params: written, outcome: outcome, started: started, duration: duration, before: before, after: after,
                                target: target, script: ControlHandler.scriptCall?.rawValue)
         var stopped = false
         if op == "vm.stop", case .success = outcome { stopped = true }
