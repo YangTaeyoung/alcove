@@ -24,7 +24,7 @@ import (
 
 func (e *testEnv) get(id int, part string, extra map[string]any) map[string]any {
 	e.t.Helper()
-	p := map[string]any{"id": id, "part": part}
+	p := map[string]any{"exchange": id, "part": part}
 	for k, v := range extra {
 		p[k] = v
 	}
@@ -491,11 +491,17 @@ func TestListFilters(t *testing.T) {
 		t.Fatalf("since: %d", n)
 	}
 	res := env.call("list", map[string]any{"limit": 2})
-	if len(res["exchanges"].([]any)) != 2 || res["next"].(float64) != 2 {
-		t.Fatalf("limit: %v", res)
+	newest := res["exchanges"].([]any)
+	if len(newest) != 2 || idOf(newest[0].(map[string]any)) != 3 || idOf(newest[1].(map[string]any)) != 4 || res["next"].(float64) != 4 {
+		t.Fatalf("without since the newest rows are returned in ascending order: %v", res)
+	}
+	res = env.call("list", map[string]any{"since": 0.0 + 1, "limit": 2})
+	oldest := res["exchanges"].([]any)
+	if len(oldest) != 2 || idOf(oldest[0].(map[string]any)) != 2 || res["next"].(float64) != 3 {
+		t.Fatalf("with since the first rows after it are returned: %v", res)
 	}
 	res = env.call("list", map[string]any{"since": res["next"]})
-	if len(res["exchanges"].([]any)) != 2 || res["next"].(float64) != 4 {
+	if len(res["exchanges"].([]any)) != 1 || res["next"].(float64) != 4 {
 		t.Fatalf("page two: %v", res)
 	}
 	env.call("clear", nil)
@@ -537,9 +543,9 @@ func TestParameterTypeErrorsNameTheParameter(t *testing.T) {
 		{"config", map[string]any{"hosts": "a"}, "hosts"},
 		{"list", map[string]any{"limit": "ten"}, "limit"},
 		{"list", map[string]any{"status": true}, "status"},
-		{"get", map[string]any{"id": "1", "part": "request"}, "id"},
-		{"get", map[string]any{"id": 1, "part": "both"}, "part"},
-		{"get", map[string]any{"id": 99, "part": "request"}, "99"},
+		{"get", map[string]any{"exchange": "1", "part": "request"}, "exchange"},
+		{"get", map[string]any{"exchange": 1, "part": "both"}, "part"},
+		{"get", map[string]any{"exchange": 99, "part": "request"}, "99"},
 		{"rule.remove", map[string]any{"rule": "x"}, "rule"},
 	}
 	for _, c := range cases {
@@ -593,5 +599,82 @@ func TestNoGoroutinesRemainAfterClose(t *testing.T) {
 	}
 	if after := runtime.NumGoroutine(); after > before {
 		t.Fatalf("goroutines: %d before, %d after Close", before, after)
+	}
+}
+
+func TestPendingRequestIsListedUntilItFinishes(t *testing.T) {
+	release := make(chan struct{})
+	reached := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(reached)
+		<-release
+		io.WriteString(w, "late")
+	}))
+	defer up.Close()
+	env := newEnv(t)
+	env.call("rule.add", map[string]any{"match": map[string]any{"path": "/held"}, "action": map[string]any{"delayMs": 1}})
+	errc := make(chan error, 1)
+	go func() {
+		resp, err := env.client.Post(up.URL+"/held", "text/plain", strings.NewReader("abcd"))
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		errc <- err
+	}()
+	<-reached
+	res := env.call("list", nil)
+	pending := res["pending"].([]any)
+	if len(pending) != 1 || len(res["exchanges"].([]any)) != 0 {
+		t.Fatalf("while held: %v", res)
+	}
+	row := pending[0].(map[string]any)
+	if row["method"] != "POST" || row["url"] != up.URL+"/held" || row["kind"] != "http" || row["reqBytes"].(float64) != 4 || row["rule"].(float64) != 1 {
+		t.Fatalf("pending row %v", row)
+	}
+	close(release)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	env.waitExchange(func(x map[string]any) bool { return x["status"] == float64(200) })
+	deadline := time.Now().Add(5 * time.Second)
+	for len(env.call("list", nil)["pending"].([]any)) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("pending row never cleared")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestGetPagesOnCharacterBoundaries(t *testing.T) {
+	env := newEnv(t)
+	text := "aé€😀z"
+	env.proxy.store.add(&Exchange{Kind: "http", URL: "http://h/", ResBody: []byte(text)})
+	var got strings.Builder
+	offset := 0
+	for offset < len(text) {
+		res := env.call("get", map[string]any{"exchange": 1, "part": "response", "offset": offset, "length": 3})
+		if res["base64"] == true {
+			t.Fatalf("page at %d is base64: %v", offset, res)
+		}
+		page := res["body"].(string)
+		if page == "" {
+			t.Fatalf("empty page at %d", offset)
+		}
+		got.WriteString(page)
+		offset += len(page)
+	}
+	if got.String() != text {
+		t.Fatalf("pages joined to %q", got.String())
+	}
+}
+
+func TestTruncatedCaptureEndingMidCharacterIsShownAsText(t *testing.T) {
+	env := newEnv(t)
+	cut := []byte("ab€")[:4]
+	env.proxy.store.add(&Exchange{Kind: "http", URL: "http://h/", ResBody: cut, ResTruncated: true})
+	res := env.call("get", map[string]any{"exchange": 1, "part": "response"})
+	if res["body"] != "ab" || res["base64"] != nil {
+		t.Fatalf("got %v", res)
 	}
 }

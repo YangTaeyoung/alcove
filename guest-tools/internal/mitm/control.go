@@ -15,10 +15,13 @@ const maxControlLine = 16 << 20
 // prints a ready event first and returns after in ends, with the listener and
 // all proxy connections closed.
 func RunControl(p *Proxy, l net.Listener, in io.Reader, out io.Writer) error {
+	serveErr := make(chan error, 1)
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
-		_ = p.Serve(l)
+		if err := p.Serve(l); err != nil {
+			serveErr <- err
+		}
 	}()
 	defer func() {
 		p.Close()
@@ -35,22 +38,36 @@ func RunControl(p *Proxy, l net.Listener, in io.Reader, out io.Writer) error {
 		return err
 	}
 
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64*1024), maxControlLine)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
+	lines := make(chan []byte)
+	scanErr := make(chan error, 1)
+	go func() {
+		sc := bufio.NewScanner(in)
+		sc.Buffer(make([]byte, 0, 64*1024), maxControlLine)
+		for sc.Scan() {
+			line := bytes.TrimSpace(sc.Bytes())
+			if len(line) == 0 {
+				continue
+			}
+			lines <- append([]byte(nil), line...)
 		}
-		if err := enc.Encode(dispatch(p, line)); err != nil {
+		scanErr <- sc.Err()
+	}()
+	for {
+		select {
+		case line := <-lines:
+			if err := enc.Encode(dispatch(p, line)); err != nil {
+				return err
+			}
+		case err := <-scanErr:
+			if err != nil {
+				_ = enc.Encode(map[string]any{"ok": false, "error": fmt.Sprintf("the request line is unreadable (%v); keep requests under 16 MiB", err)})
+			}
+			return err
+		case err := <-serveErr:
+			_ = enc.Encode(map[string]any{"ev": "fatal", "error": "the proxy listener stopped: " + err.Error()})
 			return err
 		}
 	}
-	if err := sc.Err(); err != nil {
-		_ = enc.Encode(map[string]any{"ok": false, "error": fmt.Sprintf("the request line is unreadable (%v); keep requests under 16 MiB", err)})
-		return err
-	}
-	return nil
 }
 
 func dispatch(p *Proxy, line []byte) map[string]any {

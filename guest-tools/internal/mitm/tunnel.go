@@ -33,10 +33,11 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 	}
 	ex.Status = 200
 	var up2down, down2up atomic.Int64
+	endPending := p.beginPending(&pendingEntry{time: start, kind: "tunnel", method: "CONNECT", url: authority, req: down2up.Load, res: up2down.Load})
+	defer endPending()
 	done := make(chan struct{}, 2)
 	pipe := func(dst net.Conn, src io.Reader, n *atomic.Int64) {
-		c, _ := io.Copy(dst, src)
-		n.Store(c)
+		_, _ = io.Copy(dst, &countingReader{r: src, n: n})
 		if tc, ok := dst.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -50,4 +51,15 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 	ex.ResBytes = up2down.Load()
 	ex.Ms = time.Since(start).Milliseconds()
 	p.record(ex)
+}
+
+type countingReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c *countingReader) Read(b []byte) (int, error) {
+	n, err := c.r.Read(b)
+	c.n.Add(int64(n))
+	return n, err
 }

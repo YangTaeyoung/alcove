@@ -46,15 +46,17 @@
 | op | params | result |
 |---|---|---|
 | `config` | `hosts?` ([glob], empty intercepts all), `secrets?` (bool), `bodies?` (bool, default true) | — |
-| `list` | `since?` (exchange id), `host?` (substring), `path?` (substring), `status?` (number or class like `4xx`), `limit?` (default 50, cap 500) | `exchanges`: [{`id`, `time`, `kind` (`http`, `tunnel`, `tlsError`), `method`, `url`, `status`, `ms`, `reqBytes`, `resBytes`, `rule?`, `error?`}], `next` |
-| `get` | `id`, `part` (`request` or `response`), `offset?`, `length?` (default and cap 200000) | `headers` ([[name, value]]), `body` (text; base64 when not UTF-8 text, with `base64: true`), `total`, `bodyTruncated`, `encoding?` (the removed content encoding) |
+| `list` | `since?` (exchange id), `host?` (substring), `path?` (substring), `status?` (number or class like `4xx`), `limit?` (default 50, cap 500) | `exchanges`: [{`id`, `time`, `kind` (`http`, `tunnel`, `tlsError`), `method`, `url`, `status`, `ms`, `reqBytes`, `resBytes`, `rule?`, `error?`, `bodyDropped?`}], `next`, `pending`: [{`time`, `kind`, `method`, `url`, `ms`, `reqBytes`, `resBytes`, `rule?`}] |
+| `get` | `exchange` (exchange id), `part` (`request` or `response`), `offset?`, `length?` (default and cap 200000) | `headers` ([[name, value]]), `body` (text; base64 when not UTF-8 text, with `base64: true`), `total`, `bodyTruncated`, `bodyDropped?`, `encoding?` (the removed content encoding), `trailers?` ([[name, value]]) |
 | `clear` | — | — |
-| `rule.add` | `match` {`host?` (glob), `path?` (glob), `method?`}, `action` {`status?`, `headers?` (object), `body?` (string), `delayMs?`, `drop?` (bool: close the connection without a response), `times?`} | `rule` (id) |
+| `rule.add` | `match` {`host?` (glob), `path?` (glob), `method?`}, `action` {`status?`, `headers?` (object), `body?` (string), `delayMs?`, `drop?` (bool: close the connection without a response), `times?`} (`status` 200-599, `delayMs` 0-600000) | `rule` (id) |
 | `rule.list` | — | `rules`: [{`id`, `match`, `action`, `hits`, `remaining?`}] |
 | `rule.remove` | `rule` | — |
 | `rule.clear` | — | — |
 
 A rule with `status` or `body` answers without contacting the upstream (default status 200, `content-type: application/json` when the body parses as JSON, else `text/plain; charset=utf-8`). `delayMs` alone delays and then forwards. `get` decodes `gzip` and `deflate` bodies; a body with another content encoding is returned as base64 with `encoding` set.
+
+`id` in a request line is the reply envelope id; the exchange of `get` is `exchange`. `list` without `since` returns the newest `limit` exchanges in ascending id order; with `since` it returns the first `limit` after it; `next` is the id to pass as `since`. `pending` holds requests in flight and open tunnels (oldest first, at most 200); they have no id. Bodies are kept up to a total budget of 256 MiB; beyond it the oldest exchanges lose their bodies and report `bodyDropped: true`. A plain `http://` request to a host not selected by `hosts` is forwarded without rules or capture and recorded as a `tunnel` row.
 
 ---
 

@@ -2,10 +2,15 @@ package mitm
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +61,30 @@ func TestControlLoop(t *testing.T) {
 	if r := readLine(); r["ok"] != true || len(r["exchanges"].([]any)) != 0 {
 		t.Fatalf("list reply %v", r)
 	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "from upstream") }))
+	defer up.Close()
+	proxyURL, _ := url.Parse("http://" + l.Addr().String())
+	hc := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := hc.Get(up.URL + "/via-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	hc.CloseIdleConnections()
+	var exchangeID float64
+	for i := 0; i < 200 && exchangeID == 0; i++ {
+		send(`{"id":20,"op":"list"}`)
+		r := readLine()
+		if rows := r["exchanges"].([]any); len(rows) > 0 {
+			exchangeID = rows[0].(map[string]any)["id"].(float64)
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	send(fmt.Sprintf(`{"id":21,"op":"get","exchange":%v,"part":"response"}`, exchangeID))
+	if r := readLine(); r["id"].(float64) != 21 || r["ok"] != true || r["body"] != "from upstream" {
+		t.Fatalf("get reply %v", r)
+	}
 	send(`{"id":3,"op":"frobnicate"}`)
 	if r := readLine(); r["ok"] != false || r["error"] != "unknown op 'frobnicate'" || r["id"].(float64) != 3 {
 		t.Fatalf("unknown op reply %v", r)
@@ -83,5 +112,27 @@ func TestControlLoop(t *testing.T) {
 	}
 	if _, err := net.DialTimeout("tcp", l.Addr().String(), time.Second); err == nil {
 		t.Fatal("the listener is still open after exit")
+	}
+}
+
+type failingListener struct{ net.Listener }
+
+func (f failingListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed") }
+
+func TestControlLoopReportsListenerFailure(t *testing.T) {
+	ca, _ := LoadOrCreateCA(t.TempDir())
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	var out bytes.Buffer
+	err = RunControl(NewProxy(ca), failingListener{l}, inR, &out)
+	if err == nil {
+		t.Fatal("RunControl should return the listener error")
+	}
+	if !strings.Contains(out.String(), `"ev":"fatal"`) || !strings.Contains(out.String(), "accept failed") {
+		t.Fatalf("output %q", out.String())
 	}
 }

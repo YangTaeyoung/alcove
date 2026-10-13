@@ -19,8 +19,8 @@ func main() {
 	if *caDir == "" {
 		fail("--ca-dir is required; pass the directory that holds (or will hold) the proxy CA")
 	}
-	if !loopback(*listen) {
-		fail("alcove-proxy listens on loopback only; use an address such as 127.0.0.1:0")
+	if !loopbackHost(*listen) {
+		fail(loopbackOnly)
 	}
 	ca, err := mitm.LoadOrCreateCA(*caDir)
 	if err != nil {
@@ -30,21 +30,30 @@ func main() {
 	if err != nil {
 		fail("cannot listen on " + *listen + ": " + err.Error())
 	}
+	if !loopbackAddr(l.Addr()) {
+		l.Close()
+		fail(loopbackOnly)
+	}
 	if err := mitm.RunControl(mitm.NewProxy(ca), l, os.Stdin, os.Stdout); err != nil {
 		fail(err.Error())
 	}
 }
 
-func loopback(addr string) bool {
+const loopbackOnly = "alcove-proxy listens on loopback only; use an address such as 127.0.0.1:0"
+
+// loopbackHost accepts an address whose host is the literal 127.0.0.1.
+func loopbackHost(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false
 	}
-	if host == "localhost" {
-		return true
-	}
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return ip != nil && ip.Equal(net.IPv4(127, 0, 0, 1))
+}
+
+func loopbackAddr(a net.Addr) bool {
+	t, ok := a.(*net.TCPAddr)
+	return ok && t.IP.Equal(net.IPv4(127, 0, 0, 1))
 }
 
 func fail(msg string) {

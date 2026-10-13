@@ -42,6 +42,9 @@ type Proxy struct {
 	tOnce     sync.Once
 	transport *http.Transport
 
+	pmu  sync.Mutex
+	pend map[*pendingEntry]struct{}
+
 	mu       sync.Mutex
 	listener net.Listener
 	conns    map[net.Conn]struct{}
@@ -57,6 +60,7 @@ func NewProxy(ca *CA) *Proxy {
 		rules: newRuleSet(),
 		cfg:   config{bodies: true},
 		conns: map[net.Conn]struct{}{},
+		pend:  map[*pendingEntry]struct{}{},
 	}
 }
 

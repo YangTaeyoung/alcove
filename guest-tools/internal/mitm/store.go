@@ -62,6 +62,12 @@ func (c *capBuf) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (c *capBuf) count() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
 func (c *capBuf) snapshot() (data []byte, total int64, truncated bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -94,12 +100,14 @@ func (s *Store) add(e *Exchange) int64 {
 	return e.ID
 }
 
+// get returns a copy of the stored exchange.
 func (s *Store) get(id int64) (*Exchange, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range s.items {
 		if e.ID == id {
-			return e, true
+			c := *e
+			return &c, true
 		}
 	}
 	return nil, false
@@ -136,17 +144,25 @@ func (f listFilter) matches(e *Exchange) bool {
 	return true
 }
 
+// list returns copies of the matching exchanges in ascending id order. With
+// since set it returns the first limit rows after it; without, the newest
+// limit rows.
 func (s *Store) list(f listFilter) []*Exchange {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*Exchange
 	for _, e := range s.items {
-		if f.matches(e) {
-			out = append(out, e)
-			if f.limit > 0 && len(out) >= f.limit {
-				break
-			}
+		if !f.matches(e) {
+			continue
 		}
+		c := *e
+		out = append(out, &c)
+		if f.since > 0 && f.limit > 0 && len(out) >= f.limit {
+			break
+		}
+	}
+	if f.since == 0 && f.limit > 0 && len(out) > f.limit {
+		out = out[len(out)-f.limit:]
 	}
 	return out
 }

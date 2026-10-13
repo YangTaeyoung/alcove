@@ -190,6 +190,10 @@ func TestRuleAddValidation(t *testing.T) {
 		{"action": map[string]any{}},
 		{"action": map[string]any{"status": "x"}},
 		{"action": map[string]any{"status": 99}},
+		{"action": map[string]any{"status": 100}},
+		{"action": map[string]any{"status": 600}},
+		{"action": map[string]any{"delayMs": 600001}},
+		{"action": map[string]any{"delayMs": -1}},
 		{"action": map[string]any{"headers": map[string]any{"a": "b"}}},
 		{"action": map[string]any{"drop": true}, "match": "x"},
 	}

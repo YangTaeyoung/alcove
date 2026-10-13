@@ -105,7 +105,10 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		URL:        target,
 		ReqHeaders: headerPairs(r.Header),
 	}
+	pe := &pendingEntry{time: start, kind: "http", method: r.Method, url: target, req: reqCap.count, res: resCap.count}
+	endPending := p.beginPending(pe)
 	defer func() {
+		defer endPending()
 		ex.Ms = time.Since(start).Milliseconds()
 		ex.ReqBody, ex.ReqBytes, ex.ReqTruncated = reqCap.snapshot()
 		ex.ResBody, ex.ResBytes, ex.ResTruncated = resCap.snapshot()
@@ -121,6 +124,7 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 	var act ruleAction
 	if a, id, ok := p.rules.pick(host, r.URL.Path, r.Method); ok {
 		act, ex.Rule = a, id
+		pe.rule.Store(int64(id))
 		if act.DelayMs > 0 {
 			t := time.NewTimer(time.Duration(act.DelayMs) * time.Millisecond)
 			select {

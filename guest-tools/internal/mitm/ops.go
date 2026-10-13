@@ -20,6 +20,7 @@ const (
 	maxListLimit     = 500
 	maxGetLength     = 200000
 	maxDecodedBytes  = 64 << 20
+	maxDelayMs       = 600000
 )
 
 // Handle runs one control operation.
@@ -227,16 +228,16 @@ func (p *Proxy) opList(params map[string]any) (map[string]any, error) {
 		out = append(out, row)
 		next = e.ID
 	}
-	return map[string]any{"exchanges": out, "next": next}, nil
+	return map[string]any{"exchanges": out, "next": next, "pending": p.pendingRows()}, nil
 }
 
 func (p *Proxy) opGet(params map[string]any) (map[string]any, error) {
-	id, has, err := intParam(params, "id")
+	id, has, err := intParam(params, "exchange")
 	if err != nil {
 		return nil, err
 	}
 	if !has {
-		return nil, fmt.Errorf("parameter 'id' is required")
+		return nil, fmt.Errorf("parameter 'exchange' is required")
 	}
 	part, _, err := stringParam(params, "part")
 	if err != nil {
@@ -275,6 +276,10 @@ func (p *Proxy) opGet(params map[string]any) (map[string]any, error) {
 	if encoding != "" {
 		res["encoding"] = encoding
 	}
+	view := decoded
+	if truncated && !undecodable {
+		view = trimPartialRune(decoded)
+	}
 	if offset > len(decoded) {
 		offset = len(decoded)
 	}
@@ -282,14 +287,43 @@ func (p *Proxy) opGet(params map[string]any) (map[string]any, error) {
 	if end > len(decoded) {
 		end = len(decoded)
 	}
-	page := decoded[offset:end]
-	if undecodable || !utf8.Valid(decoded) || !utf8.Valid(page) {
-		res["body"] = base64.StdEncoding.EncodeToString(page)
-		res["base64"] = true
+	if !undecodable && utf8.Valid(view) {
+		if end > len(view) {
+			end = len(view)
+		}
+		start := offset
+		for start < end && !utf8.RuneStart(view[start]) {
+			start++
+		}
+		for end < len(view) && end > start && !utf8.RuneStart(view[end]) {
+			end--
+		}
+		if start > end {
+			start = end
+		}
+		if start == end && start < len(view) {
+			_, size := utf8.DecodeRune(view[start:])
+			end = start + size
+		}
+		res["body"] = string(view[start:end])
 	} else {
-		res["body"] = string(page)
+		res["body"] = base64.StdEncoding.EncodeToString(decoded[offset:end])
+		res["base64"] = true
 	}
 	return res, nil
+}
+
+// trimPartialRune drops an incomplete UTF-8 character at the end of b.
+func trimPartialRune(b []byte) []byte {
+	if utf8.Valid(b) {
+		return b
+	}
+	for k := 1; k <= 3 && k <= len(b); k++ {
+		if utf8.Valid(b[:len(b)-k]) {
+			return b[:len(b)-k]
+		}
+	}
+	return b
 }
 
 // decodeBody removes a gzip or deflate content encoding. For an encoding it
@@ -354,8 +388,8 @@ func (p *Proxy) opRuleAdd(params map[string]any) (map[string]any, error) {
 	if a.Status, a.HasStatus, err = intParam(actionObj, "status"); err != nil {
 		return nil, fmt.Errorf("action: %w", err)
 	}
-	if a.HasStatus && (a.Status < 100 || a.Status > 599) {
-		return nil, fmt.Errorf("action: 'status' must be between 100 and 599")
+	if a.HasStatus && (a.Status < 200 || a.Status > 599) {
+		return nil, fmt.Errorf("action: 'status' must be between 200 and 599")
 	}
 	if a.Body, a.HasBody, err = stringParam(actionObj, "body"); err != nil {
 		return nil, fmt.Errorf("action: %w", err)
@@ -363,8 +397,8 @@ func (p *Proxy) opRuleAdd(params map[string]any) (map[string]any, error) {
 	if a.DelayMs, _, err = intParam(actionObj, "delayMs"); err != nil {
 		return nil, fmt.Errorf("action: %w", err)
 	}
-	if a.DelayMs < 0 {
-		return nil, fmt.Errorf("action: 'delayMs' must not be negative")
+	if a.DelayMs < 0 || a.DelayMs > maxDelayMs {
+		return nil, fmt.Errorf("action: 'delayMs' must be between 0 and %d", maxDelayMs)
 	}
 	if a.Drop, _, err = boolParam(actionObj, "drop"); err != nil {
 		return nil, fmt.Errorf("action: %w", err)
