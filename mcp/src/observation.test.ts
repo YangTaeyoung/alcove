@@ -131,6 +131,37 @@ test("wait_for lists the conditions that could not be evaluated", () => {
   ].join("\n"));
 });
 
+test("wait_for names a condition the helper did not answer without a count", () => {
+  const r = waitForResult({ matched: -1, waited: 30, problems: [
+    { condition: 0, type: "ui_exists", error: "the UI helper has not answered ui.find for 25 s" },
+    { condition: 1, type: "ui_gone", error: "the UI helper was busy with other requests", failures: 0 },
+  ] }, 30);
+  assert.equal(textOf(r), [
+    "no condition matched within 30 s",
+    "condition 0 (ui_exists) could not be evaluated: the UI helper has not answered ui.find for 25 s",
+    "condition 1 (ui_gone) could not be evaluated: the UI helper was busy with other requests",
+  ].join("\n"));
+});
+
+test("an action result shows eventSeq as a line and as structured content", () => {
+  const plain = actionResult("clicked left at (1, 2)", { eventSeq: 41 });
+  assert.equal(textOf(plain), "clicked left at (1, 2)\neventSeq 41");
+  assert.deepEqual(plain.structuredContent, { eventSeq: 41 });
+  const observed = actionResult("clicked left at (1, 2)", { eventSeq: 0, observation: base });
+  assert.equal(textOf(observed), "clicked left at (1, 2)\neventSeq 0\nscreen settled\nnothing changed");
+  assert.deepEqual(observed.structuredContent, { eventSeq: 0 });
+  const failed = actionResult("typed", { eventSeq: 3, observationError: "gone" });
+  assert.equal(textOf(failed), "typed\neventSeq 3\nscreen not read after the action: gone");
+  const without = actionResult("typed", {});
+  assert.equal(textOf(without), "typed");
+  assert.equal(without.structuredContent, undefined);
+});
+
+test("an observation names why UI facts are missing", () => {
+  const out = renderObservation({ ...base, uiError: "the UI helper is busy with another request; call vm.ui.tree when you need the tree" });
+  assert.match((out[0] as { text: string }).text, /\nUI facts missing: the UI helper is busy with another request; call vm\.ui\.tree when you need the tree$/);
+});
+
 test("wait_for puts the detail and problems before the observation", () => {
   const r = waitForResult({ matched: -1, detail: "job exited", waited: 2, problems: [{ condition: 1, type: "file_exists", error: "x", failures: 2 }], observation: base }, 30);
   assert.equal(textOf(r), "no condition matched: job exited (after 2 s)\ncondition 1 (file_exists) could not be evaluated: x (2 times in a row)\nscreen settled\nnothing changed");

@@ -36,10 +36,15 @@ export function screenshotCaption(name: string, r: Record<string, unknown>): str
   return `${name}: guest frame ${r.width}x${r.height}; image ${sentWidth}x${sentHeight} shows guest (${x},${y}) ${w}x${h} at scale ${formatScale(scale)}; guest = origin + image_pixel / scale`;
 }
 
-/** Lines `n: ref Role "name" (x,y WxH)` for the `marks` of a `vm.screenshot` reply, preceded by a newline; empty without marks. */
-export function marksLegend(marks: unknown): string {
-  if (!Array.isArray(marks) || marks.length === 0) return "";
+/**
+ * Lines `n: ref Role "name" (x,y WxH)` for the `marks` of a `vm.screenshot` reply, preceded by a newline; empty without marks.
+ * With `truncated` a last line says that more elements exist than are marked.
+ */
+export function marksLegend(marks: unknown, truncated = false): string {
+  const more = "more elements exist than are marked; capture a smaller region or read the window with alcove_ui_tree";
+  if (!Array.isArray(marks) || marks.length === 0) return truncated ? `\n${more}` : "";
   const lines = (marks as Array<Record<string, unknown>>).map((m) => `${m.n}: ${m.ref} ${m.role} "${m.name ?? ""}" (${m.x},${m.y} ${m.w}x${m.h})`);
+  if (truncated) lines.push(more);
   return `\nmarked elements:\n${lines.join("\n")}`;
 }
 
@@ -68,20 +73,33 @@ export function renderObservation(o: Record<string, unknown> | undefined, settle
   if (events) lines.push(`events: ${events}`);
   const tree = field(o.tree);
   if (tree) lines.push(tree);
+  const uiError = field(o.uiError);
+  if (uiError) lines.push(`UI facts missing: ${uiError}`);
   const out: Array<TextContent | ImageContent> = [{ type: "text", text: lines.join("\n") }];
   if (png) out.push({ type: "image", data: png, mimeType: "image/png" });
   return out;
 }
 
-/** Tool result: `line` followed by the rendered `observation` of the control reply, when it has one. */
+/** `eventSeq <n>` for a control reply that carries the event sequence number of its start; nothing otherwise. */
+export function eventSeqLine(reply: Record<string, unknown>): string | undefined {
+  return typeof reply.eventSeq === "number" ? `eventSeq ${reply.eventSeq}` : undefined;
+}
+
+/**
+ * Tool result: `line`, the reply's `eventSeq` when it has one (also as structured content), then the rendered
+ * `observation` of the control reply, when it has one.
+ */
 export function actionResult(line: string, reply: Record<string, unknown>, settleTimeoutMs?: number): ToolResult {
+  const seq = eventSeqLine(reply);
+  const head = seq ? `${line}\n${seq}` : line;
+  const structured = seq ? { structuredContent: { eventSeq: reply.eventSeq } } : {};
   if (typeof reply.observationError === "string") {
-    return { content: [{ type: "text", text: `${line}\nscreen not read after the action: ${reply.observationError}` }] };
+    return { content: [{ type: "text", text: `${head}\nscreen not read after the action: ${reply.observationError}` }], ...structured };
   }
   const obs = renderObservation(reply.observation as Record<string, unknown> | undefined, settleTimeoutMs);
-  if (obs.length === 0) return { content: [{ type: "text", text: line }] };
-  const [head, ...rest] = obs;
-  return { content: [{ type: "text", text: `${line}\n${(head as TextContent).text}` }, ...rest] };
+  if (obs.length === 0) return { content: [{ type: "text", text: head }], ...structured };
+  const [first, ...rest] = obs;
+  return { content: [{ type: "text", text: `${head}\n${(first as TextContent).text}` }, ...rest], ...structured };
 }
 
 /** Tool result of `alcove_wait_for` for a `vm.wait_for` reply. */
@@ -98,7 +116,8 @@ export function waitForResult(reply: Record<string, unknown>, timeoutS: number, 
       ? `no condition matched within ${timeoutS} s`
       : `no condition matched: ${typeof d === "string" ? d : JSON.stringify(d)} (after ${reply.waited} s)`);
     for (const p of (reply.problems as Array<Record<string, unknown>> | undefined) ?? []) {
-      lines.push(`condition ${p.condition} (${p.type}) could not be evaluated: ${p.error} (${p.failures} times in a row)`);
+      const times = typeof p.failures === "number" && p.failures > 0 ? ` (${p.failures} times in a row)` : "";
+      lines.push(`condition ${p.condition} (${p.type}) could not be evaluated: ${p.error}${times}`);
     }
   }
   return actionResult(lines.join("\n"), reply, settleTimeoutMs);

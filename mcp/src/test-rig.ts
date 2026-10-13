@@ -6,6 +6,7 @@ export type Call = { op: string; params: Record<string, unknown> };
 
 export function rig(register: (r: Registrar, c: ControlClient) => void, reply: Record<string, unknown> = {}) {
   const calls: Call[] = [];
+  const timeouts: Array<number | undefined> = [];
   const handlers = new Map<string, ToolHandler>();
   const descriptions = new Map<string, string>();
   const registrar: Registrar = {
@@ -14,9 +15,11 @@ export function rig(register: (r: Registrar, c: ControlClient) => void, reply: R
       descriptions.set(name, config.description ?? "");
     },
   };
-  const client = { call: async (op: string, params: Record<string, unknown> = {}) => (calls.push({ op, params }), reply) } as unknown as ControlClient;
+  const client = {
+    call: async (op: string, params: Record<string, unknown> = {}, timeout?: number) => (calls.push({ op, params }), timeouts.push(timeout), reply),
+  } as unknown as ControlClient;
   register(registrar, client);
-  return { calls, descriptions, run: (tool: string, args: Record<string, unknown>) => handlers.get(tool)!(args) };
+  return { calls, timeouts, descriptions, run: (tool: string, args: Record<string, unknown>) => handlers.get(tool)!(args) };
 }
 
 export const textOf = (r: ToolResult) => r.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");

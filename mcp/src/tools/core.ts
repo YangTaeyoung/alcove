@@ -2,7 +2,7 @@
 import { z } from "zod";
 import type { ControlClient } from "../control.js";
 import { actionResult, actionTimeout, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
-import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, type Registrar } from "../toolkit.js";
+import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
 
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("core",
@@ -140,11 +140,11 @@ export function register(r: Registrar, client: ControlClient): void {
           ...(quality !== undefined ? { quality } : {}),
           ...(window !== undefined ? { window } : {}),
           ...(marks !== undefined ? { marks } : {}),
-        }, 60000);
+        }, window !== undefined || marks ? UI_CALL_TIMEOUT_MS : 60000);
         const jpeg = typeof r.jpeg === "string";
         return {
           content: [
-            { type: "text", text: screenshotCaption(name, r) + marksLegend(r.marks) },
+            { type: "text", text: screenshotCaption(name, r) + marksLegend(r.marks, r.marksTruncated === true) },
             jpeg ? { type: "image", data: r.jpeg as string, mimeType: "image/jpeg" } : { type: "image", data: r.png as string, mimeType: "image/png" },
           ],
         };

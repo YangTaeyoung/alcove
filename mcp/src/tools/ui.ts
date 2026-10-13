@@ -2,9 +2,9 @@
 // actions, app launch, deploy and guest events.
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
-import { actionResult, actionTimeout, observeParams, observePayload, type ObserveArgs } from "../observation.js";
+import { actionResult, actionTimeout, eventSeqLine, observeParams, observePayload, type ObserveArgs } from "../observation.js";
 import { selectorParams, toSelector } from "../selector.js";
-import { clip, fail, text, vmName, type Registrar } from "../toolkit.js";
+import { clip, fail, text, vmName, DEPLOY_TIMEOUT_MS, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -26,6 +26,17 @@ function nodeLabel(n: Obj | undefined): string {
 
 const WAIT_WINDOW_DEFAULT_S = 20;
 
+/** One line per guest event: `seq time name` followed by the window title, or by the exit code and the program or job. */
+export function eventLine(e: Obj): string {
+  const parts = [`${e.seq} ${e.time} ${e.name}`];
+  const w = e.window as Obj | undefined;
+  if (w && w.title !== undefined) parts.push(`"${w.title}"`);
+  if (e.code !== undefined) parts.push(`code ${e.code}`);
+  if (e.path !== undefined) parts.push(String(e.path));
+  if (e.job !== undefined) parts.push(`job ${e.job}`);
+  return parts.join(" ");
+}
+
 const windowRef = z.string().min(1).describe("Window id from alcove_list_windows, \"foreground\", or a part of the title");
 
 export function register(r: Registrar, client: ControlClient): void {
@@ -36,7 +47,7 @@ export function register(r: Registrar, client: ControlClient): void {
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ name }) => {
     try {
-      const reply = await client.call("vm.window.list", { name }, 60000);
+      const reply = await client.call("vm.window.list", { name }, UI_CALL_TIMEOUT_MS);
       const windows = (reply.windows as Obj[]) ?? [];
       const body = windows.length === 0 ? "no windows" : windows.map(windowLine).join("\n");
       return text(body, { windows });
@@ -72,9 +83,10 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(a.width !== undefined ? { width: a.width } : {}),
         ...(a.height !== undefined ? { height: a.height } : {}),
         ...observePayload(a as ObserveArgs, "summary"),
-      }, actionTimeout(a as ObserveArgs));
+      }, actionTimeout(a as ObserveArgs, UI_CALL_TIMEOUT_MS));
       const w = reply.window as Obj | undefined;
-      return actionResult(`${a.action} ${a.window}${w ? `\n${windowLine(w)}` : ""}`, reply, a.settle_timeout_ms);
+      const closed = reply.closed === true ? ": the window closed" : reply.closed === false ? ": the window is still open" : "";
+      return actionResult(`${a.action} ${a.window}${closed}${w ? `\n${windowLine(w)}` : ""}`, reply, a.settle_timeout_ms);
     } catch (e) {
       return fail(e);
     }
@@ -101,7 +113,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(a.depth !== undefined ? { depth: a.depth } : {}),
         ...(a.max !== undefined ? { max: a.max } : {}),
         ...(a.filter !== undefined ? { filter: a.filter } : {}),
-      }, 120000);
+      }, UI_CALL_TIMEOUT_MS);
       const tree = String(reply.tree ?? "");
       const lines = [clip(tree, 100000, "use root, depth or max to read a smaller part")];
       if (reply.truncated === true) {
@@ -125,7 +137,7 @@ export function register(r: Registrar, client: ControlClient): void {
   }, async (a) => {
     try {
       const { name, limit, ...sel } = a;
-      const reply = await client.call("vm.ui.find", { name, ...toSelector(sel), ...(limit !== undefined ? { limit } : {}) }, 60000);
+      const reply = await client.call("vm.ui.find", { name, ...toSelector(sel), ...(limit !== undefined ? { limit } : {}) }, UI_CALL_TIMEOUT_MS);
       const nodes = (reply.nodes as Obj[]) ?? [];
       const body = nodes.length === 0 ? "no matches" : `${nodes.length} matches\n${String(reply.text ?? "")}`;
       return text(body, { nodes });
@@ -154,7 +166,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(mode !== undefined ? { mode } : {}),
         ...(offset !== undefined ? { offset } : {}),
         ...(length !== undefined ? { length } : {}),
-      }, 60000);
+      }, UI_CALL_TIMEOUT_MS);
       const body = String(reply.text ?? "");
       const start = offset ?? 0;
       const head = `source ${reply.source}, ${reply.total} characters in total, showing from ${start}`;
@@ -187,7 +199,7 @@ export function register(r: Registrar, client: ControlClient): void {
         button: button ?? "left",
         count: count ?? 1,
         ...observePayload(obs, "summary"),
-      }, actionTimeout(obs));
+      }, actionTimeout(obs, UI_CALL_TIMEOUT_MS));
       const line = `clicked ${button ?? "left"}${count && count > 1 ? ` x${count}` : ""} ${nodeLabel(reply.node as Obj | undefined)} at (${reply.x}, ${reply.y})`;
       return actionResult(line, reply, settle_timeout_ms);
     } catch (e) {
@@ -218,7 +230,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(clear !== undefined ? { clear } : {}),
         ...(submit !== undefined ? { submit } : {}),
         ...observePayload(obs, "summary"),
-      }, actionTimeout(obs, 60000 + typed.length * 20));
+      }, actionTimeout(obs, UI_CALL_TIMEOUT_MS + typed.length * 20));
       const line = `typed ${typed.length} characters into ${nodeLabel(reply.node as Obj | undefined)}${clear ? " (cleared first)" : ""}${submit ? " and pressed enter" : ""}`;
       return actionResult(line, reply, settle_timeout_ms);
     } catch (e) {
@@ -248,11 +260,13 @@ export function register(r: Registrar, client: ControlClient): void {
         action,
         ...(value !== undefined ? { value } : {}),
         ...observePayload(obs, "summary"),
-      }, actionTimeout(obs));
+      }, actionTimeout(obs, UI_CALL_TIMEOUT_MS));
       const node = reply.node as Obj | undefined;
       const flags = Array.isArray(node?.flags) && (node?.flags as unknown[]).length ? ` [${(node?.flags as string[]).join(", ")}]` : "";
       const val = node?.value !== undefined ? ` value="${node.value}"` : "";
-      return actionResult(`${action} ${nodeLabel(node)}${flags}${val}`, reply, settle_timeout_ms);
+      const after = reply.gone === true ? "\nthe element is gone after the action; the line above shows it as it was before"
+        : reply.unresponsive === true ? "\nits window stopped responding during the action; the line above shows the element as it was before" : "";
+      return actionResult(`${action} ${nodeLabel(node)}${flags}${val}${after}`, reply, settle_timeout_ms);
     } catch (e) {
       return fail(e);
     }
@@ -282,8 +296,13 @@ export function register(r: Registrar, client: ControlClient): void {
         waitWindow: wait,
       }, (wait + 60) * 1000);
       const w = reply.window as Obj | undefined;
-      const body = `started pid ${reply.pid}${w ? `\n${windowLine(w)}` : "\nno window appeared yet; check alcove_list_windows"}`;
-      return text(body, { pid: reply.pid, window: w });
+      const lines = [`started pid ${reply.pid}`];
+      if (w) lines.push(windowLine(w));
+      if (reply.windowTimedOut === true) lines.push(`no window appeared within ${wait} s; check alcove_list_windows`);
+      const seq = eventSeqLine(reply);
+      if (seq) lines.push(seq);
+      return text(lines.join("\n"), { pid: reply.pid, window: w, ...(reply.windowTimedOut === true ? { windowTimedOut: true } : {}),
+        ...(seq ? { eventSeq: reply.eventSeq } : {}) });
     } catch (e) {
       return fail(e);
     }
@@ -295,14 +314,14 @@ export function register(r: Registrar, client: ControlClient): void {
     inputSchema: {
       name: vmName,
       path: z.string().min(1).describe("Absolute file or folder path on the Mac"),
-      guest_dir: z.string().optional().describe("Target folder in the guest (default C:\\alcove-apps\\<base name>)"),
+      guest_dir: z.string().optional().describe("Target folder in the guest, an absolute path (default C:\\alcove-apps\\<base name>). System and profile folders are refused; a folder that already holds files is accepted only below C:\\alcove-apps or when an earlier deploy filled it"),
       install: z.object({
         kind: z.enum(["msi", "exe"]),
-        file: z.string().min(1).describe("Installer file, relative to guest_dir unless absolute"),
+        file: z.string().min(1).describe("Installer file, inside guest_dir when relative (no .. segments), or an absolute path"),
         args: z.array(z.string()).optional(),
       }).optional().describe("Installer to run after the copy; a non-zero exit code fails the call (3010 counts as success)"),
       launch: z.object({
-        exe: z.string().min(1).describe("Executable, relative to guest_dir unless absolute"),
+        exe: z.string().min(1).describe("Executable, inside guest_dir when relative (no .. segments), or an absolute path"),
         args: z.array(z.string()).optional(),
         env: z.record(z.string()).optional(),
         cwd: z.string().optional(),
@@ -321,7 +340,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(a.launch ? { launch: a.launch } : {}),
         ...(a.wait_window_s !== undefined ? { waitWindow: a.wait_window_s } : {}),
         ...(a.kill_running !== undefined ? { killRunning: a.kill_running } : {}),
-      }, 1800000);
+      }, DEPLOY_TIMEOUT_MS);
       const sent = reply.sent;
       const sentCount = Array.isArray(sent) ? sent.length : Number(sent ?? 0);
       const lines = [`deployed to ${reply.guestDir}: sent ${sentCount} file(s), skipped ${reply.skipped ?? 0} unchanged, ${reply.bytes ?? 0} bytes`];
@@ -329,7 +348,9 @@ export function register(r: Registrar, client: ControlClient): void {
       if (reply.pid !== undefined) lines.push(`started pid ${reply.pid}`);
       const w = reply.window as Obj | undefined;
       if (w) lines.push(windowLine(w));
-      else if (a.launch) lines.push("no window appeared yet; check alcove_list_windows");
+      if (reply.windowTimedOut === true) lines.push(`no window appeared within ${a.wait_window_s ?? WAIT_WINDOW_DEFAULT_S} s; check alcove_list_windows`);
+      const seq = eventSeqLine(reply);
+      if (seq) lines.push(seq);
       return text(lines.join("\n"), reply);
     } catch (e) {
       return fail(e);
@@ -338,7 +359,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("ui", "alcove_events", {
     title: "Read guest events",
-    description: "Read the window and dialog events of a Windows guest (window opened, closed, foreground, title changed, dialog opened) in order, newest 500 kept. Pass the `next` value of the previous call as `since` to get only new events. Use it to notice dialogs and crashes that appeared while you were not looking.",
+    description: "Read the window, dialog and process events of a Windows guest (window opened, closed, foreground, title changed, dialog opened, process or job exited with its code) in order, newest 500 kept. Pass the `next` value of the previous call as `since` to get only new events; a line says so when events between `since` and the oldest kept one were dropped. Use it to notice dialogs and crashes that appeared while you were not looking.",
     inputSchema: {
       name: vmName,
       since: z.number().int().min(0).optional().describe("Return events after this sequence number (default: all kept)"),
@@ -348,14 +369,12 @@ export function register(r: Registrar, client: ControlClient): void {
     try {
       const reply = await client.call("vm.events", { name: a.name, ...(a.since !== undefined ? { since: a.since } : {}) }, 60000);
       const events = (reply.events as Obj[]) ?? [];
-      const lines = events.map((e) => {
-        const { seq, time, name: ev, ...rest } = e;
-        const w = (rest.window ?? rest) as Obj;
-        const title = w.title !== undefined ? ` "${w.title}"` : "";
-        return `${seq} ${time} ${ev}${title}`;
-      });
+      const lines = events.map(eventLine);
       const head = events.length === 0 ? "no new events" : `${events.length} events`;
-      return text([head, ...lines, `next: ${reply.next}`].join("\n"), { events, next: reply.next });
+      const first = typeof reply.first === "number" ? reply.first : 0;
+      const since = a.since ?? 0;
+      const gap = first > since + 1 ? [`events ${since + 1} to ${first - 1} are no longer kept; the list starts at ${first}`] : [];
+      return text([head, ...gap, ...lines, `next: ${reply.next}`].join("\n"), { events, next: reply.next, first: reply.first });
     } catch (e) {
       return fail(e);
     }

@@ -65,6 +65,11 @@ export function registrar(server: Pick<McpServer, "registerTool">, enabled: Set<
   };
 }
 
+/** `client.call` timeout in ms of a tool whose control op asks the guest's UI helper: the op's wait for the helper plus the helper's answer. */
+export const UI_CALL_TIMEOUT_MS = 250000;
+/** `client.call` timeout in ms of `alcove_deploy`: copy, installer, launch and window wait. */
+export const DEPLOY_TIMEOUT_MS = 5400000;
+
 export const vmName = z.string().describe("VM name as shown by alcove_list_vms, e.g. \"Windows 11\"");
 
 /** Command parameters shared by alcove_exec and alcove_exec_start. */
