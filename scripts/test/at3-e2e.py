@@ -112,6 +112,7 @@ class Run:
         self.notepad_before = None
         self.notepad_copy = None
         self.notepad_names = None
+        self.notepad_dirs = []
         self.notepad_job = None
         self.notepad_stub = None
         self.notepad_window = None
@@ -180,14 +181,15 @@ class Run:
         return self.notepad_pids(c) - self.notepad_before
 
     def snapshot_notepad(self):
-        """Copies the files of Notepad's saved tabs to a new temporary directory on the host."""
+        """Copies the files of Notepad's saved tabs to a new temporary directory on the host and notes the folders."""
         copy = tempfile.mkdtemp(prefix="alcove-notepad-state-")
         try:
-            names = None
+            names, dirs = None, []
             if self.exec(NOTEPAD_STATE_EXISTS) == "True":
                 entries = self.call("vm.fs.list", path=NOTEPAD_STATE, recursive=True)
                 expect(not entries["truncated"], f"{NOTEPAD_STATE} holds more files than vm.fs.list returns")
                 names = [e["name"] for e in entries["entries"] if not e["dir"]]
+                dirs = [e["name"] for e in entries["entries"] if e["dir"]]
                 for name in names:
                     target = os.path.join(copy, *name.split("/"))
                     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -195,16 +197,21 @@ class Run:
         except BaseException:
             shutil.rmtree(copy, ignore_errors=True)
             raise
-        self.notepad_copy, self.notepad_names = copy, names
+        self.notepad_copy, self.notepad_names, self.notepad_dirs = copy, names, dirs
 
     def restore_notepad(self, c):
-        """Makes the files of Notepad's saved tabs equal to the host copy; deletes the folder when it did not exist."""
+        """Makes the files of Notepad's saved tabs equal to the host copy and removes the folders that were not there
+        before the run; deletes the whole folder when it did not exist."""
         if self.notepad_names is None:
             c.call("vm.fs.delete", 120, name=self.vm, path=NOTEPAD_STATE, recursive=True)
             return
         entries = c.call("vm.fs.list", 120, name=self.vm, path=NOTEPAD_STATE, recursive=True)["entries"]
         for name in {e["name"] for e in entries if not e["dir"]} - set(self.notepad_names):
             c.call("vm.fs.delete", 120, name=self.vm, path=NOTEPAD_STATE + "/" + name)
+        added = {e["name"] for e in entries if e["dir"]} - set(self.notepad_dirs)
+        for name in sorted(added):
+            if name.rpartition("/")[0] not in added:
+                c.call("vm.fs.delete", 120, name=self.vm, path=NOTEPAD_STATE + "/" + name, recursive=True)
         for name in self.notepad_names:
             source = os.path.join(self.notepad_copy, *name.split("/"))
             pushed = c.call("vm.push_file", 120, name=self.vm, path=source, guestPath=NOTEPAD_STATE + "/" + name, overwrite=True)
@@ -394,6 +401,10 @@ def _(run):
 
     read = lines(run.exec(f"Get-Content -LiteralPath '{OCR_FILE}' -Encoding UTF8"))
     expect(read == [ENGLISH, KOREAN], f"vm.exec read {read!r} from {OCR_FILE}, expected {[ENGLISH, KOREAN]!r}")
+
+    plain = run.find(ENGLISH)["matches"]
+    expect(len(plain) == 1 and abs(plain[0]["x"] - detail["x"]) <= 16 and abs(plain[0]["y"] - detail["y"]) <= 8,
+           f"vm.find_text '{ENGLISH}' without languages returned {plain!r}; with {LATIN} the line is at {detail['x']},{detail['y']}")
 
     found = run.find(KOREAN)
     expect(len(found["matches"]) == 1, f"vm.find_text '{KOREAN}' returned {[m['text'] for m in found['matches']]!r} of {found['lines']} lines")
@@ -640,7 +651,9 @@ def main():
             run.cleanup()
         except Exception as e:
             run.cleanup_error(f"{type(e).__name__}: {e}")
-    if failed or run.cleanup_failed:
+        if run.cleanup_failed:
+            sys.exit(1)
+    if failed:
         sys.exit(1)
 
 
