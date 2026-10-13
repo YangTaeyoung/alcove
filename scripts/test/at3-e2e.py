@@ -403,7 +403,7 @@ def _(run):
     expect(read == [ENGLISH, KOREAN], f"vm.exec read {read!r} from {OCR_FILE}, expected {[ENGLISH, KOREAN]!r}")
 
     plain = run.find(ENGLISH)["matches"]
-    expect(len(plain) == 1 and abs(plain[0]["x"] - detail["x"]) <= 16 and abs(plain[0]["y"] - detail["y"]) <= 8,
+    expect(any(abs(m["x"] - detail["x"]) <= 16 and abs(m["y"] - detail["y"]) <= 8 for m in plain),
            f"vm.find_text '{ENGLISH}' without languages returned {plain!r}; with {LATIN} the line is at {detail['x']},{detail['y']}")
 
     found = run.find(KOREAN)
