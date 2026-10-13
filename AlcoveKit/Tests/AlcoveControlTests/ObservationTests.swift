@@ -252,13 +252,18 @@ final class ObservationTests: XCTestCase {
         let base = solid(320, 192, 40)
         let (h, t) = await setup(frames: [base])
         let step: JSON = ["op": "vm.key.down", "key": "shift"]
-        for extra: JSON in [["settleMs": 500, "settleTimeoutMs": 400], ["observe": "summary", "settleMs": 2001], ["settleTimeoutMs": 200]] {
+        let cases: [(JSON, String)] = [
+            (["settleMs": 500, "settleTimeoutMs": 400], "settleMs (500) must not exceed settleTimeoutMs (400); lower settleMs or raise settleTimeoutMs"),
+            (["observe": "summary", "settleMs": 2001], "settleMs (2001) must not exceed settleTimeoutMs (2000); lower settleMs or raise settleTimeoutMs"),
+            (["settleTimeoutMs": 200], "settleMs (300) must not exceed settleTimeoutMs (200); lower settleMs or raise settleTimeoutMs"),
+        ]
+        for (extra, message) in cases {
             var params = extra.objectValue ?? [:]
             params["name"] = "Win"; params["x"] = 0; params["y"] = 0; params["steps"] = [step]
             let click = await failure(h, "vm.mouse.click", .object(params))
-            XCTAssertEqual(click, "settleMs must not exceed settleTimeoutMs")
+            XCTAssertEqual(click, message)
             let batch = await failure(h, "vm.batch", .object(params))
-            XCTAssertEqual(batch, "settleMs must not exceed settleTimeoutMs")
+            XCTAssertEqual(batch, message)
         }
         let sent = await t.sent
         XCTAssertEqual(sent, [])

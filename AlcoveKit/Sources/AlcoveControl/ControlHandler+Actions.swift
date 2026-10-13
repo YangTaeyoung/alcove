@@ -38,7 +38,9 @@ extension ControlHandler {
             guard let ms = value.intValue, (100...30000).contains(ms) else { throw ControlError.failed("settleTimeoutMs must be between 100 and 30000") }
             options.settleTimeoutMs = ms
         }
-        guard options.settleMs <= options.settleTimeoutMs else { throw ControlError.failed("settleMs must not exceed settleTimeoutMs") }
+        guard options.settleMs <= options.settleTimeoutMs else {
+            throw ControlError.failed("settleMs (\(options.settleMs)) must not exceed settleTimeoutMs (\(options.settleTimeoutMs)); lower settleMs or raise settleTimeoutMs")
+        }
         return options
     }
 
