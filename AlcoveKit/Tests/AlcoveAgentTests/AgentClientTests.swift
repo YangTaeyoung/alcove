@@ -121,6 +121,33 @@ final class AgentClientTests: XCTestCase {
         catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, "boom") }
     }
 
+    func testCallReturnsAReplyOfThreeMebibytes() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let big = String(repeating: "x", count: 3 << 20)
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true, "out": .string(big)]] : [] }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let r = try await client.call("exec.read")
+        XCTAssertEqual(r["out"]?.stringValue?.utf8.count, 3 << 20)
+    }
+
+    func testCallRefusesARequestLongerThanTheAgentReads() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true]] : [] }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        do {
+            _ = try await client.call("exec.run", ["stdin": .string(String(repeating: "x", count: 1 << 20))])
+            XCTFail("expected a refusal")
+        } catch AgentClient.AgentError.remote(let text) {
+            XCTAssertEqual(text, "request 'exec.run' is longer than 1 MiB, the most alcove-agent reads in one message; put large input in a guest file and pass its path")
+        }
+        _ = try await client.call("ping")
+        XCTAssertEqual(agent.received.filter { $0["t"]?.stringValue == "req" }.compactMap { $0["op"]?.stringValue }, ["ping"])
+        _ = try await client.call("exec.run", ["stdin": .string(String(repeating: "x", count: (1 << 20) - 200))])
+        XCTAssertEqual(agent.received.filter { $0["t"]?.stringValue == "req" }.count, 2)
+    }
+
     func testCallUnsupportedOnV1Agent() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         agent.proto = nil

@@ -141,13 +141,25 @@ public actor AgentClient {
         return r["path"]?.stringValue ?? ""
     }
 
+    /// The longest request line the agent reads, newline included (`proto.MaxLine` in guest-tools).
+    static let maxRequestBytes = 1 << 20
+
     /// Send `{"t":"req","id":n,"op":op, ...params}` and return the matching `res` object.
-    /// Throws `.remote` on `ok:false` and `.unsupported` when the agent has no RPC layer.
+    /// Throws `.remote` on `ok:false` and for a request longer than `maxRequestBytes`, which is not sent,
+    /// and `.unsupported` when the agent has no RPC layer.
     public func call(_ op: String, _ params: [String: JSON] = [:], timeout: Duration = .seconds(30)) async throws -> JSON {
         guard transport != nil else { throw AgentError.notConnected }
         guard (hello?.rpcVersion ?? 1) >= 2 else { throw AgentError.unsupported(op) }
         let id = nextCallID
         nextCallID += 1
+        var message = params
+        message["t"] = "req"
+        message["id"] = .int(Int64(id))
+        message["op"] = .string(op)
+        guard var line = try? JSON.object(message).serialized(), line.count < AgentClient.maxRequestBytes else {
+            throw AgentError.remote("request '\(op)' is longer than 1 MiB, the most alcove-agent reads in one message; put large input in a guest file and pass its path")
+        }
+        line.append(10)
         let timeoutTask = Task { [weak self] in
             do { try await Task.sleep(for: timeout) } catch { return }
             await self?.timeOutCall(id: id, op: op)
@@ -155,11 +167,7 @@ public actor AgentClient {
         defer { timeoutTask.cancel() }
         let res = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<JSON, Error>) in
             pendingCalls[id] = cont
-            var message = params
-            message["t"] = "req"
-            message["id"] = .int(Int64(id))
-            message["op"] = .string(op)
-            send(.object(message))
+            transport?.send(line)
         }
         if res["ok"]?.boolValue == false {
             throw AgentError.remote(res["error"]?.stringValue ?? "request '\(op)' failed")
