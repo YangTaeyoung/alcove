@@ -365,11 +365,10 @@ public actor ControlHandler {
         let region = try regionParam(params)
         var languages = ScreenText.defaultLanguages
         if let value = params["languages"] {
-            guard let items = value.arrayValue, !items.isEmpty else { throw ControlError.missing("languages") }
-            languages = try items.map { item in
-                guard let name = item.stringValue else { throw ControlError.missing("languages") }
-                return name
+            guard let items = value.arrayValue, !items.isEmpty, items.allSatisfy({ $0.stringValue != nil }) else {
+                throw ControlError.failed("languages must be an array of language codes such as [\"en-US\",\"ko-KR\"]")
             }
+            languages = items.compactMap(\.stringValue)
         }
         let regex = params["regex"]?.boolValue ?? false
         let query = params["query"]?.stringValue ?? ""

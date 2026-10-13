@@ -265,7 +265,8 @@ extension ControlHandler {
             let out = (r["stdout"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard code == 0, !out.isEmpty else {
                 let err = (r["stderr"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                throw ControlError.failed("the port check failed: \(err.isEmpty ? "exit code \(code)" : err)")
+                let reason = err.isEmpty ? "the guest command exited with code \(code) and printed nothing; run vm.doctor to check the guest shell" : err
+                throw ControlError.failed("the port check failed: \(reason)")
             }
             return out == "1" ? .holds(nil) : .pending
         case .logMatches(let path, let pattern):

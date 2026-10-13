@@ -446,6 +446,19 @@ final class WaitTests: XCTestCase {
         XCTAssertTrue(timedOut["problems"]?[0]?["error"]?.stringValue?.contains("ss is not installed in the guest") ?? false, "\(timedOut)")
     }
 
+    func testAPortCheckThatPrintsNothingNamesTheNextStep() async throws {
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            guard m["op"]?.stringValue == "exec.run" else { return [] }
+            return [agentReply(m, ["code": 0, "stdout": "\r\n", "stderr": ""])]
+        }
+        let (h, _) = try await agentRig(agent)
+        let r = try await waitFor(h, [["type": "port_listening", "port": 22]], timeout: 1)
+        XCTAssertEqual(r["matched"]?.intValue, -1)
+        XCTAssertEqual(r["problems"]?[0]?["error"]?.stringValue,
+                       "the port check failed: the guest command exited with code 0 and printed nothing; run vm.doctor to check the guest shell")
+    }
+
     func testRecognitionFailuresAreRetried() async throws {
         let calls = LockedBox(0)
         WaitTiming.recognizer = { frame, languages in
@@ -673,6 +686,25 @@ final class WaitTests: XCTestCase {
             let message = await failure(h, ["name": "Win", "conditions": [condition]])
             XCTAssertEqual(message, expected)
         }
+    }
+
+    func testAnUnsupportedTextLanguageIsRefusedBeforeWaiting() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            return []
+        }
+        let (h, t) = await screenRig(frames: [solid(64, 64, 10)])
+        for type in ["text_visible", "text_gone"] {
+            let message = await failure(h, ["name": "Win", "timeout": 2, "conditions": [
+                ["type": "screen_idle", "seconds": 100], ["type": .string(type), "text": "a", "languages": ["en-US", "xx-XX"]],
+            ]])
+            XCTAssertTrue(message.hasPrefix("condition 1: language 'xx-XX' is not supported; supported: "), message)
+            XCTAssertTrue(message.contains("en-US"), message)
+        }
+        XCTAssertEqual(calls.value, 0)
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 0)
     }
 
     func testInvalidRegularExpressions() async throws {

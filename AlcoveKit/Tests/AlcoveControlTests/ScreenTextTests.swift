@@ -4,6 +4,7 @@ import CoreGraphics
 import Vision
 @testable import AlcoveControl
 import AlcoveEngine
+import AlcoveQMP
 import AlcoveTestSupport
 
 /// Black text on white, drawn with CoreText into a BGRA frame; `rects` are the drawn glyph bounds in top-left pixels.
@@ -221,6 +222,20 @@ final class ScreenTextTests: XCTestCase {
             XCTAssertTrue(e.description.hasPrefix("language 'xx-XX' is not supported; supported: "), e.description)
         }
         XCTAssertLessThanOrEqual(calls.value, 1)
+    }
+
+    func testFindTextNamesTheExpectedTypeOfLanguages() async throws {
+        let (h, t) = textHandler(drawText([], width: 200, height: 100).frame)
+        for bad: JSON in ["en-US", [], ["en-US", 7], 5] {
+            do {
+                _ = try await h.handle(op: "vm.find_text", params: ["name": "Win", "languages": bad])
+                XCTFail("expected an error for \(bad)")
+            } catch let e as ControlHandler.ControlError {
+                XCTAssertEqual(e.description, "languages must be an array of language codes such as [\"en-US\",\"ko-KR\"]")
+            }
+        }
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 0)
     }
 
     func testFindTextDoesNotRetryAFailureThatIsNotARecognitionFailure() async throws {

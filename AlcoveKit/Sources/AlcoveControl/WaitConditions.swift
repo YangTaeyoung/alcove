@@ -141,6 +141,8 @@ enum WaitCondition: Sendable {
                 }
                 languages = items.compactMap(\.stringValue)
             }
+            do { try ScreenText.validate(languages: languages) }
+            catch let error as ControlHandler.ControlError { throw fail(error.description) }
             return WaitText(query: query, expression: expression, region: try region(), languages: languages)
         }
 
