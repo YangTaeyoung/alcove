@@ -31,9 +31,15 @@ def main():
         "alcove_process_list", "alcove_process_kill",
     }
     files = {"alcove_pull_file", "alcove_sync_dir", "alcove_fs_list", "alcove_fs_read", "alcove_fs_write", "alcove_fs_delete"}
-    toolsets = {"core": core, "shell": shell, "files": files}
+    state = {
+        "alcove_pause_vm", "alcove_resume_vm", "alcove_snapshot_list", "alcove_snapshot_create", "alcove_snapshot_restore",
+        "alcove_snapshot_delete", "alcove_clone_vm", "alcove_delete_vm", "alcove_lease_acquire", "alcove_lease_release",
+        "alcove_port_forward_add", "alcove_port_forward_remove", "alcove_port_forward_list", "alcove_set_network",
+        "alcove_set_resolution", "alcove_set_environment", "alcove_doctor",
+    }
+    toolsets = {"core": core, "shell": shell, "files": files, "state": state}
     selected = [s.strip() for s in env.get("ALCOVE_MCP_TOOLSETS", "").split(",") if s.strip()]
-    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files
+    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files | state
     missing = expected - set(names)
     extra = set(names) - expected
     if missing or extra:

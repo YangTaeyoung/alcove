@@ -54,12 +54,13 @@ export function register(r: Registrar, client: ControlClient): void {
         name: vmName,
         wait_for_tools: z.boolean().optional().describe("Wait for the guest tools to connect (default true)"),
         wait_timeout_s: z.number().int().min(0).max(900).optional().describe("How long to wait for the guest (default 180)"),
+        discard_changes: z.boolean().optional().describe("Run this boot as a throwaway session: disk changes are discarded when the VM stops"),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ name, wait_for_tools, wait_timeout_s }) => {
+    async ({ name, wait_for_tools, wait_timeout_s, discard_changes }) => {
       try {
-        const r = await client.call("vm.start", { name }, 300000);
+        const r = await client.call("vm.start", { name, ...(discard_changes !== undefined ? { discardChanges: discard_changes } : {}) }, 300000);
         const wait = wait_for_tools ?? true;
         const deadline = Date.now() + (wait_timeout_s ?? 180) * 1000;
         let tools = false;
@@ -70,7 +71,7 @@ export function register(r: Registrar, client: ControlClient): void {
             await new Promise((res) => setTimeout(res, 3000));
           }
         }
-        return text(`${name}: ${r.state}${wait ? (tools ? "; guest tools connected (desktop ready)" : "; guest tools did not connect in time (no tools installed, or still booting) — use alcove_wait_idle and alcove_screenshot") : ""}`);
+        return text(`${name}: ${r.state}${r.ephemeral === true ? " (changes will be discarded when it stops)" : ""}${wait ? (tools ? "; guest tools connected (desktop ready)" : "; guest tools did not connect in time (no tools installed, or still booting) — use alcove_wait_idle and alcove_screenshot") : ""}`);
       } catch (e) {
         return fail(e);
       }
