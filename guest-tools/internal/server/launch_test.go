@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,7 @@ type windowsUI struct {
 	list  func(n int) ([]any, error)
 }
 
-func (u *windowsUI) Call(op string, _ map[string]any, _ time.Duration) (map[string]any, error) {
+func (u *windowsUI) CallContext(_ context.Context, op string, _ map[string]any, _ time.Duration) (map[string]any, error) {
 	if op != "win.list" {
 		return map[string]any{}, nil
 	}
@@ -83,7 +84,7 @@ func TestLaunchMissingPath(t *testing.T) {
 		t.Fatalf("res %v", res)
 	}
 	res = c.call("app.launch", proto.Message{"path": "sh", "wait_window_ms": -1})
-	if res["ok"] != false || res.String("error") != "wait_window_ms must be 0 or more" {
+	if res["ok"] != false || res.String("error") != "pass wait_window_ms of 0 or more" {
 		t.Fatalf("res %v", res)
 	}
 }
@@ -97,7 +98,11 @@ func TestLaunchRunsInTheProgramDirectoryWithArgsAndEnv(t *testing.T) {
 		"env": map[string]any{"ALCOVE_LAUNCH_TEST": "set"}, "wait_window_ms": 0})
 	c.event("process.exited")
 	got := c.ok("fs.read", proto.Message{"path": out})
-	if text := string(decode(t, got)); text != "/bin|두 번째|set" {
+	text := string(decode(t, got))
+	parts := strings.SplitN(text, "|", 3)
+	wantDir, _ := filepath.EvalSymlinks("/bin")
+	gotDir, _ := filepath.EvalSymlinks(parts[0])
+	if len(parts) != 3 || gotDir != wantDir || parts[1] != "두 번째" || parts[2] != "set" {
 		t.Fatalf("the program saw %q", text)
 	}
 	c.events = nil
@@ -185,6 +190,127 @@ func TestLaunchWithWaitZeroDoesNotListWindows(t *testing.T) {
 	}
 }
 
+func TestLaunchRefusesABadEnvName(t *testing.T) {
+	c, _ := newRPCClient(t, Options{})
+	for _, bad := range []map[string]any{{"": "v"}, {"A=B": "v"}} {
+		res := c.call("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 0, "env": bad})
+		if res["ok"] != false || res.String("error") != "env names cannot be empty or contain '='" {
+			t.Fatalf("env %v answered %v", bad, res)
+		}
+	}
+}
+
+// delayedTwoWindowUI lists only an old window for the first poll, then two new
+// windows of different sizes, so two concurrent launches have two candidates.
+type delayedTwoWindowUI struct {
+	mu    sync.Mutex
+	start time.Time
+}
+
+func (u *delayedTwoWindowUI) CallContext(_ context.Context, op string, _ map[string]any, _ time.Duration) (map[string]any, error) {
+	if op != "win.list" {
+		return map[string]any{}, nil
+	}
+	u.mu.Lock()
+	if u.start.IsZero() {
+		u.start = time.Now()
+	}
+	elapsed := time.Since(u.start)
+	u.mu.Unlock()
+	old := window("0x10", "Program Manager", 4)
+	if elapsed < 160*time.Millisecond {
+		return map[string]any{"windows": []any{old}}, nil
+	}
+	return map[string]any{"windows": []any{sized("0xa", "App A", 77, 900, 700), sized("0xb", "App B", 88, 400, 300), old}}, nil
+}
+
+func TestTwoConcurrentLaunchesTakeDifferentWindows(t *testing.T) {
+	ui := &delayedTwoWindowUI{}
+	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui, AllowExec: true})
+	ids := make(chan string, 2)
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			res, err := s.appLaunch(context.Background(), proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 4000})
+			if err != nil {
+				errs <- err
+				return
+			}
+			w, _ := res["window"].(map[string]any)
+			if w == nil {
+				errs <- errors.New("no window")
+				return
+			}
+			ids <- windowID(w)
+		}()
+	}
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			t.Fatal(err)
+		case id := <-ids:
+			if got[id] {
+				t.Fatalf("both launches took window %s", id)
+			}
+			got[id] = true
+		case <-time.After(15 * time.Second):
+			t.Fatal("a launch did not finish")
+		}
+	}
+	if !got["0xa"] || !got["0xb"] {
+		t.Fatalf("the launches took %v, expected 0xa and 0xb", got)
+	}
+}
+
+// pollingUI lists only an old window, so a launch keeps polling, and counts
+// the win.list calls.
+type pollingUI struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (u *pollingUI) CallContext(_ context.Context, op string, _ map[string]any, _ time.Duration) (map[string]any, error) {
+	if op != "win.list" {
+		return map[string]any{}, nil
+	}
+	u.mu.Lock()
+	u.calls++
+	u.mu.Unlock()
+	return map[string]any{"windows": []any{window("0x10", "Program Manager", 4)}}, nil
+}
+
+func (u *pollingUI) listed() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
+}
+
+func TestLaunchStopsPollingWhenTheConnectionCloses(t *testing.T) {
+	ui := &pollingUI{}
+	_, r, w, c := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui, AllowExec: true})
+	expect(t, r, "hello")
+	w.Send(proto.Message{"t": "req", "id": 1, "op": "app.launch", "path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 20000})
+	for ui.listed() < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	var settled int
+	for {
+		n := ui.listed()
+		time.Sleep(400 * time.Millisecond)
+		if ui.listed() == n {
+			settled = n
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("win.list is still being called %d times after the connection closed", ui.listed())
+		}
+	}
+	_ = settled
+}
+
 func TestPickLaunchWindow(t *testing.T) {
 	before := map[string]bool{"0x10": true}
 	tree := map[int]bool{50: true, 51: true}
@@ -213,7 +339,7 @@ func TestPickLaunchWindow(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := ""
-		if w := pickLaunchWindow(c.windows, before, tree, c.foreign); w != nil {
+		if w := pickLaunchWindow(c.windows, before, tree, c.foreign, nil, ""); w != nil {
 			got = windowID(w)
 		}
 		if got != c.want {
@@ -249,13 +375,13 @@ func TestSettleFrameWindowWaitsForTheAppProcess(t *testing.T) {
 		return []any{app}, nil
 	}}
 	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui})
-	got := s.settleFrameWindow(host, time.Now().Add(10*time.Second))
+	got := s.settleFrameWindow(context.Background(), host, time.Now().Add(10*time.Second))
 	if got["process"] != "CalculatorApp.exe" {
 		t.Fatalf("window %v", got)
 	}
 	plain := window("0x60", "Fixture", 3)
 	before := ui.listed()
-	if got := s.settleFrameWindow(plain, time.Now().Add(10*time.Second)); got["id"] != "0x60" || ui.listed() != before {
+	if got := s.settleFrameWindow(context.Background(), plain, time.Now().Add(10*time.Second)); got["id"] != "0x60" || ui.listed() != before {
 		t.Fatalf("window %v after %d more listings", got, ui.listed()-before)
 	}
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -21,7 +22,7 @@ func (s *Server) registerProcs() {
 	s.register("proc.kill", true, procKill)
 }
 
-func procList(req proto.Message) (proto.Message, error) {
+func procList(_ context.Context, req proto.Message) (proto.Message, error) {
 	procs, err := listProcesses()
 	if err != nil {
 		return nil, fmt.Errorf("cannot list processes: %v", err)
@@ -45,7 +46,7 @@ func procListEntries(procs []procInfo, filter string) []any {
 	return out
 }
 
-func procKill(req proto.Message) (proto.Message, error) {
+func procKill(_ context.Context, req proto.Message) (proto.Message, error) {
 	tree := req.Bool("tree")
 	if pid := req.Int("pid"); pid > 0 {
 		var err error

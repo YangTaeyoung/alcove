@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -152,7 +153,7 @@ func (s *Server) registerShell() {
 	s.registerProcs()
 }
 
-func (s *Server) execRun(req proto.Message) (proto.Message, error) {
+func (s *Server) execRun(_ context.Context, req proto.Message) (proto.Message, error) {
 	c, err := s.newCommand(req)
 	if err != nil {
 		return nil, err

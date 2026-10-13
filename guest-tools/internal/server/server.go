@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -45,6 +46,16 @@ type Server struct {
 	connMu sync.Mutex
 	conns  map[*conn]struct{}
 	jobs   *jobTable
+
+	launchMu sync.Mutex
+	// claimed holds the ids of windows an app.launch has taken, so that a
+	// concurrent launch does not take the same window; an id leaves the set
+	// when the window closes.
+	claimed map[string]bool
+
+	ownMu   sync.Mutex
+	ownSeq  uint64
+	ownTime time.Time
 }
 
 func New(opt Options) *Server {
@@ -57,9 +68,17 @@ func New(opt Options) *Server {
 	if opt.HomeDir == "" {
 		opt.HomeDir, _ = os.UserHomeDir()
 	}
-	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable()}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable(),
+		claimed: map[string]bool{}}
 	s.registerBuiltins()
 	return s
+}
+
+// Close shuts the UI helper down when the server has one.
+func (s *Server) Close() {
+	if c, ok := s.opt.UI.(interface{ Close() }); ok {
+		c.Close()
+	}
 }
 
 // Serve accepts connections on l until it is closed.
@@ -104,33 +123,29 @@ func (s *Server) handle(c net.Conn) {
 	defer c.Close()
 	lg := s.opt.Logger
 	lg.Printf("connection from %s", c.RemoteAddr())
-	var wmu sync.Mutex
-	w := proto.NewWriter(c)
-	send := func(m proto.Message) {
-		wmu.Lock()
-		defer wmu.Unlock()
-		if err := w.Send(m); err != nil {
-			lg.Printf("send: %v", err)
-		}
-	}
-	cn := &conn{send: send}
+	cn := newConn(c, lg)
+	go cn.writeLoop()
+	defer cn.stopWriter()
+	send := cn.send
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	send(proto.Message{"t": "hello", "v": proto.Version, "proto": proto.RPCVersion, "os": runtime.GOOS, "agent": AgentVersion,
 		"token": s.opt.Token, "caps": s.caps()})
 	s.addConn(cn)
 	defer s.removeConn(cn)
-	s.startUI()
 
-	done := make(chan struct{})
-	defer close(done)
+	quit := make(chan struct{})
+	defer close(quit)
 	if s.opt.Clipboard.Available() {
-		go s.watchClipboard(send, done)
+		go s.watchClipboard(send, quit)
 	}
 	go func() { // keepalive
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
 		for {
 			select {
-			case <-done:
+			case <-quit:
 				return
 			case <-t.C:
 				send(proto.Message{"t": "ping"})
@@ -153,7 +168,7 @@ func (s *Server) handle(c net.Conn) {
 			send(proto.Message{"t": "pong"})
 		case "pong", "welcome":
 		case "req":
-			go s.dispatch(m, send)
+			go s.dispatch(ctx, m, send)
 		case "clipboard.get":
 			text, err := s.opt.Clipboard.Text()
 			if err != nil {
@@ -225,6 +240,7 @@ func (s *Server) handle(c net.Conn) {
 			}
 			send(proto.Message{"t": "file.done", "id": id, "path": x.path})
 		case "shutdown":
+			s.Close()
 			fn := s.opt.Shutdown
 			if fn == nil {
 				fn = platformShutdown
@@ -257,17 +273,11 @@ func uniquePath(p string) string {
 	}
 }
 
-var (
-	ownMu   sync.Mutex
-	ownSeq  uint64
-	ownTime time.Time
-)
-
 func (s *Server) markOwnClipboard() {
-	ownMu.Lock()
-	ownSeq = s.opt.Clipboard.Sequence()
-	ownTime = time.Now()
-	ownMu.Unlock()
+	s.ownMu.Lock()
+	s.ownSeq = s.opt.Clipboard.Sequence()
+	s.ownTime = time.Now()
+	s.ownMu.Unlock()
 }
 
 // watchClipboard polls the clipboard sequence and reports foreign changes.
@@ -286,9 +296,9 @@ func (s *Server) watchClipboard(send func(proto.Message), done chan struct{}) {
 			continue
 		}
 		last = seq
-		ownMu.Lock()
-		own := seq == ownSeq && time.Since(ownTime) < 2*time.Second
-		ownMu.Unlock()
+		s.ownMu.Lock()
+		own := seq == s.ownSeq && time.Since(s.ownTime) < 2*time.Second
+		s.ownMu.Unlock()
 		if own {
 			continue
 		}

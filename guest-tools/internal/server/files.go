@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -75,7 +76,7 @@ func (s *Server) registerFiles() {
 	s.register("fs.delete", true, s.fsDelete)
 }
 
-func (s *Server) fsStat(req proto.Message) (proto.Message, error) {
+func (s *Server) fsStat(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
@@ -107,7 +108,7 @@ func (s *Server) fsStat(req proto.Message) (proto.Message, error) {
 	return out, nil
 }
 
-func (s *Server) fsList(req proto.Message) (proto.Message, error) {
+func (s *Server) fsList(_ context.Context, req proto.Message) (proto.Message, error) {
 	root, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
@@ -214,7 +215,7 @@ func withEncoding(out proto.Message, utf16 bool) proto.Message {
 	return out
 }
 
-func (s *Server) fsRead(req proto.Message) (proto.Message, error) {
+func (s *Server) fsRead(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
@@ -245,7 +246,7 @@ func (s *Server) fsRead(req proto.Message) (proto.Message, error) {
 	}, startsWithUTF16BOM(f)), nil
 }
 
-func (s *Server) fsTail(req proto.Message) (proto.Message, error) {
+func (s *Server) fsTail(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
@@ -353,7 +354,7 @@ func lastLines(buf []byte, n int, partialFirst bool, unit int) []byte {
 	return buf[idx+unit:]
 }
 
-func (s *Server) fsWrite(req proto.Message) (proto.Message, error) {
+func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
@@ -406,7 +407,7 @@ func (s *Server) fsWrite(req proto.Message) (proto.Message, error) {
 	return proto.Message{"size": fi.Size()}, nil
 }
 
-func (s *Server) fsRename(req proto.Message) (proto.Message, error) {
+func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, error) {
 	from, err := s.pathArg(req, "from")
 	if err != nil {
 		return nil, err
@@ -435,7 +436,7 @@ func (s *Server) fsRename(req proto.Message) (proto.Message, error) {
 	return proto.Message{"path": to}, nil
 }
 
-func (s *Server) fsMkdir(req proto.Message) (proto.Message, error) {
+func (s *Server) fsMkdir(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
@@ -471,7 +472,7 @@ func pathContains(dir, target string, sep byte, fold bool) bool {
 	return true
 }
 
-func (s *Server) fsDelete(req proto.Message) (proto.Message, error) {
+func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err

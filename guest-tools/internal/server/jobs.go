@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -196,7 +197,7 @@ func (s *Server) registerJobs() {
 	s.register("exec.list", true, s.execList)
 }
 
-func (s *Server) execStart(req proto.Message) (proto.Message, error) {
+func (s *Server) execStart(_ context.Context, req proto.Message) (proto.Message, error) {
 	c, err := s.newCommand(req)
 	if err != nil {
 		return nil, err
@@ -237,7 +238,7 @@ func (s *Server) execStart(req proto.Message) (proto.Message, error) {
 	return proto.Message{"job": j.id, "pid": j.processID()}, nil
 }
 
-func (s *Server) execRead(req proto.Message) (proto.Message, error) {
+func (s *Server) execRead(_ context.Context, req proto.Message) (proto.Message, error) {
 	j, err := s.jobs.get(req.String("job"))
 	if err != nil {
 		return nil, err
@@ -294,7 +295,7 @@ func (j *job) writeInput(data string, eof bool) error {
 	return nil
 }
 
-func (s *Server) execWrite(req proto.Message) (proto.Message, error) {
+func (s *Server) execWrite(_ context.Context, req proto.Message) (proto.Message, error) {
 	j, err := s.jobs.get(req.String("job"))
 	if err != nil {
 		return nil, err
@@ -316,7 +317,7 @@ func (s *Server) execWrite(req proto.Message) (proto.Message, error) {
 	return proto.Message{}, nil
 }
 
-func (s *Server) execKill(req proto.Message) (proto.Message, error) {
+func (s *Server) execKill(_ context.Context, req proto.Message) (proto.Message, error) {
 	j, err := s.jobs.get(req.String("job"))
 	if err != nil {
 		return nil, err
@@ -337,7 +338,7 @@ func (s *Server) execKill(req proto.Message) (proto.Message, error) {
 	return proto.Message{"state": state}, nil
 }
 
-func (s *Server) execList(proto.Message) (proto.Message, error) {
+func (s *Server) execList(context.Context, proto.Message) (proto.Message, error) {
 	jobs := []any{}
 	for _, j := range s.jobs.list() {
 		exited, code := j.state()

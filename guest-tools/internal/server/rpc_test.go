@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net"
 	"testing"
@@ -79,7 +80,7 @@ func TestUnknownOp(t *testing.T) {
 
 func TestGatedOpWithoutAllowExec(t *testing.T) {
 	s, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
-	s.register("t.gated", true, func(proto.Message) (proto.Message, error) {
+	s.register("t.gated", true, func(context.Context, proto.Message) (proto.Message, error) {
 		return proto.Message{"ran": true}, nil
 	})
 	expect(t, r, "hello")
@@ -92,7 +93,7 @@ func TestGatedOpWithoutAllowExec(t *testing.T) {
 
 func TestGatedOpWithAllowExec(t *testing.T) {
 	s, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), AllowExec: true})
-	s.register("t.gated", true, func(req proto.Message) (proto.Message, error) {
+	s.register("t.gated", true, func(_ context.Context, req proto.Message) (proto.Message, error) {
 		return proto.Message{"echo": req.String("v")}, nil
 	})
 	expect(t, r, "hello")
@@ -105,7 +106,7 @@ func TestGatedOpWithAllowExec(t *testing.T) {
 
 func TestHandlerErrorBecomesFailure(t *testing.T) {
 	s, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
-	s.register("t.fail", false, func(proto.Message) (proto.Message, error) {
+	s.register("t.fail", false, func(context.Context, proto.Message) (proto.Message, error) {
 		return nil, errors.New("no such thing; check the name")
 	})
 	expect(t, r, "hello")
@@ -119,11 +120,11 @@ func TestHandlerErrorBecomesFailure(t *testing.T) {
 func TestRequestsRunConcurrently(t *testing.T) {
 	s, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
 	release := make(chan struct{})
-	s.register("t.slow", false, func(proto.Message) (proto.Message, error) {
+	s.register("t.slow", false, func(context.Context, proto.Message) (proto.Message, error) {
 		<-release
 		return proto.Message{"which": "slow"}, nil
 	})
-	s.register("t.fast", false, func(proto.Message) (proto.Message, error) {
+	s.register("t.fast", false, func(context.Context, proto.Message) (proto.Message, error) {
 		return proto.Message{"which": "fast"}, nil
 	})
 	expect(t, r, "hello")
@@ -142,7 +143,7 @@ func TestRequestsRunConcurrently(t *testing.T) {
 
 func TestHandlerPanicBecomesError(t *testing.T) {
 	s, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
-	s.register("t.panic", false, func(proto.Message) (proto.Message, error) {
+	s.register("t.panic", false, func(context.Context, proto.Message) (proto.Message, error) {
 		panic("boom")
 	})
 	expect(t, r, "hello")

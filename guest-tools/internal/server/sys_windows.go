@@ -102,16 +102,43 @@ func resolveProgram(path string) string {
 	if filepath.Ext(name) == "" {
 		name += ".exe"
 	}
+	keys := []string{
+		`SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\` + name,
+		`SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\` + name,
+	}
 	for _, root := range []syscall.Handle{syscall.HKEY_CURRENT_USER, syscall.HKEY_LOCAL_MACHINE} {
-		if full := registryString(root, `SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\`+name, ""); full != "" {
-			return strings.Trim(full, `"`)
+		for _, key := range keys {
+			if full := registryString(root, key, ""); full != "" {
+				return strings.Trim(full, `"`)
+			}
 		}
 	}
 	return path
 }
 
+var procExpandEnvironmentStrings = syscall.NewLazyDLL("kernel32.dll").NewProc("ExpandEnvironmentStringsW")
+
+// expandEnv replaces %VAR% references in a REG_EXPAND_SZ value with their
+// environment values.
+func expandEnv(s string) string {
+	src, err := syscall.UTF16PtrFromString(s)
+	if err != nil {
+		return s
+	}
+	n, _, _ := procExpandEnvironmentStrings.Call(uintptr(unsafe.Pointer(src)), 0, 0)
+	if n == 0 {
+		return s
+	}
+	buf := make([]uint16, n)
+	r, _, _ := procExpandEnvironmentStrings.Call(uintptr(unsafe.Pointer(src)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if r == 0 {
+		return s
+	}
+	return syscall.UTF16ToString(buf)
+}
+
 // registryString reads a string value; it returns "" when the key or the
-// value is missing.
+// value is missing. A REG_EXPAND_SZ value has its %VAR% references expanded.
 func registryString(root syscall.Handle, key, value string) string {
 	keyPtr, err := syscall.UTF16PtrFromString(key)
 	if err != nil {
@@ -137,7 +164,11 @@ func registryString(root syscall.Handle, key, value string) string {
 	if syscall.RegQueryValueEx(h, valuePtr, nil, &kind, (*byte)(unsafe.Pointer(&buf[0])), &size) != nil {
 		return ""
 	}
-	return syscall.UTF16ToString(buf)
+	out := syscall.UTF16ToString(buf)
+	if kind == syscall.REG_EXPAND_SZ {
+		out = expandEnv(out)
+	}
+	return out
 }
 
 // processParents maps each running process to its parent.

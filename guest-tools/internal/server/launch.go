@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -36,7 +37,7 @@ func (s *Server) registerLaunch() {
 // appLaunch starts a program with a normal window, reports its exit as a
 // process.exited event and, unless wait_window_ms is 0 or the agent has no UI
 // helper, waits for the window the launch opened.
-func (s *Server) appLaunch(req proto.Message) (proto.Message, error) {
+func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Message, error) {
 	path := req.String("path")
 	if path == "" {
 		return nil, errors.New("missing path; pass the program to start")
@@ -46,7 +47,7 @@ func (s *Server) appLaunch(req proto.Message) (proto.Message, error) {
 		waitMs = req.Int("wait_window_ms")
 	}
 	if waitMs < 0 {
-		return nil, errors.New("wait_window_ms must be 0 or more")
+		return nil, errors.New("pass wait_window_ms of 0 or more")
 	}
 	if waitMs > maxLaunchWaitMs {
 		waitMs = maxLaunchWaitMs
@@ -61,6 +62,9 @@ func (s *Server) appLaunch(req proto.Message) (proto.Message, error) {
 	if env := req.StringMap("env"); len(env) > 0 {
 		keys := make([]string, 0, len(env))
 		for k := range env {
+			if k == "" || strings.Contains(k, "=") {
+				return nil, errors.New("env names cannot be empty or contain '='")
+			}
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
@@ -73,7 +77,7 @@ func (s *Server) appLaunch(req proto.Message) (proto.Message, error) {
 	watch := waitMs > 0 && s.opt.UI != nil
 	before := map[string]bool{}
 	if watch {
-		windows, err := s.listWindows()
+		windows, err := s.listWindows(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("'%s' was not started because the windows could not be listed: %v", path, err)
 		}
@@ -99,15 +103,37 @@ func (s *Server) appLaunch(req proto.Message) (proto.Message, error) {
 
 	res := proto.Message{"pid": pid}
 	if watch {
-		if w := s.waitLaunchWindow(pid, before, exited, time.Duration(waitMs)*time.Millisecond); w != nil {
+		if w := s.waitLaunchWindow(ctx, pid, before, exited, time.Duration(waitMs)*time.Millisecond); w != nil {
 			res["window"] = w
 		}
 	}
 	return res, nil
 }
 
-func (s *Server) listWindows() ([]map[string]any, error) {
-	out, err := s.opt.UI.Call("win.list", nil, launchListTimeout)
+// claimWindow picks a window not listed before the launch and not already
+// claimed by another launch, and claims it. The launch's own current claim,
+// named by own, stays eligible so a later listing can reselect it.
+func (s *Server) claimWindow(windows []map[string]any, before map[string]bool, tree map[int]bool, foreign bool, own string) map[string]any {
+	s.launchMu.Lock()
+	defer s.launchMu.Unlock()
+	w := pickLaunchWindow(windows, before, tree, foreign, s.claimed, own)
+	if w != nil {
+		s.claimed[windowID(w)] = true
+	}
+	return w
+}
+
+func (s *Server) unclaimWindow(id string) {
+	if id == "" {
+		return
+	}
+	s.launchMu.Lock()
+	delete(s.claimed, id)
+	s.launchMu.Unlock()
+}
+
+func (s *Server) listWindows(ctx context.Context) ([]map[string]any, error) {
+	out, err := s.opt.UI.CallContext(ctx, "win.list", nil, launchListTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -136,15 +162,20 @@ func windowPID(w map[string]any) int {
 	return 0
 }
 
-// waitLaunchWindow polls win.list until pickLaunchWindow names a window or
-// the wait is over; it returns nil when no window was found. After the first
-// choice it lists the windows once more, one poll later, and returns the
-// choice among the windows of that listing when there is one.
-func (s *Server) waitLaunchWindow(pid int, before map[string]bool, exited <-chan struct{}, wait time.Duration) map[string]any {
+// waitLaunchWindow polls win.list until claimWindow names a window or the wait
+// is over; it returns nil when no window was found. After the first choice it
+// lists the windows once more, one poll later, and returns the choice among the
+// windows of that listing when there is one. When the first choice is gone from
+// the second listing and nothing else is a candidate, it keeps polling instead
+// of returning the window that has already closed.
+func (s *Server) waitLaunchWindow(ctx context.Context, pid int, before map[string]bool, exited <-chan struct{}, wait time.Duration) map[string]any {
 	start := time.Now()
 	deadline := start.Add(wait)
 	tree := map[int]bool{pid: true}
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		growTree(tree, processParents())
 		done := false
 		select {
@@ -152,18 +183,29 @@ func (s *Server) waitLaunchWindow(pid int, before map[string]bool, exited <-chan
 			done = true
 		default:
 		}
-		windows, err := s.listWindows()
+		windows, err := s.listWindows(ctx)
 		if err == nil {
 			foreign := done || time.Since(start) >= launchForeignGrace
-			if w := pickLaunchWindow(windows, before, tree, foreign); w != nil {
+			if w := s.claimWindow(windows, before, tree, foreign, ""); w != nil {
 				time.Sleep(launchPoll)
 				growTree(tree, processParents())
-				if again, err := s.listWindows(); err == nil {
-					if later := pickLaunchWindow(again, before, tree, foreign); later != nil {
-						w = later
+				again, againErr := s.listWindows(ctx)
+				if againErr == nil {
+					if later := s.claimWindow(again, before, tree, foreign, windowID(w)); later != nil {
+						if windowID(later) != windowID(w) {
+							s.unclaimWindow(windowID(w))
+							w = later
+						}
+					} else if !listedWindow(again, windowID(w)) {
+						// The chosen window is gone and nothing replaced it: keep looking.
+						s.unclaimWindow(windowID(w))
+						if !time.Now().Before(deadline) {
+							return nil
+						}
+						continue
 					}
 				}
-				return s.settleFrameWindow(w, deadline)
+				return s.settleFrameWindow(ctx, w, deadline)
 			}
 		}
 		if !time.Now().Before(deadline) {
@@ -171,6 +213,16 @@ func (s *Server) waitLaunchWindow(pid int, before map[string]bool, exited <-chan
 		}
 		time.Sleep(launchPoll)
 	}
+}
+
+// listedWindow reports whether a window with the id is in the listing.
+func listedWindow(windows []map[string]any, id string) bool {
+	for _, w := range windows {
+		if windowID(w) == id {
+			return true
+		}
+	}
+	return false
 }
 
 // growTree adds to tree every process whose parent is in it.
@@ -187,26 +239,28 @@ func growTree(tree map[int]bool, parents map[int]int) {
 }
 
 // pickLaunchWindow chooses among the titled windows that were not listed
-// before the launch: the largest one that belongs to a process of tree;
-// without such a window and with foreign set, the largest one of any process.
-// Of windows of the same size the one listed first is chosen.
-func pickLaunchWindow(windows []map[string]any, before map[string]bool, tree map[int]bool, foreign bool) map[string]any {
-	var own, other map[string]any
+// before the launch and are not already claimed by another launch: the largest
+// one that belongs to a process of tree; without such a window and with foreign
+// set, the largest one of any process. Of windows of the same size the one
+// listed first is chosen.
+func pickLaunchWindow(windows []map[string]any, before map[string]bool, tree map[int]bool, foreign bool, claimed map[string]bool, own string) map[string]any {
+	var ownWin, other map[string]any
 	for _, w := range windows {
+		id := windowID(w)
 		title, _ := w["title"].(string)
-		if title == "" || before[windowID(w)] {
+		if title == "" || before[id] || (claimed[id] && id != own) {
 			continue
 		}
 		if tree[windowPID(w)] {
-			if own == nil || windowArea(w) > windowArea(own) {
-				own = w
+			if ownWin == nil || windowArea(w) > windowArea(ownWin) {
+				ownWin = w
 			}
 		} else if other == nil || windowArea(w) > windowArea(other) {
 			other = w
 		}
 	}
-	if own != nil || !foreign {
-		return own
+	if ownWin != nil || !foreign {
+		return ownWin
 	}
 	return other
 }
@@ -220,14 +274,17 @@ func windowArea(w map[string]any) float64 {
 // settleFrameWindow re-reads the frame window of a packaged app until it
 // reports the app's process instead of the frame host, the settle time has
 // passed or the deadline is reached, and returns the newest reading.
-func (s *Server) settleFrameWindow(w map[string]any, deadline time.Time) map[string]any {
+func (s *Server) settleFrameWindow(ctx context.Context, w map[string]any, deadline time.Time) map[string]any {
 	end := time.Now().Add(launchFrameSettle)
 	if deadline.Before(end) {
 		end = deadline
 	}
 	for isFrameHostWindow(w) && time.Now().Before(end) {
+		if ctx.Err() != nil {
+			return w
+		}
 		time.Sleep(launchPoll)
-		windows, err := s.listWindows()
+		windows, err := s.listWindows(ctx)
 		if err != nil {
 			continue
 		}
