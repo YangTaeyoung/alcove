@@ -14,6 +14,8 @@ struct RecordingTable {
     var starting: [String: URL] = [:]
     /// Recordings that are ending; `vm.record.stop` waits for them.
     var retiring: [String: Recording] = [:]
+    /// The recording of each VM that ended last, with its summary.
+    var latest: [String: EndedRecording] = [:]
 }
 
 /// A recording that ended and whose summary is waiting for `vm.record.stop`.
@@ -84,6 +86,7 @@ extension ControlHandler {
         guard recordings.retiring[vm] === recording else { return }
         recordings.retiring[vm] = nil
         recordings.lastDirectory[vm] = summary.dir
+        recordings.latest[vm] = EndedRecording(recording: recording, summary: summary)
         if !recording.delivery.isTaken { recordings.ended[vm] = EndedRecording(recording: recording, summary: summary) }
     }
 
@@ -150,6 +153,7 @@ extension ControlHandler {
         if recordings.retiring[vm] === recording {
             recordings.retiring[vm] = nil
             recordings.lastDirectory[vm] = summary.dir
+            recordings.latest[vm] = EndedRecording(recording: recording, summary: summary)
         }
         if recordings.ended[vm]?.recording === recording { recordings.ended[vm] = nil }
         guard recording.delivery.take() else { throw ControlError.failed("'\(vm)' is not recording") }

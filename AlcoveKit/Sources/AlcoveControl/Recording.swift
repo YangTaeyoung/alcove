@@ -61,6 +61,8 @@ actor Recording {
         /// Seconds of video appended; nil without a video file.
         let videoSeconds: Double?
         let droppedFrames: Int?
+        /// The wall-clock time at which the recording began to end.
+        let ended: Date
 
         var json: JSON {
             var obj: [String: JSON] = ["dir": .string(dir), "trace": .string(trace), "frames": .int(Int64(frames)),
@@ -122,6 +124,12 @@ actor Recording {
     }
 
     var isActive: Bool { finishing == nil }
+
+    /// The summary of a recording that is ending or has ended, once it has ended; nil while the recording is active.
+    func ending() async -> Summary? {
+        guard let finishing else { return nil }
+        return await finishing.value
+    }
 
     /// Longest stretch without an encoded frame while the screen does not change.
     static let videoKeepAlive = Duration.seconds(2)
@@ -237,6 +245,7 @@ actor Recording {
     private func finalize() async -> Summary {
         timer?.cancel()
         timer = nil
+        let ended = wallClock()
         let seconds = elapsedSeconds
         writer?.close()
         writer = nil
@@ -258,7 +267,7 @@ actor Recording {
                        seconds: (seconds * 10).rounded() / 10, ops: lineCount,
                        writeErrors: writeErrors, lastWriteError: lastWriteError,
                        videoSeconds: hasVideo ? (sink.appendedSeconds * 10).rounded() / 10 : nil,
-                       droppedFrames: hasVideo ? sink.droppedFrames : nil)
+                       droppedFrames: hasVideo ? sink.droppedFrames : nil, ended: ended)
     }
 
     private static func requestParams(_ params: JSON) -> JSON {
