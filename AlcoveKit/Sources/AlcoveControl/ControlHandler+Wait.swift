@@ -418,7 +418,8 @@ extension ControlHandler {
         }
     }
 
-    /// The lines of this tick's frame that contain `text`, in frame coordinates. Throws when the recognition outlasts `deadline`.
+    /// The lines of this tick's frame that contain `text`, in frame coordinates. Throws when the recognition has not
+    /// ended at `deadline` and `WaitTiming.recognitionGrace` after the wait asked for it, whichever comes later.
     private func recognize(_ text: WaitText, index: Int, tick: inout Tick, vm t: VMTarget, clock: ContinuousClock,
                            deadline: ContinuousClock.Instant) async throws -> [(text: String, x: Int, y: Int, w: Int, h: Int)] {
         let frame = try await tickFrame(&tick, t)
@@ -455,25 +456,12 @@ extension ControlHandler {
         return matches.map { ($0.text, $0.rect.x + found.area.x, $0.rect.y + found.area.y, $0.rect.w, $0.rect.h) }
     }
 
-    /// The recognized lines of `frame`, or nil when the recognition is still running at `deadline` and
-    /// `WaitTiming.recognitionGrace` after its start; the recognition then ends unobserved.
+    /// The lines the recognition queue reads in `frame`, or nil when it has not answered at `deadline` and
+    /// `WaitTiming.recognitionGrace` after this call, whichever comes later; the wait then leaves the queue.
     private func recognition(of frame: Frame, languages: [String], clock: ContinuousClock,
                              deadline: ContinuousClock.Instant) async throws -> [TextMatch]? {
-        let recognizer = WaitTiming.recognizer
         let limit = max(deadline, clock.now + WaitTiming.recognitionGrace)
-        let (outcomes, outcome) = AsyncStream<Result<[TextMatch], Error>?>.makeStream()
-        Task.detached {
-            outcome.yield(Result { try recognizer(frame, languages) })
-            outcome.finish()
-        }
-        let timer = Task {
-            try? await Task.sleep(until: limit, clock: clock)
-            outcome.yield(nil)
-            outcome.finish()
-        }
-        defer { timer.cancel() }
-        for await first in outcomes { return try first?.get() }
-        return nil
+        return try await RecognitionQueue.shared.recognize(frame, languages: languages, until: limit)?.get()
     }
 
     // MARK: - agent conditions

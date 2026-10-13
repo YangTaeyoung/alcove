@@ -23,6 +23,23 @@ private func paint(_ f: Frame, tileX: Int, tileY: Int, delta: UInt8 = 100) -> Fr
 
 private func base64(_ text: String) -> JSON { .string(Data(text.utf8).base64EncodedString()) }
 
+/// Holds the threads that call `pass` until `open` is called; an opened gate stays open.
+final class RecognitionGate: Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func pass() {
+        semaphore.wait()
+        semaphore.signal()
+    }
+
+    func open() { semaphore.signal() }
+}
+
+/// Returns once the recognitions asked of the shared queue before this call have ended.
+func recognitionsEnded() async {
+    _ = await RecognitionQueue.shared.recognize(solid(1, 1, 0), languages: ["drain"], recognizer: { _, _ in [] })
+}
+
 final class WaitTests: XCTestCase {
     override func setUp() {
         WaitTiming.tick = .milliseconds(20)
@@ -476,38 +493,216 @@ final class WaitTests: XCTestCase {
         XCTAssertGreaterThan(calls.value, 3)
     }
 
+    private static let unfinished = "text recognition did not finish within the timeout; call vm.wait_for again with a longer timeout"
+    private static let ready = TextMatch(text: "ready", rect: Frame.Rect(x: 1, y: 2, w: 30, h: 10), confidence: 1)
+
     func testARecognitionThatOutlastsTheTimeoutDoesNotHoldTheWait() async throws {
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
         WaitTiming.recognizer = { _, _ in
-            Thread.sleep(forTimeInterval: 2.5)
+            gate.pass()
             return []
         }
         let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
-        let start = ContinuousClock.now
         let r = try await waitFor(h, [["type": "text_visible", "text": "ready"]], timeout: 1)
-        XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(1800))
+        XCTAssertTrue(RecognitionQueue.shared.load.running)
         XCTAssertEqual(r["matched"]?.intValue, -1)
-        XCTAssertLessThan(r["waited"]?.doubleValue ?? 9, 1.8)
         let problems = try XCTUnwrap(r["problems"]?.arrayValue, "\(r)")
         XCTAssertEqual(problems.count, 1)
         XCTAssertEqual(problems[0]["type"]?.stringValue, "text_visible")
-        XCTAssertEqual(problems[0]["error"]?.stringValue,
-                       "text recognition did not finish within the timeout; call vm.wait_for again with a longer timeout")
+        XCTAssertEqual(problems[0]["error"]?.stringValue, WaitTests.unfinished)
+        gate.open()
+        await recognitionsEnded()
     }
 
     func testARecognitionThatStraddlesTheTimeoutStillCounts() async throws {
-        let calls = LockedBox(0)
-        WaitTiming.ocrPeriod = .milliseconds(20)
-        WaitTiming.recognitionGrace = .seconds(1)
+        let began = LockedBox<ContinuousClock.Instant?>(nil)
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        WaitTiming.recognitionGrace = .seconds(30)
         WaitTiming.recognizer = { _, _ in
-            calls.value += 1
-            Thread.sleep(forTimeInterval: 0.3)
-            return calls.value == 4 ? [TextMatch(text: "ready", rect: Frame.Rect(x: 1, y: 2, w: 30, h: 10), confidence: 1)] : []
+            if began.value == nil { began.value = .now }
+            gate.pass()
+            return [WaitTests.ready]
         }
         let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
-        let r = try await waitFor(h, [["type": "text_visible", "text": "ready"]], timeout: 1)
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 1, "conditions": [["type": "text_visible", "text": "ready"]]])
+        }
+        let asked = await eventually { began.value != nil }
+        XCTAssertTrue(asked)
+        let timeoutPassed = try XCTUnwrap(began.value) + .seconds(1)
+        try await Task.sleep(until: timeoutPassed, clock: .continuous)
+        gate.open()
+        let r = try await wait.value
         XCTAssertEqual(r["matched"]?.intValue, 0, "\(r)")
-        XCTAssertGreaterThan(r["waited"]?.doubleValue ?? 0, 1.0)
+        XCTAssertGreaterThanOrEqual(r["waited"]?.doubleValue ?? 0, 1.0)
         XCTAssertNil(r["problems"])
+        await recognitionsEnded()
+    }
+
+    // MARK: - the recognition queue
+
+    func testTimedOutWaitsOnTheSameFrameLeaveOneRecognitionRunning() async throws {
+        let calls = LockedBox(0)
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            gate.pass()
+            return []
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        for _ in 0..<2 {
+            let r = try await waitFor(h, [["type": "text_visible", "text": "ready", "languages": ["en-US"]]], timeout: 1)
+            XCTAssertEqual(r["matched"]?.intValue, -1)
+            XCTAssertEqual(r["problems"]?[0]?["error"]?.stringValue, WaitTests.unfinished)
+        }
+        XCTAssertEqual(calls.value, 1)
+        let load = RecognitionQueue.shared.load
+        XCTAssertTrue(load.running)
+        XCTAssertEqual(load.callers, 0)
+        XCTAssertEqual(load.waiting, 0)
+        gate.open()
+        await recognitionsEnded()
+        XCTAssertEqual(calls.value, 1)
+    }
+
+    func testARecognitionWhoseWaitEndedBeforeItsTurnIsNeverStarted() async throws {
+        let seen = LockedBox<[[String]]>([])
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        WaitTiming.recognizer = { _, languages in
+            seen.value.append(languages)
+            gate.pass()
+            return []
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let first = try await waitFor(h, [["type": "text_visible", "text": "ready", "languages": ["ko-KR"]]], timeout: 1)
+        XCTAssertEqual(first["problems"]?[0]?["error"]?.stringValue, WaitTests.unfinished)
+        let second = try await waitFor(h, [["type": "text_visible", "text": "ready", "languages": ["en-US"]]], timeout: 1)
+        XCTAssertEqual(second["matched"]?.intValue, -1)
+        XCTAssertEqual(second["problems"]?[0]?["error"]?.stringValue, WaitTests.unfinished)
+        let load = RecognitionQueue.shared.load
+        XCTAssertTrue(load.running)
+        XCTAssertEqual(load.waiting, 0)
+        gate.open()
+        await recognitionsEnded()
+        XCTAssertEqual(seen.value, [["ko-KR"]])
+    }
+
+    func testWaitsOnTheSameFrameShareOneRecognition() async throws {
+        let calls = LockedBox(0)
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            gate.pass()
+            return [WaitTests.ready]
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let params: JSON = ["name": "Win", "timeout": 60, "conditions": [["type": "text_visible", "text": "ready", "languages": ["en-US"]]]]
+        let first = Task { try await h.handle(op: "vm.wait_for", params: params) }
+        let second = Task { try await h.handle(op: "vm.wait_for", params: params) }
+        let joined = await eventually { RecognitionQueue.shared.load.callers == 2 }
+        XCTAssertTrue(joined)
+        XCTAssertEqual(RecognitionQueue.shared.load.waiting, 0)
+        gate.open()
+        let a = try await first.value, b = try await second.value
+        XCTAssertEqual(a["matched"]?.intValue, 0)
+        XCTAssertEqual(b["matched"]?.intValue, 0)
+        XCTAssertEqual(calls.value, 1)
+        await recognitionsEnded()
+    }
+
+    func testFindTextBehindARunningRecognitionAnswersAfterIt() async throws {
+        let seen = LockedBox<[[String]]>([])
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        WaitTiming.recognizer = { _, languages in
+            seen.value.append(languages)
+            if languages == ["ko-KR"] { gate.pass() }
+            return [WaitTests.ready]
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 60, "conditions": [
+                ["type": "text_visible", "text": "ready", "languages": ["ko-KR"]],
+            ]])
+        }
+        let running = await eventually { RecognitionQueue.shared.load.running }
+        XCTAssertTrue(running)
+        let answered = LockedBox(false)
+        let find = Task {
+            let r = try await h.handle(op: "vm.find_text", params: ["name": "Win", "query": "ready", "languages": ["en-US"]])
+            answered.value = true
+            return r
+        }
+        let queued = await eventually { RecognitionQueue.shared.load.waiting == 1 }
+        XCTAssertTrue(queued)
+        XCTAssertFalse(answered.value)
+        XCTAssertEqual(seen.value, [["ko-KR"]])
+        gate.open()
+        let found = try await find.value
+        XCTAssertEqual(found["matches"]?.arrayValue?.count, 1)
+        XCTAssertEqual(seen.value, [["ko-KR"], ["en-US"]])
+        let waited = try await wait.value
+        XCTAssertEqual(waited["matched"]?.intValue, 0)
+        await recognitionsEnded()
+    }
+
+    func testACancelledCallerLeavesTheQueue() async throws {
+        let queue = RecognitionQueue()
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        let started = LockedBox<[Int]>([])
+        let recognizer: RecognitionQueue.Recognizer = { frame, _ in
+            started.value.append(frame.width)
+            gate.pass()
+            return []
+        }
+        let running = Task { await queue.recognize(solid(1, 1, 0), languages: ["en-US"], recognizer: recognizer) != nil }
+        let began = await eventually { started.value == [1] }
+        XCTAssertTrue(began)
+        let behind = Task { await queue.recognize(solid(2, 1, 0), languages: ["en-US"], recognizer: recognizer) != nil }
+        let queued = await eventually { queue.load.waiting == 1 }
+        XCTAssertTrue(queued)
+        behind.cancel()
+        let behindAnswered = await behind.value
+        XCTAssertFalse(behindAnswered)
+        XCTAssertEqual(queue.load.waiting, 0)
+        running.cancel()
+        let runningAnswered = await running.value
+        XCTAssertFalse(runningAnswered)
+        XCTAssertTrue(queue.load.running)
+        XCTAssertEqual(queue.load.callers, 0)
+        gate.open()
+        let last = await queue.recognize(solid(3, 1, 0), languages: ["en-US"], recognizer: recognizer)
+        XCTAssertEqual(try last?.get(), [])
+        XCTAssertEqual(started.value, [1, 3])
+        XCTAssertFalse(queue.load.running)
+    }
+
+    func testACallerWhoseLimitPassedWhileItWaitedForItsTurnIsNotStarted() async throws {
+        let queue = RecognitionQueue()
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        let started = LockedBox<[Int]>([])
+        let recognizer: RecognitionQueue.Recognizer = { frame, _ in
+            started.value.append(frame.width)
+            gate.pass()
+            return []
+        }
+        let running = Task { await queue.recognize(solid(1, 1, 0), languages: ["en-US"], recognizer: recognizer) != nil }
+        let began = await eventually { started.value == [1] }
+        XCTAssertTrue(began)
+        let late = await queue.recognize(solid(2, 1, 0), languages: ["en-US"], recognizer: recognizer, until: .now + .milliseconds(50))
+        XCTAssertNil(late)
+        XCTAssertEqual(queue.load.waiting, 0)
+        gate.open()
+        let answered = await running.value
+        XCTAssertTrue(answered)
+        XCTAssertEqual(started.value, [1])
     }
 
     func testFrameReadFailuresAreRetried() async throws {

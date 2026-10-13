@@ -488,14 +488,13 @@ public actor ControlHandler {
         let cropped = area == frame.bounds ? frame : frame.crop(area)
         let chosen = languages
         try ScreenText.validate(languages: chosen)
-        let recognizer = WaitTiming.recognizer
         let lines: [TextMatch]
         do {
-            lines = try await Task.detached { try recognizer(cropped, chosen) }.value
+            lines = try await queuedRecognition(of: cropped, languages: chosen)
         } catch ControlError.recognitionFailed {
             try await Task.sleep(for: .milliseconds(150))
             do {
-                lines = try await Task.detached { try recognizer(cropped, chosen) }.value
+                lines = try await queuedRecognition(of: cropped, languages: chosen)
             } catch ControlError.recognitionFailed {
                 throw ControlError.failed("text recognition failed twice; call vm.find_text again or use vm.screenshot")
             }
@@ -509,6 +508,12 @@ public actor ControlHandler {
                     "confidence": .double((m.confidence * 100).rounded() / 100)]
         }
         return ["matches": .array(rows), "lines": .int(Int64(lines.count))]
+    }
+
+    /// The lines the recognition queue reads in `frame`. A cancelled task leaves the queue and throws `CancellationError`.
+    private nonisolated func queuedRecognition(of frame: Frame, languages: [String]) async throws -> [TextMatch] {
+        guard let outcome = await RecognitionQueue.shared.recognize(frame, languages: languages) else { throw CancellationError() }
+        return try outcome.get()
     }
 
     private func screenshotResult(_ t: VMTarget, _ params: JSON) async throws -> JSON {
