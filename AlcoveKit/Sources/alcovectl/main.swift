@@ -5,7 +5,7 @@
 //   alcovectl args NAME [--dir DIR]          print the QEMU command line
 //   alcovectl agent NAME [--dir DIR] [--command CMD]   probe the guest agent of a running VM
 //   alcovectl serve [--dir DIR] [--socket PATH]   headless control server (docs/control-protocol.md) until SIGTERM
-//   alcovectl run-script FILE [--vm NAME] [--var KEY=VALUE]... [--snapshot NAME] [--socket PATH]   replay a script (--help lists the exit statuses)
+//   alcovectl run-script [--vm NAME] [--var KEY[=VALUE]]... [--snapshot NAME] [--socket PATH] [--in-process] [--] FILE   replay a script (--help lists the exit statuses)
 //   alcovectl run NAME [--dir DIR] [--seconds N] [--screenshot PATH --after N] [--resize WxH --resize-after N]
 //                 start headless, keep running N seconds (default 30), then power down;
 //                 optionally take a QMP screenshot and/or ask the guest to change resolution
@@ -44,8 +44,7 @@ struct Args {
 
 if CommandLine.arguments.dropFirst().first == "run-script" { runScriptCommand(Array(CommandLine.arguments.dropFirst(2))) }
 let args = Args(Array(CommandLine.arguments.dropFirst()))
-let vmDir = URL(fileURLWithPath: args.value("dir") ?? ProcessInfo.processInfo.environment["ALCOVE_VM_DIR"]
-    ?? (NSHomeDirectory() + "/Library/Application Support/Alcove/VMs"))
+let vmDir = resolvedVMDirectory(args.value("dir"))
 try? FileManager.default.createDirectory(at: vmDir, withIntermediateDirectories: true)
 let engine: EngineLocator.Engine
 do { engine = try EngineLocator.standard().locate() } catch { fail("engine not found: \(error)") }

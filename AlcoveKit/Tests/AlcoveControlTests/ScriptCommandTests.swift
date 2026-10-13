@@ -32,11 +32,49 @@ final class ScriptCommandTests: XCTestCase {
     func testRefusesBadArguments() {
         XCTAssertTrue(usageError([]).hasPrefix("run-script needs the script file"))
         XCTAssertEqual(usageError(["/a.json", "/b.json"]), "run-script takes one script file; got '/a.json' and '/b.json'")
-        XCTAssertEqual(usageError(["/a.json", "--var", "novalue"]), "--var needs KEY=VALUE, for example --var message=hello; got 'novalue'")
+        XCTAssertEqual(usageError(["/a.json", "--var", "no_such_env_variable_for_alcove"]), "--var no_such_env_variable_for_alcove needs a value: pass no_such_env_variable_for_alcove=VALUE or set the environment variable no_such_env_variable_for_alcove")
         XCTAssertEqual(usageError(["/a.json", "--var", "=1"]), "--var needs KEY=VALUE, for example --var message=hello; got '=1'")
         XCTAssertEqual(usageError(["/a.json", "--var"]), "--var needs a value; see alcovectl run-script --help")
         XCTAssertEqual(usageError(["/a.json", "--vm", ""]), "--vm needs a VM name; see alcovectl run-script --help")
-        XCTAssertEqual(usageError(["/a.json", "--other"]), "unknown option '--other'; see alcovectl run-script --help")
+        XCTAssertEqual(usageError(["/a.json", "--other"]), "unknown option '--other'; see alcovectl run-script --help, and put -- before a file name that starts with a dash")
+        XCTAssertEqual(usageError(["-x", "/a.json"]), "unknown option '-x'; see alcovectl run-script --help, and put -- before a file name that starts with a dash")
+    }
+
+    func testVarWithoutValueReadsTheEnvironment() throws {
+        let options = try RunScriptOptions.parse(["/f.json", "--var", "password", "--var", "plain=x"], environment: ["password": "from-env"])
+        XCTAssertEqual(options.variables, ["password": "from-env", "plain": "x"])
+        XCTAssertThrowsError(try RunScriptOptions.parse(["/f.json", "--var", "password"], environment: [:])) {
+            XCTAssertEqual("\($0)", "--var password needs a value: pass password=VALUE or set the environment variable password")
+        }
+    }
+
+    func testRepeatedVariablesAreListed() throws {
+        let options = try parse(["/f.json", "--var", "a=1", "--var", "a=2", "--var", "a=3", "--var", "b=1"])
+        XCTAssertEqual(options.repeatedVariables, ["a"])
+        XCTAssertEqual(options.variables["a"], "3")
+        XCTAssertEqual(try parse(["/f.json", "--var", "a=1"]).repeatedVariables, [])
+    }
+
+    func testDoubleDashEndsOptions() throws {
+        let options = try parse(["--in-process", "--vm", "Win", "--", "-odd.json"])
+        XCTAssertTrue(options.inProcess)
+        XCTAssertEqual(options.file, FileManager.default.currentDirectoryPath + "/-odd.json")
+        XCTAssertEqual(try parse(["/f.json"]).inProcess, false)
+        XCTAssertEqual(try parse(["--", "--vm"]).file, FileManager.default.currentDirectoryPath + "/--vm")
+    }
+
+    func testUnreadableScriptSentenceSaysWhatWasResolved() throws {
+        let absolute = try parse(["/nonexistent/flow.json"])
+        XCTAssertEqual(absolute.unreadableProblem, "cannot read the script '/nonexistent/flow.json'; check that the file exists and is readable")
+        let relative = try parse(["nonexistent-flow.json"])
+        let cwd = FileManager.default.currentDirectoryPath
+        XCTAssertEqual(relative.unreadableProblem,
+                       "cannot read the script '\(cwd)/nonexistent-flow.json' (resolved from 'nonexistent-flow.json' in '\(cwd)'); check that the file exists and is readable")
+        XCTAssertNotNil(try parse([NSTemporaryDirectory()]).unreadableProblem)
+        let file = NSTemporaryDirectory() + "readable-\(UUID().uuidString).json"
+        FileManager.default.createFile(atPath: file, contents: Data("{}".utf8))
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: file) }
+        XCTAssertNil(try parse([file]).unreadableProblem)
     }
 
     func testHelpCarriesTheUsageText() {
@@ -101,7 +139,7 @@ final class ScriptCommandTests: XCTestCase {
         XCTAssertTrue(text.contains("typed <hidden>"))
     }
 
-    func testFailureImageIsWrittenNextToTheScriptAndRemovedOnAPass() throws {
+    func testFailureImageIsWrittenNextToTheScriptAndRemovedWhenTheRunHasNone() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("script-cmd-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
@@ -113,7 +151,12 @@ final class ScriptCommandTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: script + ".failure.png")), image)
 
         XCTAssertNil(ScriptReport.storeFailureImage(["passed": false], scriptFile: script))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: script + ".failure.png"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: script + ".failure.png"))
+
+        XCTAssertNil(ScriptReport.storeFailureImage(failed, scriptFile: script))
+        ScriptReport.removeFailureImage(forScript: script)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: script + ".failure.png"))
+        XCTAssertNil(ScriptReport.storeFailureImage(failed, scriptFile: script))
 
         XCTAssertNil(ScriptReport.storeFailureImage(["passed": true], scriptFile: script))
         XCTAssertFalse(FileManager.default.fileExists(atPath: script + ".failure.png"))
@@ -139,5 +182,60 @@ final class ScriptCommandTests: XCTestCase {
         XCTAssertThrowsError(try ControlSocketClient.call(op: "hello", params: [:], socketPath: "/tmp/alcove-cmd-none.sock")) {
             XCTAssertEqual("\($0)", "no control server answers at '/tmp/alcove-cmd-none.sock'")
         }
+    }
+
+    func testInterruptedReportEndsWithInterrupted() {
+        let reply: JSON = ["passed": false, "stepsRun": 1, "seconds": 1.0, "error": "the run was cancelled during step 1; start it again",
+                           "steps": [step(1, label: "open")]]
+        XCTAssertEqual(ScriptReport.lines(reply, variables: [:], interrupted: true), ["ok   1 open 250 ms", "INTERRUPTED"])
+    }
+
+    func testSignalsMapToShellExitStatuses() {
+        XCTAssertEqual(RunScriptExit.status(forSignal: SIGINT), 130)
+        XCTAssertEqual(RunScriptExit.status(forSignal: SIGTERM), 143)
+        XCTAssertNil(RunScriptExit.status(forSignal: SIGHUP))
+    }
+
+    func testRunLockIsExclusiveUntilReleased() throws {
+        let bundle = FileManager.default.temporaryDirectory.appendingPathComponent("run-lock-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: bundle) }
+        let first = try XCTUnwrap(try ScriptRunLock.acquire(in: bundle))
+        XCTAssertNil(try ScriptRunLock.acquire(in: bundle))
+        first.release()
+        let second = try XCTUnwrap(try ScriptRunLock.acquire(in: bundle))
+        XCTAssertNil(try ScriptRunLock.acquire(in: bundle))
+        second.release()
+        XCTAssertThrowsError(try ScriptRunLock.acquire(in: bundle.appendingPathComponent("missing"))) {
+            XCTAssertTrue("\($0)".hasPrefix("cannot open the lock file "), "\($0)")
+        }
+    }
+
+    func testCancellationEndsACallThatWaitsForItsReply() throws {
+        let path = "/tmp/alcove-cancel-\(UUID().uuidString.prefix(8)).sock"
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path) { p in p.withMemoryRebound(to: CChar.self, capacity: 104) { dst in _ = path.withCString { strncpy(dst, $0, 103) } } }
+        let bound = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
+        XCTAssertEqual(bound, 0)
+        XCTAssertEqual(listen(listener, 1), 0)
+        addTeardownBlock { close(listener); unlink(path) }
+        let cancellation = ControlCallCancellation()
+        let outcome = LockedBox<Error?>(nil)
+        let done = expectation(description: "call returned")
+        Thread {
+            do { _ = try ControlSocketClient.call(op: "script.run", params: ["path": "/f.json"], socketPath: path, cancellation: cancellation) }
+            catch { outcome.value = error }
+            done.fulfill()
+        }.start()
+        let accepted = accept(listener, nil, nil)
+        XCTAssertGreaterThanOrEqual(accepted, 0)
+        addTeardownBlock { close(accepted) }
+        var request = [UInt8](repeating: 0, count: 1)
+        XCTAssertEqual(read(accepted, &request, 1), 1)
+        cancellation.cancel(signal: SIGINT)
+        wait(for: [done], timeout: 20)
+        XCTAssertEqual(outcome.value as? ControlSocketClient.Interrupted, ControlSocketClient.Interrupted(signal: SIGINT))
+        XCTAssertEqual(cancellation.signal, SIGINT)
     }
 }
