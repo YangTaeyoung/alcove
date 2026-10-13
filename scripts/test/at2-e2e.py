@@ -13,13 +13,13 @@ Checks 8 and 9 stop and start the VM. Checks 2 and 8 need 8 GiB of free disk.
 Each check prints `PASS <n> <title>`; the first failing check prints
 `FAIL <n>: <reason>` and the script exits 1. However the run ends, a second
 connection releases the lease, moves a hidden clone back and deletes the
-clones, starts the VM when it is stopped, deletes the snapshot, removes the
+clones it created, starts the VM when it is stopped, deletes the snapshot, removes the
 forwards and the firewall rule, restores theme, time zone, clock, display
 scale and resolution, kills the jobs and deletes C:\\alcove-e2e.
 
 Usage: at2-e2e.py [--vm NAME] [--vm-dir DIR] [--only N[,N...]]
 """
-import argparse, base64, glob, json, os, re, shutil, socket, struct, subprocess, sys, tempfile, time
+import argparse, base64, glob, json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time
 
 sys.dont_write_bytecode = True
 from alcove_ctl import Client, ControlError, ControlTimeout
@@ -113,6 +113,7 @@ class Run:
         self.bundle = self.bundle_of(vm)
         self.clone_names = [vm + " e2e clone", vm + " e2e clone 2"]
         self.hidden = None
+        self.clones_made = []
         self.jobs = []
         self.forwards = []
         self.leases = []
@@ -256,14 +257,20 @@ class Run:
             except Exception:
                 pass
         if self.hidden and os.path.isdir(self.hidden[0]) and not os.path.exists(self.hidden[1]):
-            os.rename(self.hidden[0], self.hidden[1])
+            try:
+                os.rename(self.hidden[0], self.hidden[1])
+            except OSError as e:
+                print(f"cleanup warning: could not move {self.hidden[0]} back to {self.hidden[1]} ({e}); move it by hand")
         if self.hidden:
-            shutil.rmtree(os.path.dirname(self.hidden[0]), ignore_errors=True)
+            try:
+                shutil.rmtree(os.path.dirname(self.hidden[0]))
+            except OSError as e:
+                print(f"cleanup warning: could not remove {os.path.dirname(self.hidden[0])} ({e}); remove it by hand")
         try:
             with Client(self.c.socket_path) as c:
                 self.restore(c)
         except ControlError as e:
-            print(f"cleanup: the control server failed ({e}); check vm.list for '{self.clone_names[0]}', "
+            print(f"cleanup: the control server failed ({e}); check vm.list for the clones '{self.clone_names[0]}' and '{self.clone_names[1]}', "
                   f"vm.snapshot.list for '{SNAPSHOT}' and {GUEST} in the guest by hand")
 
     def restore(self, c):
@@ -277,12 +284,18 @@ class Run:
         for token in self.leases:
             attempt("vm.lease.release", lease=token)
         names = {row["name"]: row for row in c.call("vm.list", 60)["vms"]}
-        for clone in self.clone_names:
-            if clone in names:
+        for clone in self.clones_made:
+            if clone in names and names[clone].get("cloneOf") == self.vm:
                 attempt("vm.stop", 300, name=clone, force=True)
                 if attempt("vm.delete", name=clone) is None:
                     print(f"cleanup: could not delete the clone '{clone}'; delete it with vm.delete")
         status = c.call("vm.status", 60, name=self.vm)
+        end = time.time() + 10
+        while status.get("leasedBy") and time.time() < end:
+            time.sleep(1)
+            status = c.call("vm.status", 60, name=self.vm)
+        if status.get("leasedBy"):
+            print(f"cleanup warning: '{self.vm}' is still leased by '{status['leasedBy']}'; the guest restore will be refused until the lease ends")
         if status.get("ephemeral"):
             attempt("vm.stop", 300)
             status = c.call("vm.status", 60, name=self.vm)
@@ -646,7 +659,9 @@ def _(run):
     run.need_disk()
     clone, second = run.clone_names
     for name in run.clone_names:
-        expect(run.vm_row(name) is None, f"a VM named '{name}' exists already; delete it with vm.delete")
+        expect(run.vm_row(name) is None,
+               f"a VM named '{name}' exists already and this run does not touch it; delete it by hand with "
+               f"scripts/test/ctl.py vm.delete name=\"{name}\" (stop it first with vm.stop) or in the Alcove app")
     refusal = TEMPLATE_REFUSAL.format(vm=run.vm, clone=clone)
 
     forwards = run.call("vm.forward.list")["forwards"]
@@ -662,6 +677,7 @@ def _(run):
     began = time.monotonic()
     cloned = run.call("vm.clone", 300, newName=clone)
     clone_s = time.monotonic() - began
+    run.clones_made.append(clone)
     expect(cloned["name"] == clone, f"vm.clone answered {cloned!r}")
     row = run.vm_row(clone)
     expect(row and row.get("cloneOf") == run.vm and row["state"] == "stopped", f"vm.list shows the clone as {row!r}")
@@ -700,6 +716,7 @@ def _(run):
     run.stop_vm()
 
     run.call("vm.clone", 300, newName=second)
+    run.clones_made.append(second)
     path = run.bundle_of(second)
     expect(path, f"the bundle of '{second}' is not in {run.vm_dir}")
     hidden = os.path.join(tempfile.mkdtemp(prefix="at2-e2e-hidden-", dir=os.path.dirname(run.vm_dir.rstrip("/"))), os.path.basename(path))
@@ -842,7 +859,12 @@ def main():
         print(f"FAIL 0: no bundle of '{args.vm}' in {args.vm_dir}; pass --vm-dir")
         sys.exit(1)
 
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
     failed = None
+    cleanup_failed = False
     try:
         for n, title, fn in CHECKS:
             if only and n not in only:
@@ -862,12 +884,16 @@ def main():
             except OSError as e:
                 failed = f"FAIL {n}: {e}"
             if failed:
+                print(failed, flush=True)
                 break
             print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
     finally:
-        run.cleanup()
-    if failed:
-        print(failed)
+        try:
+            run.cleanup()
+        except Exception as e:
+            cleanup_failed = True
+            print(f"cleanup failed: {type(e).__name__}: {e}", flush=True)
+    if failed or cleanup_failed:
         sys.exit(1)
 
 
