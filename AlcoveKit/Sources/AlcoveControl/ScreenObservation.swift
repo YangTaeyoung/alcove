@@ -5,7 +5,7 @@ import AlcoveQMP
 enum ObserveLevel: String, CaseIterable, Sendable { case none, summary, diff, image }
 
 /// What the screen did after an action. Rectangles are guest pixels of the full frame.
-struct Observation: Sendable, Equatable {
+struct ScreenObservation: Sendable, Equatable {
     /// Time between two frame samples.
     static let sampleInterval = Duration.milliseconds(50)
     /// Largest width of a returned image in pixels.
@@ -47,7 +47,7 @@ extension Frame.Rect {
 ///
 /// The screen is settled once no tile differs between consecutive samples for `settleMs`;
 /// sampling stops after `settleTimeoutMs` with `settled == false`.
-func observe(_ t: VMTarget, before: Frame, level: ObserveLevel, settleMs: Int, settleTimeoutMs: Int) async throws -> Observation {
+func observe(_ t: VMTarget, before: Frame, level: ObserveLevel, settleMs: Int, settleTimeoutMs: Int) async throws -> ScreenObservation {
     let clock = ContinuousClock()
     let deadline = clock.now + .milliseconds(settleTimeoutMs)
     let settle = Duration.milliseconds(settleMs)
@@ -58,22 +58,22 @@ func observe(_ t: VMTarget, before: Frame, level: ObserveLevel, settleMs: Int, s
         let now = clock.now
         if now - quietSince >= settle { settled = true; break }
         if now >= deadline { break }
-        try await Task.sleep(for: min(Observation.sampleInterval, deadline - now))
+        try await Task.sleep(for: min(ScreenObservation.sampleInterval, deadline - now))
         let sample = try await t.frame()
         if FrameDiff.between(last, sample).changedTiles != 0 { quietSince = clock.now }
         last = sample
     }
 
     let diff = FrameDiff.between(before, last)
-    var observation = Observation(settled: settled, changed: diff.rect, changedFraction: diff.fraction,
-                                  width: last.width, height: last.height)
+    var observation = ScreenObservation(settled: settled, changed: diff.rect, changedFraction: diff.fraction,
+                                         width: last.width, height: last.height)
     var shown: Frame.Rect?
     switch level {
     case .none, .summary:
         break
     case .diff:
         if let r = diff.rect {
-            let margin = Observation.diffMargin
+            let margin = ScreenObservation.diffMargin
             shown = last.clamp(Frame.Rect(x: r.x - margin, y: r.y - margin, w: r.w + 2 * margin, h: r.h + 2 * margin))
         }
     case .image:
@@ -81,7 +81,7 @@ func observe(_ t: VMTarget, before: Frame, level: ObserveLevel, settleMs: Int, s
     }
     if let shown {
         let cropped = shown == last.bounds ? last : last.crop(shown)
-        let image = cropped.scaled(by: min(1, Double(Observation.maxImageWidth) / Double(cropped.width)))
+        let image = cropped.scaled(by: min(1, Double(ScreenObservation.maxImageWidth) / Double(cropped.width)))
         observation.image = image.encoded(.png)
         observation.imageRect = shown
         observation.imageScale = Double(image.width) / Double(shown.w)
