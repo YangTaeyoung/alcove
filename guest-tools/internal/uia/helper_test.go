@@ -2,6 +2,7 @@ package uia
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -198,10 +199,11 @@ func TestCallsReachTheHelperOneAtATimeInArrivalOrder(t *testing.T) {
 }
 
 func TestTimeoutOfAQueuedCallStartsWhenTheHelperReceivesIt(t *testing.T) {
+	release := make(chan struct{})
 	f := newFake(func(_ int, in io.Reader, out io.Writer) {
 		readRequests(in, func(req map[string]any) bool {
 			if req["op"] == "slow" {
-				time.Sleep(400 * time.Millisecond)
+				<-release
 			}
 			writeLine(out, map[string]any{"id": req["id"], "ok": true, "op": req["op"]})
 			return true
@@ -217,15 +219,74 @@ func TestTimeoutOfAQueuedCallStartsWhenTheHelperReceivesIt(t *testing.T) {
 	for h.busyNow() != "slow" {
 		time.Sleep(time.Millisecond)
 	}
-	got, err := h.Call("fast", nil, 200*time.Millisecond)
-	if err != nil || got["op"] != "fast" {
-		t.Fatalf("queued call: %v %v", got, err)
+	const fastTimeout = 50 * time.Millisecond
+	fast := make(chan result, 1)
+	go func() {
+		got, err := h.Call("fast", nil, fastTimeout)
+		fast <- result{got, err}
+	}()
+	waitQueued(t, h, 1)
+	// The queued call waits far longer than its own timeout; the timeout must
+	// not run until the helper receives the request.
+	time.Sleep(10 * fastTimeout)
+	close(release)
+	if r := <-fast; r.err != nil || r.fields["op"] != "fast" {
+		t.Fatalf("queued call: %v %v", r.fields, r.err)
 	}
 	if err := <-slow; err != nil {
 		t.Fatal(err)
 	}
 	if got := f.launches.Load(); got != 1 {
 		t.Fatalf("launches %d", got)
+	}
+}
+
+func TestCancelledQueuedCallLeavesTheQueueWithoutReachingTheHelper(t *testing.T) {
+	release := make(chan struct{})
+	var received sync.Map
+	f := newFake(func(_ int, in io.Reader, out io.Writer) {
+		readRequests(in, func(req map[string]any) bool {
+			received.Store(req["op"], true)
+			if req["op"] == "slow" {
+				<-release
+			}
+			writeLine(out, map[string]any{"id": req["id"], "ok": true, "op": req["op"]})
+			return true
+		})
+	})
+	h := New(f.launcher(), nil)
+	defer h.Close()
+	slow := make(chan error, 1)
+	go func() {
+		_, err := h.Call("slow", nil, longWait)
+		slow <- err
+	}()
+	for h.busyNow() != "slow" {
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := make(chan error, 1)
+	go func() {
+		_, err := h.CallContext(ctx, "ui.act", nil, longWait)
+		queued <- err
+	}()
+	for !h.queuedOp("ui.act") {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-queued; err == nil || err.Error() != errCancelled {
+		t.Fatalf("cancelled call: %v", err)
+	}
+	waitQueued(t, h, 0)
+	close(release)
+	if err := <-slow; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := received.Load("ui.act"); ok {
+		t.Fatal("the cancelled request reached the helper")
+	}
+	if got, err := h.Call("win.list", nil, longWait); err != nil || got["op"] != "win.list" {
+		t.Fatalf("call after the cancel: %v %v", got, err)
 	}
 }
 
@@ -430,7 +491,7 @@ func TestCloseFailsCallsThatWaitForTheirTurn(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case err := <-errs:
-			if err == nil || err.Error() != "UI helper is closed" {
+			if err == nil || err.Error() != "the UI helper is shut down; restart alcove-agent" {
 				t.Fatalf("err %v", err)
 			}
 		case <-time.After(longWait):
@@ -772,10 +833,10 @@ func TestCloseStopsChild(t *testing.T) {
 	case <-time.After(longWait):
 		t.Fatal("reader goroutine still running")
 	}
-	if err := <-pending; err == nil || err.Error() != "UI helper is closed" {
+	if err := <-pending; err == nil || err.Error() != "the UI helper is shut down; restart alcove-agent" {
 		t.Fatalf("pending call: %v", err)
 	}
-	if _, err := h.Call("ping", nil, longWait); err == nil || err.Error() != "UI helper is closed" {
+	if _, err := h.Call("ping", nil, longWait); err == nil || err.Error() != "the UI helper is shut down; restart alcove-agent" {
 		t.Fatalf("call after close: %v", err)
 	}
 	h.Close()

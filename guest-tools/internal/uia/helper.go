@@ -4,6 +4,7 @@ package uia
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,8 +18,9 @@ import (
 const maxLineBytes = 8 << 20
 
 const (
-	errExited = "UI helper exited; retry"
-	errClosed = "UI helper is closed"
+	errExited    = "UI helper exited; retry"
+	errClosed    = "the UI helper is shut down; restart alcove-agent"
+	errCancelled = "the request was cancelled"
 )
 
 const (
@@ -104,12 +106,17 @@ func (h *Helper) SetLogger(l *log.Logger) {
 }
 
 // acquire waits until no other call is inside the helper. A call that waits
-// longer than the queue wait gives up and names the op that holds the helper.
-func (h *Helper) acquire(op string) error {
+// longer than the queue wait gives up and names the op that holds the helper;
+// a call whose context is cancelled leaves the queue at once.
+func (h *Helper) acquire(ctx context.Context, op string) error {
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
 		return errors.New(errClosed)
+	}
+	if err := ctx.Err(); err != nil {
+		h.mu.Unlock()
+		return errors.New(errCancelled)
 	}
 	if !h.busy {
 		h.busy, h.busyOp = true, op
@@ -126,10 +133,16 @@ func (h *Helper) acquire(op string) error {
 	select {
 	case <-w.turn:
 	case <-timer.C:
+	case <-ctx.Done():
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if w.granted {
+		// A grant that arrives together with cancellation hands the turn back.
+		if ctx.Err() != nil {
+			h.releaseLocked()
+			return errors.New(errCancelled)
+		}
 		return nil
 	}
 	if h.closed {
@@ -141,6 +154,9 @@ func (h *Helper) acquire(op string) error {
 			break
 		}
 	}
+	if ctx.Err() != nil {
+		return errors.New(errCancelled)
+	}
 	return fmt.Errorf("the UI helper is busy with '%s'; retry", h.busyOp)
 }
 
@@ -148,6 +164,10 @@ func (h *Helper) acquire(op string) error {
 func (h *Helper) release() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.releaseLocked()
+}
+
+func (h *Helper) releaseLocked() {
 	if len(h.waiters) == 0 {
 		h.busy, h.busyOp = false, ""
 		return
@@ -159,12 +179,20 @@ func (h *Helper) release() {
 	close(w.turn)
 }
 
-// Call sends one request and waits for its reply; it starts or restarts the
-// child as needed. The returned fields exclude "id" and "ok". The call waits
-// for its turn first; timeout counts from the moment the request is handed to
-// the child, and a child that does not answer within it is killed.
+// Call sends one request with no cancellation; see CallContext.
 func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (map[string]any, error) {
-	if err := h.acquire(op); err != nil {
+	return h.CallContext(context.Background(), op, params, timeout)
+}
+
+// CallContext sends one request and waits for its reply; it starts or restarts
+// the child as needed. The returned fields exclude "id" and "ok". The call
+// waits for its turn first; timeout counts from the moment the request is
+// handed to the child, and a child that does not answer within it is killed. A
+// call whose context is cancelled before its request reaches the child leaves
+// the queue without touching the helper; a request already handed to the child
+// runs to its end.
+func (h *Helper) CallContext(ctx context.Context, op string, params map[string]any, timeout time.Duration) (map[string]any, error) {
+	if err := h.acquire(ctx, op); err != nil {
 		return nil, err
 	}
 	defer h.release()
@@ -199,6 +227,10 @@ func (h *Helper) Call(op string, params map[string]any, timeout time.Duration) (
 	case <-c.ready:
 	case <-c.done:
 		return nil, c.err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, errors.New(errCancelled)
 	}
 
 	h.mu.Lock()
