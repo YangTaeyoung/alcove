@@ -61,16 +61,21 @@ public actor ControlHandler {
     let wallClock: @Sendable () -> Date
     /// The engine binary the host runs VMs with; nil when the app manages the engine.
     let engineDescription: String?
+    /// The base directory of new recordings; nil selects `~/Library/Application Support/Alcove/Recordings`.
+    let recordingsDirectory: URL?
+    var recordings = RecordingTable()
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
     public init(registry: VMRegistry, hostKind: String, clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
-                engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() }) {
+                engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() },
+                recordingsDirectory: URL? = nil) {
         self.registry = registry
         self.hostKind = hostKind
         self.clock = clock
         self.engineDescription = engineDescription
         self.wallClock = now
+        self.recordingsDirectory = recordingsDirectory
     }
 
     /// Every op name the dispatcher accepts.
@@ -87,6 +92,7 @@ public actor ControlHandler {
         "vm.forward.add", "vm.forward.remove", "vm.forward.list", "vm.set_network",
         "vm.lease.acquire", "vm.lease.release", "vm.set_resolution",
         "vm.wait_idle", "vm.wait_for", "vm.set_environment", "vm.doctor", "vm.find_text",
+        "vm.record.start", "vm.record.stop", "vm.record.status",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -98,7 +104,7 @@ public actor ControlHandler {
         "hello", "vm.list", "vm.status", "vm.screenshot", "vm.wait_idle", "vm.clipboard.get", "vm.exec.read",
         "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
         "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
-        "vm.wait_for",
+        "vm.wait_for", "vm.record.status",
     ]
 
     /// Whether `op` runs outside the per-connection request order.
@@ -118,10 +124,11 @@ public actor ControlHandler {
            let refusal = leases.refusal(vm: vm, token: params["lease"]?.stringValue, now: clock()) {
             throw ControlError.failed(refusal)
         }
+        let run: @Sendable () async throws -> JSON = { try await self.recorded(op: op, params: params) { try await self.perform(op: op, params: params) } }
         if ControlHandler.isInput(op: op), let vm = params["name"]?.stringValue {
-            return try await inputGate.withLock(vm) { try await self.perform(op: op, params: params) }
+            return try await inputGate.withLock(vm, run)
         }
-        return try await perform(op: op, params: params)
+        return try await run()
     }
 
     /// Runs one operation without the lease guard and without taking the input gate.
@@ -209,6 +216,8 @@ public actor ControlHandler {
             return try await guest(op: op, params: params)
         case "vm.wait_for":
             return try await waitFor(params)
+        case "vm.record.start", "vm.record.stop", "vm.record.status":
+            return try await record(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of the frame's tiles changing between samples 250 ms apart
@@ -254,6 +263,7 @@ public actor ControlHandler {
         let st = await t.state()
         guard st == .running || st == .paused else {
             runtimeForwards[t.name] = nil
+            noteVMGone(t.name)
             throw ControlError.notRunning(t.name, st)
         }
         return t

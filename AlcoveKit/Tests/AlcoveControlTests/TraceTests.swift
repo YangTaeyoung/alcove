@@ -1,0 +1,384 @@
+import XCTest
+@testable import AlcoveControl
+import AlcoveEngine
+import AlcoveQMP
+
+final class TraceTests: XCTestCase {
+    private var base: URL!
+
+    override func setUpWithError() throws {
+        base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("alcove-trace-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(at: base)
+    }
+
+    private func setup(state: VMController.State = .running) -> (ControlHandler, FakeTarget, TestClock) {
+        let t = FakeTarget(name: "Win", state: state, png: makePNG(width: 800, height: 600))
+        let clock = TestClock()
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", clock: { clock.now },
+                               recordingsDirectory: base)
+        return (h, t, clock)
+    }
+
+    private func start(_ h: ControlHandler, _ extra: [String: JSON] = [:]) async throws -> URL {
+        var params: [String: JSON] = ["name": "Win"]
+        for (k, v) in extra { params[k] = v }
+        let r = try await h.handle(op: "vm.record.start", params: .object(params))
+        return URL(fileURLWithPath: try XCTUnwrap(r["dir"]?.stringValue))
+    }
+
+    private func lines(_ dir: URL) throws -> [JSON] {
+        let text = try String(contentsOf: dir.appendingPathComponent("trace.jsonl"), encoding: .utf8)
+        return try text.split(separator: "\n").map { try JSON.parse(Data($0.utf8)) }
+    }
+
+    private func failure(_ h: ControlHandler, _ op: String, _ params: JSON) async -> String {
+        do { _ = try await h.handle(op: op, params: params); XCTFail("expected failure"); return "" }
+        catch { return "\(error)" }
+    }
+
+    // MARK: sanitizer
+
+    func testSanitizerRemovesLeaseAndImages() {
+        let input: JSON = ["lease": "tok", "png": "AAAA", "jpeg": "BBBB", "keep": 1,
+                           "nested": ["lease": "x", "list": [["png": "C", "a": 2]]]]
+        let out = TraceSanitizer.sanitize(input)
+        XCTAssertNil(out["lease"])
+        XCTAssertEqual(out["png"]?.stringValue, "<image omitted>")
+        XCTAssertEqual(out["jpeg"]?.stringValue, "<image omitted>")
+        XCTAssertEqual(out["keep"]?.intValue, 1)
+        XCTAssertNil(out["nested"]?["lease"])
+        XCTAssertEqual(out["nested"]?["list"]?[0]?["png"]?.stringValue, "<image omitted>")
+        XCTAssertEqual(out["nested"]?["list"]?[0]?["a"]?.intValue, 2)
+    }
+
+    func testSanitizerCutsLongStrings() {
+        let long = String(repeating: "a", count: 2001)
+        let exact = String(repeating: "b", count: 2000)
+        let out = TraceSanitizer.sanitize(["text": .string(long), "exact": .string(exact), "list": [.string(long)]])
+        XCTAssertEqual(out["text"]?.stringValue, String(repeating: "a", count: 2000) + "…")
+        XCTAssertEqual(out["textTruncated"]?.boolValue, true)
+        XCTAssertEqual(out["exact"]?.stringValue, exact)
+        XCTAssertNil(out["exactTruncated"])
+        XCTAssertEqual(out["list"]?[0]?.stringValue, String(repeating: "a", count: 2000) + "…")
+    }
+
+    func testSanitizerMasksEnvSecrets() {
+        let out = TraceSanitizer.sanitize(["env": ["API_KEY": "k", "github_token": "t", "MySecret": "s", "DB_PASSWORD": "p", "PATH": "/bin"],
+                                           "other": ["API_KEY": "visible"]])
+        for key in ["API_KEY", "github_token", "MySecret", "DB_PASSWORD"] {
+            XCTAssertEqual(out["env"]?[key]?.stringValue, "<masked>", key)
+        }
+        XCTAssertEqual(out["env"]?["PATH"]?.stringValue, "/bin")
+        XCTAssertEqual(out["other"]?["API_KEY"]?.stringValue, "visible")
+    }
+
+    // MARK: trace content
+
+    func testTraceMasksSecrets() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        _ = await failure(h, "vm.exec", ["name": "Win", "command": "env", "env": ["API_TOKEN": "hunter2", "HOME": "/root"], "lease": "nope"])
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let line = try XCTUnwrap(try lines(dir).first)
+        XCTAssertEqual(line["params"]?["env"]?["API_TOKEN"]?.stringValue, "<masked>")
+        XCTAssertEqual(line["params"]?["env"]?["HOME"]?.stringValue, "/root")
+        XCTAssertNil(line["params"]?["lease"])
+        let raw = try String(contentsOf: dir.appendingPathComponent("trace.jsonl"), encoding: .utf8)
+        XCTAssertFalse(raw.contains("hunter2"))
+    }
+
+    func testTraceLineShape() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "id": 7, "maxWidth": 100])
+        _ = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows.map { $0["seq"]?.intValue }, [1, 2, 3])
+        XCTAssertEqual(rows.map { $0["op"]?.stringValue }, ["vm.screenshot", "vm.status", "vm.mouse.click"])
+        let ms = rows.compactMap { $0["ms"]?.intValue }
+        XCTAssertEqual(ms.count, 3)
+        XCTAssertEqual(ms, ms.sorted())
+        let first = rows[0]
+        XCTAssertEqual(first["ok"]?.boolValue, true)
+        XCTAssertNotNil(first["durationMs"]?.intValue)
+        XCTAssertNil(first["error"])
+        XCTAssertEqual(first["params"]?["maxWidth"]?.intValue, 100)
+        XCTAssertNil(first["params"]?["op"])
+        XCTAssertNil(first["params"]?["id"])
+        XCTAssertEqual(first["result"]?["png"]?.stringValue, "<image omitted>")
+        XCTAssertEqual(first["result"]?["sentWidth"]?.intValue, 100)
+        let time = try XCTUnwrap(first["time"]?.stringValue)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        XCTAssertNotNil(formatter.date(from: time), time)
+    }
+
+    func testActionOpsGetFrames() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        _ = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.press", "key": "a"]]])
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0]["before"]?.stringValue, "frames/000001-before.jpg")
+        XCTAssertEqual(rows[0]["after"]?.stringValue, "frames/000001-after.jpg")
+        XCTAssertEqual(rows[1]["before"]?.stringValue, "frames/000002-before.jpg")
+        XCTAssertEqual(stop["frames"]?.intValue, 4)
+        for name in ["000001-before", "000001-after", "000002-before", "000002-after"] {
+            let data = try Data(contentsOf: dir.appendingPathComponent("frames/\(name).jpg"))
+            XCTAssertEqual(Array(data.prefix(3)), [0xFF, 0xD8, 0xFF], name)
+            let decoded = try XCTUnwrap(Frame(png: data), name)
+            XCTAssertEqual(decoded.width, 400)
+            XCTAssertEqual(decoded.height, 300)
+        }
+    }
+
+    func testNonActionOpsHaveNoFrames() async throws {
+        let (h, t, _) = setup()
+        let dir = try await start(h)
+        _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
+        _ = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        _ = await failure(h, "vm.clipboard.get", ["name": "Win"])
+        let calls = await t.frameCalls
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.count, 3)
+        for row in rows {
+            XCTAssertNil(row["before"])
+            XCTAssertNil(row["after"])
+        }
+        XCTAssertEqual(calls, 1)
+        let files = try FileManager.default.contentsOfDirectory(atPath: dir.appendingPathComponent("frames").path)
+        XCTAssertEqual(files, [])
+    }
+
+    func testFailedOpIsTraced() async throws {
+        let (h, t, _) = setup()
+        let dir = try await start(h)
+        await t.setFailingFrameCalls([0])
+        let message = await failure(h, "vm.mouse.click", ["name": "Win", "x": 5, "y": 5, "button": "bogus"])
+        let unknown = await failure(h, "vm.mouse.click", ["name": "Win", "y": 5])
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0]["ok"]?.boolValue, false)
+        XCTAssertEqual(rows[0]["error"]?.stringValue, message)
+        XCTAssertNil(rows[0]["result"])
+        XCTAssertNil(rows[0]["before"])
+        XCTAssertEqual(rows[0]["after"]?.stringValue, "frames/000001-after.jpg")
+        XCTAssertEqual(rows[1]["error"]?.stringValue, unknown)
+        XCTAssertEqual(rows[1]["before"]?.stringValue, "frames/000002-before.jpg")
+    }
+
+    func testRecordingDoesNotChangeOutcomes() async throws {
+        let (plain, _, _) = setup()
+        let (recorded, _, _) = setup()
+        _ = try await start(recorded)
+        let ops: [(String, JSON)] = [("vm.status", ["name": "Win"]), ("vm.mouse.click", ["name": "Win", "x": 5, "y": 5]),
+                                     ("vm.screenshot", ["name": "Win", "maxWidth": 50])]
+        for (op, params) in ops {
+            let a = try await plain.handle(op: op, params: params)
+            let b = try await recorded.handle(op: op, params: params)
+            XCTAssertEqual(a, b, op)
+        }
+        let a = await failure(plain, "vm.mouse.click", ["name": "Win", "y": 5])
+        let b = await failure(recorded, "vm.mouse.click", ["name": "Win", "y": 5])
+        XCTAssertEqual(a, b)
+    }
+
+    func testRefusedOpIsNotTraced() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        let lease = try await h.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "a"])
+        let token = try XCTUnwrap(lease["lease"]?.stringValue)
+        _ = await failure(h, "vm.mouse.click", ["name": "Win", "x": 5, "y": 5])
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "lease": .string(token)])
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win", "lease": .string(token)])
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.map { $0["op"]?.stringValue }, ["vm.lease.acquire", "vm.mouse.click"])
+        XCTAssertNil(rows[1]["params"]?["lease"])
+    }
+
+    func testTraceLinesAreWholeAfterAbruptStop() throws {
+        let dir = base.appendingPathComponent("abrupt")
+        var writer: TraceWriter? = try TraceWriter(directory: dir)
+        for seq in 1...20 {
+            let entry = TraceEntry(seq: seq, time: Date(), ms: seq, op: "vm.type", params: ["text": .string(String(repeating: "é", count: 3000))],
+                                   outcome: .success(["n": .int(Int64(seq))]), durationMs: 1, before: nil, after: nil)
+            try writer?.append(entry)
+        }
+        writer = nil
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.count, 20)
+        XCTAssertEqual(rows.last?["seq"]?.intValue, 20)
+    }
+
+    // MARK: ops
+
+    func testRecordStartStopOps() async throws {
+        let (h, _, _) = setup()
+        let status0 = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status0["recording"]?.boolValue, false)
+        XCTAssertNil(status0["dir"])
+        let dir = try await start(h)
+        XCTAssertEqual(dir.deletingLastPathComponent().standardizedFileURL.path, base.standardizedFileURL.path)
+        XCTAssertTrue(dir.lastPathComponent.hasPrefix("Win-"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("trace.jsonl").path))
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        let status1 = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status1["recording"]?.boolValue, true)
+        XCTAssertEqual(status1["dir"]?.stringValue, dir.path)
+        XCTAssertEqual(status1["ops"]?.intValue, 1)
+        XCTAssertNotNil(status1["seconds"])
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dir.path)
+        XCTAssertEqual(stop["trace"]?.stringValue, dir.appendingPathComponent("trace.jsonl").path)
+        XCTAssertEqual(stop["ops"]?.intValue, 1)
+        XCTAssertEqual(stop["frames"]?.intValue, 2)
+        XCTAssertNotNil(stop["seconds"])
+        XCTAssertNil(stop["video"])
+        let status2 = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status2["recording"]?.boolValue, false)
+        XCTAssertEqual(status2["dir"]?.stringValue, dir.path)
+        let again = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(again, "'Win' is not recording")
+    }
+
+    func testStartParameters() async throws {
+        let (h, _, _) = setup()
+        let relative = await failure(h, "vm.record.start", ["name": "Win", "dir": "relative/path"])
+        XCTAssertTrue(relative.contains("absolute"), relative)
+        for (key, value) in [("fps", 0), ("fps", 31), ("maxSeconds", 0), ("maxSeconds", 86401)] as [(String, Int)] {
+            let message = await failure(h, "vm.record.start", ["name": "Win", key: .int(Int64(value))])
+            XCTAssertTrue(message.contains(key), message)
+        }
+        let custom = base.appendingPathComponent("custom/deeper")
+        let dir = try await start(h, ["dir": .string(custom.path), "fps": 30, "maxSeconds": 86400, "video": false])
+        XCTAssertEqual(dir.path, custom.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: custom.appendingPathComponent("trace.jsonl").path))
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let again = await failure(h, "vm.record.start", ["name": "Win", "dir": .string(custom.path)])
+        XCTAssertEqual(again, "'\(custom.path)' already holds a recording; choose another directory")
+        let unknown = await failure(h, "vm.record.start", ["name": "Nope"])
+        XCTAssertTrue(unknown.contains("no VM named"), unknown)
+    }
+
+    func testDoubleStartRefused() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        let message = await failure(h, "vm.record.start", ["name": "Win"])
+        XCTAssertEqual(message, "'Win' is already recording to \(dir.path); call vm.record.stop first")
+    }
+
+    func testRecordOpsClassification() {
+        for op in ["vm.record.start", "vm.record.stop", "vm.record.status"] {
+            XCTAssertTrue(ControlHandler.knownOps.contains(op), op)
+            XCTAssertFalse(ControlHandler.isConcurrent(op: op), op)
+        }
+        XCTAssertFalse(ControlHandler.isReadOnly(op: "vm.record.start"))
+        XCTAssertFalse(ControlHandler.isReadOnly(op: "vm.record.stop"))
+        XCTAssertTrue(ControlHandler.isReadOnly(op: "vm.record.status"))
+    }
+
+    func testRecordStartIsLeaseGuarded() async throws {
+        let (h, _, _) = setup()
+        _ = try await h.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "a"])
+        let message = await failure(h, "vm.record.start", ["name": "Win"])
+        XCTAssertTrue(message.contains("is leased by a"), message)
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, false)
+    }
+
+    // MARK: automatic end
+
+    func testRecordingStopsWhenVMStops() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        _ = try await h.handle(op: "vm.stop", params: ["name": "Win"])
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, false)
+        XCTAssertEqual(status["dir"]?.stringValue, dir.path)
+        _ = await failure(h, "vm.screenshot", ["name": "Win"])
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["ops"]?.intValue, 1)
+        XCTAssertEqual(try lines(dir).map { $0["op"]?.stringValue }, ["vm.stop"])
+        let again = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(again, "'Win' is not recording")
+    }
+
+    func testRecordingStopsWhenVMIsFoundNotRunning() async throws {
+        let (h, t, _) = setup()
+        let dir = try await start(h)
+        await t.setState(.stopped)
+        let message = await failure(h, "vm.screenshot", ["name": "Win"])
+        XCTAssertTrue(message.contains("stopped"), message)
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, false)
+        let rows = try lines(dir)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0]["ok"]?.boolValue, false)
+    }
+
+    func testMaxSecondsStops() async throws {
+        let (h, _, clock) = setup()
+        let dir = try await start(h, ["maxSeconds": 10])
+        _ = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        clock.advance(.seconds(11))
+        _ = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, false)
+        XCTAssertEqual(status["dir"]?.stringValue, dir.path)
+        XCTAssertEqual(try lines(dir).count, 1)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["ops"]?.intValue, 1)
+        let again = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(again, "'Win' is not recording")
+        _ = try await start(h, ["dir": .string(base.appendingPathComponent("second").path)])
+    }
+
+    func testMaxSecondsTimerStops() async throws {
+        let (h, _, _) = setup()
+        _ = try await start(h, ["maxSeconds": 1])
+        let deadline = ContinuousClock.now + .seconds(5)
+        var recording = true
+        while recording, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(100))
+            let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+            recording = status["recording"]?.boolValue ?? true
+        }
+        XCTAssertFalse(recording)
+    }
+
+    func testVideoSinkIsFinishedOnStop() async throws {
+        let dir = base.appendingPathComponent("sink")
+        let sink = CountingSink()
+        let recording = Recording(vm: "Win", directory: dir, fps: 5, video: true, maxSeconds: 60, frames: { nil }, sink: sink)
+        try await recording.start()
+        let summary = await recording.stop()
+        let finished = sink.finished
+        XCTAssertEqual(finished, 1)
+        XCTAssertNil(summary.video)
+        let again = await recording.stop()
+        XCTAssertEqual(again.dir, summary.dir)
+        XCTAssertEqual(sink.finished, 1)
+        let active = await recording.isActive
+        XCTAssertFalse(active)
+    }
+}
+
+private final class CountingSink: VideoSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var finished: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func append(frame: Frame, at time: Duration) {}
+    func finish() async { bump() }
+    private func bump() { lock.lock(); count += 1; lock.unlock() }
+}

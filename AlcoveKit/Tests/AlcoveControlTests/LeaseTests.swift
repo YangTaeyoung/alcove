@@ -132,6 +132,7 @@ final class LeaseTests: XCTestCase {
             "hello", "vm.list", "vm.status", "vm.screenshot", "vm.wait_idle", "vm.clipboard.get", "vm.exec.read",
             "vm.exec.list", "vm.process.list", "vm.fs.list", "vm.fs.read", "vm.pull_file", "vm.snapshot.list",
             "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text", "vm.wait_for",
+            "vm.record.status",
         ]
         for op in ControlHandler.knownOps {
             XCTAssertEqual(ControlHandler.isReadOnly(op: op), readOnly.contains(op), op)
