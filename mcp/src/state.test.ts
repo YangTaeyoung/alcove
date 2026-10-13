@@ -99,13 +99,31 @@ test("alcove_lease_acquire stores the token and alcove_lease_release sends and c
   assert.equal(leases.get("Win"), undefined);
 });
 
-test("alcove_lease_release clears the stored token when the release fails", async () => {
+test("alcove_lease_release clears the stored token when the VM does not exist", async () => {
   const { run, leases } = rig(new ControlError("no VM named 'Win'; call vm.list"));
   leases.set("Win", "tok-1");
   const r = await run("alcove_lease_release", { name: "Win" });
   assert.equal(r.isError, true);
   assert.equal(textOf(r), "no VM named 'Win'; call vm.list");
   assert.equal(leases.get("Win"), undefined);
+});
+
+test("alcove_lease_release clears the stored token when the lease is lost", async () => {
+  const { run, leases } = rig(new ControlError("lease token does not match; only the holder can release 'Win'"));
+  leases.set("Win", "tok-1");
+  const r = await run("alcove_lease_release", { name: "Win" });
+  assert.equal(r.isError, true);
+  assert.equal(leases.get("Win"), undefined);
+});
+
+test("alcove_lease_release keeps the stored token when the release times out or the connection closes", async () => {
+  for (const message of ["vm.lease.release timed out after 120s", "control connection closed"]) {
+    const { run, leases } = rig(new ControlError(message));
+    leases.set("Win", "tok-1");
+    const r = await run("alcove_lease_release", { name: "Win" });
+    assert.equal(r.isError, true);
+    assert.equal(leases.get("Win"), "tok-1");
+  }
 });
 
 test("alcove_lease_release without a stored token names alcove_lease_acquire and sends nothing", async () => {

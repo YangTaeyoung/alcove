@@ -1,7 +1,7 @@
 // The state toolset: pause, snapshots, clones, leases, port forwards, network, resolution, environment and diagnostics.
 import { z } from "zod";
 import { ControlError } from "../control.js";
-import type { LeasedControlClient } from "../leases.js";
+import { isLeaseLost, type LeasedControlClient } from "../leases.js";
 import { fail, text, vmName, type Registrar } from "../toolkit.js";
 
 const snapshotName = z.string().min(1).max(128).describe("Snapshot name (non-empty, at most 128 characters, no newline)");
@@ -219,9 +219,11 @@ export function register(r: Registrar, client: LeasedControlClient): void {
         if (lease === undefined) throw new ControlError(`this session holds no lease on '${name}'; call alcove_lease_acquire first`);
         try {
           await client.call("vm.lease.release", { name, lease });
-        } finally {
-          client.leases.clear(name);
+        } catch (e) {
+          if (e instanceof ControlError && (isLeaseLost(e.message) || /^no VM named '/.test(e.message))) client.leases.clear(name);
+          throw e;
         }
+        client.leases.clear(name);
         return text(`released the lease on '${name}'`);
       } catch (e) {
         return fail(e);

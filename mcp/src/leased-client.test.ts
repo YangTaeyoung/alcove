@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { ControlError } from "./control.js";
-import { LeasedControlClient } from "./leases.js";
+import { LeasedControlClient, isLeaseLost } from "./leases.js";
 
 type Request = { id: number; op: string; [key: string]: unknown };
 
@@ -86,11 +86,29 @@ test("call drops the stored lease when the server says the token does not match"
   const s = await serve(() => ({ ok: false, error: "lease token does not match; only the holder can release 'A'" }));
   try {
     s.client.leases.set("A", "tok-a");
-    await assert.rejects(s.client.call("vm.lease.release", { name: "A", lease: "tok-a" }), ControlError);
+    await assert.rejects(s.client.call("vm.mouse.move", { name: "A", x: 1, y: 2 }), ControlError);
     assert.equal(s.client.leases.get("A"), undefined);
   } finally {
     await s.close();
   }
+});
+
+test("call keeps the stored lease when the caller passed its own lease and it is refused", async () => {
+  const s = await serve(() => ({ ok: false, error: refusal }));
+  try {
+    s.client.leases.set("A", "tok-a");
+    await assert.rejects(s.client.call("vm.mouse.move", { name: "A", x: 1, y: 2, lease: "other" }), ControlError);
+    assert.equal(s.client.leases.get("A"), "tok-a");
+  } finally {
+    await s.close();
+  }
+});
+
+test("isLeaseLost matches the two lease sentences only at the start of the message", () => {
+  assert.equal(isLeaseLost("lease token does not match; only the holder can release 'A'"), true);
+  assert.equal(isLeaseLost(refusal), true);
+  assert.equal(isLeaseLost("cannot read C:\\lease token does not match; only the holder can release 'A'.txt"), false);
+  assert.equal(isLeaseLost("exec failed: VM 'A' is leased by someone"), false);
 });
 
 test("call keeps the stored lease when the request fails for another reason", async () => {

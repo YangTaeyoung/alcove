@@ -3,7 +3,7 @@ import { ControlClient, ControlError, type ControlReply } from "./control.js";
 
 /** Whether a control error says that a lease token is not the one that holds the VM. */
 export function isLeaseLost(message: string): boolean {
-  return /lease token does not match/.test(message) || /^VM '.*' is leased by /.test(message);
+  return /^lease token does not match; only the holder can release '/.test(message) || /^VM '.*' is leased by /.test(message);
 }
 
 /** Remembers lease tokens per VM and adds `lease` to params of calls that name that VM. */
@@ -37,7 +37,8 @@ export class LeaseBook {
 
 /**
  * A ControlClient whose calls carry the lease this session holds for the VM they name.
- * A call that fails with a lease error (`isLeaseLost`) removes the stored lease of the VM it names.
+ * A call that fails with a lease error (`isLeaseLost`) removes the stored lease of the VM it names,
+ * unless the caller passed its own `lease`.
  */
 export class LeasedControlClient extends ControlClient {
   readonly leases = new LeaseBook();
@@ -46,7 +47,9 @@ export class LeasedControlClient extends ControlClient {
     try {
       return await super.call(op, this.leases.apply(params), timeoutMs);
     } catch (e) {
-      if (e instanceof ControlError && typeof params.name === "string" && isLeaseLost(e.message)) this.leases.clear(params.name);
+      if (e instanceof ControlError && typeof params.name === "string" && params.lease === undefined && isLeaseLost(e.message)) {
+        this.leases.clear(params.name);
+      }
       throw e;
     }
   }
