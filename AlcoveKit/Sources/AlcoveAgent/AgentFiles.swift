@@ -153,10 +153,13 @@ extension AgentClient {
     }
 
     /// Upload the files of `directory` whose size or digest differ from the guest copy; optionally delete guest files without a local counterpart.
-    public func syncDirectory(_ directory: URL, toGuestPath path: String, deleteExtras: Bool, timeout: Duration = .seconds(3600)) async throws -> SyncResult {
-        let local = try localFiles(in: directory)
+    /// A file whose path below the directory is in `preserving` is neither uploaded nor deleted.
+    public func syncDirectory(_ directory: URL, toGuestPath path: String, deleteExtras: Bool, preserving: Set<String> = [],
+                              timeout: Duration = .seconds(3600)) async throws -> SyncResult {
         let windows = path.contains("\\")
         let key: (String) -> String = { windows ? foldedName($0) : $0 }
+        let kept = Set(preserving.map(key))
+        let local = try localFiles(in: directory).filter { !kept.contains(key($0.name)) }
         if windows, let (a, b) = windowsCaseConflict(in: local.map(\.name)) {
             throw AgentError.remote("'\(a)' and '\(b)' differ only by case and cannot both exist in a Windows guest folder")
         }
@@ -168,7 +171,7 @@ extension AgentClient {
                 throw AgentError.remote("'\(path)' has more than 5000 entries in the guest; sync a smaller directory")
             }
             for entry in listing["entries"]?.arrayValue ?? [] where entry["dir"]?.boolValue != true {
-                guard let name = entry["name"]?.stringValue else { continue }
+                guard let name = entry["name"]?.stringValue, !kept.contains(key(name)) else { continue }
                 remote[key(name)] = (name, entry["size"]?.intValue ?? -1, entry["sha256"]?.stringValue?.lowercased() ?? "")
             }
         }

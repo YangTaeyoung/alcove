@@ -383,10 +383,19 @@ extension ControlHandler {
     }
 
     /// `app.launch` with `request` and a window wait of `waitMs`; the agent call outlasts the wait by 30 s.
+    /// The result holds `pid`, the `window` that appeared, or `windowTimedOut` when one was waited for and none appeared.
     func launch(_ agent: AgentClient, _ request: [String: JSON], waitMs: Int) async throws -> JSON {
         var fields = request
         fields["wait_window_ms"] = .int(Int64(waitMs))
-        return pick(try await agent.call("app.launch", fields, timeout: .milliseconds(waitMs + 30_000)), ["pid", "window"])
+        let r = try await agent.call("app.launch", fields, timeout: .milliseconds(waitMs + 30_000))
+        var out: [String: JSON] = [:]
+        if let pid = r["pid"] { out["pid"] = pid }
+        if let window = r["window"], window != .null {
+            out["window"] = window
+        } else if waitMs > 0 {
+            out["windowTimedOut"] = true
+        }
+        return .object(out)
     }
 
     private func launchApp(_ params: JSON) async throws -> JSON {

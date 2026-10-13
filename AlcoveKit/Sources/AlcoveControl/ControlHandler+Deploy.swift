@@ -3,6 +3,114 @@ import AlcoveEngine
 import AlcoveAgent
 import AlcoveQMP
 
+/// The guest folder `vm.deploy` copies into: which folders it accepts and how their paths are written.
+enum DeployTarget {
+    /// The folder below which a Windows guest keeps deployed apps by default.
+    static let defaultRoot = "C:\\alcove-apps"
+    /// The file `vm.deploy` writes into every folder it copied to.
+    static let marker = ".alcove-deploy"
+    static let markerText = "vm.deploy of Alcove copied the files of this folder and replaces them on the next deploy.\n"
+
+    private static let reservedNames: Set<String> = {
+        var names: Set<String> = ["CON", "PRN", "AUX", "NUL"]
+        for n in 1...9 { names.insert("COM\(n)"); names.insert("LPT\(n)") }
+        return names
+    }()
+    private static let invalidCharacters = Set("<>:\"/\\|?*".unicodeScalars)
+    private static let profileFolders: Set<String> = ["desktop", "documents", "downloads"]
+    private static let posixFolders: Set<String> = ["usr", "etc", "bin", "sbin", "var", "boot", "home", "root", "opt"]
+
+    private static func refusal(_ message: String) -> ControlHandler.ControlError { .failed(message) }
+
+    /// Whether Windows can use `name` as the name of a folder: not empty, `.` or `..`, no trailing dot or space,
+    /// none of `<>:"/\|?*`, no control character, and not a device name such as `CON` or `COM1` with or without an extension.
+    static func isWindowsName(_ name: String) -> Bool {
+        guard !name.isEmpty, name != ".", name != "..", let last = name.unicodeScalars.last, last != ".", last != " " else { return false }
+        guard !name.unicodeScalars.contains(where: { $0.value < 0x20 || invalidCharacters.contains($0) }) else { return false }
+        let stem = name.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? name
+        return !reservedNames.contains(stem.trimmingCharacters(in: .whitespaces).uppercased())
+    }
+
+    /// The default guest folder for a host file or directory called `name`.
+    static func defaultDirectory(named name: String) throws -> String {
+        guard isWindowsName(name) else { throw refusal("pass guestDir; '\(name)' cannot be used as a folder name") }
+        return defaultRoot + "\\" + name
+    }
+
+    /// `requested` written the guest's way, without repeated or trailing separators. Throws for a path that is not absolute,
+    /// has a `.` or `..` segment, is a filesystem root, or is a system or profile folder. `example` is the folder the
+    /// refusal suggests.
+    static func directory(_ requested: String, windows: Bool, example: String) throws -> String {
+        func fail(_ reason: String) -> ControlHandler.ControlError { refusal("guestDir '\(requested)' \(reason) such as \(example)") }
+        let relative = windows ? "is not an absolute path; pass a full path" : "is not an absolute path of this guest; pass a full path"
+        let prefix: String
+        let segments: [String]
+        if windows {
+            let text = requested.replacingOccurrences(of: "/", with: "\\")
+            let scalars = Array(text.unicodeScalars.prefix(3))
+            if text.hasPrefix("\\\\") {
+                let parts = text.dropFirst(2).split(separator: "\\").map(String.init)
+                guard parts.count >= 2, !text.dropFirst(2).hasPrefix("\\"), parts[0] != "?", parts[0] != "." else { throw fail(relative) }
+                prefix = "\\\\" + parts[0] + "\\" + parts[1]
+                segments = Array(parts.dropFirst(2))
+            } else if scalars.count == 3, scalars[0].isASCII, scalars[0].properties.isAlphabetic, scalars[1] == ":", scalars[2] == "\\" {
+                prefix = String(text.prefix(2))
+                segments = text.dropFirst(3).split(separator: "\\").map(String.init)
+            } else {
+                throw fail(relative)
+            }
+        } else {
+            guard requested.hasPrefix("/"), !requested.contains("\\") else { throw fail(relative) }
+            prefix = ""
+            segments = requested.split(separator: "/").map(String.init)
+        }
+        guard !segments.contains(where: { $0 == "." || $0 == ".." }) else { throw fail("has a '.' or '..' segment; pass the folder's full path") }
+        if windows, let bad = segments.first(where: { !isWindowsName($0) }) {
+            throw fail("has the segment '\(bad)', which Windows cannot use as a folder name; pass a plain folder path")
+        }
+        guard !segments.isEmpty else { throw fail("is a filesystem root; pass a folder below it") }
+        let folded = segments.map { $0.precomposedStringWithCanonicalMapping.lowercased() }
+        if windows {
+            guard !isWindowsSystemFolder(folded) else { throw fail("is a system or profile folder; pass a folder of its own") }
+            return prefix + "\\" + segments.joined(separator: "\\")
+        }
+        let single = folded.count == 1 && (posixFolders.contains(folded[0]) || folded[0].hasPrefix("lib"))
+        guard !single, !(folded.count == 2 && folded[0] == "home") else { throw fail("is a system or home folder; pass a folder of its own") }
+        return "/" + segments.joined(separator: "/")
+    }
+
+    /// Whether the lower-case `segments` below a drive or share name the Windows folder or one below it, a `Program Files`
+    /// folder itself, `ProgramData` itself or the agent's folder in it, `Users`, a profile, or a profile's Desktop,
+    /// Documents, Downloads or anything in its AppData.
+    private static func isWindowsSystemFolder(_ segments: [String]) -> Bool {
+        switch segments[0] {
+        case "windows": return true
+        case "programdata": return segments.count == 1 || segments[1] == "alcove"
+        case "users":
+            guard segments.count >= 3 else { return true }
+            return segments[2] == "appdata" || (segments.count == 3 && profileFolders.contains(segments[2]))
+        default: return segments.count == 1 && segments[0].hasPrefix("program files")
+        }
+    }
+
+    /// Whether `directory` lies below `defaultRoot`.
+    static func isUnderDefaultRoot(_ directory: String) -> Bool {
+        ControlHandler.isPath(directory, under: defaultRoot, windows: true)
+    }
+
+    /// Whether the guest path `path` is absolute: it starts with a separator or a drive letter.
+    static func isAbsolute(_ path: String) -> Bool {
+        if path.hasPrefix("/") || path.hasPrefix("\\") { return true }
+        let scalars = Array(path.unicodeScalars.prefix(2))
+        return scalars.count == 2 && scalars[1] == ":" && scalars[0].isASCII && scalars[0].properties.isAlphabetic
+    }
+
+    /// Whether the relative guest path `path` has a `.` or `..` segment.
+    static func leavesFolder(_ path: String) -> Bool {
+        path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).contains { $0 == "." || $0 == ".." }
+    }
+}
+
 /// `vm.deploy`: copies a host file or directory into a guest folder, optionally runs an installer and launches a program.
 /// Built on the agent's `proc.*`, `fs.*`, `exec.run` and `app.launch` operations.
 extension ControlHandler {
@@ -10,7 +118,6 @@ extension ControlHandler {
     static let installTimeoutMilliseconds = 900_000
     /// The installer exit code that means success with a restart pending.
     static let installRestartCode = 3010
-    static let defaultGuestRoot = "C:\\alcove-apps"
 
     private struct InstallPlan {
         let msi: Bool
@@ -23,12 +130,27 @@ extension ControlHandler {
         var fields: [String: JSON]
     }
 
+    private struct DeployPlan {
+        let source: URL
+        let isDirectory: Bool
+        let guestDir: String
+        let windows: Bool
+        let killRunning: Bool
+        let waitMs: Int
+        let install: InstallPlan?
+        let launch: LaunchPlan?
+
+        var separator: String { windows ? "\\" : "/" }
+        func path(_ relative: String) -> String { ControlHandler.guestPath(relative, in: guestDir, windows: windows) }
+    }
+
+    /// Checks the parameters, the host path and the guest folder, then runs the deploy when no other deploy to the VM is running.
     func deploy(_ params: JSON) async throws -> JSON {
-        let op = "vm.deploy"
-        let path = try string(params, "path")
+        let given = try string(params, "path")
+        guard given.hasPrefix("/") else { throw ControlError.failed("pass an absolute host path") }
         var requestedDir: String?
         if let value = params["guestDir"], value != .null {
-            guard let text = value.stringValue, !ControlHandler.trimmingSeparators(text).isEmpty else { throw ControlError.missing("guestDir") }
+            guard let text = value.stringValue, !text.isEmpty else { throw ControlError.missing("guestDir") }
             requestedDir = text
         }
         let killRunning = try optional(params, "killRunning", .boolean)?.boolValue ?? true
@@ -36,48 +158,69 @@ extension ControlHandler {
         let install = try installPlan(params["install"])
         let launching = try launchPlan(params["launch"])
 
+        let source = URL(fileURLWithPath: given).standardizedFileURL
         var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
-            throw ControlError.failed("'\(path)' does not exist on the host; check the path")
+        guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory) else {
+            throw ControlError.failed("'\(given)' does not exist on the host; check the path")
         }
-        let source = URL(fileURLWithPath: path)
+        if !isDirectory.boolValue, source.lastPathComponent == DeployTarget.marker {
+            throw ControlError.failed("a file named \(DeployTarget.marker) cannot be deployed, vm.deploy keeps its own file under that name; rename the file")
+        }
         let t = try await running(params)
+        let windows = await t.guestOS() == .windows
+        let base = (isDirectory.boolValue ? source.lastPathComponent : source.deletingPathExtension().lastPathComponent)
+            .precomposedStringWithCanonicalMapping
         let guestDir: String
         if let requestedDir {
-            guestDir = ControlHandler.trimmingSeparators(requestedDir)
+            let name = DeployTarget.isWindowsName(base) ? base : "app"
+            guestDir = try DeployTarget.directory(requestedDir, windows: windows, example: windows ? DeployTarget.defaultRoot + "\\" + name : "/opt/" + name)
         } else {
-            let base = (isDirectory.boolValue ? source.lastPathComponent : source.deletingPathExtension().lastPathComponent)
-                .precomposedStringWithCanonicalMapping
-            let fallback = ControlHandler.defaultGuestRoot + "\\" + base
-            guard await t.guestOS() == .windows else {
-                throw ControlError.failed("pass guestDir; the default \(fallback) only fits Windows guests")
-            }
+            let fallback = try DeployTarget.defaultDirectory(named: base)
+            guard windows else { throw ControlError.failed("pass guestDir; the default \(fallback) only fits Windows guests") }
             guestDir = fallback
         }
-        let agent = try await tools(t)
+        let plan = DeployPlan(source: source, isDirectory: isDirectory.boolValue, guestDir: guestDir, windows: windows, killRunning: killRunning,
+                              waitMs: waitMs, install: install, launch: launching)
+        return try await deployGate.withLock(t.name) { try await self.run(plan, on: t) }
+    }
 
+    private func run(_ plan: DeployPlan, on t: VMTarget) async throws -> JSON {
+        let op = "vm.deploy"
+        let agent = try await tools(t)
+        let guestDir = plan.guestDir
         var out: [String: JSON] = ["guestDir": .string(guestDir)]
         do {
-            if killRunning { try await stopProcesses(under: guestDir, agent) }
-            if isDirectory.boolValue {
-                let r = try await agent.syncDirectory(source, toGuestPath: guestDir, deleteExtras: true)
+            try await checkFolder(plan, agent)
+            if plan.killRunning { try await stopProcesses(plan, agent) }
+            if plan.isDirectory {
+                let r = try await agent.syncDirectory(plan.source, toGuestPath: guestDir, deleteExtras: true, preserving: [DeployTarget.marker])
                 out["sent"] = .array(r.sent.map(JSON.string)); out["skipped"] = .int(Int64(r.skipped)); out["bytes"] = .int(Int64(r.bytes))
             } else {
-                let name = source.lastPathComponent.precomposedStringWithCanonicalMapping
-                let r = try await agent.pushFile(source, toGuestPath: ControlHandler.guestPath(name, in: guestDir), overwrite: true)
+                let name = plan.source.lastPathComponent.precomposedStringWithCanonicalMapping
+                let r = try await agent.pushFile(plan.source, toGuestPath: plan.path(name), overwrite: true)
                 out["sent"] = [.string(name)]; out["skipped"] = 0; out["bytes"] = .int(Int64(r.bytes))
             }
-            if let install { out["installCode"] = .int(Int64(try await runInstaller(install, in: guestDir, agent))) }
-            if let launching {
-                var request = launching.fields
-                request["path"] = .string(ControlHandler.guestPath(launching.exe, in: guestDir))
-                if request["cwd"] == nil { request["cwd"] = .string(guestDir) }
-                let started = try await launch(agent, request, waitMs: waitMs)
-                if let pid = started["pid"] { out["pid"] = pid }
-                if let window = started["window"] { out["window"] = window }
-            }
+            _ = try await agent.call("fs.write", ["path": .string(plan.path(DeployTarget.marker)),
+                                                  "data": .string(Data(DeployTarget.markerText.utf8).base64EncodedString()),
+                                                  "truncate": true, "mkdirs": true])
+            if let install = plan.install { out["installCode"] = .int(Int64(try await runInstaller(install, plan, agent))) }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw agentFailure(error, vm: t.name, op: op)
+        }
+        if let launching = plan.launch {
+            var request = launching.fields
+            let exe = plan.path(launching.exe)
+            request["path"] = .string(exe)
+            if request["cwd"] == nil { request["cwd"] = .string(guestDir) }
+            do {
+                for (key, value) in try await launch(agent, request, waitMs: plan.waitMs).objectValue ?? [:] { out[key] = value }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ControlError.failed("the files were copied to \(guestDir), but starting \(exe) failed: \(agentFailure(error, vm: t.name, op: op))")
+            }
         }
         return .object(out)
     }
@@ -93,6 +236,9 @@ extension ControlHandler {
         if let list = value["args"], list != .null {
             guard let items = list.arrayValue, items.allSatisfy(isString) else { throw ControlError.failed("install.args must be an array of strings") }
             args = items
+        }
+        guard DeployTarget.isAbsolute(file) || !DeployTarget.leavesFolder(file) else {
+            throw ControlError.failed("install.file must stay inside guestDir; pass an absolute path to run something else")
         }
         return InstallPlan(msi: kind == "msi", file: file, args: args)
     }
@@ -113,39 +259,26 @@ extension ControlHandler {
             guard cwd.stringValue != nil else { throw ControlError.failed("launch.cwd must be a string") }
             fields["cwd"] = cwd
         }
+        guard DeployTarget.isAbsolute(exe) || !DeployTarget.leavesFolder(exe) else {
+            throw ControlError.failed("launch.exe must stay inside guestDir; pass an absolute path to start something else")
+        }
         return LaunchPlan(exe: exe, fields: fields)
     }
 
     // MARK: - guest paths
 
-    /// Whether `path` is written the Windows way: with a backslash or a drive letter.
-    static func isWindowsPath(_ path: String) -> Bool {
-        if path.contains("\\") { return true }
-        let scalars = Array(path.unicodeScalars.prefix(2))
-        return scalars.count == 2 && scalars[1] == ":" && scalars[0].isASCII && scalars[0].properties.isAlphabetic
-    }
-
-    /// `path` without separators at its end; a root such as `/` or `C:\` stays as it is.
-    static func trimmingSeparators(_ path: String) -> String {
-        var out = path
-        while out.count > 1, let last = out.last, last == "\\" || last == "/", !out.dropLast().hasSuffix(":") { out.removeLast() }
-        return out
-    }
-
-    /// `path` when it is absolute in the guest, otherwise `path` below `directory` with the directory's separator.
-    static func guestPath(_ path: String, in directory: String) -> String {
-        if path.hasPrefix("/") || path.hasPrefix("\\") || (isWindowsPath(path) && path.unicodeScalars.dropFirst().first == ":") { return path }
-        let separator = isWindowsPath(directory) ? "\\" : "/"
-        let tail = separator == "\\" ? path.replacingOccurrences(of: "/", with: "\\") : path
+    /// `path` when it is absolute in the guest, otherwise `path` below `directory` with the guest's separator.
+    static func guestPath(_ path: String, in directory: String, windows: Bool) -> String {
+        if DeployTarget.isAbsolute(path) { return path }
+        let separator = windows ? "\\" : "/"
+        let tail = windows ? path.replacingOccurrences(of: "/", with: "\\") : path
         return directory.hasSuffix(separator) ? directory + tail : directory + separator + tail
     }
 
-    /// Whether the executable at `path` lies below `directory`; Windows paths compare without regard to case or the kind of separator.
-    static func isPath(_ path: String, under directory: String) -> Bool {
+    /// Whether `path` lies below `directory`, at a separator; Windows paths compare without regard to case or the kind of separator.
+    static func isPath(_ path: String, under directory: String, windows: Bool) -> Bool {
         guard !path.isEmpty else { return false }
-        guard isWindowsPath(directory) else {
-            return path.hasPrefix(directory.hasSuffix("/") ? directory : directory + "/")
-        }
+        guard windows else { return path.hasPrefix(directory.hasSuffix("/") ? directory : directory + "/") }
         func fold(_ s: String) -> String { s.replacingOccurrences(of: "/", with: "\\").precomposedStringWithCanonicalMapping.lowercased() }
         let root = fold(directory)
         return fold(path).hasPrefix(root.hasSuffix("\\") ? root : root + "\\")
@@ -153,28 +286,69 @@ extension ControlHandler {
 
     // MARK: - steps
 
-    /// The processes whose executable lies below `directory`.
-    private func processes(under directory: String, _ agent: AgentClient) async throws -> [JSON] {
-        let list = try await agent.call("proc.list")["procs"]?.arrayValue ?? []
-        return list.filter { ControlHandler.isPath($0["path"]?.stringValue ?? "", under: directory) }
+    /// Accepts the guest folder when it does not exist, is empty, lies below the default root or holds the deploy marker.
+    private func checkFolder(_ plan: DeployPlan, _ agent: AgentClient) async throws {
+        let guestDir = plan.guestDir
+        let found = try await agent.call("fs.stat", ["path": .string(guestDir)])
+        guard found["exists"]?.boolValue == true else { return }
+        guard found["dir"]?.boolValue == true else {
+            throw ControlError.failed("'\(guestDir)' is a file in the guest; pass a folder as guestDir")
+        }
+        if plan.windows, DeployTarget.isUnderDefaultRoot(guestDir) { return }
+        if try await agent.call("fs.stat", ["path": .string(plan.path(DeployTarget.marker))])["exists"]?.boolValue == true { return }
+        let listing = try await agent.call("fs.list", ["path": .string(guestDir)])
+        guard (listing["entries"]?.arrayValue ?? []).isEmpty, listing["truncated"]?.boolValue != true else {
+            let hint = plan.windows ? ", or one under \(DeployTarget.defaultRoot)" : ""
+            throw ControlError.failed("'\(guestDir)' already holds files that Alcove did not deploy; choose an empty or new folder\(hint)")
+        }
     }
 
-    /// Kills the process trees running from `directory` and waits until none is left; fails when one survives `processExitTimeout`.
-    private func stopProcesses(under directory: String, _ agent: AgentClient) async throws {
-        var running = try await processes(under: directory, agent)
+    /// The processes whose executable lies below the guest folder.
+    private func processes(_ plan: DeployPlan, _ agent: AgentClient) async throws -> [JSON] {
+        let list = try await agent.call("proc.list")["procs"]?.arrayValue ?? []
+        return list.filter { ControlHandler.isPath($0["path"]?.stringValue ?? "", under: plan.guestDir, windows: plan.windows) }
+    }
+
+    /// The process id of the agent: the parent of a shell the agent starts.
+    private func agentProcessID(_ plan: DeployPlan, _ agent: AgentClient) async -> Int? {
+        guard let r = try? await agent.call("exec.run", ["cmd": .string(GuestRecipes.parentProcessID(windows: plan.windows)), "timeout_ms": 30_000],
+                                            timeout: .seconds(45)),
+              r["code"]?.intValue == 0, r["timed_out"]?.boolValue != true else { return nil }
+        return Int((r["stdout"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Kills the process trees running from the guest folder and waits until none is left; fails when one survives `processExitTimeout`.
+    /// Nothing is killed when the agent's own process cannot be told, or when the agent or one of its ancestors runs from the folder.
+    private func stopProcesses(_ plan: DeployPlan, _ agent: AgentClient) async throws {
+        let all = try await agent.call("proc.list")["procs"]?.arrayValue ?? []
+        var running = all.filter { ControlHandler.isPath($0["path"]?.stringValue ?? "", under: plan.guestDir, windows: plan.windows) }
         guard !running.isEmpty else { return }
+        guard let own = await agentProcessID(plan, agent) else {
+            throw ControlError.failed("vm.deploy could not find the guest agent's own process, so it stopped nothing under '\(plan.guestDir)'; "
+                                      + "stop the running copies with vm.process.kill, or pass killRunning: false")
+        }
+        var parents: [Int: Int] = [:]
+        for process in all { if let pid = process["pid"]?.intValue, let parent = process["ppid"]?.intValue { parents[pid] = parent } }
+        var protected: Set<Int> = []
+        var next: Int? = own
+        while let pid = next, protected.insert(pid).inserted { next = parents[pid] }
+        if let kept = running.first(where: { protected.contains($0["pid"]?.intValue ?? -1) }) {
+            let name = kept["name"]?.stringValue ?? "a process"
+            throw ControlError.failed("the guest agent or a process that started it (\(name), pid \(kept["pid"]?.intValue ?? own)) runs from "
+                                      + "'\(plan.guestDir)'; pass another guestDir")
+        }
         for process in running {
             guard let pid = process["pid"] else { continue }
             do { _ = try await agent.call("proc.kill", ["pid": pid, "tree": true]) } catch AgentClient.AgentError.remote { continue }
         }
         let deadline = ContinuousClock.now + UITiming.processExitTimeout
         while true {
-            running = try await processes(under: directory, agent)
+            running = try await processes(plan, agent)
             guard let survivor = running.first else { return }
             if ContinuousClock.now >= deadline {
                 let name = survivor["name"]?.stringValue ?? "a process"
                 let pid = survivor["pid"]?.intValue.map { " (pid \($0))" } ?? ""
-                throw ControlError.failed("\(name)\(pid) under '\(directory)' is still running after vm.deploy tried to stop it; "
+                throw ControlError.failed("\(name)\(pid) under '\(plan.guestDir)' is still running after vm.deploy tried to stop it; "
                                           + "stop it with vm.process.kill or pass another guestDir")
             }
             try await Task.sleep(for: UITiming.processPoll)
@@ -182,11 +356,11 @@ extension ControlHandler {
     }
 
     /// Runs the installer without a shell and returns its exit code; a code other than 0 and `installRestartCode`, or a timeout, fails.
-    private func runInstaller(_ plan: InstallPlan, in guestDir: String, _ agent: AgentClient) async throws -> Int {
-        let file = ControlHandler.guestPath(plan.file, in: guestDir)
-        let argv: [JSON] = plan.msi ? ["msiexec.exe", "/i", .string(file), "/qn", "/norestart"] + plan.args : [.string(file)] + plan.args
+    private func runInstaller(_ install: InstallPlan, _ plan: DeployPlan, _ agent: AgentClient) async throws -> Int {
+        let file = plan.path(install.file)
+        let argv: [JSON] = install.msi ? ["msiexec.exe", "/i", .string(file), "/qn", "/norestart"] + install.args : [.string(file)] + install.args
         let seconds = ControlHandler.installTimeoutMilliseconds / 1000
-        let r = try await agent.call("exec.run", ["argv": .array(argv), "cwd": .string(guestDir),
+        let r = try await agent.call("exec.run", ["argv": .array(argv), "cwd": .string(plan.guestDir),
                                                   "timeout_ms": .int(Int64(ControlHandler.installTimeoutMilliseconds))],
                                      timeout: .seconds(seconds + 15))
         if r["timed_out"]?.boolValue == true {
