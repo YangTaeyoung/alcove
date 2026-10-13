@@ -213,6 +213,28 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertEqual(summary.lastWriteError, "no frame could be recorded for the video")
     }
 
+    func testFramesAppendedRightAfterTheFirstOneAreEncodedWithoutCrashing() async throws {
+        for n in 0..<40 {
+            let url = base.appendingPathComponent("burst-\(n).mp4")
+            let recorder = VideoRecorder(url: url, fps: 5)
+            for i in 0..<12 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 10)) }
+            await recorder.finish()
+            XCTAssertTrue(recorder.errorMessage == nil || !FileManager.default.fileExists(atPath: url.path))
+            XCTAssertGreaterThanOrEqual(recorder.appendedSeconds, 0)
+        }
+    }
+
+    func testRecorderDroppedWithoutFinishLeavesItsDirectoryRemovable() throws {
+        let dir = base.appendingPathComponent("dropped")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            let recorder = VideoRecorder(url: dir.appendingPathComponent("video.mp4"), fps: 5)
+            for i in 0..<3 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)) }
+        }
+        try FileManager.default.removeItem(at: dir)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.path))
+    }
+
     func testStaleVideoFileIsRemovedAtStart() async throws {
         let dir = base.appendingPathComponent("stale")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

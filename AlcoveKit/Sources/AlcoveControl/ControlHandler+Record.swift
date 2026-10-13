@@ -116,10 +116,8 @@ extension ControlHandler {
             return try await startRecording(t, params)
         case "vm.record.stop":
             if let current = recordings.active[vm] {
-                if recordings.active[vm] === current {
-                    recordings.active[vm] = nil
-                    recordings.retiring[vm] = current
-                }
+                recordings.active[vm] = nil
+                recordings.retiring[vm] = current
                 return try await collect(current, vm: vm)
             }
             if let retiring = recordings.retiring[vm] { return try await collect(retiring, vm: vm) }

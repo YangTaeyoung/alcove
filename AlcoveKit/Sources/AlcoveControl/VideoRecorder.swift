@@ -32,7 +32,12 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     private var dropped = 0
 
     private var renderFailures = 0
+    private var pool: CVPixelBufferPool?
     private var beforeEndSession: (@Sendable () -> Void)?
+
+    deinit {
+        if let writer, writer.status == .writing { writer.cancelWriting() }
+    }
 
     /// Removes a file already at `url`.
     init(url: URL, fps: Int) {
@@ -115,7 +120,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 if countDrop { dropped += 1 }
                 return
             }
-            guard let buffer = makeBuffer(adaptor), render(frame, into: buffer) else {
+            guard let buffer = makeBuffer(), render(frame, into: buffer) else {
                 if countDrop { dropped += 1 }
                 return
             }
@@ -202,6 +207,17 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 failure = "the video encoder does not accept the screen size \(size.width)x\(size.height)"
                 return false
             }
+            var newPool: CVPixelBufferPool?
+            let poolStatus = CVPixelBufferPoolCreate(nil, nil, [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: size.width,
+                kCVPixelBufferHeightKey as String: size.height,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+            ] as CFDictionary, &newPool)
+            guard poolStatus == kCVReturnSuccess, let newPool else {
+                failure = "the video could not be written: the pixel buffer pool could not be created"
+                return false
+            }
             writer.add(input)
             guard writer.startWriting() else {
                 failure = describe(writer.error)
@@ -210,6 +226,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
             self.writer = writer
             self.input = input
             self.adaptor = adaptor
+            pool = newPool
             width = size.width
             height = size.height
             return true
@@ -223,13 +240,11 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
         "the video could not be written: \(error?.localizedDescription ?? "the encoder stopped before the recording ended")"
     }
 
-    private func makeBuffer(_ adaptor: AVAssetWriterInputPixelBufferAdaptor) -> CVPixelBuffer? {
+    /// Buffers come from a pool this recorder owns.
+    private func makeBuffer() -> CVPixelBuffer? {
+        guard let pool else { return nil }
         var buffer: CVPixelBuffer?
-        if let pool = adaptor.pixelBufferPool {
-            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
-        } else {
-            CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &buffer)
-        }
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
         return buffer
     }
 
