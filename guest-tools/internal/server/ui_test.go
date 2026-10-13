@@ -62,6 +62,7 @@ func TestUIOpsPassThrough(t *testing.T) {
 		{"ui.rect", "ui.rect", 20 * time.Second},
 		{"ui.act", "ui.act", 20 * time.Second},
 		{"ui.focused", "ui.focused", 20 * time.Second},
+		{"ui.at", "ui.at", 20 * time.Second},
 		{"ui.ping", "ping", 20 * time.Second},
 	}
 	for i, c := range cases {

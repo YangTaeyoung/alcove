@@ -49,6 +49,7 @@ func (s *Server) registerUI() {
 		{"ui.rect", "ui.rect", normal},
 		{"ui.act", "ui.act", normal},
 		{"ui.focused", "ui.focused", normal},
+		{"ui.at", "ui.at", normal},
 		{"ui.ping", "ping", normal},
 	}
 	for _, o := range ops {

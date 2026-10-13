@@ -415,6 +415,7 @@ namespace Alcove
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int max);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
@@ -863,6 +864,7 @@ namespace Alcove
                 case "ui.text": return UiText(req);
                 case "ui.rect": return UiRect(req);
                 case "ui.focused": return UiFocused();
+                case "ui.at": return UiAt(req);
                 default: throw new HelperException("unknown op '" + op + "'; update alcove-agent");
             }
         }
@@ -2569,6 +2571,465 @@ namespace Alcove
             r["node"] = node;
             r["window"] = WindowObjectOrNull(scopeWindow);
             return r;
+        }
+
+        // ---- ui.at ----
+
+        const int DefaultAtBudgetMs = 250;
+        const int MinAtBudgetMs = 50;
+        const int MaxAtBudgetMs = 2000;
+        const int MaxAtThreadsPerApp = 8;
+        const int AtStackBytes = 16 * 1024 * 1024;
+        static readonly Dictionary<int, int> atThreads = new Dictionary<int, int>();
+
+        enum AtMode { Point, Ref, Focused }
+
+        // The element a ui.at worker found.
+        sealed class AtLocated
+        {
+            public AutomationElement Element;
+            public Dictionary<string, object> Node;
+            public Dictionary<string, object> Window;
+            public bool HasAutomationId;
+            public bool HasName;
+        }
+
+        // The selector counts of a finished walk; a field is null when the walk did not meet the element.
+        sealed class AtCounts
+        {
+            public Dictionary<string, object> ByAutomationId;
+            public Dictionary<string, object> ByName;
+        }
+
+        // What one ui.at worker reports. The worker assigns each field at most once; the request
+        // thread reads them when the worker ended or the time for the request is used up.
+        sealed class AtAnswer
+        {
+            public volatile AtLocated Located;
+            public volatile AtCounts Counts;
+            public volatile bool Nothing;
+            public volatile bool Gone;
+            public volatile Exception Failure;
+        }
+
+        // The walk that counts the elements of a window that match the found element's
+        // role and automation id, and its role and name.
+        sealed class AtCount
+        {
+            public CacheRequest Cache;
+            public Stopwatch Spent;
+            public int BudgetMs;
+            public ControlType Type;
+            public int[] Target;
+            public string AutomationId;
+            public string Name;
+            public int MatchesAutomationId, MatchesName;
+            public int IndexAutomationId = -1, IndexName = -1;
+            public bool Stopped;
+
+            public void Visit(AutomationElement element)
+            {
+                if (Type != element.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType)
+                {
+                    return;
+                }
+                bool aid = AutomationId != null
+                    && string.Equals((element.GetCachedPropertyValue(AutomationElement.AutomationIdProperty) as string) ?? "", AutomationId, StringComparison.Ordinal);
+                bool name = Name != null
+                    && string.Equals((element.GetCachedPropertyValue(AutomationElement.NameProperty) as string) ?? "", Name, StringComparison.Ordinal);
+                if (!aid && !name)
+                {
+                    return;
+                }
+                bool target = ((aid && IndexAutomationId < 0) || (name && IndexName < 0)) && IsTarget(element);
+                if (aid)
+                {
+                    if (target && IndexAutomationId < 0) { IndexAutomationId = MatchesAutomationId; }
+                    MatchesAutomationId++;
+                }
+                if (name)
+                {
+                    if (target && IndexName < 0) { IndexName = MatchesName; }
+                    MatchesName++;
+                }
+            }
+
+            bool IsTarget(AutomationElement element)
+            {
+                int[] id = element.GetRuntimeId();
+                if (id == null || id.Length != Target.Length)
+                {
+                    return false;
+                }
+                for (int i = 0; i < id.Length; i++)
+                {
+                    if (id[i] != Target[i])
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            public static Dictionary<string, object> Result(int matches, int index)
+            {
+                if (index < 0)
+                {
+                    return null;
+                }
+                Dictionary<string, object> d = new Dictionary<string, object>();
+                d["matches"] = matches;
+                d["index"] = index;
+                return d;
+            }
+        }
+
+        static int CachedHandle(AutomationElement element)
+        {
+            object v = Cached(element, AutomationElement.NativeWindowHandleProperty);
+            return v is int ? (int)v : 0;
+        }
+
+        Dictionary<string, object> UiAt(Dictionary<string, object> req)
+        {
+            bool hasX = Params.Has(req, "x"), hasY = Params.Has(req, "y");
+            string reference = Params.Str(req, "ref");
+            bool focused = Params.Bool(req, "focused", false);
+            if ((hasX || hasY ? 1 : 0) + (reference != null ? 1 : 0) + (focused ? 1 : 0) != 1 || hasX != hasY)
+            {
+                throw new HelperException("pass x and y, ref, or focused: true");
+            }
+            int budget = Math.Max(MinAtBudgetMs, Math.Min(MaxAtBudgetMs, Params.Int(req, "budgetMs", DefaultAtBudgetMs)));
+            Stopwatch spent = Stopwatch.StartNew();
+            AtMode mode = hasX ? AtMode.Point : focused ? AtMode.Focused : AtMode.Ref;
+            int x = Params.Int(req, "x", 0), y = Params.Int(req, "y", 0);
+            string nothing = mode == AtMode.Point
+                ? "no element at (" + x.ToString(CultureInfo.InvariantCulture) + ", " + y.ToString(CultureInfo.InvariantCulture) + "); take a screenshot to see what is there"
+                : "no element has the keyboard focus; click the field first";
+            string late = (mode == AtMode.Point ? "no element at (" + x.ToString(CultureInfo.InvariantCulture) + ", " + y.ToString(CultureInfo.InvariantCulture) + ")"
+                : mode == AtMode.Focused ? "the focused element was not read" : "element " + reference + " was not read")
+                + ": the app did not answer within " + budget.ToString(CultureInfo.InvariantCulture) + " ms; retry";
+
+            RefEntry entry = null;
+            IntPtr top;
+            if (mode == AtMode.Point)
+            {
+                int left = Native.GetSystemMetrics(76), topEdge = Native.GetSystemMetrics(77);
+                if (x < left || y < topEdge || x >= left + Native.GetSystemMetrics(78) || y >= topEdge + Native.GetSystemMetrics(79))
+                {
+                    throw new HelperException(nothing);
+                }
+                Native.POINT point = new Native.POINT();
+                point.X = x;
+                point.Y = y;
+                IntPtr hit = Native.WindowFromPoint(point);
+                if (hit == IntPtr.Zero)
+                {
+                    throw new HelperException(nothing);
+                }
+                top = Native.GetAncestor(hit, Native.GA_ROOT);
+            }
+            else if (mode == AtMode.Ref)
+            {
+                entry = LookupRef(reference);
+                top = entry.Window;
+            }
+            else
+            {
+                top = Native.ForegroundWindow();
+            }
+            if (top != IntPtr.Zero && Native.IsHungAppWindow(top))
+            {
+                throw new HelperException(late);
+            }
+            int pid = 0;
+            if (top != IntPtr.Zero)
+            {
+                uint p;
+                Native.GetWindowThreadProcessId(top, out p);
+                pid = (int)p;
+            }
+            int running;
+            if (!TryEnter(atThreads, MaxAtThreadsPerApp, pid, out running))
+            {
+                throw new HelperException(late);
+            }
+
+            AtAnswer answer = new AtAnswer();
+            AutomationElement known = entry != null ? entry.Element : null;
+            Thread worker = new Thread(delegate()
+            {
+                try
+                {
+                    AtWork(answer, mode, x, y, reference, known, spent, budget);
+                }
+                catch (Exception e)
+                {
+                    answer.Failure = e;
+                }
+                finally
+                {
+                    Leave(atThreads, pid);
+                }
+            }, AtStackBytes);
+            worker.IsBackground = true;
+            worker.SetApartmentState(ApartmentState.MTA);
+            worker.Start();
+            worker.Join((int)Math.Max(0, budget - spent.ElapsedMilliseconds));
+
+            AtLocated located = answer.Located;
+            if (located == null)
+            {
+                if (answer.Gone)
+                {
+                    ForgetRef(entry);
+                    throw new HelperException(GoneSentence(reference));
+                }
+                if (answer.Nothing)
+                {
+                    throw new HelperException(nothing);
+                }
+                Exception failure = answer.Failure;
+                if (failure != null)
+                {
+                    throw new InvalidOperationException(failure.Message, failure);
+                }
+                throw new HelperException(late);
+            }
+            AtCounts counts = answer.Counts;
+            if (entry != null)
+            {
+                entry.Element = located.Element;
+                entry.Used = ++clock;
+            }
+            Dictionary<string, object> r = new Dictionary<string, object>();
+            r["node"] = located.Node;
+            r["window"] = located.Window;
+            if (located.HasAutomationId)
+            {
+                r["byAutomationId"] = counts == null ? null : counts.ByAutomationId;
+            }
+            if (located.HasName)
+            {
+                r["byName"] = counts == null ? null : counts.ByName;
+            }
+            return r;
+        }
+
+        // Runs on a ui.at worker thread and uses no state of the session. Finds the element at
+        // the point, with the focus or of the ref, then counts the selector matches in its
+        // window until budget ms of spent have passed. For a point or the focus, an element
+        // below a password field is replaced by the outermost password field above it, and the
+        // result by its nearest ancestor in the control view.
+        static void AtWork(AtAnswer answer, AtMode mode, int x, int y, string reference, AutomationElement known, Stopwatch spent, int budget)
+        {
+            try { Native.SetThreadDpiAwarenessContext(new IntPtr(-4)); }
+            catch (EntryPointNotFoundException) { }
+            CacheRequest raw = NodeCache(Automation.RawViewCondition);
+            raw.Add(AutomationElement.NativeWindowHandleProperty);
+            raw.Add(AutomationElement.ProcessIdProperty);
+            CacheRequest control = NodeCache(Automation.ControlViewCondition);
+            control.Add(AutomationElement.NativeWindowHandleProperty);
+            CacheRequest up = new CacheRequest();
+            up.TreeFilter = Automation.RawViewCondition;
+            up.Add(AutomationElement.IsPasswordProperty);
+            up.Add(AutomationElement.NativeWindowHandleProperty);
+
+            AutomationElement element;
+            int handle;
+            AutomationElement outer = null;
+            bool unreadable = false;
+            try
+            {
+                if (mode == AtMode.Ref)
+                {
+                    element = known.GetUpdatedCache(raw);
+                    object owner = Cached(element, AutomationElement.ProcessIdProperty);
+                    if (!(owner is int) || (int)owner == 0)
+                    {
+                        answer.Gone = true;
+                        return;
+                    }
+                }
+                else
+                {
+                    using (raw.Activate())
+                    {
+                        element = mode == AtMode.Point ? AutomationElement.FromPoint(new Point(x, y)) : AutomationElement.FocusedElement;
+                    }
+                    if (element == null)
+                    {
+                        answer.Nothing = true;
+                        return;
+                    }
+                }
+                handle = CachedHandle(element);
+                try
+                {
+                    AutomationElement current = TreeWalker.RawViewWalker.GetParent(element, up);
+                    for (int i = 0; i < MaxWalkDepth && current != null; i++)
+                    {
+                        if (IsPasswordElement(current))
+                        {
+                            outer = current;
+                        }
+                        if (handle == 0)
+                        {
+                            handle = CachedHandle(current);
+                        }
+                        current = TreeWalker.RawViewWalker.GetParent(current, up);
+                    }
+                    unreadable = current != null;
+                }
+                catch (InvalidOperationException) { unreadable = true; }
+                catch (COMException) { unreadable = true; }
+                catch (System.ComponentModel.Win32Exception) { unreadable = true; }
+                if (mode != AtMode.Ref)
+                {
+                    element = TreeWalker.ControlViewWalker.Normalize(outer ?? element, control);
+                    if (element == null)
+                    {
+                        answer.Nothing = true;
+                        return;
+                    }
+                }
+            }
+            catch (ElementNotAvailableException)
+            {
+                if (mode == AtMode.Ref) { answer.Gone = true; } else { answer.Nothing = true; }
+                return;
+            }
+            catch (COMException)
+            {
+                if (mode == AtMode.Ref) { answer.Gone = true; } else { answer.Nothing = true; }
+                return;
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                if (mode == AtMode.Ref) { throw; }
+                answer.Nothing = true;
+                return;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                if (mode == AtMode.Ref) { throw; }
+                answer.Nothing = true;
+                return;
+            }
+
+            IntPtr desktop = Native.GetDesktopWindow();
+            IntPtr top = IntPtr.Zero;
+            if (handle != 0)
+            {
+                top = Native.GetAncestor(new IntPtr(handle), Native.GA_ROOT);
+                if (top == IntPtr.Zero)
+                {
+                    top = new IntPtr(handle);
+                }
+            }
+            if (top == IntPtr.Zero || top == desktop || CachedHandle(element) == desktop.ToInt32())
+            {
+                if (mode == AtMode.Ref) { answer.Gone = true; } else { answer.Nothing = true; }
+                return;
+            }
+
+            AtLocated located = new AtLocated();
+            located.Element = element;
+            located.Node = new Dictionary<string, object>();
+            if (mode == AtMode.Ref)
+            {
+                located.Node["ref"] = reference;
+            }
+            NodeFields(located.Node, element, 0);
+            if (unreadable || (mode == AtMode.Ref && outer != null))
+            {
+                MarkBelowPassword(located.Node);
+            }
+            located.Window = new Dictionary<string, object>();
+            located.Window["id"] = HwndId(top);
+            located.Window["title"] = WindowTitle(top);
+            string name = (string)located.Node["name"];
+            object aidValue;
+            string aid = located.Node.TryGetValue("aid", out aidValue) ? (string)aidValue : "";
+            bool password = ((List<object>)located.Node["flags"]).Contains("password");
+            located.HasAutomationId = aid.Length > 0;
+            located.HasName = name.Length > 0 && !password;
+            answer.Located = located;
+            if (!located.HasAutomationId && !located.HasName)
+            {
+                return;
+            }
+
+            try
+            {
+                AtCount count = new AtCount();
+                count.Spent = spent;
+                count.BudgetMs = budget;
+                count.Type = element.GetCachedPropertyValue(AutomationElement.ControlTypeProperty) as ControlType;
+                count.Target = element.GetRuntimeId();
+                count.AutomationId = located.HasAutomationId ? aid : null;
+                count.Name = located.HasName ? name : null;
+                if (count.Type == null || count.Target == null || count.Target.Length == 0)
+                {
+                    answer.Counts = new AtCounts();
+                    return;
+                }
+                count.Cache = new CacheRequest();
+                count.Cache.TreeFilter = Automation.ControlViewCondition;
+                count.Cache.Add(AutomationElement.NameProperty);
+                count.Cache.Add(AutomationElement.ControlTypeProperty);
+                count.Cache.Add(AutomationElement.AutomationIdProperty);
+                count.Cache.Add(AutomationElement.IsPasswordProperty);
+                AutomationElement root;
+                using (count.Cache.Activate())
+                {
+                    root = AutomationElement.FromHandle(top);
+                }
+                count.Visit(root);
+                CountChildren(count, root, 1);
+                if (!count.Stopped)
+                {
+                    AtCounts counts = new AtCounts();
+                    counts.ByAutomationId = AtCount.Result(count.MatchesAutomationId, count.IndexAutomationId);
+                    counts.ByName = AtCount.Result(count.MatchesName, count.IndexName);
+                    answer.Counts = counts;
+                }
+            }
+            catch (ElementNotAvailableException) { }
+            catch (InvalidOperationException) { }
+            catch (COMException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+        }
+
+        // Visits the children of parent, which are `level` levels below the window, in the order
+        // SearchChildren visits them. The walk stops when its time is used up and MaxWalkDepth
+        // levels below the window.
+        static void CountChildren(AtCount count, AutomationElement parent, int level)
+        {
+            AutomationElement child = TreeWalker.ControlViewWalker.GetFirstChild(parent, count.Cache);
+            if (child != null && level > MaxWalkDepth)
+            {
+                count.Stopped = true;
+                return;
+            }
+            while (child != null)
+            {
+                if (count.Spent.ElapsedMilliseconds > count.BudgetMs)
+                {
+                    count.Stopped = true;
+                    return;
+                }
+                count.Visit(child);
+                if (!IsPasswordElement(child))
+                {
+                    CountChildren(count, child, level + 1);
+                    if (count.Stopped)
+                    {
+                        return;
+                    }
+                }
+                child = TreeWalker.ControlViewWalker.GetNextSibling(child, count.Cache);
+            }
         }
     }
 }
