@@ -42,9 +42,12 @@ def main():
         "alcove_list_windows", "alcove_window_action", "alcove_ui_tree", "alcove_ui_find", "alcove_ui_get_text",
         "alcove_ui_click", "alcove_ui_type", "alcove_ui_action", "alcove_launch_app", "alcove_deploy", "alcove_events",
     }
-    toolsets = {"core": core, "shell": shell, "files": files, "state": state, "ui": ui}
+    evidence = {
+        "alcove_record_start", "alcove_record_stop", "alcove_event_log", "alcove_crash_dumps", "alcove_collect_diagnostics",
+    }
+    toolsets = {"core": core, "shell": shell, "files": files, "state": state, "ui": ui, "evidence": evidence}
     selected = [s.strip() for s in env.get("ALCOVE_MCP_TOOLSETS", "").split(",") if s.strip()]
-    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files | state | ui
+    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files | state | ui | evidence
     missing = expected - set(names)
     extra = set(names) - expected
     if missing or extra:
