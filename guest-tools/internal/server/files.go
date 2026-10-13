@@ -197,6 +197,22 @@ func openRegular(path string) (*os.File, os.FileInfo, error) {
 	return f, fi, nil
 }
 
+// startsWithUTF16BOM reports whether the file begins with the bytes FF FE.
+func startsWithUTF16BOM(f *os.File) bool {
+	var head [2]byte
+	n, _ := f.ReadAt(head[:], 0)
+	return n == 2 && head[0] == 0xFF && head[1] == 0xFE
+}
+
+// withEncoding adds "encoding": "utf-16le" to out for a file that begins with
+// the bytes FF FE.
+func withEncoding(out proto.Message, utf16 bool) proto.Message {
+	if utf16 {
+		out["encoding"] = "utf-16le"
+	}
+	return out
+}
+
 func (s *Server) fsRead(req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
@@ -221,11 +237,11 @@ func (s *Server) fsRead(req proto.Message) (proto.Message, error) {
 		return nil, fmt.Errorf("cannot read '%s': %v", path, err)
 	}
 	size := fi.Size()
-	return proto.Message{
+	return withEncoding(proto.Message{
 		"data": base64.StdEncoding.EncodeToString(buf[:n]),
 		"size": size,
 		"eof":  offset+int64(n) >= size,
-	}, nil
+	}, startsWithUTF16BOM(f)), nil
 }
 
 func (s *Server) fsTail(req proto.Message) (proto.Message, error) {
@@ -242,14 +258,22 @@ func (s *Server) fsTail(req proto.Message) (proto.Message, error) {
 	if lines <= 0 {
 		lines = fsTailDefault
 	}
+	// A file that begins with FF FE is read as UTF-16LE: its lines start
+	// after the byte order mark and end with the code unit 0A 00.
+	utf16 := startsWithUTF16BOM(f)
+	unit, first := int64(1), int64(0)
+	if utf16 {
+		unit, first = 2, 2
+	}
 	size := fi.Size()
 	start := size - fsTailWindow
-	if start < 0 {
-		start = 0
+	if start < first {
+		start = first
 	}
+	start += (start - first) % unit
 	readFrom := start
-	if start > 0 {
-		readFrom = start - 1
+	if start > first {
+		readFrom = start - unit
 	}
 	buf := make([]byte, size-readFrom)
 	n, err := f.ReadAt(buf, readFrom)
@@ -258,28 +282,66 @@ func (s *Server) fsTail(req proto.Message) (proto.Message, error) {
 	}
 	buf = buf[:n]
 	partialFirst := false
-	if start > 0 && len(buf) > 0 {
-		partialFirst = buf[0] != '\n'
-		buf = buf[1:]
+	if start > first && int64(len(buf)) >= unit {
+		partialFirst = !isLineFeed(buf, int(unit))
+		buf = buf[unit:]
 	}
-	return proto.Message{
-		"data": base64.StdEncoding.EncodeToString(lastLines(buf, lines, partialFirst)),
+	return withEncoding(proto.Message{
+		"data": base64.StdEncoding.EncodeToString(lastLines(buf, lines, partialFirst, int(unit))),
 		"size": size,
-	}, nil
+	}, utf16), nil
 }
 
-// lastLines returns the last n lines of buf. When buf begins in the middle of
-// a line and fewer than n complete lines follow, the partial first line is
-// dropped.
-func lastLines(buf []byte, n int, partialFirst bool) []byte {
-	body := bytes.TrimSuffix(buf, []byte("\n"))
+// isLineFeed reports whether b begins with a line feed of the given code unit
+// size: 0A for 1, 0A 00 for 2.
+func isLineFeed(b []byte, unit int) bool {
+	if len(b) < unit || b[0] != '\n' {
+		return false
+	}
+	return unit == 1 || b[1] == 0
+}
+
+// lineFeedIndex returns the offset of the first (last when fromEnd is set)
+// line feed in b that starts at a multiple of unit, or -1.
+func lineFeedIndex(b []byte, unit int, fromEnd bool) int {
+	if unit == 1 {
+		if fromEnd {
+			return bytes.LastIndexByte(b, '\n')
+		}
+		return bytes.IndexByte(b, '\n')
+	}
+	last := len(b) - len(b)%unit - unit
+	if fromEnd {
+		for i := last; i >= 0; i -= unit {
+			if isLineFeed(b[i:], unit) {
+				return i
+			}
+		}
+		return -1
+	}
+	for i := 0; i <= last; i += unit {
+		if isLineFeed(b[i:], unit) {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastLines returns the last n lines of buf, whose code units are unit bytes
+// wide. When buf begins in the middle of a line and fewer than n complete
+// lines follow, the partial first line is dropped.
+func lastLines(buf []byte, n int, partialFirst bool, unit int) []byte {
+	body := buf
+	if len(buf) >= unit && len(buf)%unit == 0 && isLineFeed(buf[len(buf)-unit:], unit) {
+		body = buf[:len(buf)-unit]
+	}
 	idx := len(body)
 	for i := 0; i < n; i++ {
-		j := bytes.LastIndexByte(body[:idx], '\n')
+		j := lineFeedIndex(body[:idx], unit, true)
 		if j < 0 {
 			if partialFirst {
-				if k := bytes.IndexByte(buf, '\n'); k >= 0 {
-					return buf[k+1:]
+				if k := lineFeedIndex(buf, unit, false); k >= 0 {
+					return buf[k+unit:]
 				}
 				return nil
 			}
@@ -287,7 +349,7 @@ func lastLines(buf []byte, n int, partialFirst bool) []byte {
 		}
 		idx = j
 	}
-	return buf[idx+1:]
+	return buf[idx+unit:]
 }
 
 func (s *Server) fsWrite(req proto.Message) (proto.Message, error) {

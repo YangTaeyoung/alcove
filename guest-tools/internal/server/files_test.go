@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
@@ -284,6 +285,91 @@ func TestFsTail(t *testing.T) {
 	res = c.call("fs.tail", proto.Message{"path": "gone.log"})
 	if res["ok"] != false || !strings.Contains(res.String("error"), "gone.log") {
 		t.Fatalf("missing %v", res)
+	}
+}
+
+func utf16le(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	b := make([]byte, 0, 2*len(units))
+	for _, u := range units {
+		b = append(b, byte(u), byte(u>>8))
+	}
+	return b
+}
+
+func TestFsTailUTF16(t *testing.T) {
+	c, home := fsHome(t)
+	bom := []byte{0xFF, 0xFE}
+	write := func(name string, content []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(home, name), append(append([]byte{}, bom...), content...), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var sb strings.Builder
+	for i := 1; i <= 5; i++ {
+		fmt.Fprintf(&sb, "로그 줄 %d\r\n", i)
+	}
+	write("ps.log", utf16le(sb.String()))
+	res := c.ok("fs.tail", proto.Message{"path": "ps.log", "lines": 2})
+	if got := decode(t, res); !bytes.Equal(got, utf16le("로그 줄 4\r\n로그 줄 5\r\n")) {
+		t.Fatalf("tail of two lines: % x", got)
+	}
+	if res.String("encoding") != "utf-16le" || res.Int("size") != 2+2*len(utf16.Encode([]rune(sb.String()))) {
+		t.Fatalf("encoding %q, size %d", res.String("encoding"), res.Int("size"))
+	}
+	res = c.ok("fs.tail", proto.Message{"path": "ps.log", "lines": 100})
+	if got := decode(t, res); !bytes.Equal(got, utf16le(sb.String())) {
+		t.Fatalf("tail of the whole file: % x", got)
+	}
+
+	write("units.log", utf16le("a\nĊ਀\nlast"))
+	res = c.ok("fs.tail", proto.Message{"path": "units.log", "lines": 2})
+	if got := decode(t, res); !bytes.Equal(got, utf16le("Ċ਀\nlast")) {
+		t.Fatalf("line feed bytes inside other code units split a line: % x", got)
+	}
+
+	write("long.log", utf16le(strings.Repeat("ab\n", 60000)))
+	res = c.ok("fs.tail", proto.Message{"path": "long.log", "lines": 1000000})
+	got := decode(t, res)
+	if len(got) > 262144 || len(got)%6 != 0 || !bytes.HasPrefix(got, utf16le("ab\n")) || res.String("encoding") != "utf-16le" {
+		t.Fatalf("window tail: %d bytes starting % x", len(got), got[:8])
+	}
+
+	write("odd.log", append(utf16le(strings.Repeat("ab\n", 60000)), 'x'))
+	res = c.ok("fs.tail", proto.Message{"path": "odd.log", "lines": 1000000})
+	got = decode(t, res)
+	if len(got) > 262144 || len(got)%6 != 1 || !bytes.HasPrefix(got, utf16le("ab\n")) {
+		t.Fatalf("window tail of a file with an odd size: %d bytes starting % x", len(got), got[:8])
+	}
+
+	write("bom-only.log", nil)
+	res = c.ok("fs.tail", proto.Message{"path": "bom-only.log"})
+	if got := decode(t, res); len(got) != 0 || res.String("encoding") != "utf-16le" {
+		t.Fatalf("tail of a file holding only the byte order mark: % x, encoding %q", got, res.String("encoding"))
+	}
+}
+
+func TestFsReadAndTailReportUTF16Only(t *testing.T) {
+	c, home := fsHome(t)
+	os.WriteFile(filepath.Join(home, "wide.txt"), append([]byte{0xFF, 0xFE}, utf16le("한글 text")...), 0o644)
+	os.WriteFile(filepath.Join(home, "plain.txt"), []byte("한글 text\n"), 0o644)
+	os.WriteFile(filepath.Join(home, "empty.txt"), nil, 0o644)
+
+	res := c.ok("fs.read", proto.Message{"path": "wide.txt", "offset": 2, "length": 4})
+	if got := decode(t, res); !bytes.Equal(got, utf16le("한글")) || res.String("encoding") != "utf-16le" {
+		t.Fatalf("read inside a UTF-16 file: % x, encoding %q", got, res.String("encoding"))
+	}
+	res = c.ok("fs.read", proto.Message{"path": "wide.txt"})
+	if got := decode(t, res); !bytes.HasPrefix(got, []byte{0xFF, 0xFE}) || res.String("encoding") != "utf-16le" {
+		t.Fatalf("read from the start of a UTF-16 file: % x, encoding %q", got, res.String("encoding"))
+	}
+	for _, name := range []string{"plain.txt", "empty.txt"} {
+		for _, op := range []string{"fs.read", "fs.tail"} {
+			if res := c.ok(op, proto.Message{"path": name}); res.Has("encoding") {
+				t.Fatalf("%s of %s reports encoding %q", op, name, res.String("encoding"))
+			}
+		}
 	}
 }
 
