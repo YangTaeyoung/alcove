@@ -327,7 +327,18 @@ public actor ControlHandler {
         }
         let cropped = area == frame.bounds ? frame : frame.crop(area)
         let chosen = languages
-        let lines = try await Task.detached { try ScreenText.recognize(cropped, languages: chosen) }.value
+        let recognizer = WaitTiming.recognizer
+        let lines: [TextMatch]
+        do {
+            lines = try await Task.detached { try recognizer(cropped, chosen) }.value
+        } catch {
+            try await Task.sleep(for: .milliseconds(150))
+            do {
+                lines = try await Task.detached { try recognizer(cropped, chosen) }.value
+            } catch {
+                throw ControlError.failed("text recognition failed twice; call vm.find_text again or use vm.screenshot")
+            }
+        }
         let matches = try ScreenText.filter(lines, query: query, regex: regex)
         let rows: [JSON] = matches.map { m in
             let x = m.rect.x + area.x, y = m.rect.y + area.y

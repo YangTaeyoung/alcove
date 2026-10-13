@@ -4,6 +4,7 @@ import CoreGraphics
 import Vision
 @testable import AlcoveControl
 import AlcoveEngine
+import AlcoveTestSupport
 
 /// Black text on white, drawn with CoreText into a BGRA frame; `rects` are the drawn glyph bounds in top-left pixels.
 struct DrawnText {
@@ -172,6 +173,37 @@ final class ScreenTextTests: XCTestCase {
         assertNear(Frame.Rect(x: x, y: y, w: w, h: hh), drawn.rects[0])
         let confidence = try XCTUnwrap(m["confidence"]?.doubleValue)
         XCTAssertEqual(confidence, (confidence * 100).rounded() / 100, accuracy: 1e-9)
+    }
+
+    func testFindTextRetriesOnceAfterARecognitionFailure() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            if calls.value == 1 { throw ControlHandler.ControlError.failed("text recognition failed: transient") }
+            return [TextMatch(text: "Send", rect: Frame.Rect(x: 1, y: 2, w: 30, h: 10), confidence: 1)]
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
+        let r = try await h.handle(op: "vm.find_text", params: ["name": "Win", "query": "send"])
+        XCTAssertEqual(calls.value, 2)
+        XCTAssertEqual(r["matches"]?.arrayValue?.count, 1)
+    }
+
+    func testFindTextFailsWithAnInstructionAfterTwoRecognitionFailures() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            throw ControlHandler.ControlError.failed("text recognition failed: transient")
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
+        do {
+            _ = try await h.handle(op: "vm.find_text", params: ["name": "Win"])
+            XCTFail("expected an error")
+        } catch let e as ControlHandler.ControlError {
+            XCTAssertEqual(e.description, "text recognition failed twice; call vm.find_text again or use vm.screenshot")
+        }
+        XCTAssertEqual(calls.value, 2)
     }
 
     func testFindTextIsReadOnlyAndConcurrent() {
