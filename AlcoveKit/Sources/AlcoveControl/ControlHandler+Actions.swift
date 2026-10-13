@@ -11,6 +11,10 @@ extension ControlHandler {
         "vm.mouse.move", "vm.mouse.click", "vm.mouse.drag", "vm.mouse.scroll", "vm.mouse.down", "vm.mouse.up",
         "vm.key.press", "vm.key.down", "vm.key.up", "vm.type",
     ]
+    /// Every op that takes `observe`, `settleMs` and `settleTimeoutMs`.
+    static let observingOps: Set<String> = actionOps.union([
+        "vm.batch", "vm.wait_for", "vm.window.action", "vm.ui.click", "vm.ui.type", "vm.ui.action",
+    ])
     /// What a `vm.batch` step may name besides the action ops.
     static let batchOnlyStepOps: Set<String> = ["vm.wait_idle", "vm.wait_for", "sleep"]
     static let maxBatchSteps = 50

@@ -776,6 +776,39 @@ final class ScriptTests: XCTestCase {
         XCTAssertNil(owner)
     }
 
+    func testUIOpsAndUIConditionsPassTheChecksBeforeStepOne() async throws {
+        let rig = try await rig()
+        let selector = "\"selector\": {\"role\": \"Button\", \"name\": \"Send\"}"
+        let accepted = try script(steps([
+            "{\"op\": \"vm.ui.click\", \"params\": {\(selector), \"observe\": \"ui\"}, "
+                + "\"expect\": [{\"type\": \"ui_exists\", \"name\": \"Send\"}, {\"type\": \"event\", \"event\": \"dialog.opened\"}]}",
+            "{\"op\": \"vm.wait_for\", \"params\": {\"observe\": \"ui\", \"conditions\": [{\"type\": \"window_title\", \"contains\": \"Saved\"}, "
+                + "{\"type\": \"ui_text_stable\", \"ref\": \"e4\"}, {\"type\": \"ui_gone\", \"name\": \"Busy\"}, {\"type\": \"ui_enabled\", \"ref\": \"e5\"}]}}",
+            "{\"op\": \"vm.app.launch\", \"params\": {\"path\": \"notepad.exe\"}}",
+            "{\"op\": \"vm.deploy\", \"params\": {\"path\": \"/tmp/build\"}}",
+            "{\"op\": \"vm.events\", \"params\": {}}",
+        ]))
+        let started = await run(rig, accepted)
+        XCTAssertEqual(started.stepsRun, 1)
+        XCTAssertEqual(started.error, "step 1 failed: UI Automation is only available on Windows guests with current guest tools; update alcove-agent in 'Win'")
+
+        let cases: [(String, String)] = [
+            ("{\"op\": \"vm.ui.click\", \"params\": {\(selector), \"observe\": \"tree\"}}", "step 2: observe must be one of none, summary, diff, image, ui"),
+            ("{\"op\": \"vm.ui.type\", \"params\": {\(selector), \"text\": \"a\", \"settleMs\": 99999}}", "step 2: settleMs must be between 0 and 10000"),
+            ("{\"op\": \"vm.ui.action\", \"params\": {\(selector), \"action\": \"invoke\", \"observe\": 3}}", "step 2: observe must be one of"),
+            ("{\"op\": \"vm.window.action\", \"params\": {\"window\": \"foreground\", \"action\": \"focus\", \"settleTimeoutMs\": 5}}",
+             "step 2: settleTimeoutMs must be between 100 and 30000"),
+            (exec("two", expect: "[{\"type\": \"ui_exists\"}]"), "step 2 expectation 1: ui_exists needs 'ref' or at least one of"),
+            (exec("two", expect: "[{\"type\": \"window_title\"}]"), "step 2 expectation 1: window_title needs exactly one of 'contains' and 'regex'"),
+        ]
+        for (bad, expected) in cases {
+            let result = await run(rig, try script(steps([exec("one"), bad])))
+            XCTAssertEqual(result.stepsRun, 0, bad)
+            XCTAssertTrue(result.error?.hasPrefix(expected) == true, "\(result.error ?? "") should start with \(expected)")
+        }
+        XCTAssertEqual(execCommands(rig), [])
+    }
+
     func testScriptBuiltInCodeGetsTheSameChecks() async throws {
         func step(_ params: [String: JSON] = [:], expect: [JSON] = [], timeout: Int = 5) -> Script.Step {
             Script.Step(label: nil, op: "vm.type", params: params, expect: expect, timeout: timeout)

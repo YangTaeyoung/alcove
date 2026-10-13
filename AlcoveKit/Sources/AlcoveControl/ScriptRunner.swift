@@ -119,8 +119,7 @@ struct ScriptRunner: Sendable {
 
     /// Refuses a step whose `observe`, `settleMs` or `settleTimeoutMs` the op would refuse.
     private func validateObserveOptions(_ script: Script) throws {
-        for (offset, step) in script.steps.enumerated()
-        where ControlHandler.actionOps.contains(step.op) || step.op == "vm.wait_for" || step.op == "vm.batch" {
+        for (offset, step) in script.steps.enumerated() where ControlHandler.observingOps.contains(step.op) {
             do { _ = try handler.observeOptions(.object(step.params)) } catch {
                 throw ScriptError(step: offset + 1, message: "step \(offset + 1): \(error)")
             }
