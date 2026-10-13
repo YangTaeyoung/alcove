@@ -7,7 +7,10 @@ struct ScriptResult: Sendable {
     /// Steps that started, including the one that failed.
     var stepsRun: Int
     var failedStep: Int?
+    /// Present only when `passed` is false.
     var error: String?
+    /// A problem that did not change the outcome, such as a lease that could not be released.
+    var warning: String?
     /// One entry per started step.
     var stepResults: [JSON]
     var seconds: Double
@@ -31,6 +34,7 @@ enum ScriptLimits {
     static let fileBytes = 4 * 1024 * 1024
     static let stringCharacters = 2048
     static let stepsBytes = 256 * 1024
+    static let entryBytes = 64 * 1024
 }
 
 /// Runs a script against a handler without a model: each step is one control op, followed by its expectations.
@@ -50,11 +54,11 @@ struct ScriptRunner: Sendable {
         let clock = ContinuousClock()
         let started = clock.now
         var result = ScriptResult(passed: false, stepsRun: 0, failedStep: nil, error: nil, stepResults: [], seconds: 0)
-        func finish(_ message: String?, note: String? = nil) -> ScriptResult {
+        func finish(_ message: String?, warning: String? = nil) -> ScriptResult {
             result.seconds = ScriptRunner.seconds(started.duration(to: clock.now))
             result.passed = message == nil
-            let text = [message, note].compactMap { $0 }.joined(separator: "; ")
-            result.error = text.isEmpty ? nil : text
+            result.error = message
+            result.warning = warning
             return result
         }
 
@@ -63,6 +67,7 @@ struct ScriptRunner: Sendable {
             try script.validate()
             resolved = try script.resolved(with: variables)
             try resolved.validateConditions()
+            try validateObserveOptions(resolved)
         } catch {
             return finish("\(error)")
         }
@@ -88,7 +93,7 @@ struct ScriptRunner: Sendable {
         let renewal = acquired ? renewLease(vm: name, owner: owner, token: token) : nil
 
         var leaseLost = false
-        var failure = await execute(resolved, vm: name, token: token, holdsOwnLease: acquired, snapshot: snapshot,
+        let failure = await execute(resolved, vm: name, token: token, holdsOwnLease: acquired, snapshot: snapshot,
                                     progress: progress, leaseLost: &leaseLost, into: &result)
         if failure != nil, !Task.isCancelled, result.failedStep != nil, let shot = await failureScreenshot(vm: name) {
             result.failureImage = shot.png
@@ -97,16 +102,29 @@ struct ScriptRunner: Sendable {
         }
         renewal?.cancel()
         await renewal?.value
-        var note: String?
+        var warning: String?
         if acquired, !leaseLost, let token {
             do {
                 _ = try await handler.handle(op: "vm.lease.release", params: ["name": .string(name), "lease": .string(token)])
             } catch {
-                note = "the lease on '\(name)' could not be released (\(error)); it expires by itself within \(ScriptTiming.leaseSeconds) s"
+                if await handler.holdsLease(vm: name, token: token) {
+                    warning = "the lease on '\(name)' could not be released (\(error)); it expires by itself within \(ScriptTiming.leaseSeconds) s"
+                } else {
+                    warning = "the lease on '\(name)' was lost during the last step (it expired or another client took it), so it was not released"
+                }
             }
         }
-        if failure == nil, Task.isCancelled { failure = "the run was cancelled; start it again" }
-        return finish(failure, note: note)
+        return finish(failure, warning: warning)
+    }
+
+    /// Refuses a step whose `observe`, `settleMs` or `settleTimeoutMs` the op would refuse.
+    private func validateObserveOptions(_ script: Script) throws {
+        for (offset, step) in script.steps.enumerated()
+        where ControlHandler.actionOps.contains(step.op) || step.op == "vm.wait_for" || step.op == "vm.batch" {
+            do { _ = try handler.observeOptions(.object(step.params)) } catch {
+                throw ScriptError(step: offset + 1, message: "step \(offset + 1): \(error)")
+            }
+        }
     }
 
     private static func seconds(_ duration: Duration) -> Double {
@@ -141,16 +159,21 @@ struct ScriptRunner: Sendable {
                          leaseLost: inout Bool, into result: inout ScriptResult) async -> String? {
         if let snapshot {
             do { _ = try await handler.handle(op: "vm.snapshot.restore", params: base(vm, token, ["snapshot": .string(snapshot)])) }
-            catch is CancellationError { return "the run was cancelled before step 1; start it again" }
-            catch { return "restoring snapshot '\(snapshot)' failed: \(error); check the snapshot name with vm.snapshot.list" }
+            catch {
+                if Task.isCancelled || error is CancellationError { return "the run was cancelled before step 1; start it again" }
+                return "restoring snapshot '\(snapshot)' failed: \(error); check the snapshot name with vm.snapshot.list"
+            }
         }
         var stepsBytes = 0
         for (offset, step) in script.steps.enumerated() {
             let number = offset + 1
             if Task.isCancelled { return "the run was cancelled before step \(number); start it again" }
-            if holdsOwnLease, let token, !(await handler.holdsLease(vm: vm, token: token)) {
+            if let token, !(await handler.holdsLease(vm: vm, token: token)) {
                 leaseLost = true
-                return "the lease on '\(vm)' was lost before step \(number) (it expired or another client took it); start the run again"
+                if holdsOwnLease {
+                    return "the lease on '\(vm)' was lost before step \(number) (it expired or another client took it); start the run again"
+                }
+                return "the lease on '\(vm)' is no longer the one passed to script.run (expired, released or taken over) before step \(number); renew the lease and run the script again"
             }
             result.stepsRun = number
             let began = ContinuousClock.now
@@ -158,14 +181,21 @@ struct ScriptRunner: Sendable {
             let seconds = ScriptRunner.seconds(began.duration(to: ContinuousClock.now))
             var entry: [String: JSON] = ["step": .int(Int64(number)), "op": .string(step.op), "seconds": .double(seconds)]
             if let label = step.label { entry["label"] = .string(label) }
-            let full = stepsBytes <= ScriptLimits.stepsBytes
             switch outcome {
-            case .success(let value):
-                entry["ok"] = true
-                if full { entry["result"] = ScriptRunner.bounded(value) }
+            case .success: entry["ok"] = true
             case .failure(let error):
                 entry["ok"] = false
                 entry["error"] = .string("\(error)")
+            }
+            if case .success(let value) = outcome, stepsBytes <= ScriptLimits.stepsBytes {
+                var withResult = entry
+                withResult["result"] = ScriptRunner.bounded(value)
+                let size = (try? JSON.object(withResult).serialized().count) ?? 0
+                if size > ScriptLimits.entryBytes {
+                    entry["resultOmitted"] = .string("\(size) bytes")
+                } else {
+                    entry = withResult
+                }
             }
             stepsBytes += (try? JSON.object(entry).serialized().count) ?? 0
             result.stepResults.append(.object(entry))

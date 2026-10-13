@@ -156,13 +156,15 @@ struct Script: Sendable, Equatable {
         for (offset, step) in steps.enumerated() {
             let number = offset + 1
             for (index, condition) in step.expect.enumerated() {
-                do { _ = try WaitCondition.parse(condition, index: index) } catch {
-                    let prefix = "condition \(index): "
-                    let sentence = "\(error)"
-                    throw ScriptError(step: number, message: "step \(number) expectation \(index + 1): \(sentence.hasPrefix(prefix) ? String(sentence.dropFirst(prefix.count)) : sentence)")
-                }
+                try Script.checkCondition(condition, index: index, in: "step \(number) expectation \(index + 1)", step: number)
             }
             if step.op == "vm.wait_for" {
+                guard let conditions = step.params["conditions"]?.arrayValue else {
+                    throw ScriptError(step: number, message: "step \(number): vm.wait_for needs \"conditions\", an array of condition objects")
+                }
+                for (index, condition) in conditions.enumerated() {
+                    try Script.checkCondition(condition, index: index, in: "step \(number) condition \(index + 1)", step: number)
+                }
                 do {
                     _ = try WaitCondition.parseList(.object(step.params))
                     _ = try WaitCondition.parseTimeout(.object(step.params))
@@ -170,6 +172,15 @@ struct Script: Sendable, Equatable {
                     throw ScriptError(step: number, message: "step \(number): \(error)")
                 }
             }
+        }
+    }
+
+    /// Parses one wait condition; a problem is reported as `<place>: <sentence>` without the parser's 0-based position.
+    private static func checkCondition(_ condition: JSON, index: Int, in place: String, step: Int) throws {
+        do { _ = try WaitCondition.parse(condition, index: index) } catch {
+            let prefix = "condition \(index): "
+            let sentence = "\(error)"
+            throw ScriptError(step: step, message: "\(place): \(sentence.hasPrefix(prefix) ? String(sentence.dropFirst(prefix.count)) : sentence)")
         }
     }
 

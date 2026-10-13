@@ -48,8 +48,15 @@ extension ControlHandler {
             guard let name = value.stringValue, !name.isEmpty else { throw ControlError.missing("snapshot") }
             snapshot = name
         }
+        var lease: String?
+        if let value = params["lease"], value != .null {
+            guard let token = value.stringValue else {
+                throw ControlError.failed("'lease' must be the lease token string returned by vm.lease.acquire")
+            }
+            lease = token
+        }
         let owner = "script:" + URL(fileURLWithPath: path).lastPathComponent
-        let result = await ScriptRunner(handler: self).run(script, vm: vm, variables: variables, lease: params["lease"]?.stringValue,
+        let result = await ScriptRunner(handler: self).run(script, vm: vm, variables: variables, lease: lease,
                                                            owner: owner, snapshot: snapshot, progress: nil)
         if result.couldNotStart { throw ControlError.failed(result.error ?? "the run could not start") }
 
@@ -60,6 +67,7 @@ extension ControlHandler {
             if script.steps.indices.contains(failed - 1), let label = script.steps[failed - 1].label { out["label"] = .string(label) }
         }
         if let error = result.error { out["error"] = .string(error) }
+        if let warning = result.warning { out["warning"] = .string(warning) }
         if let png = result.failureImage {
             out["failure"] = ["png": .string(png.base64EncodedString()),
                               "width": .int(Int64(result.failureWidth ?? 0)), "height": .int(Int64(result.failureHeight ?? 0))]

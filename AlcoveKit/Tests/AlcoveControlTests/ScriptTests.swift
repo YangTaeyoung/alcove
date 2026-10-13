@@ -669,6 +669,66 @@ final class ScriptTests: XCTestCase {
         XCTAssertEqual(owner, "agent-b")
     }
 
+    func testLeaseLostDuringTheLastStepIsAWarning() async throws {
+        let rig = try await rig()
+        ScriptTiming.leaseRenewal = .milliseconds(20)
+        let gate = "{\"op\": \"vm.wait_for\", \"params\": {\"conditions\": [{\"type\": \"file_exists\", \"path\": \"C:\\\\gate\"}], \"timeout\": 60}}"
+        let parsed = try script(steps([gate]))
+        let handler = rig.handler
+        let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
+        while try await leasedBy(rig) == nil { try await Task.sleep(for: .milliseconds(10)) }
+        await handler.forget(vm: "Win")
+        _ = try await handler.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "agent-b", "ttl": 60])
+        rig.fs["C:\\gate"] = Data("x".utf8)
+        let result = await task.value
+        XCTAssertTrue(result.passed, result.error ?? "")
+        XCTAssertNil(result.error)
+        XCTAssertEqual(result.warning, "the lease on 'Win' was lost during the last step (it expired or another client took it), so it was not released")
+        let owner = try await leasedBy(rig)
+        XCTAssertEqual(owner, "agent-b")
+    }
+
+    func testCleanRunHasNoWarning() async throws {
+        let rig = try await rig()
+        let result = await run(rig, try script(steps([exec("one")])))
+        XCTAssertTrue(result.passed)
+        XCTAssertNil(result.warning)
+        XCTAssertNil(result.error)
+        let viaOp = try await rig.handler.handle(op: "script.run", params: ["path": .string(try scriptFile(steps([exec("two")])))])
+        XCTAssertNil(viaOp["warning"])
+        XCTAssertNil(viaOp["error"])
+    }
+
+    func testGivenLeaseIsCheckedBeforeEveryStep() async throws {
+        let rig = try await rig()
+        let granted = try await rig.handler.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "agent-a", "ttl": 60])
+        let token = try XCTUnwrap(granted["lease"]?.stringValue)
+        let clock = rig.clock
+        let result = await ScriptRunner(handler: rig.handler).run(try script(steps([exec("one"), exec("two")])), vm: nil, variables: [:],
+                                                                   lease: token, owner: "script:test.json") { number, _, _ in
+            if number == 1 { clock.advance(.seconds(61)) }
+        }
+        XCTAssertFalse(result.passed)
+        XCTAssertEqual(result.stepsRun, 1)
+        XCTAssertNil(result.failedStep)
+        XCTAssertEqual(result.error, "the lease on 'Win' is no longer the one passed to script.run (expired, released or taken over) before step 2; renew the lease and run the script again")
+        XCTAssertEqual(execCommands(rig), ["one"])
+    }
+
+    func testLeaseParameterMustBeAString() async throws {
+        let rig = try await rig()
+        let path = try scriptFile(steps([exec("one")]))
+        for value: JSON in [3, true, ["a"], ["k": "v"]] {
+            do {
+                _ = try await rig.handler.handle(op: "script.run", params: ["path": .string(path), "lease": value])
+                XCTFail("expected a refusal for \(value)")
+            } catch {
+                XCTAssertEqual("\(error)", "'lease' must be the lease token string returned by vm.lease.acquire")
+            }
+        }
+        XCTAssertEqual(execCommands(rig), [])
+    }
+
     // MARK: - validation before step 1
 
     func testExpectationsAndConditionsValidatedBeforeAnyStep() async throws {
@@ -683,12 +743,34 @@ final class ScriptTests: XCTestCase {
         let badWait = "{\"op\": \"vm.wait_for\", \"params\": {\"conditions\": [{\"type\": \"nonsense\"}]}}"
         let second = await run(rig, try script(steps([exec("one"), badWait])))
         XCTAssertEqual(second.stepsRun, 0)
-        XCTAssertTrue(second.error?.hasPrefix("step 2: ") == true, second.error ?? "")
+        XCTAssertTrue(second.error?.hasPrefix("step 2 condition 1: ") == true, second.error ?? "")
 
         let substituted = try script(steps([exec("one", expect: "[{\"type\": \"${kind}\", \"path\": \"C:\\\\ok\"}]")]))
         let third = await run(rig, substituted, variables: ["kind": "bogus"])
         XCTAssertEqual(third.stepsRun, 0)
         XCTAssertTrue(third.error?.hasPrefix("step 1 expectation 1: ") == true, third.error ?? "")
+        XCTAssertEqual(execCommands(rig), [])
+        let owner = try await leasedBy(rig)
+        XCTAssertNil(owner)
+    }
+
+    func testWaitForStepsAreCheckedBeforeAnyStepWithOneBasedNumbers() async throws {
+        let rig = try await rig()
+        let ok = "{\"type\": \"file_exists\", \"path\": \"C:\\\\ok\"}"
+        let cases: [(String, String)] = [
+            ("{\"op\": \"vm.wait_for\", \"params\": {\"conditions\": [\(ok), {\"type\": \"nonsense\"}]}}", "step 2 condition 2: "),
+            ("{\"op\": \"vm.wait_for\", \"params\": {\"conditions\": [{\"type\": \"text_visible\"}]}}", "step 2 condition 1: "),
+            ("{\"op\": \"vm.wait_for\", \"params\": {}}", "step 2: vm.wait_for needs \"conditions\", an array of condition objects"),
+            ("{\"op\": \"vm.wait_for\", \"params\": {\"conditions\": \"x\"}}", "step 2: vm.wait_for needs \"conditions\", an array of condition objects"),
+            ("{\"op\": \"vm.type\", \"params\": {\"text\": \"a\", \"observe\": \"bogus\"}}", "step 2: observe must be one of"),
+            ("{\"op\": \"vm.mouse.click\", \"params\": {\"x\": 1, \"y\": 1, \"settleMs\": 99999}}", "step 2: settleMs must be between 0 and 10000"),
+            ("{\"op\": \"vm.wait_for\", \"params\": {\"conditions\": [\(ok)], \"observe\": 3}}", "step 2: observe must be one of"),
+        ]
+        for (bad, expected) in cases {
+            let result = await run(rig, try script(steps([exec("one"), bad])))
+            XCTAssertEqual(result.stepsRun, 0, bad)
+            XCTAssertTrue(result.error?.hasPrefix(expected) == true, "\(result.error ?? "") should start with \(expected)")
+        }
         XCTAssertEqual(execCommands(rig), [])
         let owner = try await leasedBy(rig)
         XCTAssertNil(owner)
@@ -755,6 +837,21 @@ final class ScriptTests: XCTestCase {
         XCTAssertNotNil(result.failureImage)
     }
 
+    func testOversizedStepEntryKeepsOnlyItsOutcome() async throws {
+        let rig = try await rig()
+        for index in 0..<1500 { rig.fs["C:\\big\\f\(index).txt"] = Data("x".utf8) }
+        let list = "{\"label\": \"list\", \"op\": \"vm.fs.list\", \"params\": {\"path\": \"C:\\\\big\"}}"
+        let result = await run(rig, try script(steps([list, "{\"op\": \"vm.status\", \"params\": {}}"])))
+        XCTAssertTrue(result.passed, result.error ?? "")
+        let first = try XCTUnwrap(result.stepResults[0].objectValue)
+        XCTAssertEqual(Set(first.keys), ["step", "op", "label", "ok", "seconds", "resultOmitted"])
+        let omitted = try XCTUnwrap(first["resultOmitted"]?.stringValue)
+        XCTAssertTrue(omitted.hasSuffix(" bytes"), omitted)
+        XCTAssertGreaterThan(Int(omitted.dropLast(6)) ?? 0, 64 * 1024)
+        XCTAssertNotNil(result.stepResults[1]["result"])
+        XCTAssertNil(result.stepResults[1]["resultOmitted"])
+    }
+
     // MARK: - script file
 
     func testScriptFileLimits() async throws {
@@ -789,20 +886,64 @@ final class ScriptTests: XCTestCase {
 
     func testCancelledStepIsReportedAsCancelled() async throws {
         let rig = try await rig()
-        let stall = "{\"op\": \"vm.exec\", \"params\": {\"command\": \"stall\", \"timeout\": 2}, \"timeout\": 60}"
+        let stall = "{\"op\": \"vm.exec\", \"params\": {\"command\": \"stall\"}, \"timeout\": 60}"
         let parsed = try script(steps([stall, exec("after")]))
         let handler = rig.handler
         let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
-        while agentRequests(rig.agent, "exec.run").filter({ $0["cmd"]?.stringValue == "stall" }).isEmpty {
-            try await Task.sleep(for: .milliseconds(10))
+        var request: JSON?
+        while request == nil {
+            request = agentRequests(rig.agent, "exec.run").first { $0["cmd"]?.stringValue == "stall" }
+            if request == nil { try await Task.sleep(for: .milliseconds(10)) }
         }
         task.cancel()
+        rig.agent.sendLine(["t": "res", "id": request?["id"] ?? .null, "ok": false, "error": "exec stopped"])
         let result = await task.value
         XCTAssertFalse(result.passed)
         XCTAssertNil(result.failedStep)
         XCTAssertNil(result.failureImage)
         XCTAssertTrue(result.error?.contains("cancelled") == true, result.error ?? "")
         XCTAssertFalse(result.error?.contains("failed") == true, result.error ?? "")
+        let after = try await leasedBy(rig)
+        XCTAssertNil(after)
+    }
+
+    func testCancelledSnapshotRestoreIsReportedAsCancelled() async throws {
+        let rig = try await rig()
+        let handler = rig.handler
+        let parsed = try script(steps([exec("one")]))
+        let task = Task {
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(1)) }
+            return await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json",
+                                                            snapshot: "nope", progress: nil)
+        }
+        task.cancel()
+        let result = await task.value
+        XCTAssertFalse(result.passed)
+        XCTAssertEqual(result.stepsRun, 0)
+        XCTAssertEqual(result.error, "the run was cancelled before step 1; start it again")
+        XCTAssertEqual(execCommands(rig), [])
+        let after = try await leasedBy(rig)
+        XCTAssertNil(after)
+    }
+
+    func testCancellationAfterTheLastStepStillPasses() async throws {
+        let rig = try await rig()
+        let handler = rig.handler
+        let parsed = try script(steps([exec("one"), exec("two")]))
+        let box = LockedBox<Task<ScriptResult, Never>?>(nil)
+        let task = Task {
+            await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json") { number, _, _ in
+                guard number == 2 else { return }
+                while box.value == nil { usleep(1000) }
+                box.value?.cancel()
+            }
+        }
+        box.value = task
+        let result = await task.value
+        XCTAssertTrue(result.passed, result.error ?? "")
+        XCTAssertEqual(result.stepsRun, 2)
+        XCTAssertNil(result.error)
+        XCTAssertEqual(execCommands(rig), ["one", "two"])
         let after = try await leasedBy(rig)
         XCTAssertNil(after)
     }

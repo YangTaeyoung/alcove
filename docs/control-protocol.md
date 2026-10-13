@@ -589,11 +589,16 @@ Leases: without `lease` the run holds a lease of its own (owner
 `script:<file name>`, 600 s, renewed every 200 s), checks before each step that
 it still holds it and releases it at the end, also after a failure. When the
 run loses its lease it stops before the next step. If the final release fails,
-`error` says so and that the lease expires by itself within 600 s. A passed
-`lease` must be the VM's current token; otherwise the op fails with `lease
-token is not the current lease of '<vm>' (expired, released or unknown); acquire
-a new lease or omit lease`. A passed lease is used for every step and is
-neither renewed nor released; the caller keeps it alive. A VM leased by someone
+`warning` says so and that the lease expires by itself within 600 s; when the
+run's lease was lost during the last step, `warning` says that instead. A passed
+`lease` must be a string and the VM's current token; otherwise the op fails with
+`lease token is not the current lease of '<vm>' (expired, released or unknown);
+acquire a new lease or omit lease`. A passed lease is used for every step and
+is neither renewed nor released; the caller keeps it alive. It is checked
+before every step: when it is no longer the VM's current token the run stops
+before that step with `the lease on '<vm>' is no longer the one passed to
+script.run (expired, released or taken over) before step N; renew the lease
+and run the script again` (an error when N is 1, otherwise `passed: false`). A VM leased by someone
 else is refused with the owner's name, whether the VM came from `name` or from
 the script.
 
@@ -605,7 +610,9 @@ not substituted. `params` never holds `name` or `lease`. A step may use any
 control op except `vm.lease.*`, `vm.record.*`, `script.*`, `vm.clone` and
 `vm.delete`. Each `expect` entry is a `vm.wait_for` condition, checked with the
 condition parser of `vm.wait_for` (like the `conditions` of a `vm.wait_for`
-step) before any step runs. Every expectation must hold: each is waited for
+step, and the `observe` options of the steps that take them) before any step
+runs; problems are reported as `step N expectation M: …` or `step N condition
+M: …`, counted from 1. Every expectation must hold: each is waited for
 with its own `vm.wait_for`, for up to the step's `timeout` (default 10 s, 1 to
 600) counted from the end of the op, and at least 1 s. A `vm.wait_for` step
 fails when it matches nothing. The run stops at the first failing step.
@@ -614,10 +621,13 @@ Errors and results: everything that prevents step 1 from starting answers with
 an error (`ok: false`): an unreadable, oversized (over 4 MiB) or malformed
 script, an undefined variable, a condition that does not parse, no VM, a lease
 refusal, a failed snapshot restore, a cancellation before step 1. Otherwise the
-op answers with `{passed, stepsRun, steps, failedStep?, label?, error?, seconds,
-failure?: {png, width, height}}`; `passed: false` means a step ran and failed
-(or the run was cancelled or lost its lease after it started). Step numbers
-start at 1. `stepsRun` counts the steps that started, including the failed one.
+op answers with `{passed, stepsRun, steps, failedStep?, label?, error?, warning?,
+seconds, failure?: {png, width, height}}`; `passed: false` means a step ran and
+failed (or the run was cancelled or lost its lease before its last step
+finished); `error` is present only then. A cancellation after every step
+passed leaves `passed: true`. `warning` is present only when there is
+something to report that did not change the outcome. Step numbers, condition
+numbers and expectation numbers start at 1. `stepsRun` counts the steps that started, including the failed one.
 `failure` is a screenshot taken after the failing step and is complete.
 
 Each entry of `steps` is `{step, op, label?, seconds, ok, result?, error?}`.
@@ -625,7 +635,9 @@ Each entry of `steps` is `{step, op, label?, seconds, ok, result?, error?}`.
 becomes `<omitted: N bytes>` and any other string over 2048 characters is cut
 to its first 2048 characters followed by `… (N more characters)`. Once the
 encoded entries pass 256 KiB, later entries keep only `{step, op, label?, ok,
-seconds}` (and `error` for the failing step).
+seconds}` (and `error` for the failing step). An entry whose encoded size
+alone exceeds 64 KiB is replaced by that lean form plus `resultOmitted: "<N
+bytes>"`.
 
 ## Shell, processes and files
 
