@@ -159,11 +159,11 @@ extension ControlHandler {
         }
     }
 
-    /// Sets the guest clock to the host's; false when the guest cannot run the recipe or it fails.
-    func syncGuestClock(_ t: VMTarget, agent: AgentClient) async -> Bool {
+    /// Sets the guest clock to the host's on behalf of `op`; false when the guest cannot run the recipe or it fails.
+    func syncGuestClock(_ t: VMTarget, agent: AgentClient, op: String) async -> Bool {
         guard let hello = await agent.hello, hello.rpcVersion >= 2, hello.capabilities.contains("exec"),
               let script = GuestRecipes.setClock(unixSeconds: Int(wallClock().timeIntervalSince1970), os: await t.guestOS()) else { return false }
-        return await runRecipe(agent, script, vm: t.name, op: "vm.snapshot.restore").ok
+        return await runRecipe(agent, script, vm: t.name, op: op).ok
     }
 
     // MARK: - vm.doctor

@@ -170,9 +170,11 @@ public actor ControlHandler {
                     throw ControlError.failed("start failed: \(ControlHandler.failureReason(error, fallback: "the VM did not start; check vm.status"))")
                 }
                 if resuming {
-                    let agent = await t.agent(timeout: .seconds(max(0, params["waitTools"]?.intValue ?? 30)))
+                    let hasClockRecipe = GuestRecipes.setClock(unixSeconds: 0, os: await t.guestOS()) != nil
+                    let wait = hasClockRecipe ? max(0, params["waitTools"]?.intValue ?? 30) : 0
+                    let agent = await t.agent(timeout: .seconds(wait))
                     var clockSynced = false
-                    if let agent { clockSynced = await syncGuestClock(t, agent: agent) }
+                    if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.start") }
                     return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral()),
                             "resumed": true, "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced)]
                 }

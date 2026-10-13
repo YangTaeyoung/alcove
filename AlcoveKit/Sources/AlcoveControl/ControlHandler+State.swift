@@ -97,7 +97,7 @@ extension ControlHandler {
             do { try await t.restoreSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot restore failed: \(engineReason(error))") }
             let agent = await t.agent(timeout: .seconds(max(0, wait)))
             var clockSynced = false
-            if let agent { clockSynced = await syncGuestClock(t, agent: agent) }
+            if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.snapshot.restore") }
             return ["snapshot": .string(snapshot), "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced)]
         case "vm.snapshot.delete":
             let snapshot = try string(params, "snapshot")

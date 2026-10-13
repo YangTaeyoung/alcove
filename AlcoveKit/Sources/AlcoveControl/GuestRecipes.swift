@@ -110,7 +110,7 @@ enum GuestRecipes {
     /// Asks Windows for the entry of `dpiSteps` nearest to `percent`, as a step counted from the recommended scale of
     /// the first active display, and prints one JSON object: `applied`, the percentage a process started after the
     /// change reads as the system DPI; `recommended`; and `offered`, the percentages the display offers at its resolution.
-    /// When Windows applied another entry than the one asked for, that entry's step becomes the stored setting.
+    /// When the requested entry is above what the display offers, the entry Windows applied becomes the stored setting.
     static func setDPIScale(percent: Int, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         let steps = dpiSteps.map(String.init).joined(separator: ", ")
@@ -144,7 +144,7 @@ enum GuestRecipes {
         $dpi = & powershell.exe -NoProfile -NonInteractive -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe)))
         $applied = [int]([int]$dpi * 100 / 96)
         $index = [Array]::IndexOf($steps, $applied)
-        if ($index -ge 0 -and $index -ne \(index)) { [void][Alcove.Dpi]::SystemParametersInfo(0x009F, $index - $recommended, [IntPtr]::Zero, 3) }
+        if ($index -ge 0 -and \(index) -gt $range[2] - $range[0]) { [void][Alcove.Dpi]::SystemParametersInfo(0x009F, $index - $recommended, [IntPtr]::Zero, 3) }
         [pscustomobject]@{ applied = $applied; recommended = $steps[$recommended]; offered = @($steps[0..($range[2] - $range[0])]) } | ConvertTo-Json -Compress
         """
     }

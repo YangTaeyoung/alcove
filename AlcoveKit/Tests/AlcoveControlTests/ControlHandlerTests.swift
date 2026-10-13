@@ -20,6 +20,7 @@ actor FakeTarget: VMTarget {
     var startCount = 0, stopCount = 0
     var agentWait: Duration = .zero
     var agentWaits = 0, cancelledAgentWaits = 0
+    var agentTimeouts: [Duration] = []
     var snapshotList: [VMController.SnapshotInfo] = []
     var snapshotCalls: [String] = []
     var monitorReplies: [String] = []
@@ -69,6 +70,7 @@ actor FakeTarget: VMTarget {
     }
     @discardableResult func sendDisplay(_ message: ToQEMU) async -> Bool { sent.append(message); return true }
     func agent(timeout: Duration) async -> AgentClient? {
+        agentTimeouts.append(timeout)
         if agentWait > .zero {
             agentWaits += 1
             try? await Task.sleep(for: agentWait)

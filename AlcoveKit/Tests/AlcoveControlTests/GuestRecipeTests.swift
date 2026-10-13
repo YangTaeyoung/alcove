@@ -134,10 +134,17 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertFalse(script.contains("'scale: 150 %'"), script)
     }
 
-    func testDPIRecipeStoresTheAppliedStepWhenItIsNotTheRequestedOne() throws {
+    func testDPIRecipeStoresTheAppliedStepOnlyWhenTheRequestIsAboveTheDisplaysRange() throws {
         let script = try XCTUnwrap(GuestRecipes.setDPIScale(percent: 150, os: .windows))
         XCTAssertTrue(script.contains("$index = [Array]::IndexOf($steps, $applied)"), script)
-        XCTAssertTrue(script.contains("if ($index -ge 0 -and $index -ne 2) { [void][Alcove.Dpi]::SystemParametersInfo(0x009F, $index - $recommended, [IntPtr]::Zero, 3) }"), script)
+        XCTAssertTrue(script.contains("if ($index -ge 0 -and 2 -gt $range[2] - $range[0]) { [void][Alcove.Dpi]::SystemParametersInfo(0x009F, $index - $recommended, [IntPtr]::Zero, 3) }"), script)
+        XCTAssertFalse(script.contains("$index -ne"), script)
+    }
+
+    func testDPIRecipeThrowsTheSentencesTheProtocolQuotes() throws {
+        let script = try XCTUnwrap(GuestRecipes.setDPIScale(percent: 150, os: .windows))
+        XCTAssertTrue(script.contains("throw 'the guest did not report the scale range of its display; sign in to the guest desktop and set dpiScale again'"), script)
+        XCTAssertTrue(script.contains("throw 'Windows refused the display scale; sign in to the guest desktop and set dpiScale again'"), script)
     }
 
     func testDPIScaleResultIsOkWhenTheRequestedScaleWasApplied() {
@@ -548,6 +555,18 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(r["resumed"]?.boolValue, true)
         XCTAssertEqual(r["tools"]?.boolValue, false)
         XCTAssertEqual(r["clockSynced"]?.boolValue, false)
+    }
+
+    func testStartOfASuspendedSessionOfAGuestWithoutAClockRecipeDoesNotWait() async throws {
+        let (h, t, agent) = try await setup(os: .other, state: .stopped)
+        await t.setSuspended(true)
+        let r = try await h.handle(op: "vm.start", params: ["name": "Win"])
+        XCTAssertEqual(r["resumed"]?.boolValue, true)
+        XCTAssertEqual(r["tools"]?.boolValue, true)
+        XCTAssertEqual(r["clockSynced"]?.boolValue, false)
+        let timeouts = await t.agentTimeouts
+        XCTAssertEqual(timeouts, [.zero])
+        XCTAssertEqual(commands(agent), [])
     }
 
     func testStartOfAStoppedVMRunsNoGuestCommand() async throws {

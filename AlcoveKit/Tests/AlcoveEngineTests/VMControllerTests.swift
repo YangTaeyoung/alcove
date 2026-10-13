@@ -158,6 +158,7 @@ final class VMControllerTests: XCTestCase {
 
     func testFirmwareVariableWritesReachTheFlashFileAfterASnapshot() async throws {
         let vm = try makeVM()
+        addTeardownBlock { try? await vm.shutdown(force: true) }
         try await vm.start()
         try await vm.createSnapshot(named: "first")
         let before = try Data(contentsOf: vm.bundle.efiVarsURL)
