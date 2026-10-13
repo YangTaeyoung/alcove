@@ -8,8 +8,8 @@ struct RecordingTable {
     var ended: [String: Recording.Summary] = [:]
     /// The directory of the latest recording per VM.
     var lastDirectory: [String: String] = [:]
-    /// VMs found not running while they had an active recording.
-    var vmGone: Set<String> = []
+    /// The recording each VM had when it was found not running.
+    var vmGone: [String: Recording] = [:]
     /// Recordings being created, by VM, with their directory.
     var starting: [String: URL] = [:]
     /// Recordings that are ending; `vm.record.stop` waits for them.
@@ -47,7 +47,7 @@ extension ControlHandler {
         await recording.record(op: op, params: params, outcome: outcome, started: started, duration: duration, before: before, after: after)
         var stopped = false
         if op == "vm.stop", case .success = outcome { stopped = true }
-        if recordings.vmGone.remove(vm) != nil || stopped { await retireRecording(vm) }
+        if recordings.vmGone.removeValue(forKey: vm) === recording || stopped { await retireRecording(vm, recording) }
         return try outcome.get()
     }
 
@@ -56,44 +56,71 @@ extension ControlHandler {
         guard let recording = recordings.active[vm] else { return nil }
         await recording.endIfDue()
         if await recording.isActive { return recording }
-        await retireRecording(vm)
+        await retireRecording(vm, recording)
+        if let newer = recordings.active[vm], newer !== recording { return await liveRecording(vm) }
         return nil
     }
 
-    /// Ends the VM's recording and keeps its summary for `vm.record.stop`.
-    func retireRecording(_ vm: String) async {
-        guard let recording = recordings.active.removeValue(forKey: vm) else { return }
+    /// Ends `recording` and keeps its summary for `vm.record.stop`; does nothing when it is no longer the VM's active recording.
+    func retireRecording(_ vm: String, _ recording: Recording) async {
+        guard recordings.active[vm] === recording else { return }
+        recordings.active[vm] = nil
         recordings.retiring[vm] = recording
         let summary = await recording.stop()
-        guard recordings.retiring[vm] === recording else { return }
-        recordings.retiring[vm] = nil
-        recordings.ended[vm] = summary
-        recordings.lastDirectory[vm] = summary.dir
+        settle(recording, vm: vm, summary: summary, collecting: false)
+    }
+
+    /// Records the end of `recording` once: the first to settle it clears the retirement; a retirement keeps the summary
+    /// for `vm.record.stop`, a collector takes it. Returns the summary when the caller is the one that delivers it.
+    @discardableResult
+    private func settle(_ recording: Recording, vm: String, summary: Recording.Summary, collecting: Bool) -> Recording.Summary? {
+        if recordings.retiring[vm] === recording {
+            recordings.retiring[vm] = nil
+            recordings.lastDirectory[vm] = summary.dir
+            if collecting { return summary }
+            recordings.ended[vm] = summary
+            return nil
+        }
+        guard collecting, recordings.ended[vm]?.dir == summary.dir else { return nil }
+        recordings.ended[vm] = nil
+        return summary
+    }
+
+    /// Waits until no recording of the VM is being retired.
+    private func settleRetirements(_ vm: String) async {
+        while let retiring = recordings.retiring[vm] {
+            let summary = await retiring.stop()
+            settle(retiring, vm: vm, summary: summary, collecting: false)
+        }
     }
 
     func setRecordingSeams(_ seams: RecordingSeams) { recordingSeams = seams }
 
     /// Notes that the VM was found not running; its recording ends once the op that found out is traced.
     func noteVMGone(_ vm: String) {
-        if recordings.active[vm] != nil { recordings.vmGone.insert(vm) }
+        if let recording = recordings.active[vm] { recordings.vmGone[vm] = recording }
     }
 
     func record(op: String, params: JSON) async throws -> JSON {
         let t = try await target(params)
         let vm = t.name
-        let current = await liveRecording(vm)
+        let current = op == "vm.record.start" ? nil : await liveRecording(vm)
         switch op {
         case "vm.record.start":
-            if let current { throw ControlError.failed("'\(vm)' is already recording to \(current.directory.path); call vm.record.stop first") }
+            repeat {
+                await settleRetirements(vm)
+                _ = await liveRecording(vm)
+            } while recordings.retiring[vm] != nil
+            if let active = recordings.active[vm] { throw ControlError.failed("'\(vm)' is already recording to \(active.directory.path); call vm.record.stop first") }
             if let reserved = recordings.starting[vm] { throw ControlError.failed("'\(vm)' is already recording to \(reserved.path); call vm.record.stop first") }
             return try await startRecording(t, params)
         case "vm.record.stop":
             if let current {
                 recordings.active[vm] = nil
                 recordings.retiring[vm] = current
-                return await collect(current, vm: vm)
+                return try await collect(current, vm: vm)
             }
-            if let retiring = recordings.retiring[vm] { return await collect(retiring, vm: vm) }
+            if let retiring = recordings.retiring[vm] { return try await collect(retiring, vm: vm) }
             if recordings.starting[vm] != nil { throw ControlError.failed("'\(vm)' is still starting its recording; call vm.record.stop again in a moment") }
             guard let summary = recordings.ended.removeValue(forKey: vm) else { throw ControlError.failed("'\(vm)' is not recording") }
             return summary.json
@@ -114,11 +141,12 @@ extension ControlHandler {
     }
 
     /// Waits for `recording` to end and returns its summary as the answer to `vm.record.stop`.
-    private func collect(_ recording: Recording, vm: String) async -> JSON {
+    private func collect(_ recording: Recording, vm: String) async throws -> JSON {
         let summary = await recording.stop()
-        if recordings.retiring[vm] === recording { recordings.retiring[vm] = nil }
-        recordings.lastDirectory[vm] = summary.dir
-        return summary.json
+        guard let delivered = settle(recording, vm: vm, summary: summary, collecting: true) else {
+            throw ControlError.failed("'\(vm)' is not recording")
+        }
+        return delivered.json
     }
 
     private func startRecording(_ t: VMTarget, _ params: JSON) async throws -> JSON {
@@ -134,11 +162,13 @@ extension ControlHandler {
             throw ControlError.failed("'\(directory.path)' already holds a recording; choose another directory")
         }
         let seams = recordingSeams
+        let sink: VideoSink = video ? seams.makeSink(directory, fps) : NoVideoSink()
         let recording = Recording(vm: t.name, directory: directory, fps: fps, video: video, maxSeconds: maxSeconds,
-                                  frames: { try? await t.frame() }, sink: video ? seams.makeSink(directory, fps) : NoVideoSink(),
+                                  frames: { try? await t.frame() }, sink: sink,
                                   openWriter: seams.openWriter, clock: clock, now: wallClock)
         recordings.starting[t.name] = directory
         do { try await recording.start() } catch {
+            await sink.finish()
             recordings.starting[t.name] = nil
             if case TraceWriter.WriterError.exists = error { throw ControlError.failed("'\(directory.path)' already holds a recording; choose another directory") }
             throw ControlError.failed("cannot create the recording in '\(directory.path)': \(error)")
@@ -146,7 +176,7 @@ extension ControlHandler {
         recordings.starting[t.name] = nil
         recordings.active[t.name] = recording
         recordings.ended[t.name] = nil
-        recordings.vmGone.remove(t.name)
+        recordings.vmGone[t.name] = nil
         recordings.lastDirectory[t.name] = directory.path
         return ["dir": .string(directory.path)]
     }

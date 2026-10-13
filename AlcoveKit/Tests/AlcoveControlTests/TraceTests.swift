@@ -433,6 +433,94 @@ final class TraceTests: XCTestCase {
         XCTAssertEqual(again, "'Win' is not recording")
     }
 
+    func testSummaryIsDeliveredOnce() async throws {
+        let (h, _, _) = setup()
+        let slow = SlowFinishSink()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in slow }))
+        _ = try await start(h, ["video": true])
+        let retire = Task { try await h.handle(op: "vm.stop", params: ["name": "Win"]) }
+        await slow.gate.waitUntilWaiting()
+        let stops = (0..<2).map { _ in Task { () -> Bool in
+            do { _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"]); return true } catch { return false }
+        } }
+        try await Task.sleep(for: .milliseconds(100))
+        await slow.gate.open()
+        _ = try await retire.value
+        var delivered = 0
+        for stop in stops where await stop.value { delivered += 1 }
+        do { _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"]); delivered += 1 } catch {}
+        XCTAssertEqual(delivered, 1)
+    }
+
+    func testStaleRecordingCannotRetireANewerOne() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h, ["video": false])
+        let stale = Recording(vm: "Win", directory: base.appendingPathComponent("stale"), fps: 5, video: false, maxSeconds: 60, frames: { nil })
+        await h.retireRecording("Win", stale)
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, true)
+        XCTAssertEqual(status["dir"]?.stringValue, dir.path)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dir.path)
+    }
+
+    func testStartWaitsForTheRetiringRecording() async throws {
+        let (h, _, _) = setup()
+        let slow = SlowFinishSink()
+        let sinks = SinkQueue([slow, NoVideoSink()])
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in sinks.next() }))
+        let dirA = try await start(h, ["video": true, "dir": .string(base.appendingPathComponent("a").path)])
+        let retire = Task { try await h.handle(op: "vm.stop", params: ["name": "Win"]) }
+        await slow.gate.waitUntilWaiting()
+        let dirB = base.appendingPathComponent("b")
+        let second = Task { try await h.handle(op: "vm.record.start", params: ["name": "Win", "dir": .string(dirB.path), "video": true]) }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dirB.appendingPathComponent("trace.jsonl").path))
+        await slow.gate.open()
+        _ = try await retire.value
+        let started = try await second.value
+        XCTAssertEqual(started["dir"]?.stringValue, dirB.path)
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, true)
+        XCTAssertEqual(status["dir"]?.stringValue, dirB.path)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dirB.path)
+        XCTAssertNotEqual(dirA.path, dirB.path)
+        let again = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(again, "'Win' is not recording")
+    }
+
+    func testRecordingThatEndedByItselfDoesNotRetireTheNextOne() async throws {
+        let (h, _, clock) = setup()
+        let slow = SlowFinishSink()
+        let sinks = SinkQueue([slow, NoVideoSink()])
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in sinks.next() }))
+        _ = try await start(h, ["video": true, "maxSeconds": 10, "dir": .string(base.appendingPathComponent("a").path)])
+        clock.advance(.seconds(11))
+        let probe = Task { try await h.handle(op: "vm.status", params: ["name": "Win"]) }
+        await slow.gate.waitUntilWaiting()
+        let dirB = base.appendingPathComponent("b")
+        let second = Task { try await h.handle(op: "vm.record.start", params: ["name": "Win", "dir": .string(dirB.path), "video": true]) }
+        try await Task.sleep(for: .milliseconds(100))
+        await slow.gate.open()
+        _ = try await probe.value
+        _ = try await second.value
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, true)
+        XCTAssertEqual(status["dir"]?.stringValue, dirB.path)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dirB.path)
+    }
+
+    func testFailedStartFinishesTheSink() async throws {
+        let (h, _, _) = setup()
+        let sink = FinishCountingSink()
+        await h.setRecordingSeams(RecordingSeams(openWriter: { _ in throw CocoaError(.fileWriteNoPermission) }, makeSink: { _, _ in sink }))
+        let message = await failure(h, "vm.record.start", ["name": "Win", "video": true])
+        XCTAssertTrue(message.contains("cannot create the recording"), message)
+        XCTAssertEqual(sink.finished, 1)
+    }
+
     // MARK: automatic end
 
     func testRecordingStopsWhenVMStops() async throws {
@@ -527,7 +615,11 @@ private actor AsyncGate {
         await withCheckedContinuation { waiters.append($0) }
     }
     func waitUntilWaiting() async {
-        while waiters.isEmpty { try? await Task.sleep(for: .milliseconds(5)) }
+        let limit = ContinuousClock.now + .seconds(5)
+        while waiters.isEmpty {
+            if ContinuousClock.now >= limit { XCTFail("nothing started waiting within 5 seconds"); return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
     }
     func open() {
         isOpen = true
@@ -563,4 +655,19 @@ private final class SlowFinishSink: VideoSink, @unchecked Sendable {
     let gate = AsyncGate()
     func append(frame: Frame, at time: Duration) {}
     func finish() async { await gate.wait() }
+}
+
+private final class SinkQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sinks: [VideoSink]
+    init(_ sinks: [VideoSink]) { self.sinks = sinks }
+    func next() -> VideoSink { lock.withLock { sinks.isEmpty ? NoVideoSink() : sinks.removeFirst() } }
+}
+
+private final class FinishCountingSink: VideoSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var finished: Int { lock.withLock { count } }
+    func append(frame: Frame, at time: Duration) {}
+    func finish() async { lock.withLock { count += 1 } }
 }
