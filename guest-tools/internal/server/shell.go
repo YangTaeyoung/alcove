@@ -159,9 +159,9 @@ func (s *Server) execRun(req proto.Message) (proto.Message, error) {
 	}
 	stdout, stderr := newRing(runStreamBytes), newRing(runStreamBytes)
 	c.Stdout, c.Stderr = stdout, stderr
-	if req.Has("stdin") {
-		c.Stdin = strings.NewReader(req.String("stdin"))
-	}
+	// The child reads the stdin text from a pipe that ends after it; without
+	// the field the pipe is at end-of-file from the start.
+	c.Stdin = strings.NewReader(req.String("stdin"))
 	timeout := defaultRunTimeout
 	if ms := req.Int("timeout_ms"); ms > 0 {
 		timeout = time.Duration(ms) * time.Millisecond

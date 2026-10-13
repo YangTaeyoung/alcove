@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -299,6 +300,8 @@ func runShell(cmd string) (string, int) {
 		return err.Error(), 1
 	}
 	hideWindow(c)
+	// The child's input is a pipe at end-of-file.
+	c.Stdin = strings.NewReader("")
 	out, err := c.CombinedOutput()
 	code := 0
 	if err != nil {

@@ -185,6 +185,25 @@ func TestExecRunStdinCwdEnv(t *testing.T) {
 	}
 }
 
+func TestExecRunWithoutStdinGivesEmptyPipe(t *testing.T) {
+	c, _ := newRPCClient(t, Options{})
+	res := c.ok("exec.run", proto.Message{"cmd": `read x; echo "got:$x"; [ -p /dev/stdin ] && echo pipe`, "timeout_ms": 10000})
+	if res.String("stdout") != "got:\npipe\n" || res["timed_out"] != false || res.Int("code") != 0 {
+		t.Fatalf("res %v", res)
+	}
+}
+
+func TestV1ExecWithoutStdinGivesEmptyPipe(t *testing.T) {
+	r, w, c := startServer(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), AllowExec: true})
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	expect(t, r, "hello")
+	w.Send(proto.Message{"t": "exec", "cmd": `read x; echo "got:$x"; [ -p /dev/stdin ] && echo pipe`})
+	res := expect(t, r, "exec.result")
+	if res.String("out") != "got:\npipe\n" || res.Int("code") != 0 {
+		t.Fatalf("res %v", res)
+	}
+}
+
 func TestExecRunRelativeCwdUsesHome(t *testing.T) {
 	home := t.TempDir()
 	if err := os.Mkdir(filepath.Join(home, "sub"), 0o755); err != nil {
