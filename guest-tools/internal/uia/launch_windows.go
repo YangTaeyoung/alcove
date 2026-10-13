@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 )
 
@@ -25,8 +26,11 @@ const createNoWindow = 0x08000000
 func Available() bool { return true }
 
 // DefaultLauncher writes the embedded files below dir and starts
-// powershell.exe without a console window.
+// powershell.exe without a console window. Each start tells the helper how
+// many helpers this launcher started before it, which the helper uses to keep
+// its element refs apart from those of earlier helpers.
 func DefaultLauncher(dir string) Launcher {
+	starts := 0
 	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, nil, nil, err
@@ -37,13 +41,15 @@ func DefaultLauncher(dir string) Launcher {
 		if err := writeIfDifferent(filepath.Join(dir, "helper.cs"), helperSource); err != nil {
 			return nil, nil, nil, err
 		}
-		logFile, err := os.OpenFile(filepath.Join(dir, "helper.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		logFile, err := openCappedLog(filepath.Join(dir, "helper.log"), maxLogBytes)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 			"-File", filepath.Join(dir, "bootstrap.ps1"))
 		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "ALCOVE_UIA_START="+strconv.Itoa(starts))
+		starts++
 		cmd.Stderr = logFile
 		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 		stdin, err := cmd.StdinPipe()
