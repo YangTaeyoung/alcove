@@ -277,17 +277,23 @@ extension ControlHandler {
     // MARK: - agent conditions
 
     /// One agent call bounded by the per-call limit and the deadline; nil when the call timed out.
-    private func callAgent(_ agent: AgentClient, _ op: String, _ params: [String: JSON], clock: ContinuousClock,
+    /// A `ui.*` or `win.*` call first waits for its turn among the helper calls of `vm`; its limit counts from the moment it is sent.
+    private func callAgent(_ agent: AgentClient, _ op: String, _ params: [String: JSON], vm: String, clock: ContinuousClock,
                            deadline: ContinuousClock.Instant) async throws -> JSON? {
-        let limit = min(WaitTiming.agentCallTimeout, max(deadline - clock.now, .milliseconds(200)))
-        do { return try await agent.call(op, params, timeout: limit) }
-        catch AgentClient.AgentError.timeout { return nil }
+        let send: @Sendable () async throws -> JSON = {
+            let limit = min(WaitTiming.agentCallTimeout, max(deadline - clock.now, .milliseconds(200)))
+            return try await agent.call(op, params, timeout: limit)
+        }
+        do {
+            if ControlHandler.isHelperOp(op) { return try await helperGate.withLock(vm, send) }
+            return try await send()
+        } catch AgentClient.AgentError.timeout { return nil }
     }
 
     private func evaluateAgent(_ condition: WaitCondition, index: Int, state: inout WaitState, vm: String, agent: AgentClient,
                                clock: ContinuousClock, deadline: ContinuousClock.Instant) async throws -> Verdict {
         func call(_ op: String, _ params: [String: JSON]) async throws -> JSON? {
-            try await callAgent(agent, op, params, clock: clock, deadline: deadline)
+            try await callAgent(agent, op, params, vm: vm, clock: clock, deadline: deadline)
         }
         switch condition {
         case .processStarted(let name):
@@ -366,17 +372,28 @@ extension ControlHandler {
             }
             return exited && drained ? .over(.string("job exited")) : .pending
         case .uiExists(let element), .uiGone(let element), .uiEnabled(let element):
-            let reply: JSON?
-            do { reply = try await call("ui.rect", element) }
-            catch AgentClient.AgentError.remote(let message) where UISelector.isMissingElement(message) {
-                if case .uiGone = condition { return .holds(nil) }
-                return .pending
+            var found: JSON?
+            if let ref = element["ref"]?.stringValue {
+                do {
+                    guard let r = try await call("ui.rect", element) else { return .pending }
+                    found = r["node"] ?? .null
+                } catch AgentClient.AgentError.remote(let message) where UISelector.isStaleRef(message, ref: ref) {
+                    found = nil
+                }
+            } else {
+                var request = element
+                request["limit"] = 1
+                guard let r = try await call("ui.find", request) else { return .pending }
+                found = r["nodes"]?.arrayValue?.first
             }
-            guard let node = reply?["node"] else { return .pending }
             switch condition {
-            case .uiGone: return .pending
-            case .uiEnabled: return (node["flags"]?.arrayValue ?? []).contains("disabled") ? .pending : .holds(node)
-            default: return .holds(node)
+            case .uiGone: return found == nil ? .holds(nil) : .pending
+            case .uiEnabled:
+                guard let node = found, !(node["flags"]?.arrayValue ?? []).contains("disabled") else { return .pending }
+                return .holds(node)
+            default:
+                guard let node = found else { return .pending }
+                return .holds(node)
             }
         case .windowTitle(let contains, let pattern):
             guard let r = try await call("win.list", [:]) else { return .pending }
@@ -394,7 +411,8 @@ extension ControlHandler {
         case .uiTextStable(let element, let quietMs):
             let reply: JSON?
             do { reply = try await call("ui.text", element) }
-            catch AgentClient.AgentError.remote(let message) where UISelector.isMissingElement(message) {
+            catch AgentClient.AgentError.remote(let message)
+                where UISelector.isGone(message, ref: element["ref"]?.stringValue, wasRead: state.lastText != nil) {
                 return .over(.string(message))
             }
             guard let r = reply else { return .pending }

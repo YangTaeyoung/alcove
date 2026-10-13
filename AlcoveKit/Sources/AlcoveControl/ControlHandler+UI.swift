@@ -66,9 +66,16 @@ enum UISelector {
         text.hasPrefix("e") && text.count > 1 && text.dropFirst().allSatisfy { $0.isASCII && $0.isNumber }
     }
 
-    /// Whether an agent error says that the selected element does not exist.
-    static func isMissingElement(_ message: String) -> Bool {
-        message.hasPrefix("no element matches") || (message.hasPrefix("element ") && message.contains(" no longer exists"))
+    /// Whether an agent error says that the element behind `ref` no longer exists.
+    static func isStaleRef(_ message: String, ref: String) -> Bool {
+        message.hasPrefix("element \(ref) no longer exists")
+    }
+
+    /// Whether an agent error to a read of an element says that the element is gone: the stale-ref sentence for `ref`,
+    /// or the no-match sentence for a selector whose element was read before.
+    static func isGone(_ message: String, ref: String?, wasRead: Bool) -> Bool {
+        if let ref { return isStaleRef(message, ref: ref) }
+        return wasRead && message.hasPrefix("no element matches ")
     }
 }
 
@@ -147,10 +154,18 @@ extension ControlHandler {
         return agent
     }
 
-    /// One agent call on behalf of the control op `op`; failures become control errors.
+    /// Whether the agent hands `op` to its UI helper, which serves one request at a time.
+    static func isHelperOp(_ op: String) -> Bool { op.hasPrefix("ui.") || op.hasPrefix("win.") }
+
+    /// One `ui.*` or `win.*` agent call. It waits for its turn among the helper calls of `vm`; `timeout` counts from the moment it is sent.
+    func helperCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, timeout: Duration) async throws -> JSON {
+        try await helperGate.withLock(vm) { try await agent.call(agentOp, fields, timeout: timeout) }
+    }
+
+    /// One helper call on behalf of the control op `op`; failures become control errors.
     func uiCall(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, op: String,
                 timeout: Duration = UITiming.callTimeout) async throws -> JSON {
-        do { return try await agent.call(agentOp, fields, timeout: timeout) } catch { throw agentFailure(error, vm: vm, op: op) }
+        do { return try await helperCall(agent, agentOp, fields, vm: vm, timeout: timeout) } catch { throw agentFailure(error, vm: vm, op: op) }
     }
 
     /// The agent fields that select the element of a control op: its `ref`, or the fields of its `selector` object.
@@ -185,8 +200,11 @@ extension ControlHandler {
         let r = try await uiCall(agent, "ui.rect", request, vm: vm, op: op)
         let node = r["node"] ?? .null
         guard r["clickable"]?.boolValue == true, let x = r["cx"]?.intValue, let y = r["cy"]?.intValue else {
-            let ref = node["ref"]?.stringValue ?? element["ref"]?.stringValue
-            throw ControlError.failed("element \(ref ?? "of this selector") has no clickable point (off screen or covered); use vm.ui.action or scroll it into view")
+            let ref = node["ref"]?.stringValue ?? element["ref"]?.stringValue ?? "of this selector"
+            guard let blocked = r["blocked"]?.stringValue, !blocked.isEmpty else {
+                throw ControlError.failed("element \(ref) has no clickable point (off screen or covered); use vm.ui.action or scroll it into view")
+            }
+            throw ControlError.failed("element \(ref) has no clickable point: \(blocked); or act on it with vm.ui.action")
         }
         return (node, x, y)
     }
@@ -257,13 +275,17 @@ extension ControlHandler {
         }
         let t = try await running(params)
         let agent = try await uiAgent(t, op: op)
-        let nodes: [JSON]
         if byRef {
-            nodes = [try await uiCall(agent, "ui.rect", request, vm: t.name, op: op)["node"]].compactMap { $0 }
-        } else {
-            nodes = try await uiCall(agent, "ui.find", request, vm: t.name, op: op)["nodes"]?.arrayValue ?? []
+            let nodes = [try await uiCall(agent, "ui.rect", request, vm: t.name, op: op)["node"]].compactMap { $0 }
+            return ["nodes": .array(nodes), "text": .string(UITreeText.render(nodes))]
         }
-        return ["nodes": .array(nodes), "text": .string(UITreeText.render(nodes))]
+        let r = try await uiCall(agent, "ui.find", request, vm: t.name, op: op)
+        let nodes = r["nodes"]?.arrayValue ?? []
+        guard r["truncated"]?.boolValue == true else {
+            return ["nodes": .array(nodes), "text": .string(UITreeText.render(nodes))]
+        }
+        let note = "… the search ran out of time after these matches; add window or role to the selector, or read a part with vm.ui.tree and root"
+        return ["nodes": .array(nodes), "text": .string(UITreeText.render(nodes) + "\n" + note), "truncated": true]
     }
 
     private func uiText(_ params: JSON) async throws -> JSON {
@@ -430,7 +452,7 @@ extension ControlHandler {
             return
         }
         do {
-            let r = try await agent.call("ui.focused", [:], timeout: UITiming.factTimeout)
+            let r = try await helperCall(agent, "ui.focused", [:], vm: t.name, timeout: UITiming.factTimeout)
             observation.foreground = r["window"]?["title"]?.stringValue
             observation.focused = r["node"].map(UITreeText.label)
         } catch {
@@ -440,7 +462,7 @@ extension ControlHandler {
         if level == .ui, observation.uiError == nil {
             do {
                 let request: [String: JSON] = ["window": "foreground", "max": .int(Int64(ControlHandler.observedTreeNodes))]
-                let r = try await agent.call("ui.tree", request, timeout: UITiming.treeFactTimeout)
+                let r = try await helperCall(agent, "ui.tree", request, vm: t.name, timeout: UITiming.treeFactTimeout)
                 var text = UITreeText.render(r["nodes"]?.arrayValue ?? [])
                 if r["truncated"]?.boolValue == true { text += "\n… more elements; call vm.ui.tree to read the whole window" }
                 observation.tree = text
@@ -505,7 +527,7 @@ extension ControlHandler {
               let x = window["x"]?.intValue, let y = window["y"]?.intValue, let w = window["w"]?.intValue, let h = window["h"]?.intValue,
               let area = frame.clamp(Frame.Rect(x: x, y: y, w: w, h: h)) else {
             let title = window["title"]?.stringValue ?? window["id"]?.stringValue ?? ""
-            throw ControlError.failed("window '\(title)' is minimized or outside the \(frame.width)x\(frame.height) frame; restore it with vm.window.action")
+            throw ControlError.failed("window '\(title)' is minimized or has no area on the \(frame.width)x\(frame.height) frame; call vm.window.action restore first")
         }
         return area
     }

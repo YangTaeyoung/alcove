@@ -213,6 +213,12 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "ui.tree").count, 2)
     }
 
+    func testUITreeOfAnElementWithoutAWindow() async throws {
+        let (h, _, _) = try await rig(["ui.tree": { _, _ in .ok(["window": .null, "nodes": [sendButton], "truncated": false]) }])
+        let r = try await h.handle(op: "vm.ui.tree", params: ["name": "Win", "root": "e6000535"])
+        XCTAssertEqual(r, ["tree": .string(UITreeText.render([sendButton])), "count": 1, "truncated": false, "window": .null])
+    }
+
     func testUIFindOp() async throws {
         let (h, _, agent) = try await rig([
             "ui.find": { _, _ in .ok(["nodes": [sendButton, messageEdit]]) },
@@ -224,10 +230,21 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(fields(agentRequests(agent, "ui.find").last),
                        ["window": "Alcove", "role": "button", "name": "Send \"now\"", "nameContains": "en", "automationId": "send-1", "index": 1, "limit": 5])
 
-        let byRef = try await h.handle(op: "vm.ui.find", params: ["name": "Win", "ref": "e5"])
+        let byRef = try await h.handle(op: "vm.ui.find", params: ["name": "Win", "ref": "e6000535"])
         XCTAssertEqual(byRef, ["nodes": [sendButton], "text": .string(UITreeText.render([sendButton]))])
-        XCTAssertEqual(fields(agentRequests(agent, "ui.rect").last), ["ref": "e5"])
+        XCTAssertEqual(fields(agentRequests(agent, "ui.rect").last), ["ref": "e6000535"])
         XCTAssertEqual(agentRequests(agent, "ui.find").count, 1)
+    }
+
+    func testUIFindReportsASearchThatRanOutOfTime() async throws {
+        let (h, _, _) = try await rig(["ui.find": { m, _ in
+            m["role"] == nil ? .ok(["nodes": []]) : .ok(["nodes": [sendButton], "truncated": true])
+        }])
+        let cut = try await h.handle(op: "vm.ui.find", params: ["name": "Win", "selector": ["role": "Button"]])
+        XCTAssertEqual(cut, ["nodes": [sendButton], "truncated": true, "text": .string(UITreeText.render([sendButton])
+            + "\n… the search ran out of time after these matches; add window or role to the selector, or read a part with vm.ui.tree and root")])
+        let none = try await h.handle(op: "vm.ui.find", params: ["name": "Win", "selector": ["name": "Nothing"]])
+        XCTAssertEqual(none, ["nodes": [], "text": ""])
     }
 
     func testSelectorValidation() async throws {
@@ -310,13 +327,22 @@ final class ControlUITests: XCTestCase {
 
     func testUIClickRefusesOffscreen() async throws {
         let hidden = node("e8", "Button", "Hidden", x: 0, y: 0, w: 0, h: 0, flags: ["offscreen"])
+        let covered = "window 0x50 \"Fixture Dialog\" covers the centre of the element; focus the element's window with win.action"
         let (h, t, agent) = try await rig(["ui.rect": { m, _ in
-            m["ref"]?.stringValue == "e3" ? .fail("element e3 no longer exists; call ui.tree again")
-                : .ok(["node": hidden, "cx": 0, "cy": 0, "clickable": false])
+            switch m["ref"]?.stringValue {
+            case "e3": return .fail("element e3 no longer exists; call ui.tree again")
+            case "e5": return .ok(["node": sendButton, "cx": 190, "cy": 112, "clickable": false, "blocked": .string(covered)])
+            default: return .ok(["node": hidden, "cx": 0, "cy": 0, "clickable": false])
+            }
         }])
         let text = await failure(h, "vm.ui.click", ["name": "Win", "ref": "e8", "observe": "summary", "settleMs": 20])
         XCTAssertEqual(text, "element e8 has no clickable point (off screen or covered); use vm.ui.action or scroll it into view")
         XCTAssertEqual(agentRequests(agent, "ui.rect").last?["scroll"]?.boolValue, true)
+
+        let blocked = await failure(h, "vm.ui.click", ["name": "Win", "ref": "e5"])
+        XCTAssertEqual(blocked, "element e5 has no clickable point: \(covered); or act on it with vm.ui.action")
+        let blockedType = await failure(h, "vm.ui.type", ["name": "Win", "ref": "e5", "text": "x"])
+        XCTAssertEqual(blockedType, "element e5 has no clickable point: \(covered); or act on it with vm.ui.action")
 
         let typed = await failure(h, "vm.ui.type", ["name": "Win", "selector": ["name": "Hidden"], "text": "x"])
         XCTAssertEqual(typed, "element e8 has no clickable point (off screen or covered); use vm.ui.action or scroll it into view")
@@ -763,13 +789,12 @@ final class ControlUITests: XCTestCase {
     }
 
     func testWaitUIExistsGoneEnabled() async throws {
-        let noMatch = "no element matches {\"name\":\"Send\",\"role\":\"Button\"}; call ui.tree to see what exists"
         let disabled = node("e5", "Button", "Send", flags: ["disabled"])
-        let (h, _, agent) = try await rig(["ui.rect": { m, n in
+        let (h, _, agent) = try await rig(["ui.find": { m, n in
             switch m["name"]?.stringValue {
-            case "Send": return n < 2 ? .fail(noMatch) : .ok(["node": sendButton, "cx": 190, "cy": 112, "clickable": true])
-            case "Busy": return n < 5 ? .ok(["node": sendButton, "cx": 1, "cy": 1, "clickable": true]) : .fail(noMatch)
-            default: return n < 8 ? .ok(["node": disabled, "cx": 1, "cy": 1, "clickable": false]) : .ok(["node": sendButton, "cx": 1, "cy": 1, "clickable": true])
+            case "Send": return .ok(["nodes": n < 2 ? [] : [sendButton]])
+            case "Busy": return .ok(["nodes": n < 5 ? [sendButton] : []])
+            default: return .ok(["nodes": [n < 8 ? disabled : sendButton]])
             }
         }])
         let exists = try await waitFor(h, [["type": "ui_exists", "window": "Alcove", "role": "Button", "name": "Send", "index": 0]])
@@ -777,29 +802,74 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(exists["type"]?.stringValue, "ui_exists")
         XCTAssertEqual(exists["detail"], sendButton)
         XCTAssertNil(exists["problems"])
-        XCTAssertEqual(fields(agentRequests(agent, "ui.rect").last), ["window": "Alcove", "role": "Button", "name": "Send", "index": 0])
-        XCTAssertEqual(agentRequests(agent, "ui.rect").count, 3)
+        XCTAssertEqual(fields(agentRequests(agent, "ui.find").last), ["window": "Alcove", "role": "Button", "name": "Send", "index": 0, "limit": 1])
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 3)
 
         let gone = try await waitFor(h, [["type": "ui_gone", "name": "Busy"]])
         XCTAssertEqual(gone["matched"]?.intValue, 0)
         XCTAssertEqual(gone["type"]?.stringValue, "ui_gone")
         XCTAssertNil(gone["detail"])
-        XCTAssertEqual(agentRequests(agent, "ui.rect").count, 6)
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 6)
 
         let enabled = try await waitFor(h, [["type": "ui_enabled", "automationId": "send-1"]])
         XCTAssertEqual(enabled["matched"]?.intValue, 0)
         XCTAssertEqual(enabled["type"]?.stringValue, "ui_enabled")
         XCTAssertEqual(enabled["detail"], sendButton)
-        XCTAssertEqual(agentRequests(agent, "ui.rect").count, 9)
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 9)
+    }
+
+    func testUIGoneHoldsOnlyOnAnEmptySearchResult() async throws {
+        let searchErrors = [
+            "the search for {\"name\":\"Busy\"} did not finish within 12 s; read the window in parts with ui.tree and root, then use a ref",
+            "UI helper did not answer 'ui.find' within 20 s; it was restarted",
+            "UI helper exited; retry",
+        ]
+        let (h, _, agent) = try await rig(["ui.find": { m, n in
+            switch m["name"]?.stringValue {
+            case "Busy": return n < searchErrors.count ? .fail(searchErrors[n]) : .ok(["nodes": []])
+            case "Closed": return .fail("no window has \"Fixture Dialog\" in its title; call win.list to see the open windows")
+            default: return .fail("UI helper exited; retry")
+            }
+        }])
+        let gone = try await waitFor(h, [["type": "ui_gone", "name": "Busy"]])
+        XCTAssertEqual(gone["matched"]?.intValue, 0)
+        XCTAssertEqual(agentRequests(agent, "ui.find").count, 4)
+
+        let unknown = try await waitFor(h, [["type": "ui_gone", "name": "Other"]], timeout: 1)
+        XCTAssertEqual(unknown["matched"]?.intValue, -1)
+        XCTAssertEqual(unknown["problems"]?[0]?["type"]?.stringValue, "ui_gone")
+        XCTAssertEqual(unknown["problems"]?[0]?["error"]?.stringValue, "UI helper exited; retry")
+
+        let closed = try await waitFor(h, [["type": "ui_gone", "window": "Fixture Dialog", "name": "Closed"]], timeout: 1)
+        XCTAssertEqual(closed["matched"]?.intValue, -1)
+        XCTAssertEqual(closed["problems"]?[0]?["error"]?.stringValue, "no window has \"Fixture Dialog\" in its title; call win.list to see the open windows")
+
+        let exists = try await waitFor(h, [["type": "ui_exists", "name": "Other"]], timeout: 1)
+        XCTAssertEqual(exists["matched"]?.intValue, -1)
+        XCTAssertEqual(exists["problems"]?[0]?["error"]?.stringValue, "UI helper exited; retry")
     }
 
     func testWaitUIConditionsTakeARef() async throws {
-        let (h, _, agent) = try await rig(["ui.rect": { _, n in
-            n < 2 ? .ok(["node": sendButton, "cx": 1, "cy": 1, "clickable": true]) : .fail("element e5 no longer exists; call ui.tree again")
+        let (h, _, agent) = try await rig(["ui.rect": { m, n in
+            switch m["ref"]?.stringValue {
+            case "e5": return n < 2 ? .ok(["node": sendButton, "cx": 1, "cy": 1, "clickable": true]) : .fail("element e5 no longer exists; call ui.tree again")
+            case "e6": return n < 4 ? .fail("UI helper exited; retry") : .ok(["node": sendButton, "cx": 1, "cy": 1, "clickable": true])
+            default: return .fail("UI helper exited; retry")
+            }
         }])
         let gone = try await waitFor(h, [["type": "ui_gone", "ref": "e5"]])
         XCTAssertEqual(gone["matched"]?.intValue, 0)
         XCTAssertEqual(fields(agentRequests(agent, "ui.rect").last), ["ref": "e5"])
+        XCTAssertEqual(agentRequests(agent, "ui.rect").count, 3)
+
+        let exists = try await waitFor(h, [["type": "ui_exists", "ref": "e6"]])
+        XCTAssertEqual(exists["matched"]?.intValue, 0)
+        XCTAssertEqual(exists["detail"], sendButton)
+        XCTAssertEqual(agentRequests(agent, "ui.rect").count, 5)
+
+        let unknown = try await waitFor(h, [["type": "ui_gone", "ref": "e7"]], timeout: 1)
+        XCTAssertEqual(unknown["matched"]?.intValue, -1)
+        XCTAssertEqual(unknown["problems"]?[0]?["error"]?.stringValue, "UI helper exited; retry")
     }
 
     func testWaitWindowTitle() async throws {
@@ -848,10 +918,25 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(fields(agentRequests(agent, "ui.text").last), ["ref": "e7"])
 
         let noMatch = "no element matches {\"name\":\"Transcript\"}; call ui.tree to see what exists"
-        let (other, _, _) = try await rig(["ui.text": { _, _ in .fail(noMatch) }])
-        let missing = try await waitFor(other, [["type": "ui_text_stable", "name": "Transcript"]])
-        XCTAssertEqual(missing["matched"]?.intValue, -1)
-        XCTAssertEqual(missing["detail"]?.stringValue, noMatch)
+        let (other, _, otherAgent) = try await rig(["ui.text": { m, n in
+            m["name"]?.stringValue == "Transcript" && n == 0 ? .ok(["text": "partial", "total": 7, "source": "value"]) : .fail(noMatch)
+        }])
+        let vanished = try await waitFor(other, [["type": "ui_text_stable", "name": "Transcript", "quietMs": 60_000]])
+        XCTAssertEqual(vanished["matched"]?.intValue, -1)
+        XCTAssertEqual(vanished["type"]?.stringValue, "ui_text_stable")
+        XCTAssertEqual(vanished["detail"]?.stringValue, noMatch)
+        XCTAssertEqual(agentRequests(otherAgent, "ui.text").count, 2)
+
+        let neverRead = try await waitFor(other, [["type": "ui_text_stable", "name": "Later"]], timeout: 1)
+        XCTAssertEqual(neverRead["matched"]?.intValue, -1)
+        XCTAssertNil(neverRead["type"])
+        XCTAssertNil(neverRead["detail"])
+        XCTAssertEqual(neverRead["problems"]?[0]?["error"]?.stringValue, noMatch)
+
+        let otherRef = try await waitFor(other, [["type": "ui_text_stable", "ref": "e9"]], timeout: 1)
+        XCTAssertEqual(otherRef["matched"]?.intValue, -1)
+        XCTAssertNil(otherRef["detail"])
+        XCTAssertEqual(otherRef["problems"]?[0]?["error"]?.stringValue, noMatch)
     }
 
     func testWaitEvent() async throws {
@@ -915,15 +1000,15 @@ final class ControlUITests: XCTestCase {
         catch { XCTAssertEqual("\(error)", "guest tools in 'Win' disconnected during vm.wait_for; retry once the guest is back") }
     }
 
-    /// A fake agent with the `ui` capability, connected to a new running VM "Win". Every `ui.rect` request is answered with
-    /// the no-match error followed by the `emitted` event.
+    /// A fake agent with the `ui` capability, connected to a new running VM "Win". Every `ui.find` request is answered with
+    /// no nodes followed by the `emitted` event.
     private func target(emitting emitted: JSON) async throws -> (FakeTarget, FakeAgent) {
         let agent = FakeAgent()
         agent.caps = ["clipboard", "files", "exec", "ui"]
         agent.handler = { m, _ in
             switch m["op"]?.stringValue {
             case "ui.focused": return [agentReply(m, ["node": messageEdit, "window": fixtureWindow])]
-            case "ui.rect": return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "no element matches {}; call ui.tree to see what exists"], emitted]
+            case "ui.find": return [agentReply(m, ["nodes": []]), emitted]
             default: return []
             }
         }
@@ -988,22 +1073,61 @@ final class ControlUITests: XCTestCase {
     }
 
     func testHelperErrorsDuringAWaitAreReportedAsProblems() async throws {
-        let (h, _, agent) = try await rig(["ui.rect": { _, _ in .fail("UI helper did not answer in time; call the op again") }])
+        let restarted = "UI helper did not answer 'ui.find' within 20 s; it was restarted"
+        let (h, _, agent) = try await rig(["ui.find": { _, _ in .fail(restarted) }])
         let r = try await waitFor(h, [["type": "ui_exists", "name": "Send"]], timeout: 1)
         XCTAssertEqual(r["matched"]?.intValue, -1)
         let problem = try XCTUnwrap(r["problems"]?[0])
         XCTAssertEqual(problem["condition"]?.intValue, 0)
         XCTAssertEqual(problem["type"]?.stringValue, "ui_exists")
-        XCTAssertEqual(problem["error"]?.stringValue, "UI helper did not answer in time; call the op again")
+        XCTAssertEqual(problem["error"]?.stringValue, restarted)
         XCTAssertGreaterThanOrEqual(problem["failures"]?.intValue ?? 0, 1)
-        XCTAssertGreaterThanOrEqual(agentRequests(agent, "ui.rect").count, 1)
+        XCTAssertGreaterThanOrEqual(agentRequests(agent, "ui.find").count, 1)
+    }
+
+    // MARK: - one helper call at a time
+
+    func testHelperCallsOfOneVMRunOneAtATime() async throws {
+        let (h, _, agent) = try await rig([
+            "ui.tree": { _, _ in .silent },
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+            "ui.find": { _, _ in .ok(["nodes": [sendButton]]) },
+            "ui.focused": { _, _ in .ok(["node": messageEdit, "window": fixtureWindow]) },
+        ])
+        let tree = Task { try await h.handle(op: "vm.ui.tree", params: ["name": "Win"]) }
+        let sent = await eventually { agentRequests(agent, "ui.tree").count == 1 }
+        XCTAssertTrue(sent)
+
+        let list = Task { try await h.handle(op: "vm.window.list", params: ["name": "Win"]) }
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 30, "conditions": [["type": "ui_exists", "name": "Send"]]])
+        }
+        let click = Task { try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20]) }
+        try await Task.sleep(for: .milliseconds(500))
+        let early = agent.received.filter { $0["t"]?.stringValue == "req" }.compactMap { $0["op"]?.stringValue }
+        XCTAssertEqual(early, ["ui.tree"])
+
+        let request = try XCTUnwrap(agentRequests(agent, "ui.tree").first)
+        agent.sendLine(agentReply(request, ["window": fixtureWindow, "nodes": [sendButton], "truncated": false]))
+        let treeResult = try await tree.value
+        XCTAssertEqual(treeResult["count"]?.intValue, 1)
+        let listResult = try await list.value
+        XCTAssertEqual(listResult["windows"], [fixtureWindow])
+        let waitResult = try await wait.value
+        XCTAssertEqual(waitResult["matched"]?.intValue, 0)
+        let clickResult = try await click.value
+        XCTAssertEqual(clickResult["observation"]?["focused"], "Edit \"Message\"")
+        let all = agent.received.filter { $0["t"]?.stringValue == "req" }.compactMap { $0["op"]?.stringValue }
+        XCTAssertEqual(Set(all.dropFirst()), ["win.list", "ui.find", "ui.focused"])
     }
 
     // MARK: - screenshot
 
     func testScreenshotWindowCrop() async throws {
-        let minimized = window("0x77", "Hidden Tool", x: -32000, y: -32000, w: 160, h: 28, state: "minimized")
-        let (h, _, agent) = try await rig(["win.list": { _, _ in .ok(["windows": [notesWindow, fixtureWindow, minimized]]) }])
+        let minimized = window("0x77", "Hidden Tool", x: 0, y: 0, w: 0, h: 0, state: "minimized")
+        let onScreenMinimized = window("0x78", "Tray Tool", x: 10, y: 10, w: 100, h: 80, state: "minimized")
+        let empty = window("0x79", "Empty Tool", x: 0, y: 0, w: 0, h: 0)
+        let (h, _, agent) = try await rig(["win.list": { _, _ in .ok(["windows": [notesWindow, fixtureWindow, minimized, onScreenMinimized, empty]]) }])
         let byTitle = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "window": "alcove fix"])
         XCTAssertEqual(byTitle["x"]?.intValue, 100); XCTAssertEqual(byTitle["y"]?.intValue, 50)
         XCTAssertEqual(byTitle["areaWidth"]?.intValue, 400); XCTAssertEqual(byTitle["areaHeight"]?.intValue, 300)
@@ -1023,7 +1147,9 @@ final class ControlUITests: XCTestCase {
 
         let cases: [(JSON, String)] = [
             (["name": "Win", "window": "Paint"], "no window matches 'Paint'; call vm.window.list"),
-            (["name": "Win", "window": "Hidden Tool"], "window 'Hidden Tool' is minimized or outside the 800x600 frame; restore it with vm.window.action"),
+            (["name": "Win", "window": "Hidden Tool"], "window 'Hidden Tool' is minimized or has no area on the 800x600 frame; call vm.window.action restore first"),
+            (["name": "Win", "window": "0x78"], "window 'Tray Tool' is minimized or has no area on the 800x600 frame; call vm.window.action restore first"),
+            (["name": "Win", "window": "Empty Tool"], "window 'Empty Tool' is minimized or has no area on the 800x600 frame; call vm.window.action restore first"),
             (["name": "Win", "window": "Alcove", "region": ["x": 0, "y": 0, "w": 10, "h": 10]],
              "pass region or window, not both; region is a rectangle of the frame, window crops to a window's rectangle"),
             (["name": "Win", "window": 7], "missing or invalid parameter 'window'"),

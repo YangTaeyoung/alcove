@@ -52,6 +52,8 @@ public actor ControlHandler {
     /// Guest frame size per VM from the latest screenshot (for coordinate scaling).
     var lastSize: [String: (Int, Int)] = [:]
     private let inputGate = InputGate()
+    /// Lets one `ui.*` or `win.*` agent call per VM run at a time, in arrival order.
+    let helperGate = InputGate()
     /// Port forwards added with `vm.forward.add`, per VM name.
     var runtimeForwards: [String: [Forward]] = [:]
     /// The engine instance each VM's `runtimeForwards` belong to.
