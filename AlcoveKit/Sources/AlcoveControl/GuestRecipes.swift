@@ -346,58 +346,83 @@ enum GuestRecipes {
     }
 
     private static func localDumpsKey(_ exe: String) -> String {
-        "$sub = 'SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\' + \(quote(exe, os: .windows))\n"
-            + "$hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)\n"
+        "$root = 'SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps'\n$sub = $root + '\\' + \(quote(exe, os: .windows))\n"
     }
 
-    /// Windows only: creates `dumpFolder`, makes it writable for the Users group and sets the Windows Error Reporting
+    private static let openLocalMachine =
+        "$hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)"
+
+    /// Windows only: creates `dumpFolder`, grants the Users group modify rights on it and sets the Windows Error Reporting
     /// local dump values for `exe` (`DumpFolder`, `DumpCount` 5, `DumpType` 1 mini or 2 full). Prints `{"folder": ...}`.
+    /// A failure prints one sentence on stderr and exits with 2.
     static func enableDumps(exe: String, full: Bool, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         return windowsPrelude + localDumpsKey(exe) + """
         $folder = '\(dumpFolder)'
         try {
           [void](New-Item -ItemType Directory -Force -Path $folder)
-          $null = & icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M'
-          if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('could not make \(dumpFolder) writable for the Users group; check the folder permissions'); exit 2 }
+          if (-not (Test-Path -LiteralPath $folder -PathType Container)) { [Console]::Error.WriteLine('\(dumpFolder) is not a folder; remove or rename that file, then call vm.crash_dumps.enable again'); exit 2 }
+          $ErrorActionPreference = 'Continue'
+          $null = & icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M' 2>&1
+          $ErrorActionPreference = 'Stop'
+          if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('could not make \(dumpFolder) writable for the Users group; check that alcove-agent runs elevated and may change the permissions of that folder'); exit 2 }
+          \(openLocalMachine)
           $key = $hklm.CreateSubKey($sub)
           $key.SetValue('DumpFolder', $folder, [Microsoft.Win32.RegistryValueKind]::ExpandString)
           $key.SetValue('DumpCount', 5, [Microsoft.Win32.RegistryValueKind]::DWord)
           $key.SetValue('DumpType', \(full ? 2 : 1), [Microsoft.Win32.RegistryValueKind]::DWord)
           $key.Close()
         } catch {
-          [Console]::Error.WriteLine('could not set up crash dumps: ' + $_.Exception.Message + '; check that alcove-agent runs elevated')
+          [Console]::Error.WriteLine('could not set up crash dumps: ' + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated')
           exit 2
         }
         [pscustomobject]@{ folder = $folder } | ConvertTo-Json -Compress
         """
     }
 
-    /// Windows only: removes the local dump key of `exe`; other images keep theirs.
+    /// Windows only: removes the local dump key of `exe`, then the `LocalDumps` key itself when it holds no other key
+    /// and no value; other images keep theirs. A failure prints one sentence on stderr and exits with 2.
     static func disableDumps(exe: String, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         return windowsPrelude + localDumpsKey(exe) + """
-        try { $hklm.DeleteSubKeyTree($sub, $false) } catch {
-          [Console]::Error.WriteLine('could not remove the crash dump setting: ' + $_.Exception.Message + '; check that alcove-agent runs elevated')
+        try {
+          \(openLocalMachine)
+          $hklm.DeleteSubKeyTree($sub, $false)
+          if ($hklm.OpenSubKey($sub)) { [Console]::Error.WriteLine('the crash dump setting is still there after its removal; check that alcove-agent runs elevated'); exit 2 }
+          $parent = $hklm.OpenSubKey($root)
+          if ($parent) {
+            $empty = $parent.SubKeyCount -eq 0 -and $parent.ValueCount -eq 0
+            $parent.Close()
+            if ($empty) { $hklm.DeleteSubKey($root, $false) }
+          }
+        } catch {
+          [Console]::Error.WriteLine('could not remove the crash dump setting: ' + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check that alcove-agent runs elevated')
           exit 2
         }
         'ok'
         """
     }
 
-    /// Windows only: prints a JSON array of the `.dmp` files in `dumpFolder`, newest first, each `{file, exe, bytes, time}`.
-    /// A missing folder prints `[]`.
+    /// Windows only: prints a JSON array of the `.dmp` files in `dumpFolder`, newest first and by name within one time,
+    /// each `{file, exe, bytes, time}`. `exe` is the image name of a file named `<image>.<pid>.dmp` or
+    /// `<image>(<n>).<pid>.dmp`, otherwise empty. A missing folder prints `[]`. A failure prints one sentence on stderr
+    /// and exits with 2.
     static func listDumps(os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         return windowsPrelude + """
         $folder = '\(dumpFolder)'
         $items = @()
-        if (Test-Path -LiteralPath $folder) {
-          $items = @(Get-ChildItem -LiteralPath $folder -File -Filter *.dmp | Where-Object { $_.Extension -ieq '.dmp' } | Sort-Object LastWriteTimeUtc -Descending | ForEach-Object {
-            $exe = ''
-            if ($_.Name -match '^(.+\\.exe)\\.[0-9]+\\.dmp$') { $exe = $Matches[1] }
-            [pscustomobject][ordered]@{ file = $_.Name; exe = $exe; bytes = [int64]$_.Length; time = $_.LastWriteTimeUtc.ToString('o') }
-          })
+        try {
+          if (Test-Path -LiteralPath $folder -PathType Container) {
+            $items = @(Get-ChildItem -LiteralPath $folder -File -Filter *.dmp | Where-Object { $_.Extension -ieq '.dmp' } | Sort-Object @{ Expression = 'LastWriteTimeUtc'; Descending = $true }, @{ Expression = 'Name'; Descending = $false } | ForEach-Object {
+              $exe = ''
+              if ($_.Name -match '^(.+\\.exe)(\\([0-9]+\\))?\\.[0-9]+\\.dmp$') { $exe = $Matches[1] }
+              [pscustomobject][ordered]@{ file = $_.Name; exe = $exe; bytes = [int64]$_.Length; time = $_.LastWriteTimeUtc.ToString('o') }
+            })
+          }
+        } catch {
+          [Console]::Error.WriteLine('could not list the dumps in \(dumpFolder): ' + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check the folder permissions')
+          exit 2
         }
         ConvertTo-Json -InputObject @($items) -Compress -Depth 4
         """

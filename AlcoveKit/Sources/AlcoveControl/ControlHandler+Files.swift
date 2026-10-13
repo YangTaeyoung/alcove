@@ -41,6 +41,10 @@ extension ControlHandler {
                     return try await pull(t, guestPath: GuestRecipes.dumpFolder + "\\" + file, to: path)
                 } catch AgentClient.AgentError.remote("digest mismatch after download") {
                     throw ControlError.failed("the dump changed while it was pulled; retry in a few seconds")
+                } catch AgentClient.AgentError.remote(let text) where text.contains("being used by another process") {
+                    throw ControlError.failed("the dump '\(file)' is still being written; retry in a few seconds")
+                } catch AgentClient.AgentError.remote(let text) where text.hasSuffix("is not a file in the guest; check the path") {
+                    throw ControlError.failed("\(GuestRecipes.dumpFolder) holds no dump named '\(file)'; list the dumps with vm.crash_dumps.list")
                 }
             case "vm.sync_dir":
                 let path = try string(params, "path")

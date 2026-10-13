@@ -8,7 +8,7 @@ import AlcoveTestSupport
 
 final class GuestEvidenceTests: XCTestCase {
     private func setup(os: VMConfig.GuestOS = .windows, fs: FakeFS? = nil, stdout: String = "", code: Int = 0, stderr: String = "",
-                       truncated: Bool = false, timedOut: Bool = false, staleDigest: Bool = false)
+                       truncated: Bool = false, timedOut: Bool = false, staleDigest: Bool = false, statError: String? = nil)
         async throws -> (ControlHandler, FakeAgent) {
         let agent = FakeAgent()
         fs?.install(on: agent)
@@ -16,6 +16,9 @@ final class GuestEvidenceTests: XCTestCase {
         agent.handler = { m, a in
             if m["t"]?.stringValue == "req", m["op"]?.stringValue == "exec.run" {
                 return [agentReply(m, ["code": .int(Int64(code)), "stdout": .string(stdout), "stderr": .string(stderr), "timed_out": .bool(timedOut), "truncated": .bool(truncated)])]
+            }
+            if let statError, m["op"]?.stringValue == "fs.stat" {
+                return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": .string(statError)]]
             }
             let replies = files?(m, a) ?? []
             guard staleDigest, m["op"]?.stringValue == "fs.stat" else { return replies }
@@ -298,7 +301,7 @@ final class GuestEvidenceTests: XCTestCase {
         let r = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "My App.exe"])
         XCTAssertEqual(r, ["folder": "C:\\alcove-dumps", "eventSeq": 0])
         let script = try XCTUnwrap(commands(agent).first)
-        XCTAssertTrue(script.contains("Windows Error Reporting\\LocalDumps\\' + 'My App.exe'"), script)
+        XCTAssertTrue(script.contains("$root = 'SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps'\n$sub = $root + '\\' + 'My App.exe'\n"), script)
         XCTAssertTrue(script.contains("C:\\alcove-dumps"), script)
         XCTAssertTrue(script.contains("SetValue('DumpFolder'"), script)
         XCTAssertTrue(script.contains("ExpandString"), script)
@@ -309,13 +312,15 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(commands(full.1).first).contains("SetValue('DumpType', 2,"))
     }
 
-    func testDisableDumpsRemovesOnlyThatImage() async throws {
+    func testDisableDumpsRemovesThatImageAndAnEmptyLocalDumpsKey() async throws {
         let (h, agent) = try await setup()
         let r = try await h.handle(op: "vm.crash_dumps.disable", params: ["name": "Win", "exe": "MyApp.exe"])
         XCTAssertEqual(r, ["eventSeq": 0])
         let script = try XCTUnwrap(commands(agent).first)
-        XCTAssertTrue(script.contains("LocalDumps\\' + 'MyApp.exe'"), script)
-        XCTAssertTrue(script.contains("DeleteSubKeyTree"), script)
+        XCTAssertTrue(script.contains("$sub = $root + '\\' + 'MyApp.exe'\n"), script)
+        XCTAssertTrue(script.contains("$hklm.DeleteSubKeyTree($sub, $false)\n  if ($hklm.OpenSubKey($sub)) { [Console]::Error.WriteLine('the crash dump setting is still there after its removal; check that alcove-agent runs elevated'); exit 2 }"), script)
+        XCTAssertTrue(script.contains("$empty = $parent.SubKeyCount -eq 0 -and $parent.ValueCount -eq 0"), script)
+        XCTAssertTrue(script.contains("if ($empty) { $hklm.DeleteSubKey($root, $false) }"), script)
     }
 
     func testExeValidation() async throws {
@@ -339,11 +344,21 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertEqual(r["dumps"]?[0]?["exe"]?.stringValue, "MyApp.exe")
         XCTAssertEqual(r["dumps"]?[0]?["bytes"]?.intValue, 1_048_576)
         let script = try XCTUnwrap(commands(agent).first)
-        XCTAssertTrue(script.contains("Test-Path -LiteralPath $folder"), script)
+        XCTAssertTrue(script.contains("if (Test-Path -LiteralPath $folder -PathType Container) {"), script)
         XCTAssertTrue(script.contains("-Filter *.dmp"), script)
+        XCTAssertTrue(script.contains("-match '^(.+\\.exe)(\\([0-9]+\\))?\\.[0-9]+\\.dmp$'"), script)
+        XCTAssertTrue(script.contains("Sort-Object @{ Expression = 'LastWriteTimeUtc'; Descending = $true }, @{ Expression = 'Name'; Descending = $false }"), script)
         let single = try await setup(stdout: "{\"file\":\"a.exe.1.dmp\",\"exe\":\"a.exe\",\"bytes\":9,\"time\":\"t\"}")
         let one = try await single.0.handle(op: "vm.crash_dumps.list", params: ["name": "Win"])
         XCTAssertEqual(one["dumps"]?.arrayValue?.count, 1)
+    }
+
+    func testDumpListOfADumpNamedAfterAReusedProcessID() async throws {
+        let (h, _) = try await setup(stdout: "[{\"file\":\"alcove-fixture.exe(1).5648.dmp\",\"exe\":\"alcove-fixture.exe\",\"bytes\":121632778,\"time\":\"2026-10-13T22:22:07.8251684Z\"},{\"file\":\"alcove-fixture.exe.5648.dmp\",\"exe\":\"alcove-fixture.exe\",\"bytes\":122015050,\"time\":\"2026-10-13T22:20:42.7321952Z\"}]\r\n")
+        let r = try await h.handle(op: "vm.crash_dumps.list", params: ["name": "Win"])
+        XCTAssertEqual(r["dumps"]?.arrayValue?.compactMap { $0["file"]?.stringValue }, ["alcove-fixture.exe(1).5648.dmp", "alcove-fixture.exe.5648.dmp"])
+        XCTAssertEqual(r["dumps"]?[0]?["exe"]?.stringValue, "alcove-fixture.exe")
+        XCTAssertEqual(r["dumps"]?[0]?["bytes"]?.intValue, 121_632_778)
     }
 
     func testDumpListWithoutFolder() async throws {
@@ -366,17 +381,30 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(commands(agent).first).contains("$_.Extension -ieq '.dmp'"))
     }
 
+    func testDumpListFailureSentenceComesFromTheScript() async throws {
+        let sentence = "could not list the dumps in C:\\alcove-dumps: Access to the path 'C:\\alcove-dumps' is denied.; check the folder permissions"
+        let (h, agent) = try await setup(stdout: "", code: 2, stderr: sentence + "\r\n")
+        let text = await failure(h, "vm.crash_dumps.list", ["name": "Win"])
+        XCTAssertEqual(text, sentence)
+        let script = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(script.contains("[Console]::Error.WriteLine('could not list the dumps in C:\\alcove-dumps: ' + ($_.Exception.GetBaseException().Message -replace '\\s+', ' ') + '; check the folder permissions')\n  exit 2"), script)
+    }
+
     func testEnableAndDisableReportGuestFailuresAsSentences() async throws {
         let (h, agent) = try await setup()
         _ = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "a.exe"])
         let enable = try XCTUnwrap(commands(agent).first)
+        XCTAssertTrue(enable.contains("$null = & icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M' 2>&1\n"), enable)
         XCTAssertTrue(enable.contains("$LASTEXITCODE -ne 0"), enable)
-        XCTAssertTrue(enable.contains("[Console]::Error.WriteLine('could not make C:\\alcove-dumps writable for the Users group; check the folder permissions'); exit 2"), enable)
+        XCTAssertLessThan(try XCTUnwrap(enable.range(of: "try {")).lowerBound, try XCTUnwrap(enable.range(of: "OpenBaseKey")).lowerBound, enable)
+        XCTAssertTrue(enable.contains("[Console]::Error.WriteLine('could not make C:\\alcove-dumps writable for the Users group; check that alcove-agent runs elevated and may change the permissions of that folder'); exit 2"), enable)
+        XCTAssertTrue(enable.contains("if (-not (Test-Path -LiteralPath $folder -PathType Container)) { [Console]::Error.WriteLine('C:\\alcove-dumps is not a folder; remove or rename that file, then call vm.crash_dumps.enable again'); exit 2 }"), enable)
         XCTAssertTrue(enable.contains("catch {"), enable)
         XCTAssertTrue(enable.contains("check that alcove-agent runs elevated"), enable)
         _ = try await h.handle(op: "vm.crash_dumps.disable", params: ["name": "Win", "exe": "a.exe"])
         let disable = commands(agent)[1]
         XCTAssertTrue(disable.contains("check that alcove-agent runs elevated"), disable)
+        XCTAssertLessThan(try XCTUnwrap(disable.range(of: "try {")).lowerBound, try XCTUnwrap(disable.range(of: "OpenBaseKey")).lowerBound, disable)
     }
 
     func testDumpPullUsesFileOps() async throws {
@@ -396,7 +424,7 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "fs.stat").first?["path"]?.stringValue, "C:\\alcove-dumps\\MyApp.exe.4242.dmp")
 
         let absent = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": "gone.exe.1.dmp", "path": .string(dest.path)])
-        XCTAssertEqual(absent, "'C:\\alcove-dumps\\gone.exe.1.dmp' is not a file in the guest; check the path")
+        XCTAssertEqual(absent, "C:\\alcove-dumps holds no dump named 'gone.exe.1.dmp'; list the dumps with vm.crash_dumps.list")
         let noPath = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": "MyApp.exe.4242.dmp"])
         XCTAssertEqual(noPath, "missing or invalid parameter 'path'")
     }
@@ -417,6 +445,12 @@ final class GuestEvidenceTests: XCTestCase {
         let (h, _) = try await setup(fs: fs, staleDigest: true)
         let text = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": "a.exe.1.dmp", "path": "/tmp/alcove-test-never-written.dmp"])
         XCTAssertEqual(text, "the dump changed while it was pulled; retry in a few seconds")
+    }
+
+    func testDumpPullOfADumpBeingWrittenNamesTheNextStep() async throws {
+        let (h, _) = try await setup(fs: FakeFS(), statError: "cannot hash 'C:\\alcove-dumps\\alcove-fixture.exe.10128.dmp': open C:\\alcove-dumps\\alcove-fixture.exe.10128.dmp: The process cannot access the file because it is being used by another process.")
+        let text = await failure(h, "vm.crash_dumps.pull", ["name": "Win", "file": "alcove-fixture.exe.10128.dmp", "path": "/tmp/alcove-test-never-written.dmp"])
+        XCTAssertEqual(text, "the dump 'alcove-fixture.exe.10128.dmp' is still being written; retry in a few seconds")
     }
 
     func testDumpsOnLinux() async throws {
