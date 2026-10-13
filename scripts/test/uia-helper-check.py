@@ -50,6 +50,8 @@ NODE_KEYS = {"ref", "depth", "role", "name", "x", "y", "w", "h", "flags"}
 NODE_FLAGS = {"focused", "disabled", "offscreen", "selected", "checked", "expanded", "collapsed", "password"}
 WINDOW_KEYS = {"id", "title", "pid", "process", "class", "x", "y", "w", "h", "state", "foreground", "responding", "modal"}
 FIXTURE_LOG = BASE + r"\fixture.log"
+CRASH_CODE = 3221227010
+WER_ARCHIVE = r"C:\ProgramData\Microsoft\Windows\WER\ReportArchive"
 
 
 class Failure(Exception):
@@ -129,6 +131,17 @@ class Agent:
         expect(res.get("ok") is True, f"{op} failed: {res.get('error')}")
         return res
 
+    def pump(self, seconds):
+        """Reads and keeps events for the given time."""
+        end = time.time() + seconds
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                return
+            m = self._next(left)
+            if m is not None:
+                self._file(m)
+
 
 def check_node(n, where):
     """Fails unless n has the fields and value types of a node object."""
@@ -166,6 +179,7 @@ class Run:
         self.fixture_pushed = False
         self.fixture_pids = []
         self.fixture = None
+        self.wer_dirs = []
 
     def windows(self):
         return self.a.call("win.list")["windows"]
@@ -194,16 +208,20 @@ class Run:
         returns (the directory, the relative names), or (the directory, None) when
         root does not exist in the guest."""
         copy = tempfile.mkdtemp(prefix="alcove-notepad-state-")
-        if not self.a.call("fs.stat", path=root)["exists"]:
-            return copy, None
-        entries = self.a.call("fs.list", path=root, recursive=True)["entries"]
-        names = [e["name"] for e in entries if not e["dir"]]
-        for name in names:
-            target = os.path.join(copy, *name.split("/"))
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with open(target, "wb") as f:
-                f.write(self.read_file(root + "/" + name))
-        return copy, names
+        try:
+            if not self.a.call("fs.stat", path=root)["exists"]:
+                return copy, None
+            entries = self.a.call("fs.list", path=root, recursive=True)["entries"]
+            names = [e["name"] for e in entries if not e["dir"]]
+            for name in names:
+                target = os.path.join(copy, *name.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as f:
+                    f.write(self.read_file(root + "/" + name))
+            return copy, names
+        except BaseException:
+            shutil.rmtree(copy, ignore_errors=True)
+            raise
 
     def notepad_pids(self):
         return {p["pid"] for p in self.a.call("proc.list", name="notepad")["procs"]}
@@ -480,7 +498,7 @@ def act(a, run, action, **selector):
     """Runs ui.act on an element of the fixture window and returns the reply."""
     r = a.call("ui.act", window=run.fixture["id"], action=action, **selector)
     check_node(r["node"], f"ui.act {action}")
-    expect(set(r) <= {"t", "id", "ok", "node", "gone", "unresponsive"}, f"ui.act {action} returned unknown fields: {sorted(r)!r}")
+    expect(set(r) <= {"t", "id", "ok", "node", "gone", "unresponsive", "pending"}, f"ui.act {action} returned unknown fields: {sorted(r)!r}")
     return r
 
 
@@ -660,15 +678,17 @@ def _(a, run):
     expect("password" in r["node"]["flags"] and "value" not in r["node"], f"after set_value the node is {r['node']!r}")
     end = time.time() + 5
     while True:
-        changes = [l for l in run.fixture_log() if " secret " in l]
+        log = run.fixture_log()
+        changes = [l for l in log if " secret " in l]
         if changes and changes[-1].endswith(f" secret {len(SECRET)}"):
             break
         expect(time.time() < end, f"the fixture did not log a secret of {len(SECRET)} characters: {changes!r}")
         time.sleep(0.2)
+    expect(all(SECRET not in l for l in log), "the fixture log carries the secret text")
     replies = {}
     for mode in ("auto", "pattern", "descendants"):
         replies[f"ui.text {mode}"] = a.ask("ui.text", window=wid, role="Edit", name="Secret", mode=mode)
-        expect(replies[f"ui.text {mode}"].get("error") == "the element is a password field; its text is not read",
+        expect(replies[f"ui.text {mode}"].get("error") == "the element is a password field; its text is not read; it cannot be read through UI Automation",
                f"ui.text mode {mode} of the password field answered {replies[f'ui.text {mode}']!r}")
     replies["ui.text by ref"] = a.ask("ui.text", ref=r["node"]["ref"])
     replies["ui.text of the window"] = a.call("ui.text", window=wid, role="Window", mode="descendants")
@@ -684,6 +704,70 @@ def _(a, run):
     shown = replies["ui.text of the window"]["text"].split("\n")
     expect("Message" in shown and "한글 라벨" in shown, f"the text below the window is {shown!r}")
     return f"{len(replies)} replies checked; the fixture logged a secret of {len(SECRET)} characters"
+
+
+@check("the Titles button emits a bounded number of window.title events ending at the base title")
+def _(a, run):
+    if not run.fixture or same_window(a, run.fixture["id"]) is None:
+        r = run.launch_fixture()
+        expect(r.get("window"), f"app.launch returned no window: {r!r}")
+        run.fixture = r["window"]
+    wid = run.fixture["id"]
+    seen = len(a.events)
+    a.call("ui.act", window=wid, role="Button", name="Titles", action="invoke")
+    # The title changes every 50 ms for 5 s and then returns to the base title.
+    a.pump(7.5)
+    titles = [e for e in a.events[seen:] if e.get("name") == "window.title" and e["window"]["id"] == wid]
+    expect(4 <= len(titles) <= 7, f"{len(titles)} window.title events arrived: {[e['window']['title'] for e in titles]!r}")
+    expect(titles[-1]["window"]["title"] == FIXTURE_TITLE,
+           f"the last window.title carries {titles[-1]['window']['title']!r}, expected {FIXTURE_TITLE!r}")
+    final = same_window(a, wid)
+    expect(final and final["title"] == FIXTURE_TITLE, f"the window title did not return to {FIXTURE_TITLE!r}: {final!r}")
+    return f"{len(titles)} window.title events, last {titles[-1]['window']['title']!r}"
+
+
+@check("ui.act invoke on Crash ends the fixture with a crash code and a WER report")
+def _(a, run):
+    # Crash needs a fresh process; end the fixture earlier checks left running.
+    running = {p["pid"] for p in a.call("proc.list", name="alcove-fixture")["procs"]}
+    for pid in running:
+        a.call("proc.kill", pid=pid)
+    end = time.time() + 10
+    while {p["pid"] for p in a.call("proc.list", name="alcove-fixture")["procs"]} and time.time() < end:
+        time.sleep(0.3)
+    run.fixture = None
+    since = int(a.call("exec.run", cmd="[DateTime]::UtcNow.Ticks")["stdout"].strip())
+    r = run.launch_fixture()
+    expect(r.get("window"), f"app.launch returned no window: {r!r}")
+    run.fixture = r["window"]
+    wid, pid = run.fixture["id"], run.fixture["pid"]
+    seen = len(a.events)
+    t0 = time.time()
+    act = a.ask("ui.act", window=wid, role="Button", name="Crash", action="invoke")
+    if act.get("ok") is True:
+        expect(act.get("gone") is True or act.get("pending") is True or act.get("unresponsive") is True,
+               f"ui.act invoke on Crash answered {act!r}")
+    ev = a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}")
+    expect(ev.get("code") == CRASH_CODE, f"process.exited carries code {ev.get('code')!r}, expected {CRASH_CODE}")
+    run.fixture = None
+    # Wait for Windows Error Reporting to finish, which releases the crashed exe.
+    end = time.time() + 15
+    found = find_wer(a, since)
+    while not found and time.time() < end:
+        time.sleep(0.5)
+        found = find_wer(a, since)
+    run.wer_dirs.extend(found)
+    expect(found, f"no AppCrash_alcove-fixture report created after the check started under {WER_ARCHIVE}")
+    return f"process.exited code {ev['code']} {ev['at'] - t0:.2f} s after invoke; WER report {ntpath.basename(found[0])}"
+
+
+def find_wer(a, since_ticks):
+    """Returns the AppCrash_alcove-fixture report folders created after since_ticks."""
+    ps = (f"Get-ChildItem -LiteralPath '{WER_ARCHIVE}' -Directory -ErrorAction SilentlyContinue | "
+          "Where-Object { $_.Name -like 'AppCrash_alcove-fixture*' -and $_.CreationTimeUtc.Ticks -gt "
+          f"{since_ticks} }} | ForEach-Object {{ $_.FullName }}")
+    out = a.call("exec.run", cmd=ps)["stdout"]
+    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
 def wait_gone(a, pids, timeout=15):
@@ -721,6 +805,7 @@ def cleanup(port, run):
     the run opened and deletes the files it wrote. Returns the sentences that
     say what could not be cleaned up."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     problems = []
     try:
         a = Agent(port)
@@ -738,12 +823,28 @@ def cleanup(port, run):
         while {p["pid"] for p in a.call("proc.list", name="alcove-fixture")["procs"]} & set(run.fixture_pids) and time.time() < end:
             time.sleep(0.3)
 
+    def remove_wer():
+        for d in run.wer_dirs:
+            a.call("exec.run", cmd=f"Remove-Item -LiteralPath '{d}' -Recurse -Force -ErrorAction SilentlyContinue")
+
     steps = [("ending the fixture", kill_fixtures)]
+    if run.wer_dirs:
+        steps.append(("removing the crash WER reports", remove_wer))
     if run.explorer_before is not None:
         steps.append(("closing File Explorer", lambda: close_explorer(a, explorer_windows(a) - run.explorer_before)))
     steps.append((f"deleting {BASE}", lambda: a.call("fs.delete", path=BASE, recursive=True)))
+    def delete_fixture_exe():
+        # A just-crashed fixture can hold its exe open briefly while WER finishes.
+        end = time.time() + 15
+        while True:
+            res = a.ask("fs.delete", path=FIXTURE)
+            if res.get("ok") is True or time.time() > end:
+                expect(res.get("ok") is True, f"fs.delete {FIXTURE}: {res.get('error')}")
+                return
+            time.sleep(0.5)
+
     if run.fixture_pushed:
-        steps.append((f"deleting {FIXTURE}", lambda: a.call("fs.delete", path=FIXTURE)))
+        steps.append((f"deleting {FIXTURE}", delete_fixture_exe))
     steps.append((f"deleting {E2E}", lambda: a.ask("fs.delete", path=E2E)))
     if run.notepad_before is not None:
         problem = restore_notepad(a, run)
