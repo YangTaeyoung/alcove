@@ -2,7 +2,6 @@ import Foundation
 import AlcoveEngine
 import AlcoveAgent
 import AlcoveQMP
-import AlcoveDisplayProtocol
 
 /// Executes control-protocol operations (docs/control-protocol.md) against a registry.
 public actor ControlHandler {
@@ -47,7 +46,7 @@ public actor ControlHandler {
     public let registry: VMRegistry
     public let hostKind: String
     /// Guest frame size per VM from the latest screenshot (for coordinate scaling).
-    private var lastSize: [String: (Int, Int)] = [:]
+    var lastSize: [String: (Int, Int)] = [:]
     private let inputGate = InputGate()
     /// Port forwards added with `vm.forward.add`, per VM name.
     var runtimeForwards: [String: [Forward]] = [:]
@@ -75,8 +74,8 @@ public actor ControlHandler {
     /// Every op name the dispatcher accepts.
     static let knownOps: [String] = [
         "hello", "vm.list", "vm.status", "vm.start", "vm.stop", "vm.pause", "vm.resume", "vm.screenshot",
-        "vm.mouse.move", "vm.mouse.click", "vm.mouse.drag", "vm.mouse.scroll",
-        "vm.key.press", "vm.key.down", "vm.key.up", "vm.type",
+        "vm.mouse.move", "vm.mouse.click", "vm.mouse.drag", "vm.mouse.scroll", "vm.mouse.down", "vm.mouse.up",
+        "vm.key.press", "vm.key.down", "vm.key.up", "vm.type", "vm.batch",
         "vm.exec", "vm.exec.start", "vm.exec.read", "vm.exec.write", "vm.exec.kill", "vm.exec.list",
         "vm.process.list", "vm.process.kill",
         "vm.clipboard.get", "vm.clipboard.set",
@@ -106,7 +105,7 @@ public actor ControlHandler {
 
     /// Whether `op` sends mouse or keyboard input to a guest.
     static func isInput(op: String) -> Bool {
-        op.hasPrefix("vm.mouse.") || op.hasPrefix("vm.key.") || op == "vm.type"
+        op.hasPrefix("vm.mouse.") || op.hasPrefix("vm.key.") || op == "vm.type" || op == "vm.batch"
     }
 
     /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
@@ -121,7 +120,8 @@ public actor ControlHandler {
         return try await perform(op: op, params: params)
     }
 
-    private func perform(op: String, params: JSON) async throws -> JSON {
+    /// Runs one operation without the lease guard and without taking the input gate.
+    func perform(op: String, params: JSON) async throws -> JSON {
         switch op {
         case "hello":
             return ["version": 1, "host": .string(hostKind)]
@@ -164,74 +164,11 @@ public actor ControlHandler {
         case "vm.find_text":
             let t = try await running(params)
             return try await findText(t, params)
-        case "vm.mouse.move":
-            let t = try await running(params)
-            try await move(t, x: try int(params, "x"), y: try int(params, "y"))
-            await t.sendDisplay(.sync)
-            return [:]
-        case "vm.mouse.click":
-            let t = try await running(params)
-            let button = try button(params["button"]?.stringValue)
-            let count = max(1, min(3, params["count"]?.intValue ?? 1))
-            let hold = params["hold"]?.intValue ?? 60
-            try await move(t, x: try int(params, "x"), y: try int(params, "y"))
-            for i in 0..<count {
-                await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
-                try await Task.sleep(for: .milliseconds(hold))
-                await t.sendDisplay(.btn(con: 0, button: button, down: false)); await t.sendDisplay(.sync)
-                if i < count - 1 { try await Task.sleep(for: .milliseconds(90)) }
-            }
-            return [:]
-        case "vm.mouse.drag":
-            let t = try await running(params)
-            let button = try button(params["button"]?.stringValue)
-            let (fx, fy, tx, ty) = (try int(params, "fromX"), try int(params, "fromY"), try int(params, "toX"), try int(params, "toY"))
-            try await move(t, x: fx, y: fy); await t.sendDisplay(.sync)
-            await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
-            try await Task.sleep(for: .milliseconds(80))
-            for step in 1...10 {
-                try await move(t, x: fx + (tx - fx) * step / 10, y: fy + (ty - fy) * step / 10)
-                await t.sendDisplay(.sync)
-                try await Task.sleep(for: .milliseconds(25))
-            }
-            await t.sendDisplay(.btn(con: 0, button: button, down: false)); await t.sendDisplay(.sync)
-            return [:]
-        case "vm.mouse.scroll":
-            let t = try await running(params)
-            try await move(t, x: try int(params, "x"), y: try int(params, "y")); await t.sendDisplay(.sync)
-            let dy = params["dy"]?.intValue ?? 0, dx = params["dx"]?.intValue ?? 0
-            for _ in 0..<abs(dy) { await wheel(t, dy > 0 ? .wheelDown : .wheelUp) }
-            for _ in 0..<abs(dx) { await wheel(t, dx > 0 ? .wheelRight : .wheelLeft) }
-            return [:]
-        case "vm.key.press":
-            let t = try await running(params)
-            guard let spec = params["keys"]?.stringValue, !spec.isEmpty else { throw ControlError.missing("keys") }
-            let seq: [(code: Int, down: Bool)]
-            do { seq = try KeyNames.pressSequence(spec) } catch { throw ControlError.failed("bad key spec '\(spec)': \(error)") }
-            let hold = params["hold"]?.intValue ?? 0
-            try await sendKeys(t, seq, gap: 20, holdBeforeRelease: hold)
-            return [:]
-        case "vm.key.down", "vm.key.up":
-            let t = try await running(params)
-            guard let name = params["key"]?.stringValue else { throw ControlError.missing("key") }
-            let key: KeyNames.Key
-            do { key = try KeyNames.key(named: name) } catch { throw ControlError.failed("unknown key '\(name)'") }
-            await t.sendDisplay(.key(mac: key.code, q: nil, down: op == "vm.key.down"))
-            return [:]
-        case "vm.type":
-            let t = try await running(params)
-            guard let text = params["text"]?.stringValue else { throw ControlError.missing("text") }
-            let delay = params["delay"]?.intValue ?? 12
-            if let seq = try? KeyNames.typeSequence(text) {
-                try await sendKeys(t, seq, gap: delay, holdBeforeRelease: 0)
-            } else {
-                // non-US characters: go through the guest clipboard and paste
-                guard let agent = await t.agent(timeout: .seconds(2)) else { throw ControlError.untypable("this text") }
-                do { try await agent.setClipboard(text: text) } catch { throw agentFailure(error, vm: t.name, op: op) }
-                try await Task.sleep(for: .milliseconds(150))
-                try await sendKeys(t, try KeyNames.pressSequence("ctrl+v"), gap: 20, holdBeforeRelease: 0)
-            }
-            return [:]
+        case "vm.mouse.move", "vm.mouse.click", "vm.mouse.drag", "vm.mouse.scroll", "vm.mouse.down", "vm.mouse.up",
+             "vm.key.press", "vm.key.down", "vm.key.up", "vm.type":
+            return try await action(op: op, params: params)
+        case "vm.batch":
+            return try await batch(params)
         case "vm.exec", "vm.exec.start", "vm.exec.read", "vm.exec.write", "vm.exec.kill", "vm.exec.list",
              "vm.process.list", "vm.process.kill":
             return try await shell(op: op, params: params)
@@ -324,15 +261,6 @@ public actor ControlHandler {
     func int(_ params: JSON, _ key: String) throws -> Int {
         guard let v = params[key]?.intValue else { throw ControlError.missing(key) }
         return v
-    }
-
-    private func button(_ name: String?) throws -> InputButton {
-        switch (name ?? "left").lowercased() {
-        case "left": return .left
-        case "right": return .right
-        case "middle": return .middle
-        default: throw ControlError.missing("button")
-        }
     }
 
     private func status(of t: VMTarget, quick: Bool) async -> JSON {
@@ -447,29 +375,6 @@ public actor ControlHandler {
                 "sentWidth": .int(Int64(image.width)), "sentHeight": .int(Int64(image.height)),
                 "x": .int(Int64(area.x)), "y": .int(Int64(area.y)),
                 "scale": .double(Double(image.width) / Double(area.w))]
-    }
-
-    private func move(_ t: VMTarget, x: Int, y: Int) async throws {
-        if lastSize[t.name] == nil { _ = try await screenshot(t) }
-        guard let (w, h) = lastSize[t.name], w > 1, h > 1 else { throw ControlError.noDisplay(t.name) }
-        let ax = Int((Double(max(0, min(x, w - 1))) / Double(w - 1) * Double(ToQEMU.absoluteMax)).rounded())
-        let ay = Int((Double(max(0, min(y, h - 1))) / Double(h - 1) * Double(ToQEMU.absoluteMax)).rounded())
-        guard await t.sendDisplay(.abs(con: 0, x: ax, y: ay)) else { throw ControlError.noDisplay(t.name) }
-    }
-
-    private func wheel(_ t: VMTarget, _ b: InputButton) async {
-        await t.sendDisplay(.btn(con: 0, button: b, down: true)); await t.sendDisplay(.sync)
-        await t.sendDisplay(.btn(con: 0, button: b, down: false)); await t.sendDisplay(.sync)
-    }
-
-    private func sendKeys(_ t: VMTarget, _ seq: [(code: Int, down: Bool)], gap: Int, holdBeforeRelease: Int) async throws {
-        for (i, ev) in seq.enumerated() {
-            if !ev.down, holdBeforeRelease > 0, i > 0, seq[i - 1].down, seq[i - 1].code == ev.code {
-                try await Task.sleep(for: .milliseconds(holdBeforeRelease))
-            }
-            guard await t.sendDisplay(.key(mac: ev.code, q: nil, down: ev.down)) else { throw ControlError.noDisplay(t.name) }
-            if gap > 0 { try await Task.sleep(for: .milliseconds(gap)) }
-        }
     }
 }
 

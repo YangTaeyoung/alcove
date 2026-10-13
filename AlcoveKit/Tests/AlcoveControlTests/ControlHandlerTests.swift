@@ -5,12 +5,15 @@ import AlcoveAgent
 import AlcoveQMP
 import AlcoveDisplayProtocol
 
-/// A scripted VM: records display messages, serves a fixed PNG, and hands out the agent set with `setAgent`.
+/// A scripted VM: records display messages, serves the queued frames or a fixed PNG, and hands out the agent set with `setAgent`.
 actor FakeTarget: VMTarget {
     nonisolated let name: String
     var stateValue: VMController.State
     var sent: [ToQEMU] = []
     var png: Data
+    /// Frames served one per `frame()` call; the last one repeats. Empty: `frame()` decodes `png`.
+    var frames: [Frame] = []
+    var frameCalls = 0
     var agentClient: AgentClient?
     var startCount = 0, stopCount = 0
     var agentWait: Duration = .zero
@@ -37,6 +40,9 @@ actor FakeTarget: VMTarget {
     func resume() async throws { stateValue = .running }
     func screenshotPNG() async throws -> Data { png }
     func frame() async throws -> Frame {
+        frameCalls += 1
+        if frames.count > 1 { return frames.removeFirst() }
+        if let last = frames.first { return last }
         guard let f = Frame(png: png) else { throw NSError(domain: "FakeTarget", code: 1) }
         return f
     }
@@ -72,6 +78,7 @@ actor FakeTarget: VMTarget {
     func setAgent(_ a: AgentClient?) { agentClient = a }
     func setAgentWait(_ d: Duration) { agentWait = d }
     func setPNG(_ d: Data) { png = d }
+    func setFrames(_ f: [Frame]) { frames = f }
     func setState(_ s: VMController.State) { stateValue = s }
 }
 
