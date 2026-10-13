@@ -13,7 +13,7 @@ extension ControlHandler {
         guard await registry.target(named: name) != nil else { throw ControlError.noSuchVM(name) }
         do {
             if op == "vm.clone" {
-                let newName = try string(params, "newName")
+                let newName = try string(params, "newName").trimmingCharacters(in: .whitespacesAndNewlines)
                 try await provisioning.cloneVM(named: name, as: newName)
                 return ["name": .string(newName)]
             }

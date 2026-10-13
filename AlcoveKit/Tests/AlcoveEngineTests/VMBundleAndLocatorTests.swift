@@ -21,7 +21,9 @@ final class VMBundleAndLocatorTests: XCTestCase {
         // real QEMU prints the header, then one backend per line (ui/console.c qemu_display_help)
         let qemu = "#!/bin/sh\ncase \"$1 $2\" in \"-display help\") echo \"Available display backend types:\"; for b in \(backends); do echo \"$b\"; done;; esac\n"
         fm.createFile(atPath: root.appendingPathComponent("qemu-system-aarch64").path, contents: Data(qemu.utf8), attributes: [.posixPermissions: 0o755])
-        let img = "#!/bin/sh\n# create -q -f qcow2 FILE SIZE\ncase \"$5\" in *boom)  echo 'qemu-img: boom' >&2; exit 1;; esac\nprintf 'QFI' > \"$5\"\n"
+        let img = "#!/bin/sh\n# create -q -f qcow2 FILE SIZE | create -q -f qcow2 -F qcow2 -b BACKING FILE\n"
+            + "out=\"$5\"; if [ \"$5\" = -F ]; then for out; do :; done; fi\n"
+            + "case \"$out\" in *boom*)  echo 'qemu-img: boom' >&2; exit 1;; esac\nprintf 'QFI' > \"$out\"\n"
         fm.createFile(atPath: root.appendingPathComponent("qemu-img").path, contents: Data(img.utf8), attributes: [.posixPermissions: 0o755])
         fm.createFile(atPath: root.appendingPathComponent("pc-bios/edk2-aarch64-code.fd").path, contents: Data(count: 16))
         if withVarsTemplate {
@@ -140,6 +142,115 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("Broken.alcovevm").path))
     }
 
+    // MARK: - clone registry (stand-in qemu-img)
+
+    private func stubTemplate(name: String = "Base") throws -> (VMBundle, EngineLocator.Engine) {
+        let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
+        return (try VMBundle.create(VMConfig.defaults(name: name, guestOS: .linux), in: tmp, engine: engine), engine)
+    }
+
+    private func standardPath(_ url: URL) -> String { url.standardizedFileURL.path }
+
+    /// Moves `bundle` to `<newName>.alcovevm` and saves its config under that name.
+    private func rename(_ bundle: VMBundle, to newName: String) throws -> VMBundle {
+        let moved = VMBundle(url: tmp.appendingPathComponent(newName).appendingPathExtension(VMBundle.pathExtension))
+        try FileManager.default.moveItem(at: bundle.url, to: moved.url)
+        var config = try moved.loadConfig()
+        config.name = newName
+        try moved.save(config)
+        return moved
+    }
+
+    func testRenamedCloneStillGuardsTemplate() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "Copy", engine: engine)
+        let renamed = try rename(clone, to: "Renamed")
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(renamed.url)])
+        XCTAssertEqual(try listedClones(template), [standardPath(renamed.url)])
+        XCTAssertEqual(template.liveClones().map { VMBundle(url: $0).configName }, ["Renamed"])
+
+        let movedOnly = VMBundle(url: tmp.appendingPathComponent("Elsewhere.alcovevm"))
+        try FileManager.default.moveItem(at: renamed.url, to: movedOnly.url)
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(movedOnly.url)])
+        XCTAssertEqual(movedOnly.configName, "Renamed")
+    }
+
+    func testUnreadableCloneListFallsBackToSiblings() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "Copy", engine: engine)
+        try Data("not json".utf8).write(to: template.clonesURL)
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(clone.url)])
+        XCTAssertEqual(try listedClones(template), [standardPath(clone.url)])
+        try FileManager.default.removeItem(at: template.clonesURL)
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(clone.url)])
+        XCTAssertEqual(try listedClones(template), [standardPath(clone.url)])
+    }
+
+    func testPlainVMUnderOldCloneNameIsNotAClone() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "Copy", engine: engine)
+        try FileManager.default.removeItem(at: clone.url)
+        XCTAssertEqual(try listedClones(template), [standardPath(clone.url)])
+        _ = try VMBundle.create(VMConfig.defaults(name: "Copy", guestOS: .linux), in: tmp, engine: engine)
+        XCTAssertEqual(template.liveClones(), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
+    }
+
+    func testRecloneDoesNotDuplicate() throws {
+        let (template, engine) = try stubTemplate()
+        let first = try template.cloneLinked(named: "Copy", engine: engine)
+        try FileManager.default.removeItem(at: first.url)
+        XCTAssertEqual(try listedClones(template), [standardPath(first.url)])
+        let second = try template.cloneLinked(named: "Copy", engine: engine)
+        XCTAssertEqual(try listedClones(template), [standardPath(second.url)])
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(second.url)])
+    }
+
+    func testClonePortsAvoidSiblings() throws {
+        let (template, engine) = try stubTemplate()
+        var config = try template.loadConfig()
+        var ports = [config.agentHostPort]
+        // sibling bundles hold every port of the range except the template's and three others
+        let free = Set([17011, 17503, 17998, 17100].filter { $0 != config.agentHostPort }.prefix(3))
+        var crowd = VMConfig.defaults(name: "Crowd", guestOS: .linux)
+        for (i, port) in (17000...17999).filter({ !free.contains($0) && $0 != config.agentHostPort }).enumerated() {
+            crowd.name = "Crowd\(i)"
+            crowd.agentHostPort = port
+            let sibling = VMBundle(url: tmp.appendingPathComponent(crowd.name).appendingPathExtension(VMBundle.pathExtension))
+            try FileManager.default.createDirectory(at: sibling.url, withIntermediateDirectories: true)
+            try sibling.save(crowd)
+        }
+        for name in ["One", "Two", "Three"] {
+            config = try template.cloneLinked(named: name, engine: engine).loadConfig()
+            XCTAssertEqual(config.agentHostPort, VMConfig.agentPort(for: config.agentToken))
+            ports.append(config.agentHostPort)
+        }
+        XCTAssertEqual(Set(ports.dropFirst()), free)
+        XCTAssertFalse(ports.dropFirst().contains(ports[0]))
+    }
+
+    func testCloneNameIsTrimmed() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "  Copy \n", engine: engine)
+        XCTAssertEqual(clone.url.lastPathComponent, "Copy.alcovevm")
+        XCTAssertEqual(try clone.loadConfig().name, "Copy")
+        XCTAssertThrowsError(try template.cloneLinked(named: "   ", engine: engine)) {
+            XCTAssertEqual($0 as? VMBundle.CloneError, .invalidName(""))
+        }
+        XCTAssertEqual(VMBundle.list(in: tmp).map(\.url.lastPathComponent), ["Base.alcovevm", "Copy.alcovevm"])
+    }
+
+    func testFailedOverlayLeavesNoClone() throws {
+        let (template, engine) = try stubTemplate()
+        XCTAssertThrowsError(try template.cloneLinked(named: "boom", engine: engine)) {
+            XCTAssertEqual($0 as? VMBundle.CloneError, .overlayFailed("qemu-img: boom"))
+            XCTAssertEqual("\($0)", "qemu-img could not create the clone's disk (qemu-img: boom); check the template's disk images and the free space, then clone again")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("boom.alcovevm").path))
+        XCTAssertEqual(template.liveClones(), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
+    }
+
     // MARK: - linked clones (real qemu-img)
 
     private func realEngine() throws -> EngineLocator.Engine {
@@ -220,12 +331,12 @@ final class VMBundleAndLocatorTests: XCTestCase {
 
         let first = try template.cloneLinked(named: "First", engine: engine)
         let second = try template.cloneLinked(named: "Second", engine: engine)
-        XCTAssertEqual(template.liveClones().map(\.path), [first.url.path, second.url.path])
-        XCTAssertEqual(try listedClones(template), [first.url.path, second.url.path])
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(first.url), standardPath(second.url)])
+        XCTAssertEqual(try listedClones(template), [standardPath(first.url), standardPath(second.url)])
 
         try fm.removeItem(at: first.url)
-        XCTAssertEqual(template.liveClones().map(\.path), [second.url.path])
-        XCTAssertEqual(try listedClones(template), [second.url.path])
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(second.url)])
+        XCTAssertEqual(try listedClones(template), [standardPath(second.url)])
 
         try second.deleteClone()
         XCTAssertFalse(fm.fileExists(atPath: second.url.path))
@@ -268,7 +379,7 @@ final class VMBundleAndLocatorTests: XCTestCase {
             XCTAssertEqual("\($0)", "'Template' is not a clone; delete it in the Alcove app")
         }
         XCTAssertEqual(VMBundle.list(in: tmp).map(\.url.lastPathComponent), ["Clone.alcovevm", "Template.alcovevm"])
-        XCTAssertEqual(try listedClones(template), [clone.url.path])
+        XCTAssertEqual(try listedClones(template), [standardPath(clone.url)])
         XCTAssertTrue(fm.fileExists(atPath: template.configURL.path))
     }
 }

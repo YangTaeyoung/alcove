@@ -217,7 +217,7 @@ final class ControlStateTests: XCTestCase {
         let registry = FakeProvisioningRegistry(targets: ["Win": t])
         let h = ControlHandler(registry: registry, hostKind: "test")
 
-        let cloned = try await h.handle(op: "vm.clone", params: ["name": "Win", "newName": "Copy"])
+        let cloned = try await h.handle(op: "vm.clone", params: ["name": "Win", "newName": "  Copy "])
         XCTAssertEqual(cloned, ["name": "Copy"])
         let missingName = await failure(h, "vm.clone", ["name": "Win"])
         XCTAssertEqual(missingName, "missing or invalid parameter 'newName'")
@@ -258,6 +258,10 @@ final class ControlStateTests: XCTestCase {
         await registry.setFailure(VMBundle.CloneError.cloneRunning("Win"))
         let delete = await failure(h, "vm.delete", ["name": "Win"])
         XCTAssertEqual(delete, "'Win' is running; stop it before deleting it")
+        await registry.setFailure(VMBundle.CloneError.overlayFailed("qemu-img: No space left on device"))
+        let overlay = await failure(h, "vm.clone", ["name": "Win", "newName": "Copy"])
+        XCTAssertEqual(overlay, "qemu-img could not create the clone's disk (qemu-img: No space left on device); "
+                       + "check the template's disk images and the free space, then clone again")
         let row = try await h.handle(op: "vm.list", params: [:])
         XCTAssertEqual(row["vms"]?[0]?["width"]?.intValue, 800)
     }

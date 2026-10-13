@@ -13,6 +13,7 @@ final class AppModel {
         case engineUnavailable(String)
         case vmIsActive(String)
         case nameAlreadyUsed(String)
+        case templateHasClones(String, clones: [String])
     }
 
     /// Directory holding `*.alcovevm` bundles (`$ALCOVE_VM_DIR` or Application Support).
@@ -131,9 +132,11 @@ final class AppModel {
         return session
     }
 
-    /// Remove the bundle (to the Trash when possible) and its session. The VM must be stopped.
+    /// Remove the bundle (to the Trash when possible) and its session. The VM must be stopped
+    /// and must not be the template of a clone; a clone leaves its template's clone list.
     func deleteVM(_ session: VMSession) throws {
         guard !session.state.isActive else { throw AppError.vmIsActive(session.name) }
+        try refuseTemplate(session)
         let fm = FileManager.default
         do {
             try fm.trashItem(at: session.bundle.url, resultingItemURL: nil)
@@ -141,16 +144,19 @@ final class AppModel {
             try fm.removeItem(at: session.bundle.url)
         }
         try? fm.removeItem(atPath: session.bundle.socketDirectory)
+        refreshCloneList(ofTemplate: session.config.cloneOf)
         session.invalidate()
         sessions.removeAll { $0.id == session.id }
         refreshDockBadge()
     }
 
     /// Move the bundle to `<newConfig.name>.alcovevm`, save `newConfig` into it
-    /// and replace the session. The VM must be stopped. Returns the new session.
+    /// and replace the session. The VM must be stopped and must not be the template
+    /// of a clone; a renamed clone is re-listed by its template. Returns the new session.
     func rename(_ session: VMSession, to newConfig: VMConfig) throws -> VMSession {
         guard let engine else { throw AppError.engineUnavailable(engineIssue ?? "") }
         guard !session.state.isActive else { throw AppError.vmIsActive(session.name) }
+        try refuseTemplate(session)
         var config = newConfig
         config.name = newConfig.name.trimmingCharacters(in: .whitespacesAndNewlines)
         try config.validate()
@@ -166,6 +172,7 @@ final class AppModel {
             throw error
         }
         try? fm.removeItem(atPath: session.bundle.socketDirectory)
+        refreshCloneList(ofTemplate: config.cloneOf)
         session.invalidate()
         let replacement = makeSession(bundle: bundle, config: config, engine: engine)
         sessions = sorted(sessions.filter { $0.id != session.id } + [replacement])
@@ -214,6 +221,18 @@ final class AppModel {
     }
 
     // MARK: - internals
+
+    /// Throws when clones are backed by this session's disks.
+    private func refuseTemplate(_ session: VMSession) throws {
+        let clones = session.bundle.liveClones().map { VMBundle(url: $0).configName }
+        guard clones.isEmpty else { throw AppError.templateHasClones(session.name, clones: clones) }
+    }
+
+    /// Has the template called `name` rebuild its `clones.json` from the bundles on disk.
+    private func refreshCloneList(ofTemplate name: String?) {
+        guard let name else { return }
+        _ = VMBundle.named(name, in: vmDirectory)?.liveClones()
+    }
 
     private func makeSession(bundle: VMBundle, config: VMConfig, engine: EngineLocator.Engine) -> VMSession {
         let controller = VMController(bundle: bundle, config: config, engine: engine)

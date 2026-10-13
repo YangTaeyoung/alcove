@@ -165,9 +165,12 @@ extension VMBundle {
         case nameExists(String)
         case notAClone(String)
         case cloneRunning(String)
+        case overlayFailed(String)
 
         public var description: String {
             switch self {
+            case .overlayFailed(let m):
+                return "qemu-img could not create the clone's disk (\(m)); check the template's disk images and the free space, then clone again"
             case .sourceRunning(let n): return "'\(n)' is running; stop it before cloning it"
             case .sourceSuspended(let n): return "'\(n)' has a suspended session; resume and shut it down, or discard the suspended state, before cloning it"
             case .sourceIsClone(let n, let template): return "'\(n)' is a clone of '\(template)'; clone '\(template)' instead"
@@ -182,6 +185,10 @@ extension VMBundle {
 
     /// JSON array of the absolute paths of the bundles cloned from this one.
     public var clonesURL: URL { url.appendingPathComponent("clones.json") }
+    /// The name in `config.json`; the directory name when the config cannot be read.
+    public var configName: String { storedConfig()?.name ?? url.deletingPathExtension().lastPathComponent }
+    /// `config.json` as stored, without writing migrated fields back.
+    private func storedConfig() -> VMConfig? { try? VMConfig.decode(Data(contentsOf: configURL)) }
     /// Whether an engine process holds this bundle's pidfile lock.
     public var isRunning: Bool { VMController.pidfileLockHolder(pidFileURL.path) != nil }
     /// The disk image a session that discards changes writes to in place of `diskURL(disk)`.
@@ -189,12 +196,26 @@ extension VMBundle {
     /// The UEFI variable store a session that discards changes writes to in place of `efiVarsURL`.
     public var ephemeralEFIVarsURL: URL { runURL.appendingPathComponent("ephemeral-efi-vars.fd") }
 
-    /// Bundles listed in clones.json that still exist; rewrites the file without the missing ones.
+    /// The bundles whose config names this bundle's config name as `cloneOf`: those listed in
+    /// clones.json plus those in this bundle's parent directory, once each by standardized path.
+    /// clones.json is rewritten to that set; an undecodable file counts as an empty list.
     public func liveClones(fileManager fm: FileManager = .default) -> [URL] {
+        let name = configName, own = url.standardizedFileURL.path
         let listed = (try? JSONDecoder().decode([String].self, from: Data(contentsOf: clonesURL))) ?? []
-        let live = listed.filter { fm.fileExists(atPath: VMBundle(url: URL(fileURLWithPath: $0)).configURL.path) }
-        if live.count != listed.count { try? writeClones(live, fileManager: fm) }
+        let siblings = VMBundle.list(in: url.deletingLastPathComponent(), fileManager: fm).map(\.url)
+        var live: [String] = []
+        for candidate in listed.map({ URL(fileURLWithPath: $0) }) + siblings {
+            let path = candidate.standardizedFileURL.path
+            guard path != own, !live.contains(path), VMBundle(url: candidate).storedConfig()?.cloneOf == name else { continue }
+            live.append(path)
+        }
+        if live != listed || (live.isEmpty && fm.fileExists(atPath: clonesURL.path)) { try? writeClones(live, fileManager: fm) }
         return live.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// The bundle in `directory` whose config is named `name`.
+    public static func named(_ name: String, in directory: URL, fileManager fm: FileManager = .default) -> VMBundle? {
+        list(in: directory, fileManager: fm).first { $0.storedConfig()?.name == name }
     }
 
     /// Writes `paths` to clones.json; an empty list removes the file.
@@ -208,19 +229,26 @@ extension VMBundle {
         try encoder.encode(paths).write(to: clonesURL, options: .atomic)
     }
 
-    /// New bundle next to this one whose disks are qcow2 overlays backed by this bundle's disks,
-    /// with a copy of the UEFI variables, a fresh token, MAC and agent port, no CD-ROMs, USB
-    /// passthrough or static forwards, and `cloneOf` set. The clone is added to `clones.json`.
+    /// New bundle next to this one, named `newName` without surrounding whitespace, whose disks are
+    /// qcow2 overlays backed by this bundle's disks, with a copy of the UEFI variables, a fresh token
+    /// and MAC, an agent port no bundle in the directory uses, no CD-ROMs, USB passthrough or static
+    /// forwards, and `cloneOf` set. The clone is added to `clones.json`.
     /// The overlays reference the template's disk files by absolute path.
     public func cloneLinked(named newName: String, engine: EngineLocator.Engine, fileManager fm: FileManager = .default) throws -> VMBundle {
+        let newName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let directory = url.deletingLastPathComponent()
         let source = try loadConfig()
         if let template = source.cloneOf { throw CloneError.sourceIsClone(source.name, template: template) }
         guard !source.tpm else { throw CloneError.sourceHasTPM }
         guard !isRunning else { throw CloneError.sourceRunning(source.name) }
         guard !isSuspended else { throw CloneError.sourceSuspended(source.name) }
 
-        var token = UUID().uuidString.lowercased()
-        while VMConfig.agentPort(for: token) == source.agentHostPort { token = UUID().uuidString.lowercased() }
+        let takenPorts = Set(VMBundle.list(in: directory, fileManager: fm).compactMap { $0.storedConfig()?.agentHostPort } + [source.agentHostPort])
+        var token = UUID().uuidString.lowercased(), attempts = 0
+        while takenPorts.contains(VMConfig.agentPort(for: token)), attempts < VMBundle.tokenAttempts {
+            token = UUID().uuidString.lowercased()
+            attempts += 1
+        }
         var network = VMConfig.Network.user(portForwards: [])
         if case .none = source.network { network = .none }
         let config = VMConfig(name: newName, guestOS: source.guestOS, cpuCount: source.cpuCount, memoryMiB: source.memoryMiB,
@@ -231,8 +259,10 @@ extension VMBundle {
         } catch VMConfig.ValidationError.emptyName, VMConfig.ValidationError.invalidName {
             throw CloneError.invalidName(newName)
         }
-        let clone = VMBundle(url: url.deletingLastPathComponent().appendingPathComponent(newName).appendingPathExtension(VMBundle.pathExtension))
-        guard !fm.fileExists(atPath: clone.url.path) else { throw CloneError.nameExists(newName) }
+        let clone = VMBundle(url: directory.appendingPathComponent(newName).appendingPathExtension(VMBundle.pathExtension))
+        guard !fm.fileExists(atPath: clone.url.path), VMBundle.named(newName, in: directory, fileManager: fm) == nil else {
+            throw CloneError.nameExists(newName)
+        }
 
         do {
             try fm.createDirectory(at: clone.runURL, withIntermediateDirectories: true)
@@ -241,13 +271,18 @@ extension VMBundle {
                 try VMBundle.createOverlay(at: clone.diskURL(disk), backing: diskURL(disk), engine: engine)
             }
             try fm.copyItem(at: efiVarsURL, to: clone.efiVarsURL)
-            try writeClones(liveClones(fileManager: fm).map(\.path) + [clone.url.path], fileManager: fm)
+            try writeClones(liveClones(fileManager: fm).map(\.path), fileManager: fm)
         } catch {
             try? fm.removeItem(at: clone.url)
+            _ = liveClones(fileManager: fm)
+            if case BundleError.qemuImgFailed(let message) = error { throw CloneError.overlayFailed(message) }
             throw error
         }
         return clone
     }
+
+    /// Tokens tried by `cloneLinked` to find an agent port no bundle in the directory uses.
+    private static let tokenAttempts = 100_000
 
     /// Removes this clone's bundle directory, its socket directory and its entry in the template's `clones.json`.
     public func deleteClone(fileManager fm: FileManager = .default) throws {
@@ -256,8 +291,7 @@ extension VMBundle {
         guard !isRunning else { throw CloneError.cloneRunning(config.name) }
         try fm.removeItem(at: url)
         try? fm.removeItem(atPath: socketDirectory)
-        let templateURL = url.deletingLastPathComponent().appendingPathComponent(template).appendingPathExtension(VMBundle.pathExtension)
-        _ = VMBundle(url: templateURL).liveClones(fileManager: fm)
+        _ = VMBundle.named(template, in: url.deletingLastPathComponent(), fileManager: fm)?.liveClones(fileManager: fm)
     }
 
     /// Removes the overlays and the UEFI variable copy of a session that discards changes.

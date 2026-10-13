@@ -316,6 +316,73 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try await vm.shutdown(force: true)
     }
 
+    func testCloneRefusedWhileTemplateStarting() async throws {
+        let vm = try makeVM()
+        let cloneURL = vm.bundle.url.deletingLastPathComponent().appendingPathComponent("Clone.alcovevm")
+        let starter = Task { try await vm.start() }
+        let active = await waitUntil { await vm.state.isActive }
+        XCTAssertTrue(active)
+        do {
+            _ = try await vm.cloneLinked(named: "Clone")
+            XCTFail("an active template was cloned")
+        } catch {
+            XCTAssertEqual(error as? VMBundle.CloneError, .sourceRunning("Fake"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cloneURL.path))
+        XCTAssertEqual(vm.bundle.liveClones(), [])
+        try await starter.value
+        await XCTAssertThrowsErrorAsync(try await vm.cloneLinked(named: "Clone"))
+        try await vm.shutdown(force: true)
+
+        let clone = try await vm.cloneLinked(named: "Clone")
+        XCTAssertEqual(clone.url.lastPathComponent, "Clone.alcovevm")
+        try FileManager.default.removeItem(at: vm.bundle.runURL.appendingPathComponent("fake-argv.json"))
+        do {
+            try await vm.start()
+            XCTFail("a template with clones started")
+        } catch {
+            XCTAssertEqual(error as? VMController.ControllerError,
+                           .engineDidNotStart("'Fake' is a template with clones (Clone); delete the clones first or start a clone"))
+        }
+        XCTAssertFalse(launched(vm))
+    }
+
+    func testCloneDeletionRefusedWhileTheCloneIsActive() async throws {
+        let vm = try makeVM()
+        let bundle = try await vm.cloneLinked(named: "Clone")
+        let clone = VMController(bundle: bundle, config: try bundle.loadConfig(), engine: vm.engine)
+        controllers.append(clone)
+        let starter = Task { try await clone.start() }
+        let active = await waitUntil { await clone.state.isActive }
+        XCTAssertTrue(active)
+        do {
+            try await clone.deleteClone()
+            XCTFail("an active clone was deleted")
+        } catch {
+            XCTAssertEqual(error as? VMBundle.CloneError, .cloneRunning("Clone"))
+        }
+        try await starter.value
+        try await clone.shutdown(force: true)
+        try await clone.deleteClone()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.url.path))
+        XCTAssertEqual(vm.bundle.liveClones(), [])
+    }
+
+    func testTemplateGuardNamesClonesByTheirConfigName() async throws {
+        let vm = try makeVM()
+        let clone = try await vm.cloneLinked(named: "Clone")
+        let moved = clone.url.deletingLastPathComponent().appendingPathComponent("Moved.alcovevm")
+        try FileManager.default.moveItem(at: clone.url, to: moved)
+        do {
+            try await vm.start()
+            XCTFail("a template with a moved clone started")
+        } catch {
+            XCTAssertEqual(error as? VMController.ControllerError,
+                           .engineDidNotStart("'Fake' is a template with clones (Clone); delete the clones first or start a clone"))
+        }
+        let s = await vm.state; XCTAssertEqual(s, .stopped)
+    }
+
     func testEphemeralOverlayRemovedOnStop() async throws {
         let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
         let run = vm.bundle.runURL

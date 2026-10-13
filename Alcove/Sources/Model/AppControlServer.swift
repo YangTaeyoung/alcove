@@ -97,27 +97,21 @@ actor AppVMRegistry: VMRegistry {
     }
 }
 
-/// Clones and deletes bundles in the app's VM directory, then has `AppModel` re-scan it.
+/// Clones and deletes bundles through the session's controller, then has `AppModel` re-scan the VM directory.
 extension AppVMRegistry: VMProvisioning {
     func cloneVM(named name: String, as newName: String) async throws {
-        let (bundle, controller) = try await session(named: name)
-        guard await !controller.state.isActive else { throw VMBundle.CloneError.sourceRunning(name) }
-        _ = try bundle.cloneLinked(named: newName, engine: controller.engine)
+        _ = try await controller(named: name).cloneLinked(named: newName)
         await MainActor.run { AppModel.shared.reload() }
     }
 
     func deleteVM(named name: String) async throws {
-        let (bundle, controller) = try await session(named: name)
-        guard await !controller.state.isActive else { throw VMBundle.CloneError.cloneRunning(name) }
-        try bundle.deleteClone()
+        try await controller(named: name).deleteClone()
         await MainActor.run { AppModel.shared.reload() }
     }
 
-    /// The bundle and controller of the session called `name`.
-    private func session(named name: String) async throws -> (VMBundle, VMController) {
-        let found: (VMBundle, VMController)? = await MainActor.run {
-            AppModel.shared.sessions.first { $0.name == name }.map { ($0.bundle, $0.controller) }
-        }
+    /// The controller of the session called `name`.
+    private func controller(named name: String) async throws -> VMController {
+        let found = await MainActor.run { AppModel.shared.sessions.first { $0.name == name }?.controller }
         guard let found else { throw ControlHandler.ControlError.noSuchVM(name) }
         return found
     }

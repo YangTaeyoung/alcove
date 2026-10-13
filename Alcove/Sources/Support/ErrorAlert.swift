@@ -131,6 +131,8 @@ enum ErrorText {
         case .engineUnavailable(let m): m.isEmpty ? "The QEMU engine is not available." : m
         case .vmIsActive(let name): "“\(name)” is running. Shut it down first."
         case .nameAlreadyUsed(let name): "A virtual machine named “\(name)” already exists."
+        case .templateHasClones(let name, let clones):
+            "“\(name)” is the template of \(clones.joined(separator: ", ")). Delete the clones first."
         }
     }
 }

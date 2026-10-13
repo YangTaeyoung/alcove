@@ -139,7 +139,7 @@ public actor VMController {
     /// suspended bundle asked to discard changes are refused before anything is launched.
     public func start(bootFromCDROM: Bool = false, discardChanges: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
-        let clones = bundle.liveClones().map { $0.deletingPathExtension().lastPathComponent }
+        let clones = bundle.liveClones().map { VMBundle(url: $0).configName }
         guard clones.isEmpty else {
             throw ControllerError.engineDidNotStart(
                 "'\(config.name)' is a template with clones (\(clones.joined(separator: ", "))); delete the clones first or start a clone")
@@ -354,6 +354,20 @@ public actor VMController {
     public func discardSuspendState() throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
         try bundle.discardSuspendState()
+    }
+
+    // MARK: - linked clones
+
+    /// Creates a linked clone of this VM's bundle (`VMBundle.cloneLinked`); refused while the engine is active.
+    public func cloneLinked(named newName: String) throws -> VMBundle {
+        guard !state.isActive else { throw VMBundle.CloneError.sourceRunning(config.name) }
+        return try bundle.cloneLinked(named: newName, engine: engine)
+    }
+
+    /// Deletes this VM's bundle when it is a clone (`VMBundle.deleteClone`); refused while the engine is active.
+    public func deleteClone() throws {
+        guard !state.isActive else { throw VMBundle.CloneError.cloneRunning(config.name) }
+        try bundle.deleteClone()
     }
 
     // MARK: - snapshots (qcow2 internal snapshots on every disk, vmstate on the first)

@@ -16,12 +16,21 @@ public actor HeadlessRegistry: VMRegistry {
         VMBundle.list(in: directory).compactMap { (try? $0.loadConfig())?.name }
     }
 
-    public func target(named name: String) async -> VMTarget? {
+    public func target(named name: String) async -> VMTarget? { await controllerTarget(named: name) }
+
+    /// The target registered for `name`, returned once its controller drains display messages.
+    private func controllerTarget(named name: String) async -> ControllerTarget? {
+        guard let t = registeredTarget(named: name) else { return nil }
+        await t.controller.setDrainsDisplayMessages(true)
+        return t
+    }
+
+    /// The one target per name: the first call for a name creates its controller and registers it
+    /// without suspending.
+    private func registeredTarget(named name: String) -> ControllerTarget? {
         if let t = targets[name] { return t }
         guard let bundle = bundle(named: name), let config = try? bundle.loadConfig() else { return nil }
-        let controller = VMController(bundle: bundle, config: config, engine: engine)
-        await controller.setDrainsDisplayMessages(true)
-        let t = ControllerTarget(name: name, controller: controller)
+        let t = ControllerTarget(name: name, controller: VMController(bundle: bundle, config: config, engine: engine))
         targets[name] = t
         return t
     }
@@ -40,15 +49,13 @@ public actor HeadlessRegistry: VMRegistry {
 
 extension HeadlessRegistry: VMProvisioning {
     public func cloneVM(named name: String, as newName: String) async throws {
-        guard let bundle = bundle(named: name) else { throw ControlHandler.ControlError.noSuchVM(name) }
-        if let t = targets[name], await t.state().isActive { throw VMBundle.CloneError.sourceRunning(name) }
-        _ = try bundle.cloneLinked(named: newName, engine: engine)
+        guard let t = await controllerTarget(named: name) else { throw ControlHandler.ControlError.noSuchVM(name) }
+        _ = try await t.controller.cloneLinked(named: newName)
     }
 
     public func deleteVM(named name: String) async throws {
-        guard let bundle = bundle(named: name) else { throw ControlHandler.ControlError.noSuchVM(name) }
-        if let t = targets[name], await t.state().isActive { throw VMBundle.CloneError.cloneRunning(name) }
-        try bundle.deleteClone()
+        guard let t = await controllerTarget(named: name) else { throw ControlHandler.ControlError.noSuchVM(name) }
+        try await t.controller.deleteClone()
         targets[name] = nil
     }
 }
