@@ -116,3 +116,25 @@ func entryAction(name string, attributes uint32, keep, leave map[string]bool) in
 	}
 	return entryInherit
 }
+
+const (
+	// removeAttempts is how often the lock tries to delete an entry.
+	removeAttempts = 40
+	// removePause is the time between two of those tries.
+	removePause = 50 * time.Millisecond
+)
+
+// removeRetrying calls remove until it returns nil or has failed attempts
+// times, running pause between two calls, and returns the last error.
+func removeRetrying(remove func() error, attempts int, pause func()) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			pause()
+		}
+		if err = remove(); err == nil {
+			return nil
+		}
+	}
+	return err
+}

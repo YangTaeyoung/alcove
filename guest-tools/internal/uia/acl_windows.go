@@ -204,7 +204,8 @@ func ownerAccount(h syscall.Handle, fallback string) string {
 // is neither Administrators nor SYSTEM, it is renamed to untrustedName and a
 // new directory is created in its place. Any other owner or access list is
 // replaced by lockedSDDL on the handle. The entries are handled as entryAction
-// says. An error means the directory is not known to be locked.
+// says; deleting one is tried removeAttempts times, removePause apart. An error
+// means the directory is not known to be locked.
 func secureDir(dir string, keep, leave map[string]bool) error {
 	d, err := newLockedDescriptor()
 	if err != nil {
@@ -272,7 +273,7 @@ func secureDir(dir string, keep, leave map[string]bool) error {
 				err = nil
 			}
 		case entryRemove:
-			err = os.RemoveAll(path)
+			err = removeRetrying(func() error { return os.RemoveAll(path) }, removeAttempts, func() { time.Sleep(removePause) })
 		case entryLeave:
 			err = nil
 		default:

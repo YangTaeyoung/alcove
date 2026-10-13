@@ -1,6 +1,7 @@
 package uia
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -148,5 +149,33 @@ func TestUntrustedNameAppendsTheUTCTime(t *testing.T) {
 	got := untrustedName(`C:\ProgramData\Alcove`, now)
 	if want := `C:\ProgramData\Alcove.untrusted-20261013230509`; got != want {
 		t.Fatalf("untrustedName = %q, expected %q", got, want)
+	}
+}
+
+func TestRemoveRetryingStopsAtTheFirstSuccess(t *testing.T) {
+	calls, pauses := 0, 0
+	err := removeRetrying(func() error {
+		calls++
+		if calls < 3 {
+			return errors.New("access is denied")
+		}
+		return nil
+	}, 5, func() { pauses++ })
+	if err != nil || calls != 3 || pauses != 2 {
+		t.Fatalf("err %v after %d calls and %d pauses", err, calls, pauses)
+	}
+}
+
+func TestRemoveRetryingReturnsTheLastErrorAfterItsAttempts(t *testing.T) {
+	calls, pauses := 0, 0
+	err := removeRetrying(func() error {
+		calls++
+		return errors.New("access is denied")
+	}, 4, func() { pauses++ })
+	if err == nil || err.Error() != "access is denied" || calls != 4 || pauses != 3 {
+		t.Fatalf("err %v after %d calls and %d pauses", err, calls, pauses)
+	}
+	if err := removeRetrying(func() error { return errors.New("unused") }, 0, func() {}); err != nil {
+		t.Fatalf("no attempt returned %v", err)
 	}
 }
