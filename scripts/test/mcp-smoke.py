@@ -45,9 +45,10 @@ def main():
     evidence = {
         "alcove_record_start", "alcove_record_stop", "alcove_event_log", "alcove_crash_dumps", "alcove_collect_diagnostics",
     }
-    toolsets = {"core": core, "shell": shell, "files": files, "state": state, "ui": ui, "evidence": evidence}
+    http = {"alcove_http_capture_start", "alcove_http_capture_stop", "alcove_http_requests", "alcove_http_rule"}
+    toolsets = {"core": core, "shell": shell, "files": files, "state": state, "ui": ui, "evidence": evidence, "http": http}
     selected = [s.strip() for s in env.get("ALCOVE_MCP_TOOLSETS", "").split(",") if s.strip()]
-    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files | state | ui | evidence
+    expected = set().union(*(toolsets[s] for s in selected)) if selected else core | shell | files | state | ui | evidence | http
     missing = expected - set(names)
     extra = set(names) - expected
     if missing or extra:
