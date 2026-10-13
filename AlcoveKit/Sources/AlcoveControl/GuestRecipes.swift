@@ -9,18 +9,24 @@ enum GuestRecipes {
 
     private static let windowsPrelude = "$ErrorActionPreference = 'Stop'\n$WarningPreference = 'SilentlyContinue'\n"
 
-    /// Quotes a value for a single-quoted PowerShell or sh string.
+    /// Quotes a value for a single-quoted PowerShell or sh string. Works on Unicode scalars, so a quote
+    /// followed by a combining mark is still escaped.
     static func quote(_ s: String, os: VMConfig.GuestOS) -> String {
-        if os == .windows {
-            var out = ""
-            for ch in s {
-                out.append(ch)
-                if "'\u{2018}\u{2019}\u{201A}\u{201B}".contains(ch) { out.append(ch) }
+        var out = String.UnicodeScalarView()
+        for scalar in s.unicodeScalars {
+            if os == .windows {
+                out.append(scalar)
+                if powerShellQuotes.contains(scalar.value) { out.append(scalar) }
+            } else if scalar == "'" {
+                out.append(contentsOf: "'\\''".unicodeScalars)
+            } else {
+                out.append(scalar)
             }
-            return "'" + out + "'"
         }
-        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return "'" + String(out) + "'"
     }
+
+    private static let powerShellQuotes: Set<UInt32> = [0x27, 0x2018, 0x2019, 0x201A, 0x201B]
 
     static func setClock(unixSeconds: Int, os: VMConfig.GuestOS) -> String? {
         switch os {
@@ -92,30 +98,31 @@ enum GuestRecipes {
         """
     }
 
-    /// Prints one JSON object: `user`, `locked`, `freeBytes`, `utc`, `dns`, `scale`.
+    /// Prints one JSON object: `user`, `freeBytes`, `utc`, `dns` and, where the guest can tell, `locked` and `scale`.
     static func doctorProbe(os: VMConfig.GuestOS) -> String? {
         switch os {
         case .windows:
             return """
             $ErrorActionPreference = 'SilentlyContinue'
-            Add-Type -Namespace Alcove -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern uint GetDpiForSystem();'
             $dns = $false
             try { if ([System.Net.Dns]::GetHostAddresses('example.com').Count -gt 0) { $dns = $true } } catch { }
             $free = (Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')).Free
-            [pscustomobject]@{
+            $o = [ordered]@{
               user = [Environment]::UserName
               locked = [bool](Get-Process LogonUI -ErrorAction SilentlyContinue)
               freeBytes = [int64]$free
               utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
               dns = $dns
-              scale = [int]([Alcove.Dpi]::GetDpiForSystem() * 100 / 96)
-            } | ConvertTo-Json -Compress
+            }
+            $applied = (Get-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop\\WindowMetrics' -Name AppliedDPI).AppliedDPI
+            if ($applied) { $o.scale = [int]($applied * 100 / 96) }
+            [pscustomobject]$o | ConvertTo-Json -Compress
             """
         case .linux:
             return """
             dns=false; getent hosts example.com >/dev/null 2>&1 && dns=true
-            free=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')
-            printf '{"user":"%s","locked":false,"freeBytes":%s,"utc":"%s","dns":%s,"scale":100}\\n' "$(id -un)" "${free:-0}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dns"
+            free=$(df -Pk / | awk 'NR==2 { printf "%.0f", $4 * 1024 }')
+            printf '{"user":"%s","freeBytes":%s,"utc":"%s","dns":%s}\\n' "$(id -un)" "${free:-0}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dns"
             """
         case .other:
             return nil

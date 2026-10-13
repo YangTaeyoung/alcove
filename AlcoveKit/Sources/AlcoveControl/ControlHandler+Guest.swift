@@ -80,9 +80,12 @@ extension ControlHandler {
         var layouts: [String]?
         if let value = present("keyboardLayouts") {
             guard let items = value.arrayValue else { throw ControlError.missing("keyboardLayouts") }
-            let tags = items.compactMap(\.stringValue).filter { !$0.isEmpty }
+            let tags = items.compactMap(\.stringValue)
             guard !tags.isEmpty, tags.count == items.count else {
                 throw ControlError.failed("keyboardLayouts must be a non-empty list of language tags such as en-US")
+            }
+            guard tags.allSatisfy(Self.isLanguageTag) else {
+                throw ControlError.failed("keyboardLayouts entries must be language tags such as en-US (letters, digits and '-', 2 to 35 characters, not starting with '-')")
             }
             layouts = tags
         }
@@ -91,7 +94,25 @@ extension ControlHandler {
             guard let s = value.stringValue else { throw ControlError.missing("clock") }
             clock = Int(try clockDate(s).timeIntervalSince1970.rounded(.down))
         }
-        return (clock, try text("timeZone"), try text("locale"), layouts, dark, scale)
+        let timeZone = try text("timeZone")
+        if let timeZone, !Self.isTimeZoneID(timeZone) {
+            throw ControlError.failed("timeZone must be 1 to 64 characters: letters, digits, space and _ - + / ( ) . :, not starting with '-'")
+        }
+        let locale = try text("locale")
+        if let locale, !Self.isLanguageTag(locale) {
+            throw ControlError.failed("locale must be a language tag such as ko-KR (letters, digits and '-', 2 to 35 characters, not starting with '-')")
+        }
+        return (clock, timeZone, locale, layouts, dark, scale)
+    }
+
+    private static func isTimeZoneID(_ s: String) -> Bool {
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _-+/().:".unicodeScalars)
+        return (1...64).contains(s.unicodeScalars.count) && !s.hasPrefix("-") && s.unicodeScalars.allSatisfy(allowed.contains)
+    }
+
+    private static func isLanguageTag(_ s: String) -> Bool {
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-".unicodeScalars)
+        return (2...35).contains(s.unicodeScalars.count) && !s.hasPrefix("-") && s.unicodeScalars.allSatisfy(allowed.contains)
     }
 
     private func clockDate(_ text: String) throws -> Date {
@@ -181,7 +202,7 @@ extension ControlHandler {
 
         let os = await t.guestOS()
         guard let script = GuestRecipes.doctorProbe(os: os) else {
-            rows.append(check("probe", false, unsupportedDetail(os)))
+            rows.append(check("probe", false, unsupportedDetail(os), hint: "this guest OS has no health probe"))
             return ["checks": .array(rows)]
         }
         let result = await runRecipe(agent, script, vm: t.name, op: "vm.doctor")
@@ -203,12 +224,23 @@ extension ControlHandler {
     }
 
     private func probeRows(_ probe: JSON, received: Date) -> [JSON] {
-        let user = probe["user"]?.stringValue ?? "?"
-        let locked = probe["locked"]?.boolValue ?? false
-        var rows = [check("session", !locked, "\(user), \(locked ? "locked" : "unlocked")",
-                          hint: "unlock the guest session; vm.type the password at the lock screen")]
-        let free = Int64(probe["freeBytes"]?.intValue ?? 0)
-        rows.append(check("disk", free >= ControlHandler.minimumFreeBytes, "\(free) bytes free", hint: "free disk space in the guest"))
+        let notChecked = "not checked on this guest"
+        var rows: [JSON]
+        if let user = probe["user"]?.stringValue {
+            if let locked = probe["locked"]?.boolValue {
+                rows = [check("session", !locked, "\(user), \(locked ? "locked" : "unlocked")",
+                              hint: "unlock the guest session; vm.type the password at the lock screen")]
+            } else {
+                rows = [check("session", true, "\(user), lock state \(notChecked)")]
+            }
+        } else {
+            rows = [check("session", false, "the guest reported no user", hint: "sign in to the guest and retry")]
+        }
+        if let free = probe["freeBytes"]?.intValue {
+            rows.append(check("disk", Int64(free) >= ControlHandler.minimumFreeBytes, "\(free) bytes free", hint: "free disk space in the guest"))
+        } else {
+            rows.append(check("disk", false, "the guest reported no free space", hint: "check the guest shell with vm.exec"))
+        }
         if let text = probe["utc"]?.stringValue, let utc = ISO8601DateFormatter().date(from: text) {
             let skew = abs(received.timeIntervalSince(utc))
             rows.append(check("clock", skew <= ControlHandler.maximumClockSkew, "skew \(Int(skew.rounded())) s", hint: "vm.set_environment clock=host"))
@@ -218,7 +250,11 @@ extension ControlHandler {
         let dns = probe["dns"]?.boolValue ?? false
         rows.append(check("network", dns, dns ? "example.com resolves" : "example.com does not resolve",
                           hint: "call vm.set_network up=true and check the guest DNS settings"))
-        rows.append(check("scale", true, "\(probe["scale"]?.intValue ?? 0) %"))
+        if let scale = probe["scale"]?.intValue {
+            rows.append(check("scale", true, "\(scale) % (applied at sign-in)"))
+        } else {
+            rows.append(check("scale", true, notChecked))
+        }
         return rows
     }
 }

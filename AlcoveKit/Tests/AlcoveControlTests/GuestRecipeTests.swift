@@ -59,6 +59,17 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(GuestRecipes.quote("a\u{2018}b\u{2019}c", os: .windows), "'a\u{2018}\u{2018}b\u{2019}\u{2019}c'")
     }
 
+    func testQuoteEscapesQuoteFollowedByCombiningMark() {
+        XCTAssertEqual(GuestRecipes.quote("x'\u{0301};evil", os: .windows), "'x''\u{0301};evil'")
+        XCTAssertEqual(GuestRecipes.quote("x'\u{0301};evil", os: .linux), "'x'\\''\u{0301};evil'")
+    }
+
+    func testQuoteDoublesEachPowerShellQuoteScalar() {
+        for scalar in ["'", "\u{2018}", "\u{2019}", "\u{201A}", "\u{201B}"] {
+            XCTAssertEqual(GuestRecipes.quote("a\(scalar)b", os: .windows), "'a\(scalar)\(scalar)b'", scalar)
+        }
+    }
+
     func testRecipesAvailability() {
         typealias Row = (String, (VMConfig.GuestOS) -> String?, windows: Bool, linux: Bool)
         let table: [Row] = [
@@ -170,6 +181,34 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(commands(agent), [])
     }
 
+    func testSetEnvironmentRefusesUnsafeValuesWithoutSendingCommands() async throws {
+        let (h, _, agent) = try await setup()
+        let zones = ["-Asia/Seoul", "", "UTC'; evil", "a\u{0301}", String(repeating: "a", count: 65)]
+        for zone in zones {
+            let message = await failure(h, "vm.set_environment", ["name": "Win", "timeZone": .string(zone)])
+            XCTAssertTrue(message.hasPrefix("timeZone must be") || message.hasPrefix("missing or invalid"), "\(zone): \(message)")
+        }
+        for locale in ["-ko", "k", "ko KR", "ko-KR'; evil", String(repeating: "a", count: 36)] {
+            let message = await failure(h, "vm.set_environment", ["name": "Win", "locale": .string(locale)])
+            XCTAssertTrue(message.hasPrefix("locale must be a language tag"), "\(locale): \(message)")
+        }
+        for tag in ["-en", "e", "en US", "en'x"] {
+            let message = await failure(h, "vm.set_environment", ["name": "Win", "keyboardLayouts": ["en-US", .string(tag)]])
+            XCTAssertTrue(message.hasPrefix("keyboardLayouts entries must be language tags"), "\(tag): \(message)")
+        }
+        XCTAssertEqual(commands(agent), [])
+    }
+
+    func testSetEnvironmentAcceptsWindowsAndIANAZoneIDs() async throws {
+        let (h, _, agent) = try await setup(os: .linux) { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m)] : []
+        }
+        for zone in ["America/Argentina/Buenos_Aires", "Etc/GMT+5", "(UTC+09:00) Seoul"] {
+            _ = try await h.handle(op: "vm.set_environment", params: ["name": "Win", "timeZone": .string(zone)])
+        }
+        XCTAssertEqual(commands(agent).count, 3)
+    }
+
     func testSetEnvironmentNeedsExecCapability() async throws {
         let (h, _, agent) = try await setup(caps: ["clipboard"])
         let message = await failure(h, "vm.set_environment", ["name": "Win", "theme": "dark"])
@@ -251,7 +290,7 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(check(r, "clock")?["ok"]?.boolValue, false)
         XCTAssertEqual(check(r, "clock")?["hint"]?.stringValue, "vm.set_environment clock=host")
         XCTAssertEqual(check(r, "network")?["ok"]?.boolValue, true)
-        XCTAssertEqual(check(r, "scale")?["detail"]?.stringValue, "125 %")
+        XCTAssertEqual(check(r, "scale")?["detail"]?.stringValue, "125 % (applied at sign-in)")
         XCTAssertEqual(commands(agent).count, 1)
         XCTAssertEqual(commands(agent).first, GuestRecipes.doctorProbe(os: .windows))
     }
@@ -280,6 +319,61 @@ final class GuestRecipeTests: XCTestCase {
         let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(check(r, "clock")?["ok"]?.boolValue, true)
         XCTAssertNil(check(r, "clock")?["hint"])
+    }
+
+    func testDoctorReportsOnlyWhatTheProbeMeasured() async throws {
+        let text = ISO8601DateFormatter().string(from: hostNow)
+        let (h, _, _) = try await setup(os: .linux) { m, _ in
+            m["op"]?.stringValue == "exec.run"
+                ? [exitReply(m, stdout: "{\"user\":\"root\",\"freeBytes\":5000000000,\"utc\":\"\(text)\",\"dns\":true}\n")] : []
+        }
+        let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(r, "session")?["ok"]?.boolValue, true)
+        XCTAssertEqual(check(r, "session")?["detail"]?.stringValue, "root, lock state not checked on this guest")
+        XCTAssertEqual(check(r, "scale")?["ok"]?.boolValue, true)
+        XCTAssertEqual(check(r, "scale")?["detail"]?.stringValue, "not checked on this guest")
+    }
+
+    func testDoctorSessionNeedsUser() async throws {
+        let (h, _, _) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m, stdout: "{\"dns\":true}\n")] : []
+        }
+        let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(r, "session")?["ok"]?.boolValue, false)
+        XCTAssertNotNil(check(r, "session")?["hint"]?.stringValue)
+        XCTAssertEqual(check(r, "disk")?["ok"]?.boolValue, false)
+        XCTAssertEqual(check(r, "clock")?["ok"]?.boolValue, false)
+    }
+
+    func testEveryFailingDoctorRowHasAHint() async throws {
+        var results: [(String, JSON)] = []
+        let probeOK: @Sendable (JSON, FakeAgent) -> [JSON] = { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m, stdout: probeJSON(utc: hostNow)) ] : []
+        }
+        let (stopped, _, _) = try await setup(state: .stopped)
+        results.append(("stopped", try await stopped.handle(op: "vm.doctor", params: ["name": "Win"])))
+        let (paused, _, _) = try await setup(state: .paused)
+        results.append(("paused", try await paused.handle(op: "vm.doctor", params: ["name": "Win"])))
+        let (noTools, _, _) = try await setup(connected: false)
+        results.append(("no tools", try await noTools.handle(op: "vm.doctor", params: ["name": "Win"])))
+        let (noExec, _, _) = try await setup(caps: ["clipboard"])
+        results.append(("no exec", try await noExec.handle(op: "vm.doctor", params: ["name": "Win"])))
+        let (other, _, _) = try await setup(os: .other, probeOK)
+        results.append(("other", try await other.handle(op: "vm.doctor", params: ["name": "Win"])))
+        let (garbage, _, _) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m, stdout: "not json")] : []
+        }
+        results.append(("bad output", try await garbage.handle(op: "vm.doctor", params: ["name": "Win"])))
+        let (skewed, _, _) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m, stdout: probeJSON(utc: hostNow.addingTimeInterval(60), locked: true, free: 1, dns: false))] : []
+        }
+        results.append(("skewed", try await skewed.handle(op: "vm.doctor", params: ["name": "Win"])))
+        for (name, r) in results {
+            XCTAssertTrue(checks(r).contains { $0["ok"]?.boolValue == false }, "\(name) has a failing row")
+            for row in checks(r) where row["ok"]?.boolValue == false {
+                XCTAssertNotNil(row["hint"]?.stringValue, "\(name): \(row["id"]?.stringValue ?? "?")")
+            }
+        }
     }
 
     func testDoctorReportsProbeFailure() async throws {
