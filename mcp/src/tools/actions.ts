@@ -87,14 +87,14 @@ export function register(r: Registrar, client: ControlClient): void {
     "vm.mouse.up", buttonLine("up"), buttonParams);
 
   held("alcove_key_down", "Key down",
-    "Press a key or combination and keep it held, e.g. \"shift\" or \"ctrl+shift\". Pair with alcove_key_up. Reports nothing about the screen unless `observe` is set.",
-    { name: vmName, keys: z.string().min(1), ...observeParams },
-    "vm.key.down", (a) => `key down ${a.keys}`, (a) => ({ keys: a.keys }));
+    "Press one key and keep it held, e.g. \"shift\" or \"a\" (a single key name, not a combination). Pair with alcove_key_up. Reports nothing about the screen unless `observe` is set.",
+    { name: vmName, key: z.string().min(1).describe("One key name, e.g. shift, ctrl, a, enter"), ...observeParams },
+    "vm.key.down", (a) => `key down ${a.key}`, (a) => ({ key: a.key }));
 
   held("alcove_key_up", "Key up",
-    "Release keys held with alcove_key_down. Reports nothing about the screen unless `observe` is set.",
-    { name: vmName, keys: z.string().min(1), ...observeParams },
-    "vm.key.up", (a) => `key up ${a.keys}`, (a) => ({ keys: a.keys }));
+    "Release the key held with alcove_key_down. Reports nothing about the screen unless `observe` is set.",
+    { name: vmName, key: z.string().min(1).describe("One key name, e.g. shift, ctrl, a, enter"), ...observeParams },
+    "vm.key.up", (a) => `key up ${a.key}`, (a) => ({ key: a.key }));
 
   r.tool("core",
     "alcove_find_text",
