@@ -8,6 +8,10 @@ enum ScriptBuilder {
         var script: Script
         /// One sentence per trace line that was left out or whose step needs a change by hand; each starts with `seq <n> (<op>)`.
         var warnings: [String]
+        /// The `seq` of the trace line each step was made from, in step order.
+        var sources: [Int] = []
+        /// The variables the steps read and the script gives no value for, in the order the steps first read them.
+        var required: [String] = []
     }
 
     /// The read-only ops that become steps.
@@ -44,24 +48,58 @@ enum ScriptBuilder {
     /// Every step has the label `<op> <what it acts on>`; the label of a `vm.type` step that follows a click or UI op
     /// on a password field does not show the text.
     static func draft(trace: [JSON], vm: String, from: Int?, to: Int?) -> Draft {
-        var pending: [Pending] = []
-        var warnings: [String] = []
-        var foreground: String?
-        var intoPassword = false
-        for entry in trace {
-            guard let seq = entry["seq"]?.intValue, let op = entry["op"]?.stringValue, entry["ok"]?.boolValue == true else { continue }
-            if let to, seq > to { continue }
+        var assembly = Assembly(from: from, to: to)
+        for entry in trace { assembly.add(entry) }
+        return assembly.draft(vm: vm)
+    }
+
+    /// Builds a draft from trace entries given one at a time, in the order of the trace. Of an entry outside
+    /// `from...to` it keeps the foreground window title it shows and nothing else.
+    struct Assembly {
+        private let from: Int?
+        private let to: Int?
+        private var pending: [Pending] = []
+        private var warnings: [String] = []
+        private var required: [String] = []
+        private var foreground: String?
+        private var intoPassword = false
+        /// The VM the first entry with a VM name names.
+        private(set) var recordedVM: String?
+
+        /// An assembly of the entries with a `seq` in `from...to`; nil leaves that side open.
+        init(from: Int?, to: Int?) {
+            self.from = from
+            self.to = to
+        }
+
+        /// The draft of the entries added so far, as a script for the VM `vm`.
+        func draft(vm: String) -> Draft {
+            let steps = pending.map { item -> Script.Step in
+                var step = item.step
+                if let text = item.text { step.params["text"] = .string(Script.escape(text)) }
+                step.label = label(item)
+                return step
+            }
+            return Draft(script: Script(vm: vm, variables: [:], steps: steps), warnings: warnings, sources: pending.map(\.seq), required: required)
+        }
+
+        /// Takes one trace entry into account; `draft(trace:vm:from:to:)` says what becomes of it.
+        mutating func add(_ entry: JSON) {
+            guard let seq = entry["seq"]?.intValue, let op = entry["op"]?.stringValue else { return }
+            if recordedVM == nil, let name = entry["params"]?["name"]?.stringValue, !name.isEmpty { recordedVM = name }
+            guard entry["ok"]?.boolValue == true else { return }
+            if let to, seq > to { return }
             let shown = shownForeground(entry)
             defer { if let shown { foreground = shown } }
-            if let from, seq < from { continue }
-            if let role = entry["script"], role != .null, role.stringValue != ScriptCall.step.rawValue { continue }
+            if let from, seq < from { return }
+            if let role = entry["script"], role != .null, role.stringValue != ScriptCall.step.rawValue { return }
             guard Script.allows(op: op), ControlHandler.knownOps.contains(op),
-                  !ControlHandler.isReadOnly(op: op) || keptReadOnlyOps.contains(op) else { continue }
+                  !ControlHandler.isReadOnly(op: op) || keptReadOnlyOps.contains(op) else { return }
             var params = entry["params"]?.objectValue ?? [:]
             params["name"] = nil
             params["lease"] = nil
             let line = "seq \(seq) (\(op))"
-            var item = Pending(step: Script.Step(label: nil, op: op, params: params, expect: [], timeout: Script.defaultTimeout))
+            var item = Pending(seq: seq, step: Script.Step(label: nil, op: op, params: params, expect: [], timeout: Script.defaultTimeout))
 
             switch op {
             case "vm.batch":
@@ -73,10 +111,10 @@ enum ScriptBuilder {
                     })
                 }
             case "vm.wait_for":
-                guard entry["result"]?["matched"]?.intValue != -1 else { continue }
+                guard entry["result"]?["matched"]?.intValue != -1 else { return }
                 if (params["conditions"]?.arrayValue ?? []).contains(where: { ($0["ref"] ?? .null) != .null }) {
                     warnings.append("\(line) is left out: a condition names its element by ref; add the step by hand with selector fields")
-                    continue
+                    return
                 }
             case "vm.mouse.click", "vm.mouse.drag":
                 let facts = entry["target"]
@@ -112,13 +150,13 @@ enum ScriptBuilder {
                     item.step.params["y"] = .int(Int64(y))
                 } else {
                     warnings.append("\(line) is left out: its element was named by ref and has neither a name nor an automation id; add the step by hand with a selector")
-                    continue
+                    return
                 }
             case "vm.window.action":
                 if let window = params["window"]?.stringValue, isWindowID(window) {
                     guard let title = entry["result"]?["window"]?["title"]?.stringValue, !title.isEmpty, isTitlePart(title) else {
                         warnings.append("\(line) is left out: its window was named by id and the trace holds no title for it; add the step by hand with a title part")
-                        continue
+                        return
                     }
                     item.step.params["window"] = .string(title)
                 }
@@ -133,7 +171,7 @@ enum ScriptBuilder {
                 warnings.append("\(line): its \(id) belongs to the recorded session and a replay gets another one; change the step by hand")
             }
             if item.subject == nil { item.subject = subject(of: item.step) }
-            item.step.params = prepared(item.step.params, inEnv: false, line: line, warnings: &warnings)
+            item.step.params = prepared(item.step.params, inEnv: false, line: line, warnings: &warnings, required: &required)
             if let shown, let previous = foreground, shown != previous {
                 item.step.expect = [["type": "window_title", "contains": .string(Script.escape(shown))]]
             }
@@ -141,17 +179,10 @@ enum ScriptBuilder {
                last.hidesText == item.hidesText, last.step.params.filter({ $0.key != "text" }) == item.step.params.filter({ $0.key != "text" }) {
                 pending[pending.count - 1].text = before + text
                 pending[pending.count - 1].step.expect = item.step.expect
-                continue
+                return
             }
             pending.append(item)
         }
-        let steps = pending.map { item -> Script.Step in
-            var step = item.step
-            if let text = item.text { step.params["text"] = .string(Script.escape(text)) }
-            step.label = label(item)
-            return step
-        }
-        return Draft(script: Script(vm: vm, variables: [:], steps: steps), warnings: warnings)
     }
 
     /// The selector fields for an element a trace line describes as `{window?, role, name, aid?}`: `name` and
@@ -176,6 +207,8 @@ enum ScriptBuilder {
 
     /// A step being built.
     private struct Pending {
+        /// The `seq` of the trace line the step is made from.
+        var seq: Int
         var step: Script.Step
         /// The typed text of a `vm.type` step, unescaped.
         var text: String?
@@ -215,8 +248,9 @@ enum ScriptBuilder {
 
     /// `fields` as a step holds them: every string with `${` escaped, without the marker of a string the trace cut,
     /// and with `${<key>}` in place of an env value the trace masks. `warnings` gains a sentence per cut string and
-    /// per masked value, in key order.
-    private static func prepared(_ fields: [String: JSON], inEnv: Bool, line: String, warnings: inout [String]) -> [String: JSON] {
+    /// per masked value, in key order; `required` gains the key of each masked value it does not hold yet.
+    private static func prepared(_ fields: [String: JSON], inEnv: Bool, line: String, warnings: inout [String],
+                                 required: inout [String]) -> [String: JSON] {
         var out: [String: JSON] = [:]
         for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
             if key.hasSuffix(TraceSanitizer.cutMarkerSuffix), value == true,
@@ -228,24 +262,25 @@ enum ScriptBuilder {
             }
             if inEnv, value == .string(TraceSanitizer.mask), TraceSanitizer.isSecret(key), !key.contains("}") {
                 out[key] = .string("${\(key)}")
+                if !required.contains(key) { required.append(key) }
                 warnings.append("\(line): the trace masks the env value '\(key)'; the step reads it from the variable '\(key)', pass it in variables when running the script")
                 continue
             }
             switch value {
             case .string(let text): out[key] = .string(Script.escape(text))
-            case .object(let inner): out[key] = .object(prepared(inner, inEnv: key == "env", line: line, warnings: &warnings))
-            case .array(let items): out[key] = .array(items.map { prepared(item: $0, line: line, warnings: &warnings) })
+            case .object(let inner): out[key] = .object(prepared(inner, inEnv: key == "env", line: line, warnings: &warnings, required: &required))
+            case .array(let items): out[key] = .array(items.map { prepared(item: $0, line: line, warnings: &warnings, required: &required) })
             default: out[key] = value
             }
         }
         return out
     }
 
-    private static func prepared(item: JSON, line: String, warnings: inout [String]) -> JSON {
+    private static func prepared(item: JSON, line: String, warnings: inout [String], required: inout [String]) -> JSON {
         switch item {
         case .string(let text): return .string(Script.escape(text))
-        case .object(let inner): return .object(prepared(inner, inEnv: false, line: line, warnings: &warnings))
-        case .array(let items): return .array(items.map { prepared(item: $0, line: line, warnings: &warnings) })
+        case .object(let inner): return .object(prepared(inner, inEnv: false, line: line, warnings: &warnings, required: &required))
+        case .array(let items): return .array(items.map { prepared(item: $0, line: line, warnings: &warnings, required: &required) })
         default: return item
         }
     }

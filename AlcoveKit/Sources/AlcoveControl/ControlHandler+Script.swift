@@ -6,10 +6,12 @@ extension ControlHandler {
     /// Builds a script from a trace and writes it to the host file `path`.
     ///
     /// The trace is `trace.jsonl` in the recording directory `dir`, or the file `trace`. `name` is the script's VM;
-    /// without it the script names the VM of the trace. `from` and `to` bound the `seq` of the lines used. A line that
-    /// is not a JSON object with an integer `seq` and a string `op` is left out and counted in `skipped`.
+    /// without it the script names the VM of the trace. `from` and `to` bound the `seq` of the lines used. The trace
+    /// is read one line at a time. A line that is not a JSON object with an integer `seq` and a string `op`, and a
+    /// line longer than `ScriptLimits.traceLineBytes`, is left out and counted in `skipped`.
+    /// The script passes the checks `script.run` makes before its first step, or nothing is written.
     /// `path` is absolute and ends in `.json`; its folder is created when the folder above it exists. A file at `path`
-    /// is replaced only with `overwrite: true`. The file is written through a temporary file beside it.
+    /// is replaced only with `overwrite: true`. The file is written through a temporary file beside it, with mode 0600.
     /// The result holds `path`, the number of `steps`, `skipped` and, when there are any, the builder's `warnings`.
     nonisolated func scriptSave(_ params: JSON) async throws -> JSON {
         func given(_ key: String) -> JSON? { params[key].flatMap { $0 == .null ? nil : $0 } }
@@ -67,21 +69,22 @@ extension ControlHandler {
         let from = try seq("from"), to = try seq("to")
         if let from, let to, from > to { throw ControlError.failed("from (\(from)) must not exceed to (\(to))") }
 
-        guard let bytes = try? Data(contentsOf: URL(fileURLWithPath: tracePath), options: .mappedIfSafe) else {
+        var assembly = ScriptBuilder.Assembly(from: from, to: to)
+        var skipped = 0
+        do {
+            skipped += try TraceReader.lines(at: tracePath, limit: ScriptLimits.traceLineBytes) { line in
+                guard line.contains(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0D }) else { return }
+                guard let entry = try? JSON.parse(line), entry.objectValue != nil, entry["seq"]?.intValue != nil,
+                      entry["op"]?.stringValue != nil else {
+                    skipped += 1
+                    return
+                }
+                assembly.add(entry)
+            }
+        } catch {
             throw ControlError.failed("cannot read the trace '\(tracePath)'; check that the file is readable")
         }
-        var entries: [JSON] = []
-        var skipped = 0
-        for line in bytes.split(separator: 0x0A) where line.contains(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0D }) {
-            guard let entry = try? JSON.parse(Data(line)), entry.objectValue != nil, entry["seq"]?.intValue != nil,
-                  entry["op"]?.stringValue != nil else {
-                skipped += 1
-                continue
-            }
-            entries.append(entry)
-        }
-        let recorded = entries.lazy.compactMap { $0["params"]?["name"]?.stringValue }.first { !$0.isEmpty }
-        var draft = ScriptBuilder.draft(trace: entries, vm: vm ?? recorded ?? "", from: from, to: to)
+        var draft = assembly.draft(vm: vm ?? assembly.recordedVM ?? "")
         if draft.script.vm?.isEmpty == true { draft.script.vm = nil }
         guard !draft.script.steps.isEmpty else {
             guard from != nil || to != nil else {
@@ -92,10 +95,16 @@ extension ControlHandler {
         }
         let data: Data
         do {
-            try draft.script.validate()
+            let standIns = Dictionary(draft.required.map { ($0, $0) }) { first, _ in first }
+            _ = try ScriptRunner(handler: self).checked(draft.script, variables: standIns)
             data = try draft.script.encoded()
         } catch {
-            throw ControlError.failed("the trace does not make a script that script.run accepts: \(ControlHandler.failureReason(error, fallback: "a step is not valid")); save another part of it with from and to")
+            var source = ""
+            if let step = (error as? ScriptError)?.step, draft.sources.indices.contains(step - 1) {
+                source = " (step \(step) is seq \(draft.sources[step - 1]) of the trace)"
+            }
+            let reason = ControlHandler.failureReason(error, fallback: "a step is not valid")
+            throw ControlError.failed("the trace does not make a script that script.run accepts: \(reason)\(source); save another part of the trace with from and to")
         }
         guard data.count <= ScriptLimits.fileBytes else {
             throw ControlError.failed("the script would be larger than 4 MiB, the most script.run reads; save a part of the trace with from and to")
@@ -115,11 +124,17 @@ extension ControlHandler {
     }
 
     /// Writes `data` to a temporary file beside `url` and renames it to `url`: `url` holds all of `data` or is as it
-    /// was. Without `replacing`, a file that is at `url` at the moment of the rename stays and the result is false.
+    /// was. The file is readable and writable by its owner only. Without `replacing`, a file that is at `url` at the
+    /// moment of the rename stays and the result is false.
     nonisolated static func writeHostFile(_ data: Data, to url: URL, replacing: Bool) throws -> Bool {
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try data.write(to: temporary)
+        let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         defer { try? FileManager.default.removeItem(at: temporary) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        guard fchmod(descriptor, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        try handle.write(contentsOf: data)
+        try handle.close()
         if renamex_np(temporary.path, url.path, replacing ? 0 : UInt32(RENAME_EXCL)) == 0 { return true }
         var code = errno
         if code == ENOTSUP, !replacing {

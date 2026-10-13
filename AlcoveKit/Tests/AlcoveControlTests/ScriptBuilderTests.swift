@@ -586,6 +586,100 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertEqual(onFolder, "'\(folder.path)' is a folder; pass the path of a file")
     }
 
+    func testSaveRefusesATraceWhoseScriptWouldNotRun() async throws {
+        let h = handler()
+        let base = try tempDir()
+        let out = base.appendingPathComponent("flow.json")
+        let condition = try recordingDir([
+            entry(4, "vm.key.press", ["keys": "a"]),
+            entry(5, "vm.wait_for", ["conditions": [["type": "nonsense"]]], result: ["matched": 0]),
+        ])
+        let first = await failure(h, "script.save", ["dir": .string(condition.path), "path": .string(out.path)])
+        XCTAssertTrue(first.hasPrefix("the trace does not make a script that script.run accepts: step 2 condition 1: unknown type 'nonsense'; "), first)
+        XCTAssertTrue(first.hasSuffix(" (step 2 is seq 5 of the trace); save another part of the trace with from and to"), first)
+
+        let observe = try recordingDir([entry(7, "vm.key.press", ["keys": "a", "observe": "everything"])])
+        let second = await failure(h, "script.save", ["dir": .string(observe.path), "path": .string(out.path)])
+        let levels = ObserveLevel.allCases.map(\.rawValue).joined(separator: ", ")
+        XCTAssertEqual(second, "the trace does not make a script that script.run accepts: step 1: observe must be one of \(levels) "
+            + "(step 1 is seq 7 of the trace); save another part of the trace with from and to")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: base.path), [])
+
+        let masked = try recordingDir([entry(1, "vm.exec", ["command": "x", "env": ["TOKEN": "<masked>"]], result: ["code": 0])])
+        let saved = try await h.handle(op: "script.save", params: ["dir": .string(masked.path), "path": .string(out.path)])
+        XCTAssertEqual(saved["steps"], 1)
+    }
+
+    func testSaveWritesTheScriptWithOwnerOnlyAccess() async throws {
+        let h = handler()
+        let dir = try recordingDir([entry(1, "vm.key.press", ["keys": "a"])])
+        let base = try tempDir()
+        func mode(_ url: URL) throws -> Int? { try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int }
+        let fresh = base.appendingPathComponent("flow.json")
+        _ = try await h.handle(op: "script.save", params: ["dir": .string(dir.path), "path": .string(fresh.path)])
+        XCTAssertEqual(try mode(fresh), 0o600)
+
+        let open = base.appendingPathComponent("open.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: open.path, contents: Data("mine".utf8), attributes: [.posixPermissions: 0o644]))
+        _ = try await h.handle(op: "script.save", params: ["dir": .string(dir.path), "path": .string(open.path), "overwrite": true])
+        XCTAssertEqual(try mode(open), 0o600)
+        XCTAssertEqual(ops(try Script.parse(try Data(contentsOf: open))), ["vm.key.press"])
+    }
+
+    func testSaveSkipsATraceLineLongerThanEightMebibytes() async throws {
+        XCTAssertEqual(ScriptLimits.traceLineBytes, 8 * 1024 * 1024)
+        let h = handler()
+        func line(_ seq: Int, _ keys: String, bytes: Int) throws -> JSON {
+            let bare = try entry(seq, "vm.key.press", ["keys": .string(keys)], result: ["pad": ""]).serialized().count
+            return entry(seq, "vm.key.press", ["keys": .string(keys)], result: ["pad": .string(String(repeating: "x", count: bytes - bare))])
+        }
+        let dir = try recordingDir([
+            entry(1, "vm.key.press", ["keys": "a"]),
+            try line(2, "b", bytes: ScriptLimits.traceLineBytes + 1),
+            try line(3, "c", bytes: ScriptLimits.traceLineBytes),
+            entry(4, "vm.key.press", ["keys": "d"]),
+        ])
+        let out = try tempDir().appendingPathComponent("flow.json")
+        let saved = try await h.handle(op: "script.save", params: ["dir": .string(dir.path), "path": .string(out.path)])
+        XCTAssertEqual(saved, ["path": .string(out.path), "steps": 3, "skipped": 1])
+        XCTAssertEqual(try Script.parse(try Data(contentsOf: out)).steps.map { $0.params["keys"] }, ["a", "c", "d"])
+    }
+
+    func testTraceLinesAreReadInPiecesAndLongOnesAreCounted() throws {
+        let file = try tempDir().appendingPathComponent("trace.jsonl")
+        func read(_ text: String, limit: Int, chunk: Int) throws -> (lines: [String], long: Int) {
+            try Data(text.utf8).write(to: file)
+            var seen: [String] = []
+            let long = try TraceReader.lines(at: file.path, limit: limit, chunk: chunk) { seen.append(String(decoding: $0, as: UTF8.self)) }
+            return (seen, long)
+        }
+        for chunk in [1, 4, 5, 64] {
+            let mixed = try read("one\n\nthree3\nseven77\nx\ntail", limit: 6, chunk: chunk)
+            XCTAssertEqual(mixed.lines, ["one", "", "three3", "x", "tail"], "chunk \(chunk)")
+            XCTAssertEqual(mixed.long, 1, "chunk \(chunk)")
+            let ending = try read("a\nlonger than six", limit: 6, chunk: chunk)
+            XCTAssertEqual(ending.lines, ["a"], "chunk \(chunk)")
+            XCTAssertEqual(ending.long, 1, "chunk \(chunk)")
+            let closed = try read("a\nb\n", limit: 6, chunk: chunk)
+            XCTAssertEqual(closed.lines, ["a", "b"], "chunk \(chunk)")
+            XCTAssertEqual(closed.long, 0, "chunk \(chunk)")
+        }
+        let none = try read("", limit: 6, chunk: 4)
+        XCTAssertEqual(none.lines, [])
+        XCTAssertThrowsError(try TraceReader.lines(at: file.path + ".missing", limit: 6, chunk: 4) { _ in })
+    }
+
+    func testAnAssemblyKeepsOnlyTheStepsOfItsRange() {
+        var assembly = ScriptBuilder.Assembly(from: 3, to: 4)
+        for seq in 1...6 { assembly.add(entry(seq, "vm.key.press", ["keys": .string("f\(seq)")])) }
+        XCTAssertEqual(assembly.recordedVM, "Win")
+        let draft = assembly.draft(vm: "Other")
+        XCTAssertEqual(draft.script.vm, "Other")
+        XCTAssertEqual(draft.script.steps.map { $0.params["keys"] }, ["f3", "f4"])
+        XCTAssertEqual(draft.sources, [3, 4])
+        XCTAssertEqual(draft, ScriptBuilder.draft(trace: (1...6).map { entry($0, "vm.key.press", ["keys": .string("f\($0)")]) }, vm: "Other", from: 3, to: 4))
+    }
+
     func testSaveNeedsNoLeaseAndIsNotTraced() async throws {
         let (h, _, _) = try await rig(LockedBox([:]))
         let recording = try await startRecording(h)

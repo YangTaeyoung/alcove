@@ -46,6 +46,8 @@ enum ScriptTiming {
 /// The sizes a script run keeps and accepts.
 enum ScriptLimits {
     static let fileBytes = 4 * 1024 * 1024
+    /// The longest line of a trace that `script.save` reads.
+    static let traceLineBytes = 8 * 1024 * 1024
     static let stringCharacters = 2048
     static let stepsBytes = 256 * 1024
     static let entryBytes = 64 * 1024
@@ -82,14 +84,7 @@ struct ScriptRunner: Sendable {
         }
 
         let resolved: Script
-        do {
-            try script.validate()
-            resolved = try script.resolved(with: variables)
-            try resolved.validateConditions()
-            try validateObserveOptions(resolved)
-        } catch {
-            return finish("\(error)")
-        }
+        do { resolved = try checked(script, variables: variables) } catch { return finish("\(error)") }
         guard let name = vm ?? script.vm, !name.isEmpty else {
             return finish("the script names no VM; pass name or add \"vm\" to the script")
         }
@@ -134,6 +129,16 @@ struct ScriptRunner: Sendable {
             }
         }
         return finish(failure, warning: warning)
+    }
+
+    /// `script` with `variables` in place of `${name}`, after the checks a run makes before its first step: the steps
+    /// themselves, the variables they read, their wait conditions and their observe options.
+    func checked(_ script: Script, variables: [String: String]) throws -> Script {
+        try script.validate()
+        let resolved = try script.resolved(with: variables)
+        try resolved.validateConditions()
+        try validateObserveOptions(resolved)
+        return resolved
     }
 
     /// Refuses a step whose `observe`, `settleMs` or `settleTimeoutMs` the op would refuse.

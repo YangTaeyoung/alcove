@@ -131,6 +131,44 @@ enum TraceSanitizer {
     }
 }
 
+/// Reads a trace file one line at a time.
+enum TraceReader {
+    /// Calls `body` with each line of the file at `path` that is at most `limit` bytes long, in file order and without
+    /// its line feed, and returns the number of longer lines. The file is read in pieces of `chunk` bytes; of a longer
+    /// line nothing is kept. Throws when the file cannot be read, and what `body` throws.
+    static func lines(at path: String, limit: Int, chunk: Int = 1 << 20, _ body: (Data) throws -> Void) throws -> Int {
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? handle.close() }
+        var line = Data()
+        var tooLong = false
+        var longLines = 0
+        while let piece = try handle.read(upToCount: chunk), !piece.isEmpty {
+            var rest = piece[...]
+            while let feed = rest.firstIndex(of: 0x0A) {
+                let head = rest[rest.startIndex..<feed]
+                if tooLong || line.count + head.count > limit {
+                    longLines += 1
+                } else {
+                    line.append(head)
+                    try body(line)
+                }
+                line = Data()
+                tooLong = false
+                rest = rest[rest.index(after: feed)...]
+            }
+            if tooLong { continue }
+            if line.count + rest.count > limit {
+                tooLong = true
+                line = Data()
+            } else {
+                line.append(rest)
+            }
+        }
+        if tooLong { longLines += 1 } else if !line.isEmpty { try body(line) }
+        return longLines
+    }
+}
+
 /// Where a recording writes its trace lines and frame files.
 protocol TraceStore: Sendable {
     func append(_ entry: TraceEntry) throws
