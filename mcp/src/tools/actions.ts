@@ -107,7 +107,7 @@ export function register(r: Registrar, client: ControlClient): void {
         query: z.string().optional().describe("Text to look for (case-insensitive substring); omit to list all text"),
         regex: z.boolean().optional().describe("Treat `query` as a regular expression"),
         region: regionSchema.optional().describe("Only search this guest-pixel rectangle {x, y, w, h}"),
-        languages: z.array(z.string()).optional().describe("Recognition languages (default [\"ko-KR\", \"en-US\"])"),
+        languages: z.array(z.string()).optional().describe("Recognition languages (default [\"ko-KR\", \"en-US\"]). The first one selects the recognizer: the default reads Hangul and makes mistakes in small Latin text; pass [\"en-US\"] for text in Latin letters only, which then reads no Hangul"),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -137,7 +137,7 @@ export function register(r: Registrar, client: ControlClient): void {
       title: "Wait for a condition",
       description:
         "Wait until one of several conditions becomes true, or the timeout passes. Each condition is an object with a `type` and its fields: " +
-        "screen_idle {seconds}, region_changed {region}, text_visible {text, regex?, region?}, text_gone {text, regex?, region?}, " +
+        "screen_idle {seconds}, region_changed {region}, text_visible {text, regex?, region?, languages?}, text_gone {text, regex?, region?, languages?} (languages as for alcove_find_text: [\"en-US\"] for text in Latin letters only), " +
         "process_started {process_name}, process_exited {pid | process_name}, file_exists {path}, port_listening {port}, " +
         "log_matches {path, pattern}, job_output_matches {job, pattern}; " +
         "on Windows guests also ui_exists | ui_gone | ui_enabled {ref | window, role, name, name_contains, automation_id, index} (element conditions; here `name` is the element's accessible name), " +
