@@ -32,10 +32,25 @@ func refuseReparse(path string) error {
 	return nil
 }
 
+// lockDataFolder locks the Alcove folder under %ProgramData% and its uia
+// folder to Administrators and SYSTEM and returns the Alcove folder.
+func lockDataFolder() (string, error) {
+	base := os.Getenv("ProgramData")
+	if base == "" {
+		return "", errors.New("the ProgramData environment variable is empty, so the Alcove data folder cannot be located; set it (normally C:\\ProgramData) and run alcove-agent --install again")
+	}
+	dir := filepath.Join(base, "Alcove")
+	if err := uia.LockHelperFolders(dir, filepath.Join(dir, "uia")); err != nil {
+		return "", fmt.Errorf("the Alcove data folder %s could not be locked (%v); fix its owner and access list with icacls, then run alcove-agent --install again", dir, err)
+	}
+	return dir, nil
+}
+
 // installAtLogon registers a scheduled task that starts the agent in the
 // interactive session at logon (the clipboard is per session, so a service
-// in session 0 could not see it) and opens the firewall port.
-func installAtLogon(port int, allowExec bool) error {
+// in session 0 could not see it) with its log in dataDir, opens the firewall
+// port and starts the task.
+func installAtLogon(port int, allowExec bool, dataDir string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -67,7 +82,7 @@ func installAtLogon(port int, allowExec bool) error {
 			return fmt.Errorf("copy to %s verification failed", dst)
 		}
 	}
-	args := fmt.Sprintf(`--port %d --log "C:\ProgramData\Alcove\agent.log"`, port)
+	args := fmt.Sprintf(`--port %d --log "%s"`, port, filepath.Join(dataDir, "agent.log"))
 	if allowExec {
 		args += " --allow-exec"
 	}
@@ -79,13 +94,6 @@ func installAtLogon(port int, allowExec bool) error {
 	_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=AlcoveAgent").Run()
 	if out, err := exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=AlcoveAgent", "dir=in", "action=allow", "protocol=TCP", fmt.Sprintf("localport=%d", port)).CombinedOutput(); err != nil {
 		return fmt.Errorf("netsh: %v: %s", err, out)
-	}
-	// lock the data folders before the agent (and any helper) uses them
-	if base := os.Getenv("ProgramData"); base != "" {
-		alcoveDir := filepath.Join(base, "Alcove")
-		if err := uia.LockHelperFolders(alcoveDir, filepath.Join(alcoveDir, "uia")); err != nil {
-			return fmt.Errorf("lock %s: %w", alcoveDir, err)
-		}
 	}
 	// start it now in this session too
 	if out, err := exec.Command("schtasks", "/Run", "/TN", "AlcoveAgent").CombinedOutput(); err != nil {

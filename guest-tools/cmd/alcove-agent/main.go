@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/server"
@@ -26,24 +27,43 @@ func main() {
 	logPath := flag.String("log", "", "log file (default: stderr)")
 	flag.Parse()
 
-	logger := log.Default()
-	if *logPath != "" {
-		_ = os.MkdirAll(filepath.Dir(*logPath), 0o755)
-		if err := refuseReparse(*logPath); err != nil {
-			fmt.Fprintln(os.Stderr, "log:", err)
-		} else if f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-			logger = log.New(f, "", log.LstdFlags)
-		}
-	}
 	if *install {
-		if err := installAtLogon(*port, *allowExec); err != nil {
+		dir, err := lockDataFolder()
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "install failed:", err)
-			writeInstallLog("install failed: " + err.Error())
+			os.Exit(1)
+		}
+		if err := installAtLogon(*port, *allowExec, dir); err != nil {
+			fmt.Fprintln(os.Stderr, "install failed:", err)
+			writeInstallLog(dir, "install failed: "+err.Error())
 			os.Exit(1)
 		}
 		fmt.Println("installed")
-		writeInstallLog("installed")
+		writeInstallLog(dir, "installed")
 		return
+	}
+
+	var alcoveDir, uiaDir string
+	var lockErr error
+	if uia.Available() {
+		base := os.Getenv("ProgramData")
+		if base == "" {
+			base = os.TempDir()
+		}
+		alcoveDir = filepath.Join(base, "Alcove")
+		uiaDir = filepath.Join(alcoveDir, "uia")
+		lockErr = uia.LockHelperFolders(alcoveDir, uiaDir)
+	}
+	logger := log.Default()
+	if *logPath != "" {
+		if f, err := openLog(*logPath, alcoveDir, lockErr); err != nil {
+			fmt.Fprintln(os.Stderr, "log:", err)
+		} else {
+			logger = log.New(f, "", log.LstdFlags)
+		}
+	}
+	if lockErr != nil {
+		logger.Printf("the helper folders are not locked (%v); the UI helper will not start until they can be locked", lockErr)
 	}
 	if *tok == "" {
 		*tok = token.Read()
@@ -56,24 +76,43 @@ func main() {
 	var s *server.Server
 	var ui server.UI
 	if uia.Available() {
-		base := os.Getenv("ProgramData")
-		if base == "" {
-			base = os.TempDir()
-		}
-		alcoveDir := filepath.Join(base, "Alcove")
-		uiaDir := filepath.Join(alcoveDir, "uia")
-		if err := uia.LockHelperFolders(alcoveDir, uiaDir); err != nil {
-			logger.Printf("the helper folders are not locked (%v); the UI helper will not start until they can be locked", err)
-		}
 		helper := uia.New(uia.DefaultLauncher(uiaDir),
 			func(name string, fields map[string]any) { s.HandleUIEvent(name, fields) })
+		helper.SetOnStart(func() { s.HandleUIStart() })
 		helper.SetLogger(logger)
 		helper.SetLogPath(filepath.Join(uiaDir, "helper.log"))
 		ui = helper
 	}
 	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui})
-	defer s.Close()
-	logger.Fatal(s.Serve(l))
+	err = s.Serve(l)
+	s.Close()
+	logger.Fatal(err)
+}
+
+// openLog opens the log file for appending after creating its folder. A log
+// file inside lockedDir is not opened when locking that folder failed with
+// lockErr, and a log file that is a reparse point is not opened.
+func openLog(path, lockedDir string, lockErr error) (*os.File, error) {
+	if lockErr != nil && insideDir(lockedDir, path) {
+		return nil, fmt.Errorf("%s is not opened because its folder is not locked (%v)", path, lockErr)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := refuseReparse(path); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+}
+
+// insideDir reports whether path lies in dir or below it; names are compared
+// without regard to case.
+func insideDir(dir, path string) bool {
+	if dir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(strings.ToLower(filepath.Clean(dir)), strings.ToLower(filepath.Clean(path)))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func mask(t string) string {
@@ -83,15 +122,12 @@ func mask(t string) string {
 	return t[:4] + "..." + t[len(t)-4:]
 }
 
-// writeInstallLog records the install result where a GUI-subsystem build can be
-// inspected afterwards (stdout/stderr are invisible on Windows).
-func writeInstallLog(msg string) {
-	dir := os.Getenv("ProgramData")
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	path := filepath.Join(dir, "Alcove", "install.log")
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+// writeInstallLog appends the install result to install.log in dir, where the
+// result of a build without a console can be read afterwards. It does nothing
+// when the file is a reparse point.
+func writeInstallLog(dir, msg string) {
+	path := filepath.Join(dir, "install.log")
+	_ = os.MkdirAll(dir, 0o755)
 	if refuseReparse(path) != nil {
 		return
 	}

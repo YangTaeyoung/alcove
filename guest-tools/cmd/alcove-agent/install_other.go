@@ -6,13 +6,20 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // refuseReparse never refuses outside Windows; there are no junctions to plant.
 func refuseReparse(string) error { return nil }
 
+// lockDataFolder returns the folder of install.log; there is nothing to lock
+// outside Windows.
+func lockDataFolder() (string, error) {
+	return filepath.Join(os.TempDir(), "Alcove"), nil
+}
+
 // installAtLogon installs a systemd system unit on Linux.
-func installAtLogon(port int, allowExec bool) error {
+func installAtLogon(port int, allowExec bool, _ string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
