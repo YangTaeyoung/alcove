@@ -715,7 +715,7 @@ final class ScriptBuilderTests: XCTestCase {
             entry(2, "vm.deploy", ["path": "C:\\x.exe"], result: ["window": ["id": "0x3", "title": "x.txt - Notepad++"]]),
             click(3, "Untitled - Notepad"),
         ], vm: "Win", from: 3, to: nil)
-        XCTAssertEqual(windows(launched), ["Notepad"])
+        XCTAssertEqual(windows(launched), ["Untitled - Notepad"])
         let inRange = ScriptBuilder.draft(trace: [
             entry(1, "vm.app.launch", ["path": "C:\\x.exe"], result: ["window": ["id": "0x3", "title": "x.txt - Notepad++"]]),
             click(2, "Untitled - Notepad"),
@@ -753,6 +753,96 @@ final class ScriptBuilderTests: XCTestCase {
         ], vm: "Win", from: nil, to: nil)
         XCTAssertEqual(altogether.script.steps[1].params["altSelector"]?["window"], "Word")
         XCTAssertEqual(altogether.warnings.filter { $0.hasPrefix("steps name the window") }, [part("report.docx - Word")])
+    }
+
+    func testWindowTitlesComeFromEventsAndInspectionsAndTheWholeTrace() {
+        func click(_ seq: Int, _ title: String) -> JSON {
+            entry(seq, "vm.mouse.click", ["x": 190, "y": 112], ["target": target(title, "Button", "Close", byName: (1, 0))])
+        }
+        func window(_ draft: ScriptBuilder.Draft) -> String? { draft.script.steps.last?.params["selector"]?["window"]?.stringValue }
+        func shows(_ events: [String]) -> JSON { ["observation": ["settled": true, "events": .array(events.map(JSON.string))]] }
+
+        let events: [(String, String)] = [
+            ("window.opened", "x.txt - Notepad++"), ("window.created", "x.txt - Notepad++"), ("window.title", "x.txt - Notepad++"),
+            ("window.foreground", "x.txt - Notepad++"), ("window.closed", "x.txt - Notepad++"), ("dialog.opened", "x.txt - Notepad++"),
+        ]
+        for (name, title) in events {
+            let draft = ScriptBuilder.draft(trace: [entry(1, "vm.key.press", ["keys": "a", "observe": "summary"], result: shows(["\(name) \"\(title)\""])),
+                                                    click(2, "Untitled - Notepad")], vm: "Win", from: nil, to: nil)
+            XCTAssertEqual(window(draft), "Untitled - Notepad", name)
+        }
+        let quoted = ScriptBuilder.draft(trace: [
+            entry(1, "vm.key.press", ["keys": "a", "observe": "summary"], result: shows(["window.opened \"say \\\"hi\\\" - Notepad++\"", "window.foreground notepad.exe"])),
+            click(2, "say \"hi\" - Notepad++"), click(3, "Untitled - Notepad"),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(quoted.script.steps.map { $0.params["selector"]?["window"]?.stringValue }, [nil, "Notepad++", "Untitled - Notepad"])
+        XCTAssertEqual(ScriptBuilder.windowTitle(ofEvent: "window.opened \"a\\u{9}b\\n\""), "a\tb\n")
+        XCTAssertNil(ScriptBuilder.windowTitle(ofEvent: "window.opened notepad.exe"))
+        XCTAssertNil(ScriptBuilder.windowTitle(ofEvent: "process.exited \"x\""))
+
+        for op in ["vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action"] {
+            let draft = ScriptBuilder.draft(trace: [
+                entry(1, op, ["selector": ["name": "Close"]], result: ["window": ["id": "0x9", "title": "x.txt - Notepad++"]]),
+                click(2, "Untitled - Notepad"),
+            ], vm: "Win", from: nil, to: nil)
+            XCTAssertEqual(window(draft), "Untitled - Notepad", op)
+        }
+
+        let outside = ScriptBuilder.draft(trace: [
+            entry(1, "vm.app.launch", ["path": "C:\\x.exe"], result: ["window": ["id": "0x3", "title": "x.txt - Notepad++"]]),
+            click(2, "Untitled - Notepad"),
+            entry(3, "vm.window.list", result: ["windows": [["id": "0x4", "title": "y.txt - Notepad++"]]]),
+        ], vm: "Win", from: 2, to: 2)
+        XCTAssertEqual(outside.script.steps.map { $0.params["selector"]?["window"]?.stringValue }, ["Untitled - Notepad"])
+    }
+
+    func testTwoWindowsWithOneTitleAreReportedAndOneWindowWithSuccessiveTitlesIsNot() {
+        func click(_ seq: Int, _ title: String) -> JSON {
+            entry(seq, "vm.mouse.click", ["x": 190, "y": 112], ["target": target(title, "Button", "Close", byName: (1, 0))])
+        }
+        func list(_ seq: Int, _ windows: [(String, String)]) -> JSON {
+            entry(seq, "vm.window.list", result: ["windows": .array(windows.map { ["id": .string($0.0), "title": .string($0.1)] })])
+        }
+        let shared = "steps name the window \"a.docx - Word\"; more than one window had that title while recording, the first one found is used"
+
+        let two = ScriptBuilder.draft(trace: [list(1, [("0x1", "a.docx - Word"), ("0x2", "a.docx - Word")]), click(2, "a.docx - Word"), click(3, "a.docx - Word")],
+                                      vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(two.script.steps.map { $0.params["selector"]?["window"]?.stringValue }, ["Word", "Word"])
+        XCTAssertEqual(two.warnings.filter { $0.contains("more than one window") }, [shared])
+
+        let one = ScriptBuilder.draft(trace: [list(1, [("0x1", "a.docx - Word")]), list(2, [("0x1", "a.docx - Word")]), click(3, "a.docx - Word")],
+                                      vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(one.script.steps.map { $0.params["selector"]?["window"]?.stringValue }, ["Word"])
+        XCTAssertFalse(one.warnings.contains { $0.contains("more than one window") })
+
+        let renamed = ScriptBuilder.draft(trace: [
+            list(1, [("0x1", "Untitled - Notepad")]), list(2, [("0x1", "*Untitled - Notepad")]), list(3, [("0x1", "x.txt - Notepad")]),
+            click(4, "x.txt - Notepad"),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(renamed.script.steps.map { $0.params["selector"]?["window"]?.stringValue }, ["Notepad"])
+        XCTAssertFalse(renamed.warnings.contains { $0.contains("more than one window") })
+
+        let withoutIDs = ScriptBuilder.draft(trace: [
+            entry(1, "vm.key.press", ["keys": "a", "observe": "summary"], result: ["observation": ["settled": true, "foreground": "*Untitled - Notepad"]]),
+            click(2, "Untitled - Notepad"),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(withoutIDs.script.steps.map { $0.params["selector"]?["window"]?.stringValue }, [nil, "Untitled - Notepad"])
+
+        let other = ScriptBuilder.draft(trace: [list(1, [("0x1", "Untitled - Notepad"), ("0x2", "x.txt - Notepad++")]), click(2, "Untitled - Notepad")],
+                                        vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(other.script.steps.map { $0.params["selector"]?["window"]?.stringValue }, ["Untitled - Notepad"])
+    }
+
+    func testDroppedKeyStepsGiveOneWarningPerRun() {
+        func key(_ seq: Int) -> JSON { entry(seq, "vm.key.press", ["keys": "<masked>"]) }
+        let draft = ScriptBuilder.draft(trace: [
+            key(1), entry(2, "vm.batch", ["steps": [["op": "vm.ui.click", "ref": "e1"]]]), key(3),
+            entry(4, "vm.key.press", ["keys": "enter"]), key(5),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(draft.warnings.filter { $0.contains("pressed keys") }, [
+            "step 1 pressed keys in a password field; type the password with vm.type and a variable instead",
+            "step 2 pressed keys in a password field; type the password with vm.type and a variable instead",
+        ])
     }
 
     func testAStepWithAnIndexSaysItIsPositional() {
@@ -1282,6 +1372,18 @@ final class ScriptBuilderTests: XCTestCase {
         let retried = try await run(h, "{\"op\": \"vm.ui.click\", \"params\": {\(aidSelector), \(nameSelector)}}")
         XCTAssertEqual(retried.stepResults[0]["usedAltSelector"], true)
         XCTAssertEqual(retried.stepResults[0]["positional"], true)
+
+        let indexedPrimary = "\"selector\": {\"window\": \"Alcove Fixture\", \"role\": \"Button\", \"automationId\": \"send\", \"index\": 1}"
+        let plainAlt = "\"altSelector\": {\"window\": \"Alcove Fixture\", \"role\": \"Button\", \"name\": \"Send\"}"
+        let unindexedAlt = try await run(h, "{\"op\": \"vm.ui.click\", \"params\": {\(indexedPrimary), \(plainAlt)}}")
+        XCTAssertEqual(unindexedAlt.stepResults[0]["usedAltSelector"], true)
+        XCTAssertNil(unindexedAlt.stepResults[0]["positional"])
+
+        answers.value["ui.rect"] = .fail(noAidMatch)
+        let fallback = try await run(h, "{\"op\": \"vm.ui.click\", \"params\": {\(indexedPrimary), \"fallback\": {\"x\": 190, \"y\": 112}}}")
+        XCTAssertTrue(fallback.passed, fallback.error ?? "")
+        XCTAssertEqual(fallback.stepResults[0]["usedFallback"], true)
+        XCTAssertNil(fallback.stepResults[0]["positional"])
     }
 
     func testTypeAndActionStepsRetryWithAltSelector() async throws {
@@ -1681,34 +1783,39 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertFalse(sent.isEmpty)
     }
 
-    func testSingleCharacterKeysAfterAPasswordElementAreMaskedInTheTrace() async throws {
+    func testTextKeysAreMaskedByTheElementTheyAreAimedAt() async throws {
         let secretAt = at("Edit", "", id: "pw", flags: ["enabled", "focused", "password"], byID: (1, 0))
         let userAt = at("Edit", "User", id: "user", byID: (1, 0), byName: (1, 0))
-        let focused = LockedBox(secretAt)
+        let focused = LockedBox(userAt)
         let answers = LockedBox<[String: Reply]>(["ui.at": .by { _ in .ok(focused.value) }])
-        let (h, _, _) = try await rig(answers)
+        let (h, _, agent) = try await rig(answers)
         let dir = try await startRecording(h)
         func press(_ keys: String) async throws { _ = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": .string(keys)]) }
         func key(_ op: String, _ key: String) async throws { _ = try await h.handle(op: op, params: ["name": "Win", "key": .string(key)]) }
         try await press("q")
+        focused.value = secretAt
         _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": "hunter2"])
         try await press("a")
         try await key("vm.key.down", "B")
         try await key("vm.key.up", "B")
-        try await press("7")
+        try await press("shift+c")
+        try await press(" ")
         try await press("enter")
         try await press("ctrl+a")
         try await press("tab")
         try await key("vm.key.down", "ctrl")
-        try await key("vm.key.up", "ctrl")
         focused.value = userAt
+        try await press("y")
         _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": "bob"])
-        try await press("c")
+        try await key("vm.key.down", "z")
+        try await key("vm.key.up", "z")
         _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
 
+        XCTAssertEqual(agentRequests(agent, "ui.at").map(fields), Array(repeating: ["focused": true, "budgetMs": 200], count: 9))
         let rows = try lines(dir)
         XCTAssertEqual(rows.map { $0["params"]?["keys"] ?? $0["params"]?["key"] ?? $0["params"]?["text"] },
-                       ["q", "<masked>", "<masked>", "<masked>", "<masked>", "<masked>", "enter", "ctrl+a", "tab", "ctrl", "ctrl", "bob", "c"])
+                       ["q", "<masked>", "<masked>", "<masked>", "<masked>", "<masked>", "<masked>", "enter", "ctrl+a", "tab", "ctrl", "y", "bob", "z", "z"])
+        XCTAssertEqual(rows.map { $0["target"]?["password"] }, [nil, true, true, true, nil, true, true, nil, nil, nil, nil, nil, nil, nil, nil])
         let trace = try String(contentsOf: dir.appendingPathComponent("trace.jsonl"), encoding: .utf8)
         XCTAssertFalse(trace.contains("hunter2"))
 
@@ -1716,9 +1823,16 @@ final class ScriptBuilderTests: XCTestCase {
         let saved = try await h.handle(op: "script.save", params: ["dir": .string(dir.path), "path": .string(out.path)])
         let script = try Script.parse(try Data(contentsOf: out))
         XCTAssertEqual(script.steps.map { $0.params["keys"] ?? $0.params["key"] ?? $0.params["text"] },
-                       ["q", "${password}", "enter", "ctrl+a", "tab", "ctrl", "ctrl", "bob", "c"])
+                       ["q", "${password}", "enter", "ctrl+a", "tab", "ctrl", "y", "bob", "z", "z"])
         let leftOut = "step 3 pressed keys in a password field; type the password with vm.type and a variable instead"
         XCTAssertEqual(saved["warnings"]?.arrayValue?.filter { $0.stringValue?.contains("pressed keys") == true }, [.string(leftOut)])
+    }
+
+    func testTextKeys() {
+        for keys in ["a", "Z", "7", "+", " ", "é", "shift+a", "Shift+shift+a", "shift+ ", "shift++"] { XCTAssertTrue(ControlHandler.isTextKey(keys), keys) }
+        for keys in ["", "ab", "enter", "tab", "ctrl+a", "alt+a", "shift+ctrl+a", "shift+", "shift", "ctrl", "\n", "\t", "space", "shift+enter"] {
+            XCTAssertFalse(ControlHandler.isTextKey(keys), keys)
+        }
     }
 
     func testAFailedTargetQuestionIsAskedAgain() async throws {

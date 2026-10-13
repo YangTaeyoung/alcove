@@ -299,7 +299,7 @@ struct ScriptRunner: Sendable {
         if case .failure(let first) = acted, let alt, ScriptRunner.matchedNothing(first) {
             run.usedAltSelector = true
             params["selector"] = alt
-            run.positional = run.positional || hasIndex(alt)
+            run.positional = hasIndex(alt)
             do {
                 acted = .success(try await call(.step, step.op, base(vm, token, params)))
             } catch is CancellationError {
@@ -319,6 +319,7 @@ struct ScriptRunner: Sendable {
             click["x"] = fallback["x"]
             click["y"] = fallback["y"]
             run.usedFallback = true
+            run.positional = false
             do {
                 acted = .success(try await call(.step, "vm.mouse.click", base(vm, token, click)))
             } catch is CancellationError {

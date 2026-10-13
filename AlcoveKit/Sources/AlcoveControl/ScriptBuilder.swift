@@ -72,14 +72,16 @@ enum ScriptBuilder {
         private var warnings: [String] = []
         private var required: [String] = []
         private var foreground: String?
-        /// Every window title the entries in range show.
-        private var titles: Set<String> = []
+        /// What the trace shows of each window title it holds.
+        private var titles: [String: Sighting] = [:]
         /// Whether the latest entry that says what it was aimed at was aimed at a password element.
         private var passwordAimed = false
         /// The variable each masked env key is read from.
         private var envVariables: [String: String] = [:]
         /// Whether an entry was left out with a warning since the latest step was added.
         private var leftOut = false
+        /// Whether the warning about the run of key steps left out since the latest step was added has been given.
+        private var keysWarned = false
         /// The VM the first entry with a VM name names.
         private(set) var recordedVM: String?
 
@@ -93,6 +95,7 @@ enum ScriptBuilder {
         func draft(vm: String) -> Draft {
             var warnings = self.warnings
             var namedParts: Set<String> = []
+            var namedShared: Set<String> = []
             var steps: [Script.Step] = []
             for (offset, item) in pending.enumerated() {
                 var step = item.step
@@ -113,6 +116,9 @@ enum ScriptBuilder {
                     case .windowParam:
                         step.params["window"] = escaped
                     }
+                    if isShared(use.title), namedShared.insert(use.title).inserted {
+                        warnings.append("steps name the window \"\(use.title)\"; more than one window had that title while recording, the first one found is used")
+                    }
                     if name != use.title, namedParts.insert(name).inserted {
                         warnings.append("steps name the window \"\(name)\" by a part of its title \"\(use.title)\"; another window whose title contains \"\(name)\" would be used instead")
                     }
@@ -127,23 +133,40 @@ enum ScriptBuilder {
         }
 
         /// What a script names the window titled `title` by: the stable part of the title when no other title the
-        /// entries show contains that part (compared as the agent compares, ignoring case), the whole title otherwise.
-        /// `onlyTitleParts` makes a part that does not read as a title part give way to the whole title.
+        /// trace shows contains that part (compared as the agent compares, ignoring case), the whole title otherwise.
+        /// A title shown only by windows that also showed `title` is not another window's. `onlyTitleParts` makes a part
+        /// that does not read as a title part give way to the whole title.
         private func windowName(_ title: String, onlyTitleParts: Bool) -> String {
             let part = ScriptBuilder.stablePart(ofTitle: title)
-            guard part != title, !onlyTitleParts || ScriptBuilder.isTitlePart(part),
-                  !titles.contains(where: { $0 != title && $0.range(of: part, options: .caseInsensitive) != nil }) else { return title }
-            return part
+            guard part != title, !onlyTitleParts || ScriptBuilder.isTitlePart(part) else { return title }
+            let own = titles[title]?.ids ?? []
+            let other = titles.contains { entry in
+                guard entry.key != title, entry.key.range(of: part, options: .caseInsensitive) != nil else { return false }
+                return entry.value.hasNoID || own.isEmpty || !entry.value.ids.isSubset(of: own)
+            }
+            return other ? title : part
         }
 
-        /// Notes the window titles `entry` shows.
+        /// Whether more than one window id showed `title`.
+        private func isShared(_ title: String) -> Bool { (titles[title]?.ids.count ?? 0) > 1 }
+
+        /// Notes the window titles `entry` shows, with the window ids the trace gives for them.
         private mutating func collectTitles(_ entry: JSON) {
-            func add(_ title: JSON?) { if let text = title?.stringValue, !text.isEmpty { titles.insert(text) } }
-            add(entry["target"]?["window"])
-            add(entry["result"]?["observation"]?["foreground"])
-            guard let op = entry["op"]?.stringValue, ["vm.window.list", "vm.app.launch", "vm.deploy", "vm.window.action"].contains(op) else { return }
-            add(entry["result"]?["window"]?["title"])
-            for window in entry["result"]?["windows"]?.arrayValue ?? [] { add(window["title"]) }
+            func note(_ title: String?, id: String? = nil) {
+                guard let title, !title.isEmpty else { return }
+                var sighting = titles[title] ?? Sighting()
+                if let id, !id.isEmpty { sighting.ids.insert(id) } else { sighting.hasNoID = true }
+                titles[title] = sighting
+            }
+            func note(window: JSON?) { note(window?["title"]?.stringValue, id: window?["id"]?.stringValue) }
+            note(entry["target"]?["window"]?.stringValue)
+            let result = entry["result"]
+            note(result?["observation"]?["foreground"]?.stringValue)
+            for event in result?["observation"]?["events"]?.arrayValue ?? [] {
+                if let text = event.stringValue, let title = ScriptBuilder.windowTitle(ofEvent: text) { note(title) }
+            }
+            note(window: result?["window"])
+            for window in result?["windows"]?.arrayValue ?? [] { note(window: window) }
         }
 
         /// A variable no step reads yet, which becomes one of `required`: `preferred`, or `preferred` followed by the
@@ -200,7 +223,7 @@ enum ScriptBuilder {
         mutating func add(_ entry: JSON) {
             guard let seq = entry["seq"]?.intValue, let op = entry["op"]?.stringValue else { return }
             if recordedVM == nil, let name = entry["params"]?["name"]?.stringValue, !name.isEmpty { recordedVM = name }
-            if (from.map { seq >= $0 } ?? true) && (to.map { seq <= $0 } ?? true) { collectTitles(entry) }
+            collectTitles(entry)
             guard entry["ok"]?.boolValue == true else { return }
             if let to, seq > to { return }
             let shown = shownForeground(entry)
@@ -287,8 +310,10 @@ enum ScriptBuilder {
                 }
             case "vm.key.press", "vm.key.down", "vm.key.up":
                 if let param = ControlHandler.keyParam(op: op), params[param] == .string(TraceSanitizer.mask) {
-                    let warning = "step \(pending.count + 1) pressed keys in a password field; type the password with vm.type and a variable instead"
-                    if warnings.last != warning { warnings.append(warning) }
+                    if !keysWarned {
+                        warnings.append("step \(pending.count + 1) pressed keys in a password field; type the password with vm.type and a variable instead")
+                        keysWarned = true
+                    }
                     leftOut = true
                     return
                 }
@@ -324,9 +349,11 @@ enum ScriptBuilder {
                 pending[pending.count - 1].text = before + text
                 pending[pending.count - 1].step.expect = item.step.expect
                 pending[pending.count - 1].windows += item.windows
+                keysWarned = false
                 return
             }
             leftOut = false
+            keysWarned = false
             pending.append(item)
         }
     }
@@ -399,6 +426,43 @@ enum ScriptBuilder {
     }
 
     // MARK: - parts of a step
+
+    /// The window ids that showed a window title in the trace, and whether it was shown without an id.
+    private struct Sighting {
+        var ids: Set<String> = []
+        var hasNoID = false
+    }
+
+    /// The events whose line in an observation names a window title.
+    private static let windowEvents = ["window.opened", "window.created", "window.title", "window.foreground", "window.closed", "dialog.opened"]
+
+    /// The title in the observation event line `line` (`<event> "<title>"`) of a window event; nil for another line.
+    static func windowTitle(ofEvent line: String) -> String? {
+        guard let name = windowEvents.first(where: { line.hasPrefix($0 + " \"") }) else { return nil }
+        var title = ""
+        var characters = line.dropFirst(name.count + 2).makeIterator()
+        while let character = characters.next() {
+            switch character {
+            case "\"": return title
+            case "\\":
+                guard let escaped = characters.next() else { return nil }
+                switch escaped {
+                case "n": title.append("\n")
+                case "r": title.append("\r")
+                case "t": title.append("\t")
+                case "u":
+                    guard characters.next() == "{" else { return nil }
+                    var digits = ""
+                    while let digit = characters.next(), digit != "}" { digits.append(digit) }
+                    guard let value = UInt32(digits, radix: 16), let scalar = Unicode.Scalar(value) else { return nil }
+                    title.unicodeScalars.append(scalar)
+                default: title.append(escaped)
+                }
+            default: title.append(character)
+            }
+        }
+        return nil
+    }
 
     /// A step being built.
     private struct Pending {

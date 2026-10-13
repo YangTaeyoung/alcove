@@ -192,10 +192,15 @@ actor Recording {
         if isActive, clock() >= deadline { _ = await stop() }
     }
 
-    /// Whether the latest action that said what it was aimed at was aimed at a password element.
-    private(set) var aimedAtPassword = false
+    private var maskedKeysDown: Set<String> = []
 
-    func noteAim(password: Bool) { aimedAtPassword = password }
+    /// Notes that the key `key` went down, and whether the trace masks it.
+    func noteKeyDown(_ key: String, masked: Bool) {
+        if masked { maskedKeysDown.insert(key) } else { maskedKeysDown.remove(key) }
+    }
+
+    /// Whether `key` went down masked and has not been released since; releasing it ends that.
+    func releasesMaskedKey(_ key: String) -> Bool { maskedKeysDown.remove(key) != nil }
 
     var opCount: Int { lineCount }
     var writeErrorCount: Int { writeErrors }

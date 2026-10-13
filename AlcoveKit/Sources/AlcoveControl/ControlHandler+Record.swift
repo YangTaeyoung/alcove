@@ -73,6 +73,9 @@ extension ControlHandler {
             return ["ref": .string(ref)]
         case "vm.type":
             return params["text"]?.stringValue == nil ? nil : ["focused": true]
+        case "vm.key.press", "vm.key.down":
+            guard let param = keyParam(op: op), let keys = params[param]?.stringValue, isTextKey(keys) else { return nil }
+            return ["focused": true]
         default:
             return nil
         }
@@ -131,30 +134,20 @@ extension ControlHandler {
         }
     }
 
-    /// `params` of `op` with `TraceSanitizer.mask` in place of its `keyParam` when that is one printable character
-    /// (a key name such as `enter` or a combination such as `ctrl+a` stays).
-    static func maskingPrintableKey(op: String, params: JSON) -> JSON {
-        guard let key = keyParam(op: op), var fields = params.objectValue, let text = fields[key]?.stringValue,
-              text.count == 1, let character = text.first, !character.isWhitespace, !character.isNewline,
-              !character.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return params }
-        fields[key] = .string(TraceSanitizer.mask)
-        return .object(fields)
+    /// Whether `keys` is a text key: one printable character, a space included, alone or after `shift+` only.
+    static func isTextKey(_ keys: String) -> Bool {
+        var rest = Substring(keys)
+        while rest.count > 1, rest.lowercased().hasPrefix("shift+") { rest = rest.dropFirst("shift+".count) }
+        guard rest.count == 1, let character = rest.first, !character.isNewline,
+              !character.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return false }
+        return !character.isWhitespace || character == " "
     }
 
-    /// Whether the succeeded `op` was aimed at a password element, from the `target` asked for before it and the
-    /// `result` it returned; nil for an op that does not say what it was aimed at.
-    static func aimedAtPassword(op: String, params: JSON, target: JSON?, result: JSON) -> Bool? {
-        switch op {
-        case "vm.mouse.click", "vm.mouse.drag":
-            return target?["password"]?.boolValue == true
-        case "vm.ui.click", "vm.ui.type", "vm.ui.action":
-            if let ref = params["ref"], ref != .null { return target?["password"]?.boolValue == true }
-            return isPasswordNode(result["node"])
-        case "vm.type":
-            return target.map { $0["password"]?.boolValue == true }
-        default:
-            return nil
-        }
+    /// `params` of `op` with `TraceSanitizer.mask` in place of its `keyParam`.
+    static func maskingKey(op: String, params: JSON) -> JSON {
+        guard let key = keyParam(op: op), var fields = params.objectValue, fields[key]?.stringValue != nil else { return params }
+        fields[key] = .string(TraceSanitizer.mask)
+        return .object(fields)
     }
 
     /// Whether the agent connection `agent` of `vm` has not answered that it does not know the op `ui.at`.
@@ -202,8 +195,6 @@ extension ControlHandler {
             aimed = await registry.target(named: vm)
             if let aimed { target = await aimedElement(question, of: aimed) }
         }
-        let aimedAtPassword = await recording.aimedAtPassword
-        let keysMayBePassword = ControlHandler.keyParam(op: op) != nil && aimedAtPassword
         let framed = ControlHandler.capturesFrames(op: op)
         let before = framed ? await recording.capture() : nil
         let started = wallClock()
@@ -224,9 +215,11 @@ extension ControlHandler {
         if target?["password"]?.boolValue == true || ControlHandler.isPasswordNode((try? outcome.get())?["node"]) {
             written = ControlHandler.maskingWrittenText(op: op, params: params)
         }
-        if keysMayBePassword { written = ControlHandler.maskingPrintableKey(op: op, params: written) }
-        if case .success(let result) = outcome, let password = ControlHandler.aimedAtPassword(op: op, params: params, target: target, result: result) {
-            await recording.noteAim(password: password)
+        if let param = ControlHandler.keyParam(op: op), let key = params[param]?.stringValue {
+            let masked = op == "vm.key.up" ? await recording.releasesMaskedKey(key)
+                : ControlHandler.isTextKey(key) && target?["password"]?.boolValue == true
+            if op == "vm.key.down" { await recording.noteKeyDown(key, masked: masked) }
+            if masked { written = ControlHandler.maskingKey(op: op, params: written) }
         }
         await recording.record(op: op, params: written, outcome: outcome, started: started, duration: duration, before: before, after: after,
                                target: target, script: ControlHandler.scriptCall?.rawValue)
