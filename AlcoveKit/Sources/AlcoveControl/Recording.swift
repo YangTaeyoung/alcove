@@ -199,9 +199,10 @@ actor Recording {
     nonisolated var videoError: String? { sink.errorMessage }
     var elapsedSeconds: Double { Recording.seconds(startedInstant.duration(to: clock())) }
 
-    /// Appends one trace line and its frames; nothing happens after the recording ended.
+    /// Appends one trace line and its frames; nothing happens after the recording ended. `target`, `selector` and
+    /// `script` are written to the line when given.
     func record(op: String, params: JSON, outcome: Result<JSON, Error>, started: Date, duration: Duration,
-                before: Frame?, after: Frame?) {
+                before: Frame?, after: Frame?, target: JSON? = nil, selector: JSON? = nil, script: String? = nil) {
         guard isActive, let writer else { return }
         seq += 1
         let name = String(format: "%06d", seq)
@@ -210,7 +211,8 @@ actor Recording {
         frameCount += (beforePath == nil ? 0 : 1) + (afterPath == nil ? 0 : 1)
         let entry = TraceEntry(seq: seq, time: started, ms: max(0, Int((started.timeIntervalSince(startedAt) * 1000).rounded())),
                                op: op, params: Recording.requestParams(params), outcome: outcome,
-                               durationMs: Int((Recording.seconds(duration) * 1000).rounded()), before: beforePath, after: afterPath)
+                               durationMs: Int((Recording.seconds(duration) * 1000).rounded()), before: beforePath, after: afterPath,
+                               target: target, selector: selector, script: script)
         do {
             try writer.append(entry)
             lineCount += 1

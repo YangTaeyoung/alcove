@@ -55,20 +55,81 @@ extension ControlHandler {
         isInput(op: op) || op == "vm.app.launch" || op == "vm.deploy"
     }
 
+    /// The guest pixel at which `op` presses the mouse button: `x` and `y` of a click, `fromX` and `fromY` of a drag;
+    /// nil for any other op and without both integers.
+    static func pressPoint(op: String, params: JSON) -> (x: Int, y: Int)? {
+        let keys: (x: String, y: String)
+        switch op {
+        case "vm.mouse.click": keys = ("x", "y")
+        case "vm.mouse.drag": keys = ("fromX", "fromY")
+        default: return nil
+        }
+        guard let x = params[keys.x]?.intValue, let y = params[keys.y]?.intValue else { return nil }
+        return (x, y)
+    }
+
+    /// What a trace line says about a helper `node` and the `window` it is in: `role`, `name`, `aid` when the node has
+    /// one, the window's title as `window` when it has one, and `password: true` for a node with the `password` flag.
+    /// Nil for a node without a role.
+    static func elementFacts(node: JSON?, window: JSON?) -> JSON? {
+        guard let node, let role = node["role"]?.stringValue else { return nil }
+        var facts: [String: JSON] = ["role": .string(role), "name": .string(node["name"]?.stringValue ?? "")]
+        if let aid = node["aid"]?.stringValue, !aid.isEmpty { facts["aid"] = .string(aid) }
+        if let title = window?["title"]?.stringValue, !title.isEmpty { facts["window"] = .string(title) }
+        if (node["flags"]?.arrayValue ?? []).contains("password") { facts["password"] = true }
+        return .object(facts)
+    }
+
+    /// The element of the guest's UI at `point` as `elementFacts`, asked of the UI helper with `ui.at`. `end` is the
+    /// latest moment the call's turn at the helper may come and the moment this stops waiting for the answer. Nil, with
+    /// nothing sent, for a cancelled task and for a guest without a connected agent that has the `ui` capability; nil
+    /// also when the turn or the answer did not come by `end` and when the call failed.
+    private nonisolated func element(at point: (x: Int, y: Int), of t: VMTarget, by end: ContinuousClock.Instant) async -> JSON? {
+        guard !Task.isCancelled, case .connected(let agent) = await t.agentLink(), let hello = await agent.hello,
+              hello.rpcVersion >= 2, hello.capabilities.contains("ui"), !Task.isCancelled else { return nil }
+        let request: [String: JSON] = ["x": .int(Int64(point.x)), "y": .int(Int64(point.y))]
+        guard case .answer(let reply) = await fact(agent, "ui.at", request, vm: t.name, by: end) else { return nil }
+        return ControlHandler.elementFacts(node: reply["node"], window: reply["window"])
+    }
+
     /// Runs `run` and adds the op, its outcome and its frames to the VM's recording; without one it only runs `run`.
+    /// Before a `vm.mouse.click` or `vm.mouse.drag` runs, the element at its press point is read within
+    /// `UITiming.targetBudget` and written to the line as `target`; the op then runs against the target looked up for
+    /// that reading. The line of a `vm.ui.*` op that named its element by ref holds the element of its result as
+    /// `selector`, and the line of a call made by a script run holds the kind of call as `script`.
     func recorded(op: String, params: JSON, run: @Sendable () async throws -> JSON) async throws -> JSON {
         guard !op.hasPrefix("vm.record."), let vm = params["name"]?.stringValue, let recording = await liveRecording(vm) else {
             return try await run()
+        }
+        var pressed: VMTarget?
+        var target: JSON?
+        if let point = ControlHandler.pressPoint(op: op, params: params) {
+            let end = ContinuousClock.now + UITiming.targetBudget
+            pressed = await registry.target(named: vm)
+            if let pressed { target = await element(at: point, of: pressed, by: end) }
         }
         let framed = ControlHandler.capturesFrames(op: op)
         let before = framed ? await recording.capture() : nil
         let started = wallClock()
         let t0 = clock()
         let outcome: Result<JSON, Error>
-        do { outcome = .success(try await run()) } catch { outcome = .failure(error) }
+        do {
+            if let pressed {
+                outcome = .success(try await ControlHandler.$resolvedTarget.withValue((vm, pressed)) { try await run() })
+            } else {
+                outcome = .success(try await run())
+            }
+        } catch {
+            outcome = .failure(error)
+        }
         let duration = t0.duration(to: clock())
         let after = framed ? await recording.capture() : nil
-        await recording.record(op: op, params: params, outcome: outcome, started: started, duration: duration, before: before, after: after)
+        var selector: JSON?
+        if case .success(let result) = outcome, op.hasPrefix("vm.ui."), let ref = params["ref"], ref != .null {
+            selector = ControlHandler.elementFacts(node: result["node"], window: nil)
+        }
+        await recording.record(op: op, params: params, outcome: outcome, started: started, duration: duration, before: before, after: after,
+                               target: target, selector: selector, script: ControlHandler.scriptCall?.rawValue)
         var stopped = false
         if op == "vm.stop", case .success = outcome { stopped = true }
         if recordings.vmGone.removeValue(forKey: vm) === recording || stopped { await retireRecording(vm, recording) }
@@ -220,10 +281,7 @@ extension ControlHandler {
     /// The `dir` parameter as an absolute path; without it a folder named after the VM and the time below `base`
     /// (`recordingsDirectory`, or the Recordings folder of the Alcove support directory, when `base` is nil).
     func recordingDirectory(_ params: JSON, vm: String, base: URL? = nil) throws -> URL {
-        if let value = params["dir"] {
-            guard let path = value.stringValue, path.hasPrefix("/") else { throw ControlError.failed("dir must be an absolute path") }
-            return URL(fileURLWithPath: path)
-        }
+        if let value = params["dir"] { return URL(fileURLWithPath: try absolutePath(value, "dir")) }
         let base = base ?? recordingsDirectory ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Alcove/Recordings")
         let formatter = DateFormatter()

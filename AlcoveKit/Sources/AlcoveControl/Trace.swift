@@ -12,6 +12,12 @@ struct TraceEntry {
     let durationMs: Int
     let before: String?
     let after: String?
+    /// The element at the press point of a click or drag: `{window?, role, name, aid?, password?}`.
+    var target: JSON? = nil
+    /// The element a `vm.ui.*` op named by ref acted on, in the shape of `target`.
+    var selector: JSON? = nil
+    /// The kind of call a script run made this op as; nil for an op a client sent.
+    var script: String? = nil
 
     /// The sanitized JSON object of the line.
     var json: JSON {
@@ -29,6 +35,9 @@ struct TraceEntry {
         }
         if let before { obj["before"] = .string(before) }
         if let after { obj["after"] = .string(after) }
+        if let target { obj["target"] = TraceSanitizer.sanitize(target) }
+        if let selector { obj["selector"] = TraceSanitizer.sanitize(selector) }
+        if let script { obj["script"] = .string(script) }
         return .object(obj)
     }
 
@@ -45,6 +54,10 @@ enum TraceSanitizer {
     static let maxStringLength = 2000
     static let imageKeys: Set<String> = ["png", "jpeg"]
     static let secretMarkers = ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+    /// What stands in place of a secret-looking env value.
+    static let mask = "<masked>"
+    /// What follows the key of a cut string in the key of its marker.
+    static let cutMarkerSuffix = "Truncated"
 
     /// Removes `lease`, image payloads and long strings; masks secret-looking env values.
     static func sanitize(_ value: JSON) -> JSON {
@@ -62,10 +75,10 @@ enum TraceSanitizer {
             for (key, field) in fields {
                 if key == "lease" { continue }
                 if imageKeys.contains(key) { out[key] = "<image omitted>"; continue }
-                if inEnv, isSecret(key) { out[key] = "<masked>"; continue }
+                if inEnv, isSecret(key) { out[key] = .string(mask); continue }
                 if case .string(let text) = field, text.count > maxStringLength {
                     out[key] = .string(cut(text))
-                    out["\(key)Truncated"] = true
+                    out[key + cutMarkerSuffix] = true
                     continue
                 }
                 out[key] = sanitize(field, inEnv: key == "env")

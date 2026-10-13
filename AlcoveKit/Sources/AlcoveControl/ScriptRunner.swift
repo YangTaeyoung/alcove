@@ -23,6 +23,20 @@ struct ScriptResult: Sendable {
     var couldNotStart: Bool { stepsRun == 0 }
 }
 
+/// What a script run calls an op for; a recording writes it to the trace line of the call as `script`.
+enum ScriptCall: String, Sendable {
+    /// The op of a step, or the click at a step's fallback coordinates.
+    case step
+    /// The `vm.wait_for` of one expectation of a step.
+    case expect
+    /// Acquiring, renewing or releasing the run's lease.
+    case lease
+    /// Restoring the snapshot the run starts from.
+    case snapshot
+    /// The screenshot after a failing step.
+    case failure
+}
+
 /// The timing of a script run's lease.
 enum ScriptTiming {
     nonisolated(unsafe) static var leaseSeconds = 600
@@ -42,6 +56,11 @@ struct ScriptRunner: Sendable {
     let handler: ControlHandler
 
     init(handler: ControlHandler) { self.handler = handler }
+
+    /// Runs `op` through the handler as a call of kind `kind`.
+    private func call(_ kind: ScriptCall, _ op: String, _ params: JSON) async throws -> JSON {
+        try await ControlHandler.$scriptCall.withValue(kind) { try await handler.handle(op: op, params: params) }
+    }
 
     /// Runs the steps of `script` in order and stops at the first failure.
     ///
@@ -81,7 +100,7 @@ struct ScriptRunner: Sendable {
             if let refusal = await handler.leaseRefusal(vm: name, token: lease) { return finish(refusal) }
         } else {
             do {
-                let granted = try await handler.handle(op: "vm.lease.acquire", params: [
+                let granted = try await call(.lease, "vm.lease.acquire", [
                     "name": .string(name), "owner": .string(owner), "ttl": .int(Int64(ScriptTiming.leaseSeconds)),
                 ])
                 token = granted["lease"]?.stringValue
@@ -105,7 +124,7 @@ struct ScriptRunner: Sendable {
         var warning: String?
         if acquired, !leaseLost, let token {
             do {
-                _ = try await handler.handle(op: "vm.lease.release", params: ["name": .string(name), "lease": .string(token)])
+                _ = try await call(.lease, "vm.lease.release", ["name": .string(name), "lease": .string(token)])
             } catch {
                 if await handler.holdsLease(vm: name, token: token) {
                     warning = "the lease on '\(name)' could not be released (\(error)); it expires by itself within \(ScriptTiming.leaseSeconds) s"
@@ -132,17 +151,16 @@ struct ScriptRunner: Sendable {
 
     /// Renews the run's lease until cancelled or until the lease is no longer the run's own.
     private func renewLease(vm: String, owner: String, token: String?) -> Task<Void, Never> {
-        let handler = self.handler
-        return Task {
+        Task {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: ScriptTiming.leaseRenewal) } catch { return }
                 guard let token else { return }
                 let params: JSON = ["name": .string(vm), "owner": .string(owner),
                                     "ttl": .int(Int64(ScriptTiming.leaseSeconds)), "lease": .string(token)]
                 do {
-                    let granted = try await handler.handle(op: "vm.lease.acquire", params: params)
+                    let granted = try await call(.lease, "vm.lease.acquire", params)
                     if let other = granted["lease"]?.stringValue, other != token {
-                        _ = try? await handler.handle(op: "vm.lease.release", params: ["name": .string(vm), "lease": .string(other)])
+                        _ = try? await call(.lease, "vm.lease.release", ["name": .string(vm), "lease": .string(other)])
                         return
                     }
                 } catch {
@@ -157,7 +175,7 @@ struct ScriptRunner: Sendable {
                          progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?,
                          leaseLost: inout Bool, into result: inout ScriptResult) async -> String? {
         if let snapshot {
-            do { _ = try await handler.handle(op: "vm.snapshot.restore", params: base(vm, token, ["snapshot": .string(snapshot)])) }
+            do { _ = try await call(.snapshot, "vm.snapshot.restore", base(vm, token, ["snapshot": .string(snapshot)])) }
             catch {
                 if Task.isCancelled || error is CancellationError { return "the run was cancelled before step 1; start it again" }
                 return "restoring snapshot '\(snapshot)' failed: \(error); check the snapshot name with vm.snapshot.list"
@@ -176,10 +194,11 @@ struct ScriptRunner: Sendable {
             }
             result.stepsRun = number
             let began = ContinuousClock.now
-            let outcome = await perform(step, number: number, vm: vm, token: token)
+            let (outcome, usedFallback) = await perform(step, number: number, vm: vm, token: token)
             let seconds = ScriptRunner.seconds(began.duration(to: ContinuousClock.now))
             var entry: [String: JSON] = ["step": .int(Int64(number)), "op": .string(step.op), "seconds": .double(seconds)]
             if let label = step.label { entry["label"] = .string(label) }
+            if usedFallback { entry["usedFallback"] = true }
             switch outcome {
             case .success: entry["ok"] = true
             case .failure(let error):
@@ -229,27 +248,59 @@ struct ScriptRunner: Sendable {
         return .object(params)
     }
 
+    /// Whether `error` is the UI helper saying that the element `params` names is not there: no element matches the
+    /// selector, its window is gone, or the ref no longer exists.
+    static func foundNothing(_ error: Error, params: [String: JSON]) -> Bool {
+        guard case ControlHandler.ControlError.failed(let message) = error else { return false }
+        return HelperSentence(message).saysAbsent(ref: params["ref"]?.stringValue, orNoMatch: true)
+    }
+
     /// Runs one step: its op, then each expectation with the time left of the step's timeout, counted from the op's end.
-    private func perform(_ step: Script.Step, number: Int, vm: String, token: String?) async -> Result<JSON, Error> {
-        let clock = ContinuousClock()
+    /// A `vm.ui.click` step with a `fallback` whose element is not there clicks the fallback's coordinates with the
+    /// step's button, count and observe options; `usedFallback` says that the step went on to this click.
+    private func perform(_ step: Script.Step, number: Int, vm: String, token: String?) async -> (outcome: Result<JSON, Error>, usedFallback: Bool) {
         var params = step.params
         if step.op == "vm.wait_for", params["timeout"] == nil { params["timeout"] = .int(Int64(step.timeout)) }
+        var fallback: JSON?
+        if step.op == "vm.ui.click", let point = params.removeValue(forKey: "fallback"), point != .null { fallback = point }
+        var usedFallback = false
         let value: JSON
         do {
-            value = try await handler.handle(op: step.op, params: base(vm, token, params))
+            value = try await call(.step, step.op, base(vm, token, params))
         } catch {
-            return .failure(error)
+            guard let fallback, ScriptRunner.foundNothing(error, params: params) else { return (.failure(error), false) }
+            var click = params
+            click["ref"] = nil
+            click["selector"] = nil
+            click["x"] = fallback["x"]
+            click["y"] = fallback["y"]
+            usedFallback = true
+            do {
+                value = try await call(.step, "vm.mouse.click", base(vm, token, click))
+            } catch is CancellationError {
+                return (.failure(CancellationError()), true)
+            } catch let second {
+                let point = "(\(fallback["x"]?.intValue ?? 0), \(fallback["y"]?.intValue ?? 0))"
+                return (.failure(ScriptError(step: number, message: "the element was not found (\(error)) and the click at the fallback point \(point) failed: \(second)")), true)
+            }
         }
+        let outcome = await expectations(of: step, number: number, vm: vm, token: token, after: value)
+        return (outcome, usedFallback)
+    }
+
+    /// Checks the result of a `vm.wait_for` step and waits for each expectation of `step`; `value` on success.
+    private func expectations(of step: Script.Step, number: Int, vm: String, token: String?, after value: JSON) async -> Result<JSON, Error> {
         if step.op == "vm.wait_for", value["matched"]?.intValue == -1 {
             return .failure(ScriptError(step: number, message: "vm.wait_for matched none of its conditions\(problems(value)); check the conditions or raise the timeout"))
         }
+        let clock = ContinuousClock()
         let deadline = clock.now + .seconds(step.timeout)
         for expectation in step.expect {
             let left = clock.now.duration(to: deadline)
             let remaining = max(1.0, Double(left.components.seconds) + Double(left.components.attoseconds) / 1e18)
             let wait: JSON
             do {
-                wait = try await handler.handle(op: "vm.wait_for", params: base(vm, token, [
+                wait = try await call(.expect, "vm.wait_for", base(vm, token, [
                     "conditions": .array([expectation]), "timeout": .double(remaining),
                 ]))
             } catch is CancellationError {
@@ -277,7 +328,7 @@ struct ScriptRunner: Sendable {
     }
 
     private func failureScreenshot(vm: String) async -> (png: Data, width: Int, height: Int)? {
-        guard let shot = try? await handler.handle(op: "vm.screenshot", params: ["name": .string(vm)]),
+        guard let shot = try? await call(.failure, "vm.screenshot", ["name": .string(vm)]),
               let png = shot["png"]?.stringValue.flatMap({ Data(base64Encoded: $0) }),
               let width = shot["sentWidth"]?.intValue, let height = shot["sentHeight"]?.intValue else { return nil }
         return (png, width, height)

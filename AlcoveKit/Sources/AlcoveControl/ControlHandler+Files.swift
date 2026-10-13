@@ -143,10 +143,16 @@ extension ControlHandler {
         }
     }
 
-    private nonisolated func requireHostFile(_ path: String) throws {
+    nonisolated func requireHostFile(_ path: String) throws {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
             throw ControlError.failed("'\(path)' is not a file on the host; check the path")
         }
+    }
+
+    /// The host path in `value`, the parameter `key`, which must be a string starting with `/`.
+    nonisolated func absolutePath(_ value: JSON, _ key: String) throws -> String {
+        guard let path = value.stringValue, path.hasPrefix("/") else { throw ControlError.failed("\(key) must be an absolute path") }
+        return path
     }
 }

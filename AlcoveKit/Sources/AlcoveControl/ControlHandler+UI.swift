@@ -14,7 +14,9 @@ enum UITiming {
     nonisolated(unsafe) static var factBudget = Duration.seconds(3)
     /// Longest an observation at level `ui` spends on the foreground window, the focused element and the tree together.
     nonisolated(unsafe) static var treeFactBudget = Duration.seconds(20)
-    /// Returns when an observation's budget for UI facts, which ends at the given moment, has run out.
+    /// Longest a recorded click or drag waits for the element at its press point, the wait for the helper's turn included.
+    nonisolated(unsafe) static var targetBudget = Duration.milliseconds(300)
+    /// Returns when a budget for UI facts, which ends at the given moment, has run out.
     nonisolated(unsafe) static var factBudgetEnd: @Sendable (ContinuousClock.Instant) async -> Void = {
         try? await Task.sleep(until: $0, clock: .continuous)
     }
@@ -640,16 +642,17 @@ extension ControlHandler {
 
     static let busyHelperFacts = "the UI helper is busy with another request; call vm.ui.tree when you need the tree"
 
-    /// What one helper call of an observation brought.
-    private enum Fact {
+    /// What one helper call with a budget brought.
+    enum Fact {
         case answer(JSON)
-        /// The call did not end within the observation's budget.
+        /// The call did not end within the budget.
         case late
         case failed(Error)
     }
 
-    /// One helper call of an observation in a task of its own; the observation stops waiting for it at `end`.
-    private nonisolated func fact(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
+    /// One helper call in a task of its own. `end` is the latest moment its turn at the helper may come and the
+    /// moment the caller stops waiting for it.
+    nonisolated func fact(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
                                   by end: ContinuousClock.Instant) async -> Fact {
         let probe = startHelperCall(agent, agentOp, fields, vm: vm, turnBy: end)
         guard let outcome = await probe.answer.outcome(until: end, expiry: { await UITiming.factBudgetEnd(end) }) else {

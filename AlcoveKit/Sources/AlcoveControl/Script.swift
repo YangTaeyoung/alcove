@@ -137,6 +137,12 @@ struct Script: Sendable, Equatable {
         for key in ["name", "lease"] where step.params[key] != nil {
             throw fail("passes '\(key)' in params; remove it, the runner supplies the VM name and its own lease")
         }
+        if let fallback = step.params["fallback"], fallback != .null {
+            guard step.op == "vm.ui.click" else { throw fail("has a fallback, which only vm.ui.click takes; remove it") }
+            guard fallback["x"]?.intValue != nil, fallback["y"]?.intValue != nil else {
+                throw fail("has a fallback without integer 'x' and 'y'; write it as {\"x\": 120, \"y\": 80} or remove it")
+            }
+        }
         guard (1...maxTimeout).contains(step.timeout) else { throw fail(timeoutProblem) }
         for condition in step.expect where condition.objectValue == nil {
             throw fail("has an expectation that is not an object; write each as {\"type\": ...}")

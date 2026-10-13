@@ -51,7 +51,7 @@ public actor ControlHandler {
     public let hostKind: String
     /// Guest frame size per VM from the latest screenshot (for coordinate scaling).
     var lastSize: [String: (Int, Int)] = [:]
-    private let inputGate = InputGate()
+    let inputGate = InputGate()
     /// One `vm.deploy` per VM at a time.
     let deployGate = InputGate()
     /// Lets one `ui.*` or `win.*` agent call per VM run at a time, in arrival order.
@@ -90,6 +90,8 @@ public actor ControlHandler {
     var observedEvents: [String: EventMark] = [:]
     /// The target `handle` looked up for the op running in the current task.
     @TaskLocal static var resolvedTarget: (name: String, target: any VMTarget)?
+    /// The kind of call a script run is making in the current task; nil outside a script run.
+    @TaskLocal static var scriptCall: ScriptCall?
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
@@ -121,7 +123,7 @@ public actor ControlHandler {
         "vm.wait_idle", "vm.wait_for", "vm.set_environment", "vm.doctor", "vm.find_text",
         "vm.event_log", "vm.crash_dumps.enable", "vm.crash_dumps.disable", "vm.crash_dumps.list", "vm.crash_dumps.pull",
         "vm.record.start", "vm.record.stop", "vm.record.status",
-        "script.run",
+        "script.run", "script.save",
         "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",
         "vm.app.launch", "vm.deploy", "vm.events", "vm.collect_diagnostics",
     ]
@@ -137,6 +139,7 @@ public actor ControlHandler {
         "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
         "vm.wait_for", "vm.record.status", "vm.window.list", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.events",
         "vm.event_log", "vm.crash_dumps.list", "vm.crash_dumps.pull", "vm.collect_diagnostics",
+        "script.save",
     ]
 
     /// Whether `op` runs outside the per-connection request order.
@@ -292,6 +295,8 @@ public actor ControlHandler {
             return try await collectDiagnostics(params)
         case "script.run":
             return try await scriptRun(params)
+        case "script.save":
+            return try await scriptSave(params)
         case "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",
              "vm.app.launch", "vm.events":
             return try await ui(op: op, params: params)
@@ -341,12 +346,15 @@ public actor ControlHandler {
         observedEvents[vm] = nil
     }
 
-    /// Runs `op`. For an op outside the read-only set the VM is looked up once, here: its newest event sequence number
-    /// at this moment becomes the VM's event baseline when `movesEventBaseline` says so, the position of its
-    /// observations for an op of `sessionOps`, and `eventSeq` of the result unless the op set one itself.
+    /// Runs `op`. For an op outside the read-only set the VM is looked up once: here, or before the op by the code that
+    /// set `resolvedTarget` for it. Its newest event sequence number at this moment becomes the VM's event baseline
+    /// when `movesEventBaseline` says so, the position of its observations for an op of `sessionOps`, and `eventSeq`
+    /// of the result unless the op set one itself.
     private func performNotingEvents(op: String, params: JSON) async throws -> JSON {
-        guard !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
-              let t = await registry.target(named: vm) else { return try await perform(op: op, params: params) }
+        guard !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue else { return try await perform(op: op, params: params) }
+        var found = ControlHandler.resolvedTarget.flatMap { $0.name == vm ? $0.target : nil }
+        if found == nil { found = await registry.target(named: vm) }
+        guard let t = found else { return try await perform(op: op, params: params) }
         let seq = await t.events(since: .max).next
         if ControlHandler.movesEventBaseline(op: op) { advanceEventBaseline(of: t, to: seq) }
         if ControlHandler.sessionOps.contains(op) { advanceObservedEvents(of: t, to: seq) }
