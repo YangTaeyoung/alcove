@@ -76,7 +76,13 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     }
 
     /// A sentence describing why the video could not be written; nil while it can.
-    var errorMessage: String? { lock.withLock { failure } }
+    var errorMessage: String? {
+        lock.withLock {
+            if let failure { return failure }
+            guard let writer, writer.status == .failed else { return nil }
+            return describe(writer.error)
+        }
+    }
 
     /// Encodes `frame` at `time` after the start of the recording; a frame not later than the previous one is dropped.
     func append(frame: Frame, at time: Duration) {
@@ -104,6 +110,9 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
 
     /// Cancels the underlying writer as if the encoder had stopped.
     func stopWriterForTesting() { lock.withLock { writer?.cancelWriting() } }
+
+    /// Records `message` as the writer's failure; the writer itself keeps running.
+    func failWriterForTesting(_ message: String) { lock.withLock { failure = message } }
 
     /// Runs `hook` in `finish()` after the lock is released and before the session is ended.
     func setBeforeEndSessionForTesting(_ hook: (@Sendable () -> Void)?) { lock.withLock { beforeEndSession = hook } }
@@ -144,8 +153,9 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
         }
     }
 
-    /// Completes the file; later calls do nothing, and later frames are ignored. A writer that failed, or a session
-    /// without an appended frame, is cancelled and its file removed; without any writer the error is that no frame could be recorded.
+    /// Completes the file; later calls do nothing, and later frames are ignored. A writer that failed leaves the file it
+    /// wrote when that file opens as a movie and removes it when it does not; a session without an appended frame is
+    /// cancelled and its file removed; without any writer the error is that no frame could be recorded.
     func finish() async {
         let pending: (AVAssetWriter, CMTime)? = lock.withLock {
             guard !finished else { return nil }
@@ -158,35 +168,38 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 failure = describe(writer.status == .failed ? writer.error : nil)
             }
             if failure == nil, !lastTime.isValid { failure = VideoRecorder.noFrameMessage }
-            if failure != nil {
-                writer.cancelWriting()
-                try? FileManager.default.removeItem(at: url)
+            if writer.status != .writing || !lastTime.isValid {
+                if writer.status == .writing { writer.cancelWriting() }
                 return nil
             }
             input?.markAsFinished()
             return (writer, lastTime)
         }
-        guard let (writer, last) = pending else { return }
+        guard let (writer, last) = pending else {
+            await removeFileUnlessPlayable()
+            return
+        }
         let hook = lock.withLock { beforeEndSession }
         hook?()
         let writing = lock.withLock {
             guard writer.status == .writing else {
-                failure = describe(writer.error)
-                writer.cancelWriting()
-                try? FileManager.default.removeItem(at: url)
+                if failure == nil { failure = describe(writer.error) }
                 return false
             }
             return true
         }
-        guard writing else { return }
+        guard writing else { return await removeFileUnlessPlayable() }
         writer.endSession(atSourceTime: last)
         await writer.finishWriting()
-        lock.withLock {
-            if writer.status == .failed, failure == nil {
-                failure = describe(writer.error)
-                try? FileManager.default.removeItem(at: url)
-            }
+        let failed = lock.withLock {
+            if writer.status == .failed, failure == nil { failure = describe(writer.error) }
+            return failure != nil
         }
+        if failed { await removeFileUnlessPlayable() }
+    }
+
+    private func removeFileUnlessPlayable() async {
+        if await !VideoRecorder.isPlayable(url) { try? FileManager.default.removeItem(at: url) }
     }
 
     // Callers hold `lock`.

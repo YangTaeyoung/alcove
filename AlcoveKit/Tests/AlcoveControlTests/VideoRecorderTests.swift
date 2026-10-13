@@ -205,6 +205,37 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testWriterFailedAfterItsFragmentsKeepsAFileThatPlays() async throws {
+        let url = base.appendingPathComponent("failed-kept.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        for i in 0..<4 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 1200)); _ = await recorder.waitUntilReady() }
+        recorder.failWriterForTesting("the video could not be written: test")
+        await recorder.finish()
+        XCTAssertEqual(recorder.errorMessage, "the video could not be written: test")
+        let plays = await VideoRecorder.isPlayable(url)
+        XCTAssertTrue(plays)
+    }
+
+    func testFailedWriterLeavesNoFileThatDoesNotPlay() async throws {
+        let url = base.appendingPathComponent("failed-removed.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        for i in 0..<3 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
+        recorder.stopWriterForTesting()
+        try Data("not a movie".utf8).write(to: url)
+        await recorder.finish()
+        XCTAssertNotNil(recorder.errorMessage)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testErrorMessageIsVisibleBeforeTheRecorderFinishes() async throws {
+        let recorder = VideoRecorder(url: base.appendingPathComponent("live.mp4"), fps: 5)
+        recorder.append(frame: frame(320, 240, step: 0), at: .milliseconds(0))
+        XCTAssertNil(recorder.errorMessage)
+        recorder.failWriterForTesting("the video could not be written: test")
+        XCTAssertEqual(recorder.errorMessage, "the video could not be written: test")
+        await recorder.finish()
+    }
+
     func testFirstFrameThatCannotBeRenderedLeavesNoFile() async {
         let url = base.appendingPathComponent("unrendered.mp4")
         let recorder = VideoRecorder(url: url, fps: 5)
