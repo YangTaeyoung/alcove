@@ -189,7 +189,7 @@ public final class ControlServer: @unchecked Sendable {
         } catch let e as ControlHandler.ControlError {
             result = ["ok": false, "error": .string(e.description)]
         } catch {
-            result = ["ok": false, "error": .string("\(error)")]
+            result = ["ok": false, "error": .string(ControlHandler.failureReason(error, fallback: "the request failed; check the request and vm.status"))]
         }
         result["id"] = id
         var data = (try? JSON.object(result).serialized()) ?? Data("{\"ok\":false,\"error\":\"encode failed\"}".utf8)

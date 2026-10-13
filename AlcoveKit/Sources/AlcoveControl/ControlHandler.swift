@@ -160,7 +160,7 @@ public actor ControlHandler {
                 } catch VMController.ControllerError.engineDidNotStart(let reason) {
                     throw ControlError.failed("start failed: \(reason)")
                 } catch {
-                    throw ControlError.failed("start failed: \(error)")
+                    throw ControlError.failed("start failed: \(ControlHandler.failureReason(error, fallback: "the VM did not start; check vm.status"))")
                 }
             }
             return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral())]
@@ -169,7 +169,11 @@ public actor ControlHandler {
         case "vm.stop":
             let t = try await target(params)
             if await t.state().isActive {
-                do { try await t.stop(force: params["force"]?.boolValue ?? false) } catch { throw ControlError.failed("stop failed: \(error)") }
+                do {
+                    try await t.stop(force: params["force"]?.boolValue ?? false)
+                } catch {
+                    throw ControlError.failed("stop failed: \(ControlHandler.failureReason(error, fallback: "the VM did not stop; check vm.status, or call vm.stop with force"))")
+                }
             }
             lastSize[t.name] = nil
             runtimeForwards[t.name] = nil
@@ -199,7 +203,7 @@ public actor ControlHandler {
         case "vm.clipboard.get":
             let t = try await running(params)
             let agent = try await tools(t)
-            do { return ["text": .string(try await agent.getClipboard())] } catch { throw ControlError.failed("clipboard: \(error)") }
+            do { return ["text": .string(try await agent.getClipboard())] } catch { throw agentFailure(error, vm: t.name, op: op) }
         case "vm.clipboard.set":
             let t = try await running(params)
             guard let text = params["text"]?.stringValue else { throw ControlError.missing("text") }
@@ -285,7 +289,7 @@ public actor ControlHandler {
         case AgentClient.AgentError.timeout: return .failed("guest tools in '\(vm)' did not answer \(op) in time; check vm.status and retry")
         case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected:
             return .failed("guest tools in '\(vm)' disconnected during \(op); retry once the guest is back")
-        default: return .failed("\(op) failed: \(error)")
+        default: return .failed("\(op) failed: \(ControlHandler.failureReason(error, fallback: "the guest tools failed unexpectedly; check vm.status"))")
         }
     }
 
@@ -325,7 +329,7 @@ public actor ControlHandler {
 
     func screenshot(_ t: VMTarget) async throws -> Frame {
         let frame: Frame
-        do { frame = try await t.frame() } catch { throw ControlError.failed("screenshot failed: \(error)") }
+        do { frame = try await t.frame() } catch { throw ControlError.failed("screenshot failed: \(ControlHandler.failureReason(error, fallback: "the display gave no image; check vm.status"))") }
         lastSize[t.name] = (frame.width, frame.height)
         return frame
     }

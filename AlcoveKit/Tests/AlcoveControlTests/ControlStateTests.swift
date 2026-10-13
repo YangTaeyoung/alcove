@@ -93,6 +93,60 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(gone, "set network failed: the connection to the engine is gone; check vm.status and restart the VM with vm.stop and vm.start")
     }
 
+    func testStartAndStopFailuresAreSentences() async throws {
+        let (h, t) = setup(state: .stopped)
+        await t.setStartError(QMPClient.QMPError.connect("No such file or directory"))
+        let start = await failure(h, "vm.start", ["name": "Win"])
+        XCTAssertEqual(start, "start failed: could not connect to the engine (No such file or directory); check vm.status and restart the VM with vm.stop and vm.start")
+        await t.setStartError(UnknownFailure())
+        let unknown = await failure(h, "vm.start", ["name": "Win"])
+        XCTAssertEqual(unknown, "start failed: the VM did not start; check vm.status")
+        await t.setState(.running)
+        await t.setStopError(VMController.ControllerError.notRunning)
+        let stop = await failure(h, "vm.stop", ["name": "Win"])
+        XCTAssertEqual(stop, "stop failed: the VM is not running; check vm.status")
+    }
+
+    func testScreenshotFailureIsASentence() async throws {
+        let (h, t) = setup()
+        await t.setFailingFrameCalls([0])
+        let message = await failure(h, "vm.screenshot", ["name": "Win"])
+        XCTAssertEqual(message, "screenshot failed: no surface is mapped")
+    }
+
+    func testCloneAndDeleteFailuresAreSentences() async throws {
+        let t = FakeTarget(name: "Win", state: .stopped, png: makePNG(width: 800, height: 600))
+        let registry = FakeProvisioningRegistry(targets: ["Win": t])
+        let h = ControlHandler(registry: registry, hostKind: "test")
+        await registry.setFailure(QMPClient.QMPError.notConnected)
+        let clone = await failure(h, "vm.clone", ["name": "Win", "newName": "Copy"])
+        XCTAssertEqual(clone, "clone failed: the connection to the engine is gone; check vm.status and restart the VM with vm.stop and vm.start")
+        await registry.setFailure(UnknownFailure())
+        let delete = await failure(h, "vm.delete", ["name": "Win"])
+        XCTAssertEqual(delete, "delete failed: the operation could not finish; check vm.list")
+    }
+
+    func testKeySpecFailureNamesTheKey() async throws {
+        let (h, _) = setup()
+        let message = await failure(h, "vm.key.press", ["name": "Win", "keys": "hyper+x"])
+        XCTAssertEqual(message, "bad key spec 'hyper+x': unknown key 'hyper'; use a key name such as ctrl, shift, enter or a letter")
+    }
+
+    func testFailureReasonKeepsTheTextOfErrorsThatAreSentences() async throws {
+        let sentence = ControlHandler.failureReason(ControlHandler.ControlError.noSuchVM("A"), fallback: "x")
+        XCTAssertEqual(sentence, "no VM named 'A'; call vm.list")
+        XCTAssertEqual(ControlHandler.failureReason(VMBundle.CloneError.sourceRunning("A"), fallback: "x"), "'A' is running; stop it before cloning it")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.remote("denied"), fallback: "x"), "denied")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.tokenMismatch, fallback: "x"),
+                       "the guest tools refused the connection token; reinstall alcove-agent in the guest")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.connect("refused"), fallback: "x"),
+                       "the guest tools could not be reached (refused); check vm.status")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.handshake("bad hello"), fallback: "x"),
+                       "the guest tools handshake failed (bad hello); reinstall alcove-agent in the guest")
+        XCTAssertEqual(ControlHandler.failureReason(FrameError.undecodable, fallback: "x"), "the screendump image could not be decoded")
+        XCTAssertEqual(ControlHandler.failureReason(UnknownFailure(), fallback: "fallback sentence"), "fallback sentence")
+    }
+
     func testEngineReasonNamesEveryQMPError() async throws {
         let (h, _) = setup()
         let restart = "restart the VM with vm.stop and vm.start"
@@ -533,3 +587,6 @@ actor FakeProvisioningRegistry: VMRegistry, VMProvisioning {
         calls.append("delete:\(name)")
     }
 }
+
+/// An error with no sentence of its own.
+private struct UnknownFailure: Error {}

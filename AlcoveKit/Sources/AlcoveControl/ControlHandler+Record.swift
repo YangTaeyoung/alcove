@@ -178,7 +178,7 @@ extension ControlHandler {
             await sink.finish()
             recordings.starting[t.name] = nil
             if case TraceWriter.WriterError.exists = error { throw ControlError.failed("'\(directory.path)' already holds a recording; choose another directory") }
-            throw ControlError.failed("cannot create the recording in '\(directory.path)': \(error)")
+            throw ControlError.failed("cannot create the recording in '\(directory.path)': \(ControlHandler.failureReason(error, fallback: "the directory could not be written; choose another directory"))")
         }
         recordings.starting[t.name] = nil
         recordings.active[t.name] = recording

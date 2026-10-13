@@ -1,6 +1,8 @@
 import Foundation
 import AlcoveEngine
 import AlcoveQMP
+import AlcoveAgent
+import AlcoveDisplayProtocol
 
 /// Snapshots, runtime port forwards, the network link, leases, the guest resolution and clones.
 extension ControlHandler {
@@ -23,7 +25,8 @@ extension ControlHandler {
         } catch let error as VMBundle.CloneError {
             throw ControlError.failed(error.description)
         } catch {
-            throw ControlError.failed("\(op == "vm.clone" ? "clone" : "delete") failed: \(error)")
+            let what = op == "vm.clone" ? "clone" : "delete"
+            throw ControlError.failed("\(what) failed: \(ControlHandler.failureReason(error, fallback: "the operation could not finish; check vm.list"))")
         }
         forget(vm: name)
         return [:]
@@ -199,7 +202,9 @@ extension ControlHandler {
     }
 
     /// A sentence for an engine failure: the engine's own message when it gave one, otherwise the next step.
-    nonisolated func engineReason(_ error: Error) -> String {
+    nonisolated func engineReason(_ error: Error) -> String { ControlHandler.engineSentence(error) }
+
+    nonisolated static func engineSentence(_ error: Error) -> String {
         let restart = "restart the VM with vm.stop and vm.start"
         switch error {
         case let e as QMPClient.QMPError:
@@ -228,6 +233,29 @@ extension ControlHandler {
             return e.localizedDescription
         default:
             return "the engine failed in a way Alcove cannot describe; check vm.status and \(restart)"
+        }
+    }
+
+    /// A sentence for any failure: engine errors through `engineReason`, errors that carry their own sentence
+    /// (`ControlError`, `LocalizedError`, `CustomStringConvertible`) as they are, `fallback` for the rest.
+    nonisolated static func failureReason(_ error: Error, fallback: String) -> String {
+        switch error {
+        case is QMPClient.QMPError, is VMController.ControllerError, is CocoaError:
+            return ControlHandler.engineSentence(error)
+        case let e as ControlError: return e.description
+        case AgentClient.AgentError.connect(let reason): return "the guest tools could not be reached (\(reason)); check vm.status"
+        case AgentClient.AgentError.handshake(let reason): return "the guest tools handshake failed (\(reason)); reinstall alcove-agent in the guest"
+        case AgentClient.AgentError.tokenMismatch: return "the guest tools refused the connection token; reinstall alcove-agent in the guest"
+        case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected:
+            return "the guest tools are not connected; check vm.status"
+        case AgentClient.AgentError.timeout(let what): return "the guest tools did not answer \(what) in time; check vm.status and retry"
+        case AgentClient.AgentError.remote(let message): return message
+        case AgentClient.AgentError.unsupported(let what): return "the guest tools do not support \(what); update alcove-agent in the guest"
+        case KeyNames.KeyError.unknownKey(let key): return "unknown key '\(key)'; use a key name such as ctrl, shift, enter or a letter"
+        case KeyNames.KeyError.untypableCharacter(let ch): return "cannot type '\(ch)' with the US keyboard layout"
+        case let e as LocalizedError where e.errorDescription != nil: return e.errorDescription ?? fallback
+        case let e as CustomStringConvertible: return e.description
+        default: return fallback
         }
     }
 

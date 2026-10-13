@@ -204,7 +204,7 @@ actor Recording {
             lineCount += 1
             consecutiveLineFailures = 0
         } catch {
-            noteWriteError("trace line \(seq) could not be written: \(error)")
+            noteWriteError("trace line \(seq) could not be written: \(ControlHandler.failureReason(error, fallback: "the disk write failed"))")
             consecutiveLineFailures += 1
             if consecutiveLineFailures >= Recording.maxConsecutiveLineFailures { _ = beginFinish() }
         }
@@ -212,7 +212,7 @@ actor Recording {
 
     private func writeFrame(_ frame: Frame, name: String, with writer: TraceStore) -> String? {
         do { return try writer.writeFrame(frame, name: name) } catch {
-            noteWriteError("frame \(name) could not be written: \(error)")
+            noteWriteError("frame \(name) could not be written: \(ControlHandler.failureReason(error, fallback: "the disk write failed"))")
             return nil
         }
     }

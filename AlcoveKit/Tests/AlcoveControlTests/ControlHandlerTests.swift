@@ -40,11 +40,17 @@ actor FakeTarget: VMTarget {
     func state() async -> VMController.State { stateValue }
     func isSuspended() async -> Bool { false }
     func start() async throws { try await start(discardChanges: false) }
+    /// What `start` and `stop` throw when set.
+    var startError: Error?
+    var stopError: Error?
+    func setStartError(_ e: Error?) { startError = e }
+    func setStopError(_ e: Error?) { stopError = e }
     func start(discardChanges: Bool) async throws {
+        if let startError { throw startError }
         startCount += 1; startDiscard.append(discardChanges)
         ephemeral = discardChanges; stateValue = .running
     }
-    func stop(force: Bool) async throws { stopCount += 1; stateValue = .stopped; ephemeral = false }
+    func stop(force: Bool) async throws { if let stopError { throw stopError }; stopCount += 1; stateValue = .stopped; ephemeral = false }
     func isEphemeral() async -> Bool { ephemeral }
     func cloneOf() async -> String? { cloneOfValue }
     func setCloneOf(_ template: String?) { cloneOfValue = template }

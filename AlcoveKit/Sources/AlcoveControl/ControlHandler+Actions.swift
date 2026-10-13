@@ -75,7 +75,7 @@ extension ControlHandler {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                failure = (index, "\(error)")
+                failure = (index, ControlHandler.failureReason(error, fallback: "the step failed; check vm.status"))
                 break
             }
         }
@@ -141,7 +141,7 @@ extension ControlHandler {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw ControlError.failed("the screen could not be read before \(op), so no input was sent: \(error)")
+            throw ControlError.failed("the screen could not be read before \(op), so no input was sent: \(ControlHandler.failureReason(error, fallback: "the display gave no image; check vm.status"))")
         }
         lastSize[t.name] = (frame.width, frame.height)
         return frame
@@ -159,7 +159,7 @@ extension ControlHandler {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            out["observationError"] = .string("the screen could not be read after \(op): \(error); call vm.screenshot to see the result")
+            out["observationError"] = .string("the screen could not be read after \(op): \(ControlHandler.failureReason(error, fallback: "the display gave no image")); call vm.screenshot to see the result")
         }
     }
 
@@ -208,7 +208,7 @@ extension ControlHandler {
         case "vm.key.press":
             guard let spec = params["keys"]?.stringValue, !spec.isEmpty else { throw ControlError.missing("keys") }
             let seq: [(code: Int, down: Bool)]
-            do { seq = try KeyNames.pressSequence(spec) } catch { throw ControlError.failed("bad key spec '\(spec)': \(error)") }
+            do { seq = try KeyNames.pressSequence(spec) } catch { throw ControlError.failed("bad key spec '\(spec)': \(ControlHandler.failureReason(error, fallback: "the keys could not be read"))") }
             let hold = params["hold"]?.intValue ?? 0
             try await sendKeys(t, seq, gap: 20, holdBeforeRelease: hold)
         case "vm.key.down", "vm.key.up":

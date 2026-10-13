@@ -25,7 +25,7 @@ struct TraceEntry {
             obj["result"] = TraceSanitizer.sanitize(result)
         case .failure(let error):
             obj["ok"] = false
-            obj["error"] = TraceSanitizer.sanitize(.string("\(error)"))
+            obj["error"] = TraceSanitizer.sanitize(.string(ControlHandler.failureReason(error, fallback: "the op failed")))
         }
         if let before { obj["before"] = .string(before) }
         if let after { obj["after"] = .string(after) }
