@@ -215,7 +215,7 @@ export function register(r: Registrar, client: ControlClient): void {
       name: vmName,
       ...selectorParams,
       text: z.string().max(100000).describe("Text to type"),
-      clear: z.boolean().optional().describe("Press ctrl+a before typing so the text replaces the content"),
+      clear: z.boolean().optional().describe("Select the existing text before typing (ctrl+a, then ctrl+home and ctrl+shift+end) so the text replaces the content"),
       submit: z.boolean().optional().describe("Press enter after typing"),
       ...observeParams,
     },
