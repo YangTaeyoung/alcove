@@ -41,4 +41,16 @@ final class AgentKeyLinkTests: XCTestCase {
         let refusal = await link.lastRefusal()
         XCTAssertEqual(refusal, sentence)
     }
+
+    func testAnOperationOnAVMWhoseAgentRefusedTheHostSaysWhy() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
+        await t.setRefusal(sentence)
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        do {
+            _ = try await h.handle(op: "vm.fs.list", params: ["name": "Win", "path": "/"])
+            XCTFail("vm.fs.list succeeded")
+        } catch let e as ControlHandler.ControlError {
+            XCTAssertEqual(e.description, "the guest tools in 'Win' refused the connection: \(sentence)")
+        }
+    }
 }

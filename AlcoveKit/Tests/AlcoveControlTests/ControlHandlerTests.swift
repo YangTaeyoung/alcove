@@ -212,6 +212,10 @@ actor FakeTarget: VMTarget {
     var bundle: String?
     func setBundle(_ path: String?) { bundle = path }
     func bundlePath() async -> String? { bundle }
+    /// What `agentRefusal()` answers.
+    var refusal: String?
+    func setRefusal(_ text: String?) { refusal = text }
+    func agentRefusal() async -> String? { refusal }
 }
 
 /// What `FakeTarget.frame()` throws for a call listed in `failingFrameCalls`.

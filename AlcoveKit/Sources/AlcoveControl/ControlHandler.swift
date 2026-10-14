@@ -523,9 +523,15 @@ public actor ControlHandler {
         return t
     }
 
-    /// The agent of `t`, waiting up to 25 s for it to connect; `noTools` when it does not.
+    /// The agent of `t`, waiting up to 25 s for it to connect; when it does not, the agent's refusal sentence, or
+    /// `noTools` when the agent refused nothing.
     func tools(_ t: VMTarget) async throws -> AgentClient {
-        guard let a = await t.agent(timeout: .seconds(25)) else { throw ControlError.noTools(t.name) }
+        guard let a = await t.agent(timeout: .seconds(25)) else {
+            if let refusal = await t.agentRefusal() {
+                throw ControlError.failed("the guest tools in '\(t.name)' refused the connection: \(refusal)")
+            }
+            throw ControlError.noTools(t.name)
+        }
         return a
     }
 
