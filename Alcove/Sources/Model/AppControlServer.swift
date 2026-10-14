@@ -69,6 +69,31 @@ final class AppControlServer {
         guard let handler else { return }
         Task { await handler.guestToolsSeen(vm: vm) }
     }
+
+    /// Tells the control handler that the app created `snapshot` of `vm`, so that the record of HTTP captures notes
+    /// it; nothing happens without a handler.
+    func snapshotCreated(vm: String, snapshot: String) async {
+        await handler?.snapshotCreated(vm: vm, snapshot: snapshot)
+    }
+
+    /// Tells the control handler that the app restored `snapshot` of `vm`, so that a capture of the VM ends and what
+    /// a capture left in the restored guest is cleaned up; nothing happens without a handler.
+    func snapshotRestored(vm: String, snapshot: String) async {
+        await handler?.snapshotRestored(vm: vm, snapshot: snapshot)
+    }
+
+    /// Tells the control handler that the app deleted `snapshot` of `vm`, so that the record of HTTP captures drops
+    /// its note; nothing happens without a handler.
+    func snapshotDeleted(vm: String, snapshot: String) async {
+        await handler?.snapshotDeleted(vm: vm, snapshot: snapshot)
+    }
+
+    /// Tells the control handler that the app deleted the VM `vm` whose bundle was at `path`, so that the record of
+    /// HTTP captures drops the VM's entry and snapshot notes; nothing happens without a handler.
+    func vmDeleted(vm: String, path: String) {
+        guard let handler else { return }
+        Task { await handler.vmDeleted(vm: vm, path: path) }
+    }
 }
 
 /// `VMRegistry` over `AppModel.shared.sessions`; targets are cached per session

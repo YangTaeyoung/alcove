@@ -187,11 +187,22 @@ final class VMSession: Identifiable {
         do { return try await controller.snapshots() } catch { report(error); return [] }
     }
 
-    func createSnapshot(_ name: String) async { await perform { try await $0.createSnapshot(named: name) } }
+    /// Each snapshot change that worked is reported to the control server, which keeps its record of HTTP captures
+    /// in step with the VM's snapshots.
+    func createSnapshot(_ name: String) async {
+        guard await perform({ try await $0.createSnapshot(named: name) }) else { return }
+        await AppControlServer.shared.snapshotCreated(vm: config.name, snapshot: name)
+    }
 
-    func restoreSnapshot(_ name: String) async { await perform { try await $0.restoreSnapshot(named: name) } }
+    func restoreSnapshot(_ name: String) async {
+        guard await perform({ try await $0.restoreSnapshot(named: name) }) else { return }
+        await AppControlServer.shared.snapshotRestored(vm: config.name, snapshot: name)
+    }
 
-    func deleteSnapshot(_ name: String) async { await perform { try await $0.deleteSnapshot(named: name) } }
+    func deleteSnapshot(_ name: String) async {
+        guard await perform({ try await $0.deleteSnapshot(named: name) }) else { return }
+        await AppControlServer.shared.snapshotDeleted(vm: config.name, snapshot: name)
+    }
 
     // MARK: - devices
 
@@ -231,8 +242,16 @@ final class VMSession: Identifiable {
 
     // MARK: - internals
 
-    private func perform(_ operation: (VMController) async throws -> Void) async {
-        do { try await operation(controller) } catch { report(error) }
+    /// Runs `operation` on the controller; false when it threw, after recording the error in `lastError`.
+    @discardableResult
+    private func perform(_ operation: (VMController) async throws -> Void) async -> Bool {
+        do {
+            try await operation(controller)
+            return true
+        } catch {
+            report(error)
+            return false
+        }
     }
 
     private func report(_ error: Error) {

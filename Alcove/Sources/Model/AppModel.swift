@@ -145,6 +145,7 @@ final class AppModel {
         }
         try? fm.removeItem(atPath: session.bundle.socketDirectory)
         refreshCloneList(ofTemplate: session.config.cloneOf)
+        AppControlServer.shared.vmDeleted(vm: session.name, path: session.id)
         session.invalidate()
         sessions.removeAll { $0.id == session.id }
         refreshDockBadge()
