@@ -247,10 +247,21 @@ struct ScreenshotView {
 }
 
 extension Frame.Rect {
-    func offset(x dx: Int, y dy: Int) -> Frame.Rect { Frame.Rect(x: x + dx, y: y + dy, w: w, h: h) }
+    /// The rectangle moved by `dx` and `dy`; a position past the range of `Int` counts as the end of that range.
+    func offset(x dx: Int, y dy: Int) -> Frame.Rect {
+        Frame.Rect(x: Frame.Rect.saturating(x, dx), y: Frame.Rect.saturating(y, dy), w: w, h: h)
+    }
 
+    /// Whether the two rectangles overlap; a right or bottom edge past the range of `Int` counts as the end of that range.
     func intersects(_ other: Frame.Rect) -> Bool {
-        x < other.x + other.w && other.x < x + w && y < other.y + other.h && other.y < y + h
+        let sum = Frame.Rect.saturating
+        return x < sum(other.x, other.w) && other.x < sum(x, w) && y < sum(other.y, other.h) && other.y < sum(y, h)
+    }
+
+    /// `a + b`, or the end of the range of `Int` on the side the sum passed it.
+    static func saturating(_ a: Int, _ b: Int) -> Int {
+        let sum = a.addingReportingOverflow(b)
+        return sum.overflow ? (b > 0 ? Int.max : Int.min) : sum.partialValue
     }
 }
 
@@ -856,15 +867,17 @@ extension ControlHandler {
         return area
     }
 
-    /// The elements of `nodes` to number: those with a control type in `markRoles`, a rectangle that is not empty and
-    /// reaches into `area`, and without the `offscreen` flag; at most `maxMarks`, numbered from 1 in tree order.
+    /// The elements of `nodes` to number: those with a control type in `markRoles`, a rectangle that is not empty,
+    /// lies within `coordinateRange` (width and height up to `maxCoordinate`) and reaches into `area`, and without the
+    /// `offscreen` flag; at most `maxMarks`, numbered from 1 in tree order.
     /// `more` says whether further such elements were left without a number.
     static func marks(for nodes: [JSON], in area: Frame.Rect) -> (marks: [UIMark], more: Bool) {
         var marks: [UIMark] = []
         for node in nodes {
             guard let role = node["role"]?.stringValue, markRoles.contains(role.lowercased()),
                   let x = node["x"]?.intValue, let y = node["y"]?.intValue, let w = node["w"]?.intValue, let h = node["h"]?.intValue,
-                  w > 0, h > 0, !(node["flags"]?.arrayValue ?? []).contains("offscreen") else { continue }
+                  w > 0, h > 0, coordinateRange.contains(x), coordinateRange.contains(y), w <= maxCoordinate, h <= maxCoordinate,
+                  !(node["flags"]?.arrayValue ?? []).contains("offscreen") else { continue }
             let rect = Frame.Rect(x: x, y: y, w: w, h: h)
             guard rect.intersects(area) else { continue }
             guard marks.count < maxMarks else { return (marks, true) }

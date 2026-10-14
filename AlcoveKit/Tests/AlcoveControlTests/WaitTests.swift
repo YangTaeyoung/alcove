@@ -1166,6 +1166,25 @@ final class WaitTests: XCTestCase {
         XCTAssertTrue(offsets.contains([10, 5]), "\(offsets)")
     }
 
+    func testJobOffsetsAtTheEndsOfTheIntegerRangeEndTheWait() async throws {
+        let calls = LockedBox(0)
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            guard m["op"]?.stringValue == "exec.read" else { return [] }
+            calls.value += 1
+            if calls.value == 1 {
+                return [agentReply(m, ["state": "running", "out": "ab", "err": "", "out_next": .int(Int64.max), "err_next": 0])]
+            }
+            return [agentReply(m, ["state": "exited", "code": 0, "out": "x", "err": "", "err_next": .int(Int64.min)])]
+        }
+        let (h, _) = try await agentRig(agent)
+        let r = try await waitFor(h, [["type": "job_output_matches", "job": "j1", "pattern": "never appears"]], timeout: 30)
+        XCTAssertEqual(r["matched"]?.intValue, -1)
+        XCTAssertEqual(r["detail"]?.stringValue, "job exited")
+        let offsets = agentRequests(agent, "exec.read").map { $0["out_offset"]?.intValue ?? -1 }
+        XCTAssertEqual(offsets.last, ControlHandler.maxJobOffset)
+    }
+
     func testJobExitWithoutAMatchEndsTheWait() async throws {
         let agent = FakeAgent()
         agent.handler = { m, _ in

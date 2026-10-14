@@ -3308,6 +3308,40 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(after.pixel(x: 45, y: 31), before.pixel(x: 45, y: 31))
     }
 
+    func testScreenshotMarksLeaveOutElementsOutsideTheCoordinateRange() async throws {
+        let tree: [JSON] = [
+            node("e1", "Button", "Far right", depth: 1, x: Int.max, y: 60, w: 1, h: 24),
+            node("e2", "Button", "Far up", depth: 1, x: 150, y: Int.min + 10, w: 80, h: Int.max),
+            node("e3", "Button", "Wide", depth: 1, x: -70_000, y: 60, w: 140_000, h: 24),
+            node("e4", "Button", "Send", depth: 1, x: 150, y: 100, w: 80, h: 24),
+        ]
+        let (h, _, _) = try await rig([
+            "win.list": { _, _ in .ok(["windows": [notesWindow, fixtureWindow]]) },
+            "ui.tree": { _, _ in .ok(["window": fixtureWindow, "nodes": .array(tree), "truncated": false]) },
+        ])
+        let whole = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "marks": true])
+        XCTAssertEqual(whole["marks"], [["n": 1, "ref": "e4", "role": "Button", "name": "Send", "x": 150, "y": 100, "w": 80, "h": 24]])
+        let cropped = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "window": "Alcove", "marks": true])
+        XCTAssertEqual(cropped["marks"]?.arrayValue?.map { $0["ref"]?.stringValue }, ["e4"])
+    }
+
+    func testRectangleOffsetAndIntersectionSaturateAtTheEndsOfTheIntegerRange() {
+        let far = Frame.Rect(x: Int.max, y: Int.max - 1, w: 10, h: 10)
+        XCTAssertFalse(far.intersects(Frame.Rect(x: 0, y: 0, w: 100, h: 100)))
+        XCTAssertFalse(Frame.Rect(x: 0, y: 0, w: 100, h: 100).intersects(far))
+        XCTAssertTrue(Frame.Rect(x: Int.min, y: Int.min, w: Int.max, h: Int.max).intersects(Frame.Rect(x: -5, y: -5, w: 1, h: 1)))
+        XCTAssertEqual(far.offset(x: 5, y: 5), Frame.Rect(x: Int.max, y: Int.max, w: 10, h: 10))
+        XCTAssertEqual(Frame.Rect(x: Int.min, y: 3, w: 1, h: 1).offset(x: -1, y: -4), Frame.Rect(x: Int.min, y: -1, w: 1, h: 1))
+    }
+
+    func testDrawingMarksWithRectanglesAtTheEndsOfTheIntegerRangeLeavesTheFrame() throws {
+        let base = try XCTUnwrap(Frame(png: makePNG(width: 200, height: 120)))
+        let drawn = base.drawingMarks([Frame.Mark(number: 1, rect: Frame.Rect(x: 10, y: Int.min + 10, w: 20, h: Int.max)),
+                                       Frame.Mark(number: 2, rect: Frame.Rect(x: Int.max, y: Int.max, w: Int.max, h: Int.max))])
+        XCTAssertEqual(drawn.width, 200)
+        XCTAssertEqual(drawn.height, 120)
+    }
+
     func testDrawingMarksAtTheEdgesAndWithThinOrEmptyRectangles() throws {
         let base = try XCTUnwrap(Frame(png: makePNG(width: 200, height: 120)))
         func bgr(_ number: Int) -> [UInt8] {

@@ -9,6 +9,8 @@ extension ControlHandler {
     private static let tailLines = 400
     private static let logLineLimit = 500
     private static let jobBufferLimit = 64 * 1024
+    /// The largest job output offset a wait keeps; a larger one from the guest counts as this one.
+    static let maxJobOffset = 1 << 53
     /// Characters of a failed port check's output that its sentence quotes.
     private static let portOutputLimit = 200
 
@@ -750,8 +752,8 @@ extension ControlHandler {
                 }
                 guard let r = reply else { return .unanswered }
                 let out = r["out"]?.stringValue ?? "", err = r["err"]?.stringValue ?? ""
-                let outNext = r["out_next"]?.intValue ?? state.outOffset + out.utf8.count
-                let errNext = r["err_next"]?.intValue ?? state.errOffset + err.utf8.count
+                let outNext = ControlHandler.jobOffset(r["out_next"]?.intValue ?? state.outOffset + out.utf8.count)
+                let errNext = ControlHandler.jobOffset(r["err_next"]?.intValue ?? state.errOffset + err.utf8.count)
                 exited = r["state"]?.stringValue == "exited"
                 let gained = max(0, outNext - state.outOffset) + max(0, errNext - state.errOffset)
                 if outNext > state.outOffset { state.out = ControlHandler.rolling(state.out + out) }
@@ -775,6 +777,9 @@ extension ControlHandler {
         if key.hasSuffix(".exe") { key.removeLast(4) }
         return key
     }
+
+    /// `offset` within 0...`maxJobOffset`.
+    private static func jobOffset(_ offset: Int) -> Int { min(max(offset, 0), maxJobOffset) }
 
     /// The last `jobBufferLimit` bytes of `text`, starting on a character boundary.
     private static func rolling(_ text: String) -> String {

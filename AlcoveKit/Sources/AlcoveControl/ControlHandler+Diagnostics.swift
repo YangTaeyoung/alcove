@@ -743,13 +743,13 @@ extension ControlHandler {
         let time: String
     }
 
-    /// The rows to pull, in the given order, while their sizes add up to at most `budget`; a row that does not fit is skipped
-    /// and the rows after it still get their chance.
+    /// The rows to pull, in the given order, while their sizes add up to at most `budget`; a row that does not fit, or
+    /// whose size is below 0, is skipped and the rows after it still get their chance.
     nonisolated static func selectDumps(_ rows: [DumpRow], budget: Int) -> (take: [DumpRow], skipped: [DumpRow]) {
         var take: [DumpRow] = [], skipped: [DumpRow] = []
         var total = 0
         for row in rows {
-            if total + row.bytes <= budget { take.append(row); total += row.bytes } else { skipped.append(row) }
+            if row.bytes >= 0, row.bytes <= budget - total { take.append(row); total += row.bytes } else { skipped.append(row) }
         }
         return (take, skipped)
     }
@@ -828,7 +828,7 @@ extension ControlHandler {
             }
             switch pulled {
             case .success(let r):
-                left -= r["bytes"]?.intValue ?? row.bytes
+                left -= min(max(r["bytes"]?.intValue ?? row.bytes, 0), left)
                 found.append(.init(file: row.file, bytes: row.bytes, time: row.time, outcome: "collected as \(step)"))
             case .failure(let error as TransferTooLarge):
                 found.append(.init(file: row.file, bytes: row.bytes, time: row.time,

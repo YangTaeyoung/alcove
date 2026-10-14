@@ -233,7 +233,8 @@ makes it use the `screendump` always.
   role `Button`, `CheckBox`, `ComboBox`, `Edit`, `HeaderItem`, `Hyperlink`,
   `ListItem`, `MenuItem`, `RadioButton`, `Slider`, `Spinner`, `SplitButton`,
   `TabItem`, `TreeItem`, `DataItem` or `Document`, a rectangle that is not
-  empty and reaches into the image's area, and no `offscreen` flag; the first
+  empty, has `x` and `y` between -65536 and 65536 and `w` and `h` up to
+  65536, and reaches into the image's area, and no `offscreen` flag; the first
   100 in tree order, numbered from 1. `marksTruncated: true` says that more
   such elements exist. An outline is 2 pixels wide and the number sits in a
   filled tag above the rectangle's top-left corner (inside it when there is

@@ -708,6 +708,17 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(DiagnosticsLimits.dumpBudget, 500 * mib)
     }
 
+    func testDumpSelectionSkipsSizesOutsideTheBudgetAtTheEndsOfTheIntegerRange() {
+        let mib = 1024 * 1024
+        let a = ControlHandler.DumpRow(file: "a", bytes: 300 * mib, time: "")
+        let huge = ControlHandler.DumpRow(file: "b", bytes: Int.max, time: "")
+        let negative = ControlHandler.DumpRow(file: "c", bytes: Int.min, time: "")
+        let one = ControlHandler.DumpRow(file: "d", bytes: 1, time: "")
+        let picked = ControlHandler.selectDumps([a, huge, negative, one], budget: 500 * mib)
+        XCTAssertEqual(picked.take, [a, one])
+        XCTAssertEqual(picked.skipped, [huge, negative])
+    }
+
     func testDumpsOlderThanSinceMinutesAreLeftOutAndCounted() async throws {
         let old = stamp(Date().addingTimeInterval(-3 * 3600))
         let recent = stamp(Date().addingTimeInterval(-60))

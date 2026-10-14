@@ -129,7 +129,7 @@ public struct Frame: Sendable, Equatable {
             for mark in marks where mark.rect.w > 0 && mark.rect.h > 0 {
                 let rgb = Frame.markColors[((mark.number - 1) % Frame.markColors.count + Frame.markColors.count) % Frame.markColors.count]
                 guard let color = CGColor(colorSpace: space, components: [CGFloat(rgb.red) / 255, CGFloat(rgb.green) / 255, CGFloat(rgb.blue) / 255, 1]) else { continue }
-                let box = CGRect(x: CGFloat(mark.rect.x), y: CGFloat(height - mark.rect.y - mark.rect.h),
+                let box = CGRect(x: CGFloat(mark.rect.x), y: CGFloat(height) - CGFloat(mark.rect.y) - CGFloat(mark.rect.h),
                                  width: CGFloat(mark.rect.w), height: CGFloat(mark.rect.h))
                 ctx.setShouldAntialias(false)
                 ctx.setFillColor(color)
