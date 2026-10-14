@@ -66,6 +66,49 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertEqual(whole.seconds, 5.0, accuracy: 0.3)
     }
 
+    func testCopyCutInsideItsLastFragmentPlays() async throws {
+        let url = base.appendingPathComponent("torn.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        for i in 0..<26 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
+        let fragments = await eventually(timeout: .seconds(10)) {
+            guard let data = try? Data(contentsOf: url) else { return false }
+            return Self.boxCount("moof", in: data) >= 3
+        }
+        XCTAssertTrue(fragments)
+        let data = try Data(contentsOf: url)
+        let lastFragment = min(try XCTUnwrap(Self.lastBoxStart("moof", in: data)), try XCTUnwrap(Self.lastBoxStart("mdat", in: data)))
+        let cuts = [data.count - 1, data.count - 17, lastFragment + (data.count - lastFragment) / 2, lastFragment + 8, lastFragment + 1]
+        for cut in Set(cuts) where cut > lastFragment && cut < data.count {
+            let copy = base.appendingPathComponent("torn-\(cut).mp4")
+            try data.prefix(cut).write(to: copy)
+            let plays = await VideoRecorder.isPlayable(copy)
+            XCTAssertTrue(plays, "a copy of the first \(cut) of \(data.count) bytes does not play")
+        }
+        await recorder.finish()
+    }
+
+    /// The number of top-level boxes of type `type` in the MP4 bytes `data`.
+    private static func boxCount(_ type: String, in data: Data) -> Int { boxStarts(type, in: data).count }
+
+    /// The offset of the last top-level box of type `type` in `data`.
+    private static func lastBoxStart(_ type: String, in data: Data) -> Int? { boxStarts(type, in: data).last }
+
+    /// The offsets of the top-level boxes of type `type` in `data`; a box size of 1 is followed by a 64-bit size.
+    private static func boxStarts(_ type: String, in data: Data) -> [Int] {
+        var starts: [Int] = []
+        var offset = 0
+        let bytes = [UInt8](data)
+        func number(_ at: Int, _ count: Int) -> Int { bytes[at..<(at + count)].reduce(0) { $0 << 8 | Int($1) } }
+        while offset + 8 <= bytes.count {
+            var size = number(offset, 4)
+            if size == 1, offset + 16 <= bytes.count { size = number(offset + 8, 8) }
+            if String(decoding: bytes[(offset + 4)..<(offset + 8)], as: UTF8.self) == type { starts.append(offset) }
+            guard size >= 8 else { break }
+            offset += size
+        }
+        return starts
+    }
+
     func testFileThatIsNoMovieIsNotPlayable() async throws {
         let url = base.appendingPathComponent("text.mp4")
         try Data("not a movie".utf8).write(to: url)
