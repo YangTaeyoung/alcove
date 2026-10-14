@@ -232,7 +232,7 @@ func TestAMalformedMACIsRefused(t *testing.T) {
 	}
 }
 
-func TestAMACOfAnEarlierConnectionIsRefusedBecauseTheNonceChanged(t *testing.T) {
+func TestAMACOfAnEarlierConnectionIsRefused(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
 	first := a.dial()
 	mac := first.mac(t, testKey)

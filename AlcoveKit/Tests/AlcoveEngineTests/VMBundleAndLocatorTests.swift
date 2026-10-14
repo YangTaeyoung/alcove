@@ -168,7 +168,7 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(reloaded.cpuCount, stored.cpuCount + 1)
     }
 
-    /// Two loads of a config without a key that run before either saved: both return the key the first save wrote.
+    /// A config decoded without a key before a load wrote the generated key is saved with the stored key.
     func testTwoMigratingLoadsAgreeOnTheAgentKey() throws {
         let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
         let b = try VMBundle.create(VMConfig.defaults(name: "Racing", guestOS: .windows), in: tmp, engine: engine)

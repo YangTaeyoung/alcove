@@ -121,7 +121,8 @@ func (s *Server) authTimeout() time.Duration {
 
 // handshake writes the hello and, with a HostKey, reads messages until the
 // host paired or authenticated. It reports whether the connection is served.
-// A refused connection gets the answers authAnswer gives and a refused line.
+// A refused connection gets the answer unauthenticatedAnswer gives, if any,
+// and a refused line.
 func (s *Server) handshake(c net.Conn, r *proto.Reader) bool {
 	w := proto.NewWriter(c)
 	write := func(m proto.Message) bool {
