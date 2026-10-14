@@ -197,6 +197,7 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 	if !s.keyed() {
 		return refuse(reasonNoHostKey, errNoHostKey)
 	}
+	_ = c.SetReadDeadline(time.Now().Add(s.authTimeout()))
 	pending := s.handshakes.join(c)
 	served := false
 	defer func() {
@@ -214,7 +215,6 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 	if !write(hello) {
 		return false
 	}
-	_ = c.SetReadDeadline(time.Now().Add(s.authTimeout()))
 	for {
 		m, err := r.Next()
 		if err != nil {

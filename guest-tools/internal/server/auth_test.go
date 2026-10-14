@@ -383,6 +383,41 @@ func TestAHostThatSignsAtOnceIsAuthedWhile16IdleHandshakesAreOpen(t *testing.T) 
 	}
 }
 
+func TestAHandshakeReplacedWhileItsHelloIsWrittenIsRefusedWithoutWaitingForAuth(t *testing.T) {
+	a := startAuthServer(t, Options{AuthTimeout: 5 * time.Second})
+	server, client := net.Pipe()
+	defer client.Close()
+	served := make(chan bool, 1)
+	go func() {
+		defer server.Close()
+		limit := &lineLimit{r: server, max: preAuthLineMax}
+		served <- a.s.handshake(server, proto.NewReader(limit), limit)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		a.s.handshakes.mu.Lock()
+		n := len(a.s.handshakes.entries)
+		a.s.handshakes.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the handshake did not join the queue")
+		}
+	}
+	for i := 0; i < maxHandshakes; i++ {
+		a.dial()
+	}
+	client.SetDeadline(time.Now().Add(2 * time.Second))
+	c := &authConn{c: client, r: proto.NewReader(client)}
+	if hello := c.next(t); hello.Type() != "hello" {
+		t.Fatalf("first message %v", hello)
+	}
+	c.expectRefusedAndClosed(t, errHandshakeReplaced)
+	if <-served {
+		t.Fatal("the replaced handshake was served")
+	}
+}
+
 func TestAServedConnectionIsNotClosedForANewerHandshake(t *testing.T) {
 	a := startAuthServer(t, Options{})
 	served := a.dial()
