@@ -4,6 +4,9 @@ import { ControlError, type ControlClient } from "../control.js";
 import { changeResult } from "../observation.js";
 import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, type Registrar } from "../toolkit.js";
 
+/** The most bytes per stream one `alcove_exec_read` asks for: no more characters than the text shows unclipped. */
+export const EXEC_READ_MAX_BYTES = 60000;
+
 const job = z.string().describe("Job id returned by alcove_exec_start");
 
 export function register(r: Registrar, client: ControlClient): void {
@@ -39,7 +42,7 @@ export function register(r: Registrar, client: ControlClient): void {
         job,
         out_offset: z.number().int().min(0).optional().describe("Byte offset in stdout to read from (default 0)"),
         err_offset: z.number().int().min(0).optional().describe("Byte offset in stderr to read from (default 0)"),
-        max: z.number().int().min(1).max(262144).optional().describe("Maximum bytes returned per stream (default and cap 262144)"),
+        max: z.number().int().min(1).max(EXEC_READ_MAX_BYTES).optional().describe(`Maximum bytes returned per stream (default and cap ${EXEC_READ_MAX_BYTES}); the next offsets continue right after them`),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -50,7 +53,7 @@ export function register(r: Registrar, client: ControlClient): void {
           job: id,
           ...(out_offset !== undefined ? { outOffset: out_offset } : {}),
           ...(err_offset !== undefined ? { errOffset: err_offset } : {}),
-          ...(max !== undefined ? { max } : {}),
+          max: max ?? EXEC_READ_MAX_BYTES,
         });
         const state = res.state === "exited" ? `exited with code ${res.code}` : String(res.state);
         const head = `${state}${res.dropped ? " (older output was dropped)" : ""}\nnext offsets: out_offset=${res.outNext} err_offset=${res.errNext}`;

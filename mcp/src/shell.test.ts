@@ -41,6 +41,16 @@ test("the job tools print no eventSeq line for a reply without one", async () =>
   assert.equal(written.structuredContent, undefined);
 });
 
+test("alcove_exec_read asks for at most 60000 bytes per stream and shows all of them with the next offsets", async () => {
+  const out = "a".repeat(60000);
+  const t = rig(registerShell, { state: "running", pid: 5, out, err: "", outNext: 60000, errNext: 0 });
+  const r = await t.run("alcove_exec_read", { name: "vm", job: "j1", out_offset: 0 });
+  await t.run("alcove_exec_read", { name: "vm", job: "j1", max: 1000 });
+  assert.equal(t.calls[0].params.max, 60000);
+  assert.equal(t.calls[1].params.max, 1000);
+  assert.equal(textOf(r), `running\nnext offsets: out_offset=60000 err_offset=0\nstdout:\n${out}`);
+});
+
 test("alcove_wait_for waits for the observation that follows the wait", async () => {
   const t = rig(registerActions, { matched: -1, waited: 5 });
   await t.run("alcove_wait_for", { name: "vm", conditions: [{ type: "screen_idle" }], timeout_s: 5 });
