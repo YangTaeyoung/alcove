@@ -6,9 +6,9 @@ secret variables and signals, alcove_script_run through the MCP server, and the
 refusal of a second Alcove host (docs/control-protocol.md "Scripts", mcp/).
 
 Needs the VM running with the agent installed as the scheduled task
-AlcoveAgent with --allow-exec (scripts/test/install-agent.py), a control
-server built from this tree (alcovectl serve, not the app: checks 10 to 13
-read the engine's parent process), the alcovectl build in
+AlcoveAgent with --allow-exec (scripts/test/install-agent.py), the VM's
+engine started by an alcovectl serve built from this tree (not by the app),
+the alcovectl build in
 AlcoveKit/.build-ctl (or ALCOVE_CTL), `npm run build` in mcp/ and the fixture
 build build/alcove-fixture-windows-arm64.exe (scripts/test/all.sh). The guest
 must hold no C:\\alcove-e2e and no C:\\alcove-apps\\alcove-e2e-app, run no
@@ -32,7 +32,8 @@ processes the run started, starts the VM through the control server when the
 run left it stopped, waits up to 120 s until the VM runs with its tools
 connected and no lease, stops the recording of the run, ends the processes that
 run from the two guest folders, puts the clipboard text back, deletes the
-snapshot at6-base when the run took it, deletes the two folders and the host
+snapshot at6-base when the run took it or sent vm.snapshot.create and
+vm.snapshot.list lists it, deletes the two folders and the host
 directory of the run. When a
 step of that cannot finish, the script prints `cleanup failed: ...` with what
 to do by hand and exits 1. SIGTERM, SIGHUP and SIGINT print
@@ -69,8 +70,10 @@ SNAPSHOT_FREE_GIB = 18
 START_FREE_GIB = 10
 MOVE = (150, 90)
 MISSING = "Sned"
-NOTHING = "No Such Element 4711"
-SIGNAL_WAIT_S = 15
+SIGNAL_WAIT_S = 60
+RELEASE_AFTER_S = 15
+LEASE_GONE_S = 5
+AFTER_RELEASE_S = 10
 BOOT_TEXT = "Search"
 BOOT_READY = r"C:\Windows\win.ini"
 TRANSCRIPT = {"window": TITLE, "role": "Document", "name": "Transcript"}
@@ -143,7 +146,7 @@ VM_BUNDLE = "Windows 11.alcovevm"
 
 
 def serving(path, timeout=20):
-    """Waits until a server answers on the Unix socket `path`; Client() would start a server of its own otherwise."""
+    """Waits until a server answers on the Unix socket `path`."""
     end = time.time() + timeout
     while True:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -174,10 +177,12 @@ class Run:
         self.fixture_pids = set()
         self.recording = False
         self.snapshot = False
+        self.snapshot_begun = False
         self.vm_left_stopped = False
         self.script = None
         self.started_utc = None
         self.clipboard = None
+        self.timer_pids = []
 
     # calls
 
@@ -263,6 +268,10 @@ class Run:
 
     def read(self, path):
         return self.call("vm.fs.read", path=path)["text"]
+
+    def guest_names(self, folder):
+        """The names of the entries of a guest folder."""
+        return {e["name"] for e in self.call("vm.fs.list", path=folder)["entries"]}
 
     def processes(self, c=None, **params):
         return (c or self.c).call("vm.process.list", 60, name=self.vm, **params)["processes"]
@@ -429,7 +438,7 @@ class Run:
         while True:
             status = c.call("vm.status", 60, name=self.vm)
             settled = status.get("state") == "running" and status.get("tools") is True and not status.get("leasedBy")
-            if status.get("state") not in ("running", "paused") or settled or time.time() > end:
+            if status.get("state") not in ("running", "paused", "starting", "stopping") or settled or time.time() > end:
                 break
             time.sleep(1)
         if status.get("state") == "running" and status.get("leasedBy"):
@@ -450,11 +459,18 @@ class Run:
                 c.call("vm.clipboard.set", 60, name=self.vm, text=self.clipboard)
             except ControlError as e:
                 self.cleanup_error(f"vm.clipboard.set answered {e}; the guest clipboard holds text of this run")
-        if self.snapshot:
+        if self.snapshot or self.snapshot_begun:
             try:
-                c.call("vm.snapshot.delete", 600, name=self.vm, snapshot=SNAPSHOT)
+                taken = self.snapshot or SNAPSHOT in [s["name"] for s in c.call("vm.snapshot.list", 60, name=self.vm)["snapshots"]]
+                if taken:
+                    c.call("vm.snapshot.delete", 600, name=self.vm, snapshot=SNAPSHOT)
             except ControlError as e:
                 self.cleanup_error(f"vm.snapshot.delete of {SNAPSHOT} answered {e}; delete the snapshot with scripts/test/ctl.py vm.snapshot.delete")
+        try:
+            timers = {p["pid"] for p in self.processes(c) if "powershell" in (p["name"] or "").lower()} & set(self.timer_pids)
+        except ControlError:
+            timers = set()
+        self.kill(c, sorted(timers))
         try:
             left = self.end(c, lambda: self.own_processes(c))
         except ControlError as e:
@@ -503,9 +519,9 @@ def check(title):
     return add
 
 
-def boot_script(*tail):
-    """A script that starts the VM, waits for the desktop and the guest tools, then runs `tail`."""
-    return {"version": 1, "vm": "Windows 11", "variables": {}, "steps": [
+def boot_script(run, *tail):
+    """A script for the run's VM that starts it, waits for the desktop and the guest tools, then runs `tail`."""
+    return {"version": 1, "vm": run.vm, "variables": {}, "steps": [
         {"label": "start the VM", "op": "vm.start", "params": {}},
         {"label": "wait for the desktop", "op": "vm.wait_for",
          "params": {"conditions": [{"type": "text_visible", "text": BOOT_TEXT}], "timeout": 300}},
@@ -526,8 +542,10 @@ def expect_passed(code, out, err, what):
 
 
 def expect_done(run, what):
+    """The transcript holds the typed message exactly once and ends its reply with [done]."""
     text = run.transcript()
-    expect(f"You: {MESSAGE}" in text and "[done]" in text, f"after {what} the transcript reads {text[-300:]!r}")
+    sent = text.count(f"You: {MESSAGE}")
+    expect(sent == 1 and "[done]" in text, f"after {what} the transcript holds the message {sent} times (expected once) and reads {text[-300:]!r}")
 
 
 @check("the fixture is deployed and started, and the snapshot at6-base is taken when the disk has room for it")
@@ -536,8 +554,9 @@ def _(run):
     free = free_gib()
     if free < SNAPSHOT_FREE_GIB:
         return f"pid {window['pid']}; no snapshot: {free:.1f} GiB free on {DATA_VOLUME}, a snapshot needs {SNAPSHOT_FREE_GIB} GiB"
-    run.snapshot = True
+    run.snapshot_begun = True
     run.call("vm.snapshot.create", 900, snapshot=SNAPSHOT)
+    run.snapshot = True
     after = free_gib()
     names = [s["name"] for s in run.call("vm.snapshot.list")["snapshots"]]
     expect(SNAPSHOT in names, f"vm.snapshot.list lists {names!r} after vm.snapshot.create")
@@ -668,6 +687,7 @@ def _(run):
         raise Skipped(f"check 1 took no snapshot ({free_gib():.1f} GiB free on {DATA_VOLUME}, a snapshot needs {SNAPSHOT_FREE_GIB} GiB)")
     run.call("vm.snapshot.delete", 600, snapshot=SNAPSHOT)
     run.snapshot = False
+    run.snapshot_begun = False
     names = [s["name"] for s in run.call("vm.snapshot.list")["snapshots"]]
     expect(SNAPSHOT not in names, f"vm.snapshot.list lists {names!r} after vm.snapshot.delete")
     return f"{free_gib():.1f} GiB free after the delete"
@@ -708,29 +728,65 @@ def _(run):
     return f"exit 0 and 1; fixture logged {logged[-1].split(' ', 1)[1]!r}; trace of {stopped['ops']} ops types <masked> twice; {len(files)} files searched"
 
 
-@check("SIGINT, SIGTERM and SIGHUP during a step end run-script with 130, 143 and 129, no step runs after the signal and the lease is released")
+def signal_script(run, tag):
+    """A script that writes a start mark, waits for a release file, presses Send and writes an end mark; returns
+    (script path, start mark, release file, end mark), the last three as names in the guest folder of the run."""
+    began, release, after = f"{tag}-began.txt", f"{tag}-release.txt", f"{tag}-after.txt"
+    path = run.write_script(f"{tag}.json", {"version": 1, "vm": run.vm, "variables": {}, "steps": [
+        {"label": "write the start mark", "op": "vm.fs.write", "params": {"path": GUEST + "\\" + began, "text": "began\n"}},
+        {"label": "wait for the release file", "op": "vm.wait_for", "timeout": SIGNAL_WAIT_S,
+         "params": {"conditions": [{"type": "file_exists", "path": GUEST + "\\" + release}], "timeout": SIGNAL_WAIT_S}},
+        {"label": "press Send", "op": "vm.ui.click", "params": {"selector": {"window": TITLE, "role": "Button", "name": "Send"}}},
+        {"label": "write the end mark", "op": "vm.fs.write", "params": {"path": GUEST + "\\" + after, "text": "after\n"}}]})
+    return path, began, release, after
+
+
+@check("SIGINT, SIGTERM and SIGHUP during a step end run-script with 130, 143 and 129, the lease is released at once and no step runs after the signal")
 def _(run):
-    script = run.write_script("signal.json", {"version": 1, "vm": run.vm, "variables": {}, "steps": [
-        {"label": "wait for nothing", "op": "vm.wait_for",
-         "params": {"conditions": [{"type": "ui_exists", "window": TITLE, "role": "Button", "name": NOTHING}], "timeout": SIGNAL_WAIT_S}},
-        {"label": "press Send", "op": "vm.ui.click", "params": {"selector": {"window": TITLE, "role": "Button", "name": "Send"}}}]})
     run.fixture()
+    run.prepare_guest()
     notes = []
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    for sig in (None, signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        name = signal.Signals(sig).name if sig else "the run without a signal"
+        script, began, release, after = signal_script(run, f"signal-{signal.Signals(sig).name}" if sig else "signal-none")
         before = len(run.log())
+        timer = run.call("vm.exec.start", command=f"Start-Sleep -Seconds {RELEASE_AFTER_S}; "
+                                                  f"Set-Content -LiteralPath '{GUEST}\\{release}' -Value release")
+        run.timer_pids.append(timer["pid"])
         p = run.spawn(["run-script", "--socket", run.c.socket_path, script])
-        time.sleep(4)
+        end = time.time() + 60
+        while began not in run.guest_names(GUEST):
+            expect(time.time() < end and p.poll() is None, f"{name} did not write its start mark within 60 s")
+            time.sleep(0.2)
+        if sig is None:
+            code, out, err = run.finish(p, SIGNAL_WAIT_S + 60)
+            expect_passed(code, out, err, name)
+            sent = [l for l in run.log()[before:] if " send" in l]
+            expect(sent and after in run.guest_names(GUEST), f"{name} passed, but the fixture logged {run.log()[before:]!r} "
+                   f"and the end mark is {'present' if after in run.guest_names(GUEST) else 'absent'}")
+            continue
         os.kill(p.pid, sig)
-        began = time.monotonic()
+        signalled = time.monotonic()
         code, out, err = run.finish(p, 60)
-        took = time.monotonic() - began
-        expect(code == EXIT_FOR[sig] and lines(out)[-1:] == ["INTERRUPTED"], f"{signal.Signals(sig).name} gave exit {code}:\n{out}{err}")
-        time.sleep(SIGNAL_WAIT_S + 3)
+        exited = time.monotonic()
+        expect(code == EXIT_FOR[sig] and lines(out)[-1:] == ["INTERRUPTED"], f"{name} gave exit {code}:\n{out}{err}")
+        while True:
+            status = run.status()
+            if not status.get("leasedBy"):
+                break
+            expect(time.monotonic() - exited < LEASE_GONE_S,
+                   f"'{run.vm}' is still leased by {status.get('leasedBy')!r} {LEASE_GONE_S} s after run-script exited on {name}")
+            time.sleep(0.2)
+        released = time.monotonic() - exited
+        end = time.time() + RELEASE_AFTER_S + 30
+        while release not in run.guest_names(GUEST):
+            expect(time.time() < end, f"the guest job did not write {release} within {RELEASE_AFTER_S + 30} s")
+            time.sleep(0.5)
+        time.sleep(AFTER_RELEASE_S)
         added = run.log()[before:]
-        expect(not added, f"the fixture logged {added!r} after {signal.Signals(sig).name}; the step after the signal ran")
-        status = run.status()
-        expect(not status.get("leasedBy"), f"'{run.vm}' is still leased by {status.get('leasedBy')!r} after {signal.Signals(sig).name}")
-        notes.append(f"{signal.Signals(sig).name} {code} after {took:.1f} s")
+        expect(not added, f"the fixture logged {added!r} after {name}; a step after the signal ran")
+        expect(after not in run.guest_names(GUEST), f"the end mark {after} exists after {name}; a step after the signal ran")
+        notes.append(f"{name} {code} after {exited - signalled:.1f} s, lease gone {released:.1f} s later")
     return "; ".join(notes)
 
 
@@ -739,7 +795,7 @@ def _(run):
     held = engine()
     expect(held and held[1] == run.server_pid, f"the engine {held!r} is not the child of the control server (pid {run.server_pid})")
     booted = run.exec(BOOTED_AT)
-    script = run.write_script("in-process-refused.json", boot_script())
+    script = run.write_script("in-process-refused.json", boot_script(run))
     code, out, err = run.run_script("--in-process", "--socket", run.c.socket_path, script)
     expect(code == 2 and f"a control server answers at {run.c.socket_path}; run the script without --in-process, or stop that server first" in err,
            f"--in-process with the server's socket exited with {code}:\n{out}{err}")
@@ -778,7 +834,7 @@ def _(run):
 def _(run):
     run.stop_vm()
     run.need_disk("the in-process run")
-    script = run.write_script("in-process.json", boot_script(
+    script = run.write_script("in-process.json", boot_script(run,
         {"label": "list the windows", "op": "vm.window.list", "params": {}}))
     began = time.monotonic()
     code, out, err = run.run_script("--in-process", "--socket", run.socket_path("none.sock"), script, timeout=600)
@@ -794,16 +850,17 @@ def _(run):
 def _(run):
     run.stop_vm()
     run.need_disk("the in-process run")
-    script = run.write_script("in-process-signal.json", boot_script(
+    mark = os.path.join(run.host_dir(), "pulled-mark.ini")
+    script = run.write_script("in-process-signal.json", boot_script(run,
+        {"label": "pull the mark", "op": "vm.pull_file", "params": {"guestPath": BOOT_READY, "path": mark}},
         {"label": "wait for nothing", "op": "vm.wait_for",
          "params": {"conditions": [{"type": "file_exists", "path": GUEST + r"\no-such-file"}], "timeout": 300}},
         {"label": "write after the signal", "op": "vm.fs.write", "params": {"path": AFTER_SIGNAL, "text": "after\n"}}))
     p = run.spawn(["run-script", "--in-process", "--socket", run.socket_path("none.sock"), script])
-    end = time.time() + 60
-    while engine() is None:
-        expect(time.time() < end and p.poll() is None, "the in-process run did not start the engine within 60 s")
+    end = time.time() + 600
+    while not os.path.exists(mark):
+        expect(time.time() < end and p.poll() is None, f"the in-process run did not pull {BOOT_READY} to {mark} within 600 s")
         time.sleep(0.5)
-    time.sleep(90)
     expect(p.poll() is None, "the in-process run ended before the signal")
     os.kill(p.pid, signal.SIGTERM)
     began = time.monotonic()
@@ -811,7 +868,7 @@ def _(run):
     took = time.monotonic() - began
     rows = lines(out)
     expect(code == 143 and rows[-1:] == ["INTERRUPTED"], f"SIGTERM gave exit {code}:\n{out}{err}")
-    expect("     the run was cancelled during step 4; start it again" in rows and not [r for r in rows if r.startswith("ok   5") or r.startswith("FAIL 5")],
+    expect("     the run was cancelled during step 5; start it again" in rows and not [r for r in rows if r.startswith("ok   6") or r.startswith("FAIL 6")],
            f"the interrupted run printed:\n{out}")
     expect(engine() is None, f"the engine {engine()!r} still runs after the interrupted in-process run")
     run.start_vm()
@@ -844,7 +901,8 @@ def _(run):
     gone = subprocess.run(["ps", "-p", str(orphan[0])], capture_output=True).returncode != 0
     expect(gone, f"the orphaned engine pid {orphan[0]} still runs")
     power = int(run.exec(KERNEL_POWER.replace("SINCE", run.started_utc)))
-    return f"orphan pid {orphan[0]} stopped; engine pid {held[0]} of the control server; tools after {took:.0f} s; Kernel-Power 41 entries since the run began: {power}"
+    expect(power == 0, f"the System log holds {power} Kernel-Power 41 entries since the run began")
+    return f"orphan pid {orphan[0]} stopped; engine pid {held[0]} of the control server; tools after {took:.0f} s; no Kernel-Power 41 entry since the run began"
 
 
 def refusal_to_start(client, vm):
