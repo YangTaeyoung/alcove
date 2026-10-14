@@ -64,7 +64,8 @@ struct ScriptRunner: Sendable {
         try await ControlHandler.$scriptCall.withValue(kind) { try await handler.handle(op: op, params: params) }
     }
 
-    /// Runs the steps of `script` in order and stops at the first failure.
+    /// Runs the steps of `script` in order and stops at the first failure. A run that fails or is cancelled releases
+    /// the buttons and keys that its `vm.mouse.down` and `vm.key.down` steps pressed and no later step released.
     ///
     /// `vm` overrides the script's VM. A `lease` must be the VM's current token; it is used for every step and
     /// is neither renewed nor released. Without one the runner holds a lease of its own named `owner` for the run.
@@ -117,8 +118,10 @@ struct ScriptRunner: Sendable {
         let renewal = acquired ? renewLease(vm: name, owner: owner, token: token) : nil
 
         var leaseLost = false
+        var held = ControlHandler.HeldInput()
         let failure = await execute(resolved, vm: name, token: token, holdsOwnLease: acquired, snapshot: snapshot,
-                                    progress: progress, leaseLost: &leaseLost, into: &result)
+                                    progress: progress, leaseLost: &leaseLost, held: &held, into: &result)
+        if failure != nil { await handler.release(held, vm: name) }
         if failure != nil, !Task.isCancelled, result.failedStep != nil, let shot = await failureScreenshot(vm: name, maxWidth: failureMaxWidth) {
             result.failureImage = shot.png
             result.failureWidth = shot.width
@@ -185,10 +188,11 @@ struct ScriptRunner: Sendable {
         }
     }
 
-    /// Restores the snapshot and runs the steps; returns the failure sentence, or nil when all passed.
+    /// Restores the snapshot and runs the steps; returns the failure sentence, or nil when all passed. `held` takes in
+    /// the buttons and keys that the steps which ran pressed and did not release.
     private func execute(_ script: Script, vm: String, token: String?, holdsOwnLease: Bool, snapshot: String?,
                          progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?,
-                         leaseLost: inout Bool, into result: inout ScriptResult) async -> String? {
+                         leaseLost: inout Bool, held: inout ControlHandler.HeldInput, into result: inout ScriptResult) async -> String? {
         if let snapshot {
             do { _ = try await call(.snapshot, "vm.snapshot.restore", base(vm, token, ["snapshot": .string(snapshot)])) }
             catch {
@@ -218,7 +222,9 @@ struct ScriptRunner: Sendable {
             if run.usedFallback { entry["usedFallback"] = true }
             if run.positional { entry["positional"] = true }
             switch outcome {
-            case .success: entry["ok"] = true
+            case .success:
+                entry["ok"] = true
+                held.note(step.op, step.params)
             case .failure(let error):
                 entry["ok"] = false
                 entry["error"] = .string(Task.isCancelled || error is CancellationError ? ScriptRunner.cancelledDuring(number) : "\(error)")

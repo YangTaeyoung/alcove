@@ -136,6 +136,14 @@ extension ControlHandler {
         }
     }
 
+    /// Sends the VM `vm` the release of every button and key in `held` while it holds its input gate, in a task that a
+    /// cancelled caller does not cancel; does nothing when `held` is empty or no VM has that name.
+    func release(_ held: HeldInput, vm: String) async {
+        guard !held.buttons.isEmpty || !held.keys.isEmpty, let t = await lookUp(vm) else { return }
+        let gate = inputGate
+        await Task { await gate.withLock(vm) { await self.release(held, on: t) } }.value
+    }
+
     /// Sends `t` the release of every button and key in `held`, the latest pressed first, without a pause.
     func release(_ held: HeldInput, on t: VMTarget) async {
         for button in held.buttons.reversed() {

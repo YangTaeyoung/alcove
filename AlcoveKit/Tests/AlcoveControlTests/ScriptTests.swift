@@ -3,6 +3,7 @@ import XCTest
 import AlcoveEngine
 import AlcoveAgent
 import AlcoveQMP
+import AlcoveDisplayProtocol
 import AlcoveTestSupport
 
 /// Collects the progress callbacks of a run.
@@ -971,6 +972,60 @@ final class ScriptTests: XCTestCase {
         XCTAssertFalse(result.error?.contains("failed") == true, result.error ?? "")
         let after = try await leasedBy(rig)
         XCTAssertNil(after)
+    }
+
+    func testACancelledRunReleasesWhatItsDownStepsPressed() async throws {
+        let rig = try await rig()
+        let down = ["{\"op\": \"vm.key.down\", \"params\": {\"key\": \"shift\"}}",
+                    "{\"op\": \"vm.mouse.down\", \"params\": {\"button\": \"middle\"}}",
+                    "{\"op\": \"vm.key.down\", \"params\": {\"key\": \"a\"}}",
+                    "{\"op\": \"vm.key.up\", \"params\": {\"key\": \"a\"}}"]
+        let parsed = try script(steps(down + ["{\"op\": \"vm.exec\", \"params\": {\"command\": \"stall\"}, \"timeout\": 60}"]))
+        let handler = rig.handler
+        let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
+        let agent = rig.agent
+        let sent = await eventually("the stalling step sent its request") {
+            agentRequests(agent, "exec.run").contains { $0["cmd"]?.stringValue == "stall" }
+        }
+        XCTAssertTrue(sent)
+        task.cancel()
+        let result = await task.value
+        XCTAssertEqual(result.error, "the run was cancelled during step 5; start it again")
+        let input = await rig.target.sent
+        XCTAssertEqual(ScriptTests.pressed(input), [])
+        XCTAssertEqual(Array(input.suffix(3)), [.btn(con: 0, button: .middle, down: false), .sync, .key(mac: 56, q: nil, down: false)])
+    }
+
+    func testAFailedRunReleasesWhatItsDownStepsPressedAndAPassedRunKeepsThem() async throws {
+        let rig = try await rig()
+        let down = ["{\"op\": \"vm.key.down\", \"params\": {\"key\": \"ctrl\"}}", "{\"op\": \"vm.mouse.down\", \"params\": {}}"]
+        let failing = try script(steps(down + ["{\"op\": \"vm.key.press\", \"params\": {\"keys\": \"nosuchkey\"}}"]))
+        let failed = await run(rig, failing)
+        XCTAssertEqual(failed.failedStep, 3)
+        let afterFailure = await rig.target.sent
+        XCTAssertEqual(ScriptTests.pressed(afterFailure), [])
+        XCTAssertEqual(Array(afterFailure.suffix(3)), [.btn(con: 0, button: .left, down: false), .sync, .key(mac: 59, q: nil, down: false)])
+
+        let passing = try script(steps(down))
+        let passed = await run(rig, passing)
+        XCTAssertTrue(passed.passed, passed.error ?? "")
+        let afterPass = await rig.target.sent
+        XCTAssertEqual(ScriptTests.pressed(afterPass), ["key 59", "left"])
+    }
+
+    /// The buttons and keys that `sent` leaves pressed, in the order they went down.
+    private static func pressed(_ sent: [ToQEMU]) -> [String] {
+        var down: [String] = []
+        for message in sent {
+            switch message {
+            case .btn(_, let button, let isDown):
+                if isDown { down.append("\(button)") } else { down.removeAll { $0 == "\(button)" } }
+            case .key(let code, _, let isDown):
+                if isDown { down.append("key \(code ?? -1)") } else { down.removeAll { $0 == "key \(code ?? -1)" } }
+            default: break
+            }
+        }
+        return down
     }
 
     func testStepCancelledWhileItWaitsCarriesTheCancelSentence() async throws {
