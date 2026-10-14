@@ -2266,6 +2266,30 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.log.entries.filter { $0 != "recipe.other" }, [])
     }
 
+    func testACancelledRestoreStillWaitsForTheToolsSetsTheClockAndCleansTheGuest() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        _ = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        await c.t.setSnapshotList([VMController.SnapshotInfo(name: "mid-capture", vmStateSize: 1, date: Date())])
+        c.outputs.value["recipe.clearProxy"] = restoredState(caThumbprint)
+        await c.t.setAgentWait(.milliseconds(300))
+        c.log.clear()
+        let h = c.h
+        let caller = Task { try await h.handle(op: "vm.snapshot.restore", params: ["name": "Win", "snapshot": "mid-capture", "waitTools": 5]) }
+        let waiting = await eventually("the restore waits for the guest tools") { await c.t.agentWaits == 1 }
+        XCTAssertTrue(waiting)
+        caller.cancel()
+        let result = try await caller.value
+        XCTAssertEqual(result["clockSynced"]?.boolValue, true)
+        XCTAssertEqual(result["staleProxyCleared"]?.boolValue, true)
+        let cancelled = await c.t.cancelledAgentWaits
+        XCTAssertEqual(cancelled, 0)
+        XCTAssertEqual(c.log.entries.filter { $0 != "recipe.other" }, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertTrue(c.log.entries.contains("recipe.other"))
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
     func testASnapshotCreatedWithoutACaptureDropsTheNoteOfItsName() async throws {
         let c = try await capture()
         _ = try await c.start()

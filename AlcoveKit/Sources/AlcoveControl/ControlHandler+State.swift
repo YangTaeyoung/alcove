@@ -110,19 +110,9 @@ extension ControlHandler {
                 throw ControlError.failed("snapshot restore failed: \(engineReason(error))")
             }
             let restored = await passEvents(of: t)
-            let capturing = captures[t.name] != nil
-            await endCapture(t.name)
-            let duringCapture = captureJournal.snapshotEntry(snapshot, vm: await journalVM(t))
-            if let duringCapture { try? captureJournal.record(duringCapture, now: wallClock()) }
-            let mark = cleanupMark(t.name)
-            let agent = await t.agent(timeout: .seconds(max(0, wait)))
-            let cleaning = duringCapture == nil ? nil : agent.map { cleanup(since: mark, t, $0) }
-            var clockSynced = false
-            if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.snapshot.restore") }
-            var out: [String: JSON] = ["snapshot": .string(snapshot), "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced),
-                                       "eventSeq": .int(Int64(restored))]
-            if capturing { out["captureEnded"] = true }
-            if duringCapture != nil { out["staleProxyCleared"] = .bool(await cleaning?.value ?? false) }
+            let after = Task { await self.afterRestore(t, snapshot: snapshot, waitTools: wait) }
+            var out = await after.value
+            out["eventSeq"] = .int(Int64(restored))
             return .object(out)
         case "vm.snapshot.delete":
             let snapshot = try string(params, "snapshot")
@@ -182,6 +172,25 @@ extension ControlHandler {
         default:
             throw ControlError.unknownOp(op)
         }
+    }
+
+    /// The work after a restore of `snapshot` of `t`, which a cancelled caller does not stop: ends the VM's capture,
+    /// makes the snapshot's note the VM's journal entry, waits up to `waitTools` seconds for the guest tools, sets the
+    /// guest clock and waits for the cleanup that entry starts. Returns the fields of the result but `eventSeq`.
+    private func afterRestore(_ t: VMTarget, snapshot: String, waitTools wait: Int) async -> [String: JSON] {
+        let capturing = captures[t.name] != nil
+        await endCapture(t.name)
+        let duringCapture = captureJournal.snapshotEntry(snapshot, vm: await journalVM(t))
+        if let duringCapture { try? captureJournal.record(duringCapture, now: wallClock()) }
+        let mark = cleanupMark(t.name)
+        let agent = await t.agent(timeout: .seconds(max(0, wait)))
+        let cleaning = duringCapture == nil ? nil : agent.map { cleanup(since: mark, t, $0) }
+        var clockSynced = false
+        if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.snapshot.restore") }
+        var out: [String: JSON] = ["snapshot": .string(snapshot), "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced)]
+        if capturing { out["captureEnded"] = true }
+        if duringCapture != nil { out["staleProxyCleared"] = .bool(await cleaning?.value ?? false) }
+        return out
     }
 
     /// Notes in the capture journal that `snapshot` of `t` was created during the live capture of the VM whose guest
