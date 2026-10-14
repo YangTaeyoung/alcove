@@ -222,6 +222,19 @@ final class EventBufferTests: XCTestCase {
         XCTAssertNil(stopped)
     }
 
+    func testLinkDropsOnlyTheConnectionItIsNamed() async throws {
+        let agent = fakeAgent(caps: ["clipboard"])
+        let link = AgentLink(events: EventBuffer(), isRunning: { true }, endpoint: { (agent.port, nil) })
+        let adopted = await link.agent(timeout: .seconds(30))
+        let held = try XCTUnwrap(adopted)
+        await link.drop(only: AgentClient())
+        let kept = await link.agent(timeout: .zero)
+        XCTAssertTrue(kept === held)
+        await link.drop(only: held)
+        let dropped = await link.agent(timeout: .zero)
+        XCTAssertNil(dropped)
+    }
+
     func testLinkDoesNotAdoptAConnectionBegunBeforeADrop() async throws {
         let stale = fakeAgent(caps: ["stale"]), current = fakeAgent(caps: ["current"])
         let latch = Latch()

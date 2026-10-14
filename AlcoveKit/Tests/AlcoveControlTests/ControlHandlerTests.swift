@@ -175,6 +175,13 @@ actor FakeTarget: VMTarget {
         }
         return connectingAgent ? .connecting : .notConnected
     }
+    /// One entry per `dropAgent` call: whether it dropped the agent.
+    var drops: [Bool] = []
+    func dropAgent(_ only: AgentClient?) async {
+        let dropped = agentClient != nil && (only == nil || only === agentClient)
+        drops.append(dropped)
+        if dropped { setAgent(nil) }
+    }
     func setAgent(_ a: AgentClient?) {
         agentClient = a
         eventFeed?.cancel()

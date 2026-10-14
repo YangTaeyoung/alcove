@@ -37,6 +37,8 @@ public protocol VMTarget: Sendable {
     /// connected. Without a connected agent one connection attempt is started in the background, as by
     /// `agent(timeout: .zero)`.
     func agentLink() async -> AgentLinkState
+    /// Drops the agent connection the target holds; with `only`, only when it is that connection.
+    func dropAgent(_ only: AgentClient?) async
     /// Makes `observer` the one receiver of every agent connection the target adopts from now on; nil removes it.
     /// The observer is called with the target and the adopted connection, and the adoption does not wait for it.
     func setAgentObserver(_ observer: (@Sendable (any VMTarget, AgentClient) async -> Void)?) async
@@ -214,6 +216,12 @@ actor AgentLink {
         await dropped?.disconnect()
     }
 
+    /// Drops the client when it is `only`.
+    func drop(only: AgentClient) async {
+        guard client === only else { return }
+        await drop()
+    }
+
     /// The cached client when it is connected. A cached client found disconnected is forgotten, unless another
     /// caller replaced it while it was asked.
     private func connected() async -> AgentClient? {
@@ -358,6 +366,9 @@ public actor ControllerTarget: VMTarget {
 
     public func agent(timeout: Duration) async -> AgentClient? { await link.agent(timeout: timeout) }
     public func agentLink() async -> AgentLinkState { await link.state() }
+    public func dropAgent(_ only: AgentClient?) async {
+        if let only { await link.drop(only: only) } else { await link.drop() }
+    }
     public func setAgentObserver(_ observer: (@Sendable (any VMTarget, AgentClient) async -> Void)?) async {
         guard let observer else {
             await link.setObserver(nil)
