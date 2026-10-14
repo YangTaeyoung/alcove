@@ -796,6 +796,44 @@ final class ControlHTTPTests: XCTestCase {
                        + "not reachable; call vm.http.stop again once vm.status shows tools")
     }
 
+    func testStopOfAPausedOrStoppedVMNamesTheNextStep() async throws {
+        let c = try await capture(vmPoll: .seconds(3600))
+        _ = try await c.start()
+        await c.t.setState(.paused)
+        let paused = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertEqual(paused["warning"]?.stringValue, "the guest keeps the capture's proxy settings and CA certificate because the VM is paused; "
+                       + "call vm.resume, then vm.http.stop again")
+        let stale = await c.failure("vm.http.stop")
+        XCTAssertEqual(stale, "'Win' is not capturing, and what an earlier capture left in its guest cannot be restored while the VM is paused; "
+                       + "call vm.resume, then vm.http.stop again")
+
+        await c.t.setState(.running)
+        _ = try await c.start()
+        await c.t.setState(.stopping)
+        let stopping = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertEqual(stopping["warning"]?.stringValue, "the guest keeps the capture's proxy settings and CA certificate because the VM is not "
+                       + "running; Alcove restores them when its guest tools next connect")
+        await c.t.setState(.stopped)
+        let stopped = await c.failure("vm.http.stop")
+        XCTAssertEqual(stopped, "'Win' is not capturing, and what an earlier capture left in its guest cannot be restored while the VM is not "
+                       + "running; Alcove restores it when its guest tools next connect")
+    }
+
+    func testAStaleCleanupRemovesOnlyTheEntryItRestored() async throws {
+        let c = try await capture()
+        let first = CaptureJournal.Entry(vm: "Win", port: 49152, thumbprint: caThumbprint, systemProxy: true, since: "first")
+        let later = CaptureJournal.Entry(vm: "Win", port: 49153, thumbprint: otherThumbprint, systemProxy: true, since: "later")
+        try c.journal.record(first, now: Date())
+        let journal = c.journal
+        c.onStep.value = { step in
+            if step == "recipe.removeCA" { try? journal.record(later, now: Date()) }
+        }
+        let agent = try await newConnection(c)
+        let cleaned = await c.h.staleCleanup(c.t, agent).value
+        XCTAssertTrue(cleaned)
+        XCTAssertEqual(c.journal.entry(for: "Win"), later)
+    }
+
     func testStopWithoutACapture() async throws {
         let c = try await capture()
         let text = await c.failure("vm.http.stop")
@@ -926,6 +964,14 @@ final class ControlHTTPTests: XCTestCase {
         let doctor = try await c.h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(check(doctor, "proxy")?["ok"]?.boolValue, true)
         XCTAssertEqual(check(doctor, "proxy")?["detail"]?.stringValue, "system proxy proxy.corp.example:8080")
+    }
+
+    func testDoctorNamesAWinHTTPProxyAtTheHostAddressWithoutAStateFile() async throws {
+        let c = try await capture()
+        c.outputs.value["recipe.readProxy"] = guestProxy(winhttp: 50000)
+        let doctor = try await c.h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(doctor, "proxy"), ["id": "proxy", "ok": true,
+                                                "detail": "WinHTTP proxy 10.0.2.2:50000 (not set by Alcove; if a capture left it, change it by hand)"])
     }
 
     func testDoctorProxyRowWhenTheGuestCannotBeRead() async throws {

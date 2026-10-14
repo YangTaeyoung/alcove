@@ -1886,7 +1886,12 @@ and returns `{exchanges}`, the number of exchanges since the start. The
 captured exchanges and rules are discarded; read them first. When a guest step
 fails or the guest tools are not reachable, the capture still ends on the
 host and `warning` says what the guest keeps; a second `vm.http.stop` then
-clears it.
+clears it. Without a restore the warning reads `the guest keeps the capture's
+proxy settings and CA certificate because <why>`, the reason and next step
+being `its guest tools are not reachable; call vm.http.stop again once
+vm.status shows tools`, `the VM is paused; call vm.resume, then vm.http.stop
+again` or `the VM is not running; Alcove restores them when its guest tools
+next connect`.
 
 The restore puts back exactly the values the state file recorded, and only
 while `ProxyServer` is still `10.0.2.2:<port of the state file>` (the WinHTTP
@@ -1907,7 +1912,10 @@ in the guest (the state file, the journal's entry, the CA file) and answers
 capturing; call vm.http.start first`. Its guest tools get 5 s to connect; with
 an entry in the journal and no tools it answers `'<vm>' is not capturing, and
 what an earlier capture left in its guest cannot be restored while its guest
-tools are not reachable; call vm.http.stop again once vm.status shows tools`.
+tools are not reachable; call vm.http.stop again once vm.status shows tools`
+(`… while the VM is paused; call vm.resume, then vm.http.stop again` for a
+paused VM, `… while the VM is not running; Alcove restores it when its guest
+tools next connect` for a VM that does not run).
 
 A state file that cannot be read (a read is tried three times, 200 ms apart)
 is never changed or deleted. Every step that needs it, `vm.http.start` among
@@ -2004,7 +2012,9 @@ the system proxy points at another port: hint `call vm.http.stop, then
 vm.http.start`; `the capture through 10.0.2.2:<port> is broken: <reason>`
 with that hint when the proxy ended on its own); `no system proxy` or `system proxy <server>` when nothing of
 a capture is left, with ` (not set by Alcove; if a capture left it, change it
-by hand)` for a server at `10.0.2.2:<port>` without a state file. It is not ok
+by hand)` for a server at `10.0.2.2:<port>` without a state file, and
+`WinHTTP proxy 10.0.2.2:<port>` with that note when only the WinHTTP proxy
+points there. It is not ok
 with the hint `vm.http.stop clears stale proxy settings` when no capture runs
 but the system proxy still points at the port the state file records, the
 state file is still there, the CA is still installed, or the state file cannot

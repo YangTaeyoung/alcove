@@ -130,8 +130,8 @@ extension ControlHandler {
         }
     }
 
-    /// Whether a capture goes on while its VM is in `state`: the engine process runs. In the other states it has
-    /// ended or is not started yet, so the capture belongs to an engine that is gone.
+    /// Whether a capture goes on while its VM is in `state`: true for the states in which the engine process the
+    /// capture started with runs.
     static func keepsCapture(_ state: VMController.State) -> Bool {
         switch state {
         case .running, .paused, .suspending, .stopping: return true
@@ -239,7 +239,7 @@ extension ControlHandler {
                 } catch {
                     let undone = await restoreGuest(t, agent, os: os, thumbprint: thumbprint, op: "vm.http.start", limit: httpTiming.undo)
                     guard undone.failure != nil else {
-                        try? captureJournal.remove(vm: capture.owner, now: wallClock())
+                        try? captureJournal.remove(capture.journalEntry, now: wallClock())
                         throw error
                     }
                     let reason = ControlHandler.failureReason(error, fallback: "")
@@ -387,19 +387,29 @@ extension ControlHandler {
         if let newest = try? await capture.proxy.call("list", ["limit": 1]) { exchanges = newest["next"]?.intValue ?? 0 }
         var warnings: [String] = []
         if capture.guestChanged {
-            if await t.state() == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.toolsWait) {
+            let state = await t.state()
+            if state == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.toolsWait) {
                 let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
-                if let failure = restored.failure { warnings.append(failure) } else { try? captureJournal.remove(vm: capture.owner, now: wallClock()) }
+                if let failure = restored.failure { warnings.append(failure) } else { try? captureJournal.remove(capture.journalEntry, now: wallClock()) }
                 if let warning = restored.warning { warnings.append(warning) }
             } else {
-                warnings.append("the guest keeps the capture's proxy settings and CA certificate because its guest tools are not reachable; "
-                                + "call vm.http.stop again once vm.status shows tools")
+                warnings.append(ControlHandler.unreachableGuestWarning(state))
             }
         }
         await endCapture(vm, id: capture.id)
         var out: [String: JSON] = ["exchanges": .int(Int64(exchanges))]
         if !warnings.isEmpty { out["warning"] = .string(warnings.joined(separator: "; ")) }
         return .object(out)
+    }
+
+    /// The warning of a `vm.http.stop` that ended a capture without restoring its guest, whose VM is in `state`.
+    static func unreachableGuestWarning(_ state: VMController.State) -> String {
+        let kept = "the guest keeps the capture's proxy settings and CA certificate because"
+        switch state {
+        case .paused: return "\(kept) the VM is paused; call vm.resume, then vm.http.stop again"
+        case .running: return "\(kept) its guest tools are not reachable; call vm.http.stop again once vm.status shows tools"
+        default: return "\(kept) the VM is not running; Alcove restores them when its guest tools next connect"
+        }
     }
 
     /// `vm.http.stop` for a VM without a capture: clears what an earlier capture left in the guest.
@@ -409,14 +419,17 @@ extension ControlHandler {
         lostCaptures[vm] = nil
         let owner = await journalVM(t)
         let recorded = captureJournal.entry(for: owner)
-        guard await t.state() == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.staleToolsWait) else {
+        let state = await t.state()
+        guard state == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.staleToolsWait) else {
             guard recorded != nil else { throw ControlError.failed(notCapturing) }
-            throw ControlError.failed("'\(vm)' is not capturing, and what an earlier capture left in its guest cannot be restored while its guest "
-                                      + "tools are not reachable; call vm.http.stop again once vm.status shows tools")
+            let why = state == .paused ? "while the VM is paused; call vm.resume, then vm.http.stop again"
+                : state == .running ? "while its guest tools are not reachable; call vm.http.stop again once vm.status shows tools"
+                : "while the VM is not running; Alcove restores it when its guest tools next connect"
+            throw ControlError.failed("'\(vm)' is not capturing, and what an earlier capture left in its guest cannot be restored \(why)")
         }
         let stale = await restoreGuest(t, agent, os: await t.guestOS(), thumbprint: recorded?.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
         if let failure = stale.failure { throw ControlError.failed(failure) }
-        try? captureJournal.remove(vm: owner, now: wallClock())
+        if let recorded { try? captureJournal.remove(recorded, now: wallClock()) }
         guard stale.cleared else { throw ControlError.failed(notCapturing) }
         var out: [String: JSON] = ["exchanges": 0, "staleCleared": true]
         if let warning = stale.warning { out["warning"] = .string(warning) }
@@ -492,8 +505,8 @@ extension ControlHandler {
     /// Called after the app restored `snapshot` of `vm` without the control protocol. Drops the control target's agent
     /// connection, ends a live capture of the VM and makes the snapshot's note the VM's entry, as `vm.snapshot.restore`
     /// does; when the VM then has an entry, the control target connects its tools, and that connection starts the cleanup.
-    /// A task that is not awaited also waits up to `HTTPTiming.toolsWait` for a tools connection, so that a connection
-    /// adopted after the first attempt ended starts the cleanup as well.
+    /// A task that is not awaited also waits up to `HTTPTiming.toolsWait` for a tools connection; a connection it adopts
+    /// starts the cleanup as every adopted connection does.
     public func snapshotRestored(vm: String, snapshot: String) async {
         guard let t = await lookUp(vm) else { return }
         await t.dropAgent(nil)
@@ -634,7 +647,7 @@ extension ControlHandler {
             log(ControlHandler.cleanupFailureLine(vm: vm, restored.failures))
             return StaleOutcome(unanswered: restored.unanswered)
         }
-        try? captureJournal.remove(vm: owner, now: wallClock())
+        try? captureJournal.remove(entry, now: wallClock())
         return StaleOutcome(cleaned: restored.cleared)
     }
 
@@ -673,7 +686,7 @@ extension ControlHandler {
         }
         let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: op, limit: limit ?? httpTiming.undo)
         if let failure = restored.failure { return failure }
-        try? captureJournal.remove(vm: capture.owner, now: wallClock())
+        try? captureJournal.remove(capture.journalEntry, now: wallClock())
         return nil
     }
 
@@ -819,8 +832,12 @@ extension ControlHandler {
             return check("proxy", false, "no capture is running, but " + left.joined(separator: " and "),
                          hint: "vm.http.stop clears stale proxy settings")
         }
-        guard enabled else { return check("proxy", true, "no system proxy") }
-        let foreign = ControlHandler.capturePort(in: server) != nil ? " (not set by Alcove; if a capture left it, change it by hand)" : ""
+        let byHand = " (not set by Alcove; if a capture left it, change it by hand)"
+        guard enabled else {
+            guard let port = read["winhttpPort"]?.intValue, port > 0 else { return check("proxy", true, "no system proxy") }
+            return check("proxy", true, "WinHTTP proxy \(host):\(port)\(byHand)")
+        }
+        let foreign = ControlHandler.capturePort(in: server) != nil ? byHand : ""
         return check("proxy", true, "system proxy \(server)\(foreign)")
     }
 

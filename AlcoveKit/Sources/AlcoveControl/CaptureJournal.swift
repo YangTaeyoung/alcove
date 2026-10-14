@@ -116,6 +116,12 @@ struct CaptureJournal: Sendable {
         try change(now: now) { $0.captures.removeAll { $0.belongs(to: vm) } }
     }
 
+    /// Removes `entry` when the file holds it as it is; an entry of its VM that differs stays.
+    func remove(_ entry: Entry, now: Date) throws {
+        guard read()?.captures.contains(entry) == true else { return }
+        try change(now: now) { $0.captures.removeAll { $0 == entry } }
+    }
+
     /// Notes that `snapshot` was created during the capture `entry` describes, in place of an earlier note for that
     /// snapshot name of its VM.
     func noteSnapshot(_ snapshot: String, during entry: Entry, now: Date) throws {
