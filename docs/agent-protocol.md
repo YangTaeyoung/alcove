@@ -183,10 +183,11 @@ The other refusals before `authed`:
 | Case | `error` |
 |---|---|
 | `auth` with a wrong or malformed `signature` | `the host's signature does not match this VM's alcove-hostkey and alcove-token; restart the VM with Alcove so the guest reads the key and token in its config.json` |
-| no `auth` within 30 s of the hello | `no auth message arrived within 30 s; the host authenticates right after the hello` |
+| no `auth` within 10 s of the hello | `no auth message arrived within 10 s; the host authenticates right after the hello` |
 | a line longer than 64 KiB before `authed` | `a line before auth is longer than 65536 bytes; the host sends only auth before authed` |
-| 16 other connections are between their hello and `authed` | `16 connections are authenticating; connect again when one of them ended` (sent instead of the hello) |
+| the connection was the oldest of 16 between their hello and `authed` when another one connected | `this connection was closed for a newer one because 16 connections were authenticating; the host authenticates right after the hello` |
 | no random nonce could be read | none: the connection closes after a log line |
+| the connection fails before `authed` (a reset, for example) | none; the failure is written to the log like a refusal |
 
 **What it does not prevent.** The host authenticates to the agent; the
 agent does not authenticate to the host. A guest program that listens on
@@ -196,12 +197,19 @@ nonces under this VM's token: no agent of another VM accepts them, and the
 agent of this VM accepts none of them, because every connection to it has a
 new nonce.
 
+The agent keeps at most 16 connections between their hello and `authed`; a
+new connection closes the oldest of them, and each has 10 s to send `auth`.
+A guest program that opens connections faster than the host completes its
+handshake (one round trip) can still close the host's pending handshake, and
+the host then connects again; the agent does not tell such a program from
+the host before its signature arrives.
+
 **Agent log.** The agent writes a served connection to its log as
 `connection from <address>` once it is served (after `authed`), and a
 refused one as `refused the connection from <address>: <sentence>`. Each
 reason of a refusal (the address check, a missing host key, a wrong
-signature, a message other than `auth`, the 30 s deadline, a long line,
-the handshake limit) is written at most once per minute, with the address
+signature, a message other than `auth`, the 10 s deadline, a long line,
+the handshake limit, a connection that failed before `authed`) is written at most once per minute, with the address
 and sentence of the connection it writes; refusals for the address check
 from different addresses count as one reason. The next line written for a
 reason ends with `(<n> more refused for this reason since the last line)`
@@ -1018,9 +1026,9 @@ agent sends one event per difference, each with the window object:
 | Refs kept by a helper | 20000; beyond that the least recently used half is forgotten |
 | Waiting for the helper | 60 s per request |
 | One `res` line written by the agent | under 8 MiB minus 64 KiB; a larger answer is replaced by `the answer to '<op>' is larger than the 8 MiB line the host reads; ask for less (a lower max, depth or limit, a narrower path or a name filter)` |
-| Time from the hello to `auth` | 30 s, then `refused` |
+| Time from the hello to `auth` | 10 s, then `refused` |
 | One line read before `authed` | 64 KiB (65536 bytes); a longer line is refused |
-| Connections between their hello and `authed` | 16; one more is refused before its hello |
+| Connections between their hello and `authed` | 16; one more closes the oldest of them with `refused` |
 | Requests running at once on one connection | 256; one more answers `256 requests are running on this connection; wait for an answer before sending another` without running |
 
 The host reads lines of up to 8 MiB and does not send a `req` longer than

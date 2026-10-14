@@ -245,7 +245,7 @@ func TestASignatureOfAnEarlierConnectionIsRefused(t *testing.T) {
 	replay.expectRefusedAndClosed(t, errAuthMismatch)
 }
 
-func TestAPairOfAnEarlierHostIsRefusedAsUnauthenticated(t *testing.T) {
+func TestAPairMessageIsRefusedAsUnauthenticated(t *testing.T) {
 	a := startAuthServer(t, Options{})
 	c := a.dial()
 	c.send(t, proto.Message{"t": "pair", "publicKey": hex.EncodeToString(testKey)})
@@ -365,31 +365,32 @@ func TestALineOf64KiBBeforeAuthAndALongerOneAfterAuthAreRead(t *testing.T) {
 	}
 }
 
-func TestAtMost16ConnectionsAuthenticateAtOnce(t *testing.T) {
+func TestAHostThatSignsAtOnceIsAuthedWhile16IdleHandshakesAreOpen(t *testing.T) {
 	a := startAuthServer(t, Options{})
-	waiting := make([]*authConn, 0, maxHandshakes)
+	idle := make([]*authConn, 0, maxHandshakes)
 	for i := 0; i < maxHandshakes; i++ {
-		waiting = append(waiting, a.dial())
+		idle = append(idle, a.dial())
 	}
-	a.open().expectRefusedAndClosed(t, errHandshakesBusy)
+	for round := 0; round < 3; round++ {
+		c := a.dial()
+		c.authenticate(t)
+		c.ping(t)
+		idle[round].expectRefusedAndClosed(t, errHandshakeReplaced)
+		idle = append(idle, a.dial())
+	}
+	for _, c := range idle[3 : maxHandshakes-1] {
+		c.authenticate(t)
+	}
+}
 
-	waiting[0].authenticate(t)
-	waiting[1].c.Close()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		c := a.open()
-		m := c.next(t)
-		if m.Type() == "hello" {
-			c.hello = m
-			c.authenticate(t)
-			c.ping(t)
-			break
-		}
-		if m.String("error") != errHandshakesBusy || time.Now().After(deadline) {
-			t.Fatalf("after two handshakes ended: %v", m)
-		}
-		time.Sleep(10 * time.Millisecond)
+func TestAServedConnectionIsNotClosedForANewerHandshake(t *testing.T) {
+	a := startAuthServer(t, Options{})
+	served := a.dial()
+	served.authenticate(t)
+	for i := 0; i < maxHandshakes+2; i++ {
+		a.dial()
 	}
+	served.ping(t)
 }
 
 func TestAnUnauthenticatedServerSendsAHelloWithoutAuth(t *testing.T) {

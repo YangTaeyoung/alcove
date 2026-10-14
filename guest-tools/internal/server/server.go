@@ -82,9 +82,8 @@ type Server struct {
 	conns  map[*conn]struct{}
 	jobs   *jobTable
 
-	// handshakes holds one entry for each connection between its hello and
-	// authed.
-	handshakes chan struct{}
+	// handshakes holds the connections between their hello and authed.
+	handshakes handshakeQueue
 	// deployMu orders the creations of the deploy root.
 	deployMu sync.Mutex
 
@@ -112,8 +111,7 @@ func New(opt Options) *Server {
 	if opt.HomeDir == "" {
 		opt.HomeDir, _ = os.UserHomeDir()
 	}
-	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable(),
-		handshakes: make(chan struct{}, maxHandshakes)}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable()}
 	s.registerBuiltins()
 	return s
 }

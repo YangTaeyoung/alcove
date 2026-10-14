@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -23,21 +24,22 @@ const authContext = "alcove-agent-auth-v2"
 
 // defaultAuthTimeout is how long a connection may take from the hello to its
 // auth message.
-const defaultAuthTimeout = 30 * time.Second
+const defaultAuthTimeout = 10 * time.Second
 
 // preAuthLineMax bounds a line the agent reads before authed.
 const preAuthLineMax = 64 << 10
 
-// maxHandshakes bounds the connections between their hello and authed.
+// maxHandshakes bounds the connections between their hello and authed; a
+// newer one closes the oldest.
 const maxHandshakes = 16
 
 const (
-	errNoHostKey       = "this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later"
-	errAuthMismatch    = "the host's signature does not match this VM's alcove-hostkey and alcove-token; restart the VM with Alcove so the guest reads the key and token in its config.json"
-	errUnauthenticated = "this alcove-agent serves only a host that proves the VM's key; update the Alcove app on the host"
-	errAuthTimeout     = "no auth message arrived within 30 s; the host authenticates right after the hello"
-	errPreAuthLine     = "a line before auth is longer than 65536 bytes; the host sends only auth before authed"
-	errHandshakesBusy  = "16 connections are authenticating; connect again when one of them ended"
+	errNoHostKey         = "this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later"
+	errAuthMismatch      = "the host's signature does not match this VM's alcove-hostkey and alcove-token; restart the VM with Alcove so the guest reads the key and token in its config.json"
+	errUnauthenticated   = "this alcove-agent serves only a host that proves the VM's key; update the Alcove app on the host"
+	errAuthTimeout       = "no auth message arrived within 10 s; the host authenticates right after the hello"
+	errPreAuthLine       = "a line before auth is longer than 65536 bytes; the host sends only auth before authed"
+	errHandshakeReplaced = "this connection was closed for a newer one because 16 connections were authenticating; the host authenticates right after the hello"
 )
 
 // refusalReason names the kind of a refusal; the refusal log counts by it.
@@ -50,7 +52,8 @@ const (
 	reasonUnauthenticated refusalReason = "unauthenticated"
 	reasonTimeout         refusalReason = "timeout"
 	reasonLongLine        refusalReason = "long line"
-	reasonBusy            refusalReason = "busy"
+	reasonReplaced        refusalReason = "replaced"
+	reasonReadError       refusalReason = "read error"
 )
 
 // hostSigned reports whether signatureText is the hex Ed25519 signature by
@@ -128,15 +131,45 @@ func (l *lineLimit) lift() {
 	l.max = 0
 }
 
-// handshakeSlot takes one of the maxHandshakes places; it reports false when
-// all are taken.
-func (s *Server) handshakeSlot() bool {
-	select {
-	case s.handshakes <- struct{}{}:
-		return true
-	default:
-		return false
+// pendingHandshake is a connection between its hello and authed.
+type pendingHandshake struct {
+	c        net.Conn
+	replaced bool
+}
+
+// handshakeQueue holds the pending handshakes, oldest first.
+type handshakeQueue struct {
+	mu      sync.Mutex
+	entries []*pendingHandshake
+}
+
+// join adds c. When maxHandshakes are pending, the oldest is marked replaced
+// and its read deadline is set in the past, which ends its wait for auth.
+func (q *handshakeQueue) join(c net.Conn) *pendingHandshake {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.entries) >= maxHandshakes {
+		oldest := q.entries[0]
+		q.entries = q.entries[1:]
+		oldest.replaced = true
+		_ = oldest.c.SetReadDeadline(time.Unix(1, 0))
 	}
+	p := &pendingHandshake{c: c}
+	q.entries = append(q.entries, p)
+	return p
+}
+
+// leave removes p and reports whether a newer handshake replaced it.
+func (q *handshakeQueue) leave(p *pendingHandshake) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, e := range q.entries {
+		if e == p {
+			q.entries = append(q.entries[:i], q.entries[i+1:]...)
+			break
+		}
+	}
+	return p.replaced
 }
 
 // handshake writes the hello and, unless the server is Unauthenticated, reads
@@ -164,10 +197,13 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 	if !s.keyed() {
 		return refuse(reasonNoHostKey, errNoHostKey)
 	}
-	if !s.handshakeSlot() {
-		return refuse(reasonBusy, errHandshakesBusy)
-	}
-	defer func() { <-s.handshakes }()
+	pending := s.handshakes.join(c)
+	served := false
+	defer func() {
+		if !served {
+			s.handshakes.leave(pending)
+		}
+	}()
 	nonce := make([]byte, NonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		s.opt.Logger.Printf("refused the connection from %s: no random nonce: %v", c.RemoteAddr(), err)
@@ -187,9 +223,13 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 			case errors.Is(err, errLongLine):
 				return refuse(reasonLongLine, errPreAuthLine)
 			case errors.As(err, &ne) && ne.Timeout():
+				if s.handshakes.leave(pending) {
+					_ = c.SetReadDeadline(time.Time{})
+					return refuse(reasonReplaced, errHandshakeReplaced)
+				}
 				return refuse(reasonTimeout, errAuthTimeout)
 			case err != io.EOF:
-				s.opt.Logger.Printf("read before authentication: %v", err)
+				s.refusals.write(s.opt.Logger, reasonReadError, c.RemoteAddr(), fmt.Sprintf("the connection failed before auth (%v)", err))
 			}
 			return false
 		}
@@ -206,6 +246,8 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 			}
 			return refuse(reasonUnauthenticated, errUnauthenticated)
 		}
+		s.handshakes.leave(pending)
+		served = true
 		_ = c.SetReadDeadline(time.Time{})
 		limit.lift()
 		return write(proto.Message{"t": "authed"})

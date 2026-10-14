@@ -166,3 +166,21 @@ func TestARepeatedPeerRefusalIsLoggedOncePerMinute(t *testing.T) {
 		t.Fatalf("lines %q", got)
 	}
 }
+
+func TestReadErrorsBeforeAuthAreLoggedOncePerMinute(t *testing.T) {
+	var logs logBuffer
+	a := startAuthServer(t, Options{Logger: log.New(&logs, "", 0)})
+	for i := 0; i < 20; i++ {
+		c := a.dial()
+		c.c.(*net.TCPConn).SetLinger(0)
+		c.c.Close()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(logs.lines("before auth")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := logs.lines("before auth"); len(got) != 1 {
+		t.Fatalf("20 resets before auth gave %d lines: %q", len(got), got)
+	}
+}
