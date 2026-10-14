@@ -280,6 +280,9 @@ func (s *Server) handle(c net.Conn) {
 				continue
 			}
 			data, err := base64.StdEncoding.DecodeString(m.String("data"))
+			if err == nil && len(data) > fsChunkMax {
+				err = fmt.Errorf("a file.chunk carries at most %d bytes; send smaller chunks", fsChunkMax)
+			}
 			if err == nil {
 				_, err = x.f.Write(data)
 				x.h.Write(data)

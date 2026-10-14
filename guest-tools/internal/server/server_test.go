@@ -145,6 +145,22 @@ func TestHelloClipboardAndFiles(t *testing.T) {
 	expect(t, r, "pong")
 }
 
+func TestFileChunkOverOnePieceEndsThePush(t *testing.T) {
+	home := t.TempDir()
+	r, w, c := startServer(t, Options{Token: "tok", Clipboard: &fakeClipboard{}, HomeDir: home})
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	expect(t, r, "hello")
+	send(t, w, proto.Message{"t": "file.begin", "id": "f1", "name": "big.bin", "size": 262145, "dest": "desktop"})
+	send(t, w, proto.Message{"t": "file.chunk", "id": "f1", "data": base64.StdEncoding.EncodeToString(make([]byte, 262145))})
+	done := expect(t, r, "file.done")
+	if done.String("id") != "f1" || done.String("error") != "a file.chunk carries at most 262144 bytes; send smaller chunks" {
+		t.Fatalf("file.done %v", done)
+	}
+	if _, err := os.Stat(filepath.Join(home, "Desktop", "big.bin")); err == nil {
+		t.Fatal("the file was kept")
+	}
+}
+
 // closingUI records Close calls.
 type closingUI struct {
 	fakeUI

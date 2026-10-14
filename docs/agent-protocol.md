@@ -763,7 +763,12 @@ agent sends one event per difference, each with the window object:
 - `fs.write` creates the file when needed. With `append` the bytes go to the
   end and `offset` is not used; otherwise they are written at `offset`, after
   emptying the file when `truncate` is set. A missing parent directory is an
-  error unless `mkdirs` is set.
+  error unless `mkdirs` is set. It refuses, before opening the file, more
+  than 262144 bytes of `data`
+  (`data is <n> bytes; fs.write takes at most 262144 bytes, so write the rest with further calls`),
+  `append` together with `truncate` (`pass append or truncate, not both`) and
+  an `offset` past the end of the file, counted after `truncate`
+  (`offset <n> lies past the end of '<path>' (<size> bytes); write from offset <size> or lower`).
 - `fs.rename` fails when `to` exists unless `overwrite` is set, and never
   replaces a directory. `fs.mkdir` creates missing parents and succeeds for an
   existing directory.
@@ -780,7 +785,7 @@ agent sends one event per difference, each with the window object:
 | What | Limit |
 |---|---|
 | One message read by the agent (a line with its newline) | 1 MiB (`proto.MaxLine`); a longer line closes the connection |
-| Binary payload of one `fs.read` / `fs.write` / `file.chunk` | 256 KiB (262144 bytes) before base64 |
+| Binary payload of one `fs.read` / `fs.write` / `file.chunk` | 256 KiB (262144 bytes) before base64; a larger `fs.write` is refused and a larger `file.chunk` ends the push with `file.done` `error` `a file.chunk carries at most 262144 bytes; send smaller chunks` |
 | `exec.run` output | last 200000 bytes per stream |
 | `exec` (v1) output | last 200000 bytes of the combined output, starting on a character boundary |
 | `exec.list` `cmd` | 4096 characters per job, then `…` |

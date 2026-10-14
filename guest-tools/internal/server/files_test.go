@@ -112,6 +112,54 @@ func TestFsWriteReadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFsWriteRefusesMoreThanOnePiece(t *testing.T) {
+	c, home := fsHome(t)
+	res := c.call("fs.write", proto.Message{"path": "big.bin", "data": b64(make([]byte, 262145))})
+	want := "data is 262145 bytes; fs.write takes at most 262144 bytes, so write the rest with further calls"
+	if res["ok"] != false || res.String("error") != want {
+		t.Fatalf("res %v", res)
+	}
+	if _, err := os.Stat(filepath.Join(home, "big.bin")); err == nil {
+		t.Fatal("the file was created")
+	}
+}
+
+func TestFsWriteRefusesAppendWithTruncate(t *testing.T) {
+	c, home := fsHome(t)
+	os.WriteFile(filepath.Join(home, "f.txt"), []byte("kept"), 0o644)
+	res := c.call("fs.write", proto.Message{"path": "f.txt", "data": b64([]byte("x")), "append": true, "truncate": true})
+	if res["ok"] != false || res.String("error") != "pass append or truncate, not both" {
+		t.Fatalf("res %v", res)
+	}
+	if got, _ := os.ReadFile(filepath.Join(home, "f.txt")); string(got) != "kept" {
+		t.Fatalf("content %q", got)
+	}
+}
+
+func TestFsWriteRefusesAnOffsetPastTheEnd(t *testing.T) {
+	c, home := fsHome(t)
+	path := filepath.Join(home, "f.txt")
+	os.WriteFile(path, []byte("abc"), 0o644)
+	res := c.call("fs.write", proto.Message{"path": "f.txt", "data": b64([]byte("x")), "offset": 4})
+	if want := fmt.Sprintf("offset 4 lies past the end of '%s' (3 bytes); write from offset 3 or lower", path); res["ok"] != false || res.String("error") != want {
+		t.Fatalf("res %v", res)
+	}
+	res = c.call("fs.write", proto.Message{"path": "f.txt", "data": b64([]byte("x")), "offset": 1, "truncate": true})
+	if want := fmt.Sprintf("offset 1 lies past the end of '%s' (0 bytes after truncate); write from offset 0", path); res["ok"] != false || res.String("error") != want {
+		t.Fatalf("res %v", res)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "abc" {
+		t.Fatalf("content %q", got)
+	}
+	if res := c.ok("fs.write", proto.Message{"path": "f.txt", "data": b64([]byte("d")), "offset": 3}); res.Int("size") != 4 {
+		t.Fatalf("res %v", res)
+	}
+	res = c.call("fs.write", proto.Message{"path": "new.txt", "data": b64([]byte("x")), "offset": 2})
+	if want := fmt.Sprintf("offset 2 lies past the end of '%s' (0 bytes); write from offset 0", filepath.Join(home, "new.txt")); res["ok"] != false || res.String("error") != want {
+		t.Fatalf("res %v", res)
+	}
+}
+
 func TestFsAppend(t *testing.T) {
 	c, home := fsHome(t)
 	c.ok("fs.write", proto.Message{"path": "log.txt", "data": b64([]byte("one,")), "append": true})

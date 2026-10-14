@@ -404,6 +404,21 @@ func lastLines(buf []byte, n int, partialFirst bool, unit int) []byte {
 	return buf[idx+unit:]
 }
 
+// pastTheEnd is the error of an fs.write whose offset lies past the end of
+// the file of size bytes, counted after truncation when truncated is set.
+func pastTheEnd(offset int64, path string, size int64, truncated bool) error {
+	after, hint := "", "0"
+	if truncated {
+		after = " after truncate"
+	}
+	if size > 0 {
+		hint = fmt.Sprintf("%d or lower", size)
+	}
+	return fmt.Errorf("offset %d lies past the end of '%s' (%d bytes%s); write from offset %s", offset, path, size, after, hint)
+}
+
+// fsWrite writes at most fsChunkMax bytes at an offset within the file or at
+// its end, or appends them.
 func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
@@ -413,9 +428,25 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 	if err != nil {
 		return nil, errors.New("data is not valid base64; send the bytes base64-encoded")
 	}
+	if len(data) > fsChunkMax {
+		return nil, fmt.Errorf("data is %d bytes; fs.write takes at most %d bytes, so write the rest with further calls", len(data), fsChunkMax)
+	}
 	offset := int64(req.Int("offset"))
 	if offset < 0 {
 		return nil, errors.New("offset must not be negative")
+	}
+	appendMode, truncate := req.Bool("append"), req.Bool("truncate")
+	if appendMode && truncate {
+		return nil, errors.New("pass append or truncate, not both")
+	}
+	if !appendMode {
+		var size int64
+		if fi, err := os.Stat(path); err == nil && !truncate {
+			size = fi.Size()
+		}
+		if offset > size {
+			return nil, pastTheEnd(offset, path, size, truncate)
+		}
 	}
 	dir := filepath.Dir(path)
 	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
@@ -427,11 +458,10 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 		}
 	}
 	flags := os.O_WRONLY | os.O_CREATE
-	appendMode := req.Bool("append")
 	switch {
 	case appendMode:
 		flags |= os.O_APPEND
-	case req.Bool("truncate"):
+	case truncate:
 		flags |= os.O_TRUNC
 	}
 	f, err := os.OpenFile(path, flags, 0o644)
