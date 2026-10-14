@@ -21,6 +21,8 @@ const (
 	handshakeTimeout = 30 * time.Second
 	dialTimeout      = 15 * time.Second
 	responseTimeout  = 120 * time.Second
+	// maxUpstreamHeaderBytes bounds the header block of an upstream response.
+	maxUpstreamHeaderBytes = 1 << 20
 )
 
 // guestHostAlias is the address a guest on the user-mode network reaches the
@@ -105,13 +107,14 @@ func (p *Proxy) upstream() *http.Transport {
 	if p.transport == nil {
 		dialer := &net.Dialer{Timeout: dialTimeout}
 		p.transport = &http.Transport{
-			Proxy:                 nil,
-			ForceAttemptHTTP2:     true,
-			DisableCompression:    true,
-			ResponseHeaderTimeout: responseTimeout,
-			TLSHandshakeTimeout:   dialTimeout,
-			MaxIdleConnsPerHost:   32,
-			IdleConnTimeout:       90 * time.Second,
+			Proxy:                  nil,
+			ForceAttemptHTTP2:      true,
+			DisableCompression:     true,
+			ResponseHeaderTimeout:  responseTimeout,
+			MaxResponseHeaderBytes: maxUpstreamHeaderBytes,
+			TLSHandshakeTimeout:    dialTimeout,
+			MaxIdleConnsPerHost:    32,
+			IdleConnTimeout:        90 * time.Second,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return dialer.DialContext(ctx, network, dialAddress(addr))
 			},

@@ -282,6 +282,9 @@ func (p *Proxy) opGet(params map[string]any) (map[string]any, error) {
 	if e.BodyDropped {
 		res["bodyDropped"] = true
 	}
+	if e.HeadersTruncated {
+		res["headersTruncated"] = true
+	}
 	if len(trailers) > 0 {
 		res["trailers"] = trailers
 	}

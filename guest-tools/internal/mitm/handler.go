@@ -78,7 +78,8 @@ func redactPairs(pairs [][2]string) [][2]string {
 	return out
 }
 
-// record stores ex, redacting secret headers unless the capture keeps them.
+// record stores ex, redacting secret headers unless the capture keeps them
+// and keeping at most maxHeaderBytes of headers.
 func (p *Proxy) record(ex *Exchange) {
 	if !p.config().secrets {
 		ex.ReqHeaders = redactPairs(ex.ReqHeaders)
@@ -86,6 +87,7 @@ func (p *Proxy) record(ex *Exchange) {
 		ex.ReqTrailers = redactPairs(ex.ReqTrailers)
 		ex.ResTrailers = redactPairs(ex.ResTrailers)
 	}
+	capHeaders(ex)
 	p.store.add(ex)
 }
 
@@ -206,8 +208,8 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 
 	untouched := authority == "" && !p.intercepts(host)
 	cfg := p.config()
-	reqCap := newCapBuf(cfg.bodies && !untouched)
-	resCap := newCapBuf(cfg.bodies && !untouched)
+	reqCap := p.store.newCapBuf(cfg.bodies && !untouched)
+	resCap := p.store.newCapBuf(cfg.bodies && !untouched)
 	ex := &Exchange{
 		Time:       start,
 		Kind:       "http",
@@ -226,6 +228,7 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		ex.Ms = time.Since(start).Milliseconds()
 		ex.ReqBody, ex.ReqBytes, ex.ReqTruncated = reqCap.snapshot()
 		ex.ResBody, ex.ResBytes, ex.ResTruncated = resCap.snapshot()
+		ex.held = ex.bodyBytes()
 		if !untouched {
 			ex.ReqTrailers = headerPairs(r.Trailer)
 		}
