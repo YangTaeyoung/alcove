@@ -22,7 +22,7 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 		Host:   authority,
 		Path:   "/",
 	}
-	up, err := net.DialTimeout("tcp", authority, dialTimeout)
+	up, err := net.DialTimeout("tcp", dialAddress(authority), dialTimeout)
 	if err != nil {
 		_, _ = io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 		ex.Status = 502

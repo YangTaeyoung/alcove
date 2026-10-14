@@ -2,6 +2,7 @@ package mitm
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -19,6 +20,21 @@ const (
 	dialTimeout      = 15 * time.Second
 	responseTimeout  = 120 * time.Second
 )
+
+// guestHostAlias is the address a guest on the user-mode network reaches the
+// host's loopback interface at.
+const guestHostAlias = "10.0.2.2"
+
+// dialAddress returns the address the proxy connects to for the upstream
+// address addr: the host's loopback with the same port when addr names the
+// host as guestHostAlias, addr itself otherwise.
+func dialAddress(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host != guestHostAlias {
+		return addr
+	}
+	return net.JoinHostPort("127.0.0.1", port)
+}
 
 // firstBytesTimeout bounds how long a new client connection may take to send
 // its first bytes and its CONNECT or request header.
@@ -76,6 +92,7 @@ func (p *Proxy) config() config {
 
 func (p *Proxy) upstream() *http.Transport {
 	p.tOnce.Do(func() {
+		dialer := &net.Dialer{Timeout: dialTimeout}
 		p.transport = &http.Transport{
 			Proxy:                 nil,
 			ForceAttemptHTTP2:     true,
@@ -84,8 +101,10 @@ func (p *Proxy) upstream() *http.Transport {
 			TLSHandshakeTimeout:   dialTimeout,
 			MaxIdleConnsPerHost:   32,
 			IdleConnTimeout:       90 * time.Second,
-			DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
-			TLSClientConfig:       &tls.Config{RootCAs: p.UpstreamRoots},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, network, dialAddress(addr))
+			},
+			TLSClientConfig: &tls.Config{RootCAs: p.UpstreamRoots},
 		}
 	})
 	return p.transport
