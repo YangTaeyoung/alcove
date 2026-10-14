@@ -412,7 +412,7 @@ final class ProxyProcessTests: XCTestCase {
         let noExchange = await proxyFailure { _ = try await proxy.call("get", ["exchange": 9, "part": "response"]) }
         XCTAssertEqual(noExchange, "no exchange with id 9; the store keeps the newest 2000 exchanges and 'clear' removes them all")
         let unknown = await proxyFailure { _ = try await proxy.call("nope", [:]) }
-        XCTAssertEqual(unknown, "unknown op 'nope'")
+        XCTAssertEqual(unknown, "unknown op 'nope'; use config, list, get, clear, rule.add, rule.list, rule.remove or rule.clear")
         _ = try await proxy.call("rule.remove", ["rule": .int(Int64(rule))])
         _ = try await proxy.call("rule.clear", [:])
         _ = try await proxy.call("clear", [:])
