@@ -19,6 +19,9 @@ final class ScriptSecretTraceTests: XCTestCase {
             switch op {
             case "exec.run":
                 return [agentReply(m, ["code": 0, "stdout": m["cmd"] ?? .null, "stderr": ""])]
+            case "ui.at":
+                return [agentReply(m, ["node": ["role": "Edit", "name": "User", "x": 10, "y": 10, "w": 80, "h": 24, "flags": ["enabled"]],
+                                       "window": ["id": "0x2a", "title": "Sign in"]])]
             default:
                 return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "no element matches role=Edit name=\"Password\""]]
             }

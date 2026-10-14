@@ -195,6 +195,8 @@ enum ScriptBuilder {
                     continue
                 }
                 switch value {
+                case .string(let text) where text == TraceSanitizer.mask:
+                    out[key] = .string("${\(maskedVariable(named: key, line: line))}")
                 case .string(let text): out[key] = .string(Script.escape(text))
                 case .object(let inner): out[key] = .object(prepared(inner, inEnv: key == "env", line: line))
                 case .array(let items): out[key] = .array(items.map { prepared(item: $0, line: line) })
@@ -204,8 +206,27 @@ enum ScriptBuilder {
             return out
         }
 
+        /// A new variable for a value the trace masks, named after `key` when that is a plain identifier, with its warning.
+        private mutating func maskedVariable(named key: String, line: String) -> String {
+            let plain = key.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil
+            let variable = newVariable(plain ? key : "secret")
+            warnings.append("\(line): the trace masks a value of '\(key)'; the step reads it from the variable '\(variable)', pass it in variables when running the script")
+            return variable
+        }
+
+        /// Whether `value` holds a string that contains the mask marker without being equal to it.
+        private func holdsMaskInside(_ value: JSON) -> Bool {
+            switch value {
+            case .string(let text): return text != TraceSanitizer.mask && text.contains(TraceSanitizer.mask)
+            case .array(let items): return items.contains(where: holdsMaskInside)
+            case .object(let fields): return fields.values.contains(where: holdsMaskInside)
+            default: return false
+            }
+        }
+
         private mutating func prepared(item: JSON, line: String) -> JSON {
             switch item {
+            case .string(let text) where text == TraceSanitizer.mask: return .string("${\(maskedVariable(named: "secret", line: line))}")
             case .string(let text): return .string(Script.escape(text))
             case .object(let inner): return .object(prepared(inner, inEnv: false, line: line))
             case .array(let items): return .array(items.map { prepared(item: $0, line: line) })
@@ -328,11 +349,16 @@ enum ScriptBuilder {
                 leaveOut(line, "the trace holds only the first \(TraceSanitizer.maxStringLength) characters of '\(cut)'; add the step by hand with the full value")
                 return
             }
+            if let key = params.keys.sorted().first(where: { holdsMaskInside(params[$0] ?? .null) }) {
+                warnings.append("step \(pending.count + 1) (\(op)) holds a masked value inside \"\(key)\"; write the step by hand with a variable")
+                leftOut = true
+                return
+            }
             if let id = sessionID(op: op, params: params) {
                 warnings.append("\(line): its \(id) belongs to the recorded session and a replay gets another one; change the step by hand")
             }
             if let param = ControlHandler.writtenTextParam(op: op), item.step.params[param]?.stringValue != nil,
-               (item.step.params[param]?.stringValue == TraceSanitizer.mask && entry["target"] == nil)
+               item.step.params[param]?.stringValue == TraceSanitizer.mask
                 || (op == "vm.type" ? passwordAimed : entry["target"]?["password"]?.boolValue == true || ControlHandler.isPasswordNode(entry["result"]?["node"])) {
                 let variable = newVariable("password")
                 item.secret = (param, variable)
@@ -340,6 +366,7 @@ enum ScriptBuilder {
                 warnings.append("\(line): its \(param) goes into a password field and is not written to the script; the step reads it from the variable '\(variable)', pass it in variables when running the script")
             }
             item.subject = subject(of: item.step, element: item.element)
+            if let secret = item.secret { item.step.params[secret.param] = nil }
             item.step.params = prepared(item.step.params, inEnv: false, line: line)
             if let shown, let previous = foreground, ScriptBuilder.stablePart(ofTitle: shown) != previous {
                 item.step.expect = [["type": "window_title", "contains": .string(Script.escape(ScriptBuilder.stablePart(ofTitle: shown)))]]

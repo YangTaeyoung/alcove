@@ -117,6 +117,13 @@ extension ControlHandler {
             let reason = ControlHandler.failureReason(error, fallback: "a step is not valid")
             throw ControlError.failed("the trace does not make a script that script.run accepts: \(reason)\(source); save another part of the trace with from and to")
         }
+        if String(decoding: data, as: UTF8.self).contains(TraceSanitizer.mask) {
+            let held = draft.script.steps.firstIndex { step in
+                (try? step.json.serialized()).map { String(decoding: $0, as: UTF8.self).contains(TraceSanitizer.mask) } ?? false
+            }
+            let step = held.map { "step \($0 + 1) (\(draft.script.steps[$0].label ?? draft.script.steps[$0].op))" } ?? "a step"
+            throw ControlError.failed("\(step) still holds the mask marker '\(TraceSanitizer.mask)' of the trace; write that step by hand with a variable and save the other steps with from and to")
+        }
         guard data.count <= ScriptLimits.fileBytes else {
             throw ControlError.failed("the script would be larger than 4 MiB, the most script.run reads; save a part of the trace with from and to")
         }

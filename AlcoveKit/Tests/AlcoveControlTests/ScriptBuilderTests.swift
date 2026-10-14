@@ -520,25 +520,26 @@ final class ScriptBuilderTests: XCTestCase {
             ["selector": byID, "action": "set_value", "value": "${password4}"],
             ["selector": byID, "text": "${password5}"],
             ["selector": byID, "action": "set_value", "value": "${password6}"],
-            ["text": "<masked>ada"],
-            ["selector": byID, "fallback": ["x": 190, "y": 112]],
             ["text": "${password7}"],
+            ["text": "ada"],
+            ["selector": byID, "fallback": ["x": 190, "y": 112]],
             ["text": "${password8}"],
+            ["text": "${password9}"],
             ["selector": ["window": "Sign in", "role": "Edit", "name": "User"], "fallback": ["x": 190, "y": 112]],
             ["text": "bob"],
-            ["command": "x", "env": ["password": "${password9}", "DB_PASSWORD": "${DB_PASSWORD}"]],
+            ["command": "x", "env": ["password": "${password10}", "DB_PASSWORD": "${DB_PASSWORD}"]],
             ["selector": byID],
-            ["text": "${password10}"],
+            ["text": "${password11}"],
         ])
         XCTAssertEqual(script.steps.map(\.label), [
             "vm.key.press tab", "vm.type into a password field", "vm.type into a password field", "vm.ui.type Edit #pw",
-            "vm.ui.action set_value Edit #pw", "vm.ui.type Edit #pw", "vm.ui.action set_value Edit #pw", "vm.type \"<masked>ada\"", "vm.ui.click Edit #pw",
+            "vm.ui.action set_value Edit #pw", "vm.ui.type Edit #pw", "vm.ui.action set_value Edit #pw", "vm.type into a password field", "vm.type \"ada\"", "vm.ui.click Edit #pw",
             "vm.type into a password field", "vm.type into a password field", "vm.ui.click Edit \"User\"", "vm.type \"bob\"", "vm.exec x",
             "vm.ui.click Edit #pw", "vm.type into a password field",
         ])
         XCTAssertEqual(script.variables, [:])
         XCTAssertEqual(draft.required, ["password", "password2", "password3", "password4", "password5", "password6", "password7", "password8",
-                                        "DB_PASSWORD", "password9", "password10"])
+                                        "password9", "DB_PASSWORD", "password10", "password11"])
         func reads(_ line: String, _ param: String, _ variable: String) -> String {
             "\(line): its \(param) goes into a password field and is not written to the script; the step reads it from the variable '\(variable)', "
                 + "pass it in variables when running the script"
@@ -547,10 +548,11 @@ final class ScriptBuilderTests: XCTestCase {
             reads("seq 2 (vm.type)", "text", "password"), reads("seq 3 (vm.type)", "text", "password2"),
             reads("seq 4 (vm.ui.type)", "text", "password3"), reads("seq 5 (vm.ui.action)", "value", "password4"),
             reads("seq 6 (vm.ui.type)", "text", "password5"), reads("seq 7 (vm.ui.action)", "value", "password6"),
-            reads("seq 11 (vm.type)", "text", "password7"), reads("seq 12 (vm.type)", "text", "password8"),
+            reads("seq 8 (vm.type)", "text", "password7"),
+            reads("seq 11 (vm.type)", "text", "password8"), reads("seq 12 (vm.type)", "text", "password9"),
             "seq 15 (vm.exec): the trace masks the env value 'DB_PASSWORD'; the step reads it from the variable 'DB_PASSWORD', pass it in variables when running the script",
-            "seq 15 (vm.exec): the trace masks the env value 'password'; the step reads it from the variable 'password9', pass it in variables when running the script",
-            reads("seq 17 (vm.type)", "text", "password10"),
+            "seq 15 (vm.exec): the trace masks the env value 'password'; the step reads it from the variable 'password10', pass it in variables when running the script",
+            reads("seq 17 (vm.type)", "text", "password11"),
         ])
         let text = String(decoding: try script.encoded(), as: UTF8.self)
         for hidden in ["typed-unseen", "typed-seen", "after-selector"] { XCTAssertFalse(text.contains(hidden), hidden) }
@@ -910,6 +912,36 @@ final class ScriptBuilderTests: XCTestCase {
                                         "seq 5 (vm.process.kill): \(pid)", "seq 7 (vm.wait_for): \(pid)"])
     }
 
+    func testMaskMarkerNeverReachesAScript() {
+        let user = target("Sign in", "Edit", "User", byName: (1, 0))
+        let entries: [JSON] = [
+            entry(1, "vm.type", ["text": "<masked>"], ["target": user]),
+            entry(2, "vm.exec", ["command": "login <masked> now"], result: ["code": 0]),
+            entry(3, "vm.exec", ["command": "x", "env": ["PLAIN": "<masked>"]], result: ["code": 0]),
+            entry(4, "vm.exec", ["command": "x", "args": ["<masked>"]], result: ["code": 0]),
+            entry(5, "vm.batch", ["steps": [["op": "vm.type", "text": "pre <masked>"]]], result: ["steps": []]),
+            entry(6, "vm.batch", ["steps": [["op": "vm.type", "text": "<masked>"]]], result: ["steps": []]),
+            entry(7, "vm.wait_for", ["conditions": [["type": "file_exists", "path": "C:\\<masked>.txt"]]], result: ["matched": 0]),
+            entry(8, "vm.wait_for", ["conditions": [["type": "file_contains", "path": "C:\\a.txt", "text": "<masked>"]]], result: ["matched": 0]),
+        ]
+        let draft = ScriptBuilder.draft(trace: entries, vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(ops(draft.script), ["vm.type", "vm.exec", "vm.exec", "vm.batch", "vm.wait_for"])
+        XCTAssertEqual(draft.script.steps.map(\.params), [
+            ["text": "${password}"],
+            ["command": "x", "env": ["PLAIN": "${PLAIN}"]],
+            ["command": "x", "args": ["${secret}"]],
+            ["steps": [["op": "vm.type", "text": "${text}"]]],
+            ["conditions": [["type": "file_contains", "path": "C:\\a.txt", "text": "${text2}"]]],
+        ])
+        XCTAssertEqual(draft.required, ["password", "PLAIN", "secret", "text", "text2"])
+        XCTAssertEqual(draft.warnings.filter { $0.contains("holds a masked value") }, [
+            "step 2 (vm.exec) holds a masked value inside \"command\"; write the step by hand with a variable",
+            "step 4 (vm.batch) holds a masked value inside \"steps\"; write the step by hand with a variable",
+            "step 5 (vm.wait_for) holds a masked value inside \"conditions\"; write the step by hand with a variable",
+        ])
+        XCTAssertFalse(String(decoding: try! draft.script.encoded(), as: UTF8.self).contains("<masked>"))
+    }
+
     // MARK: - script.save
 
     func testSaveOpWritesParsableScript() async throws {
@@ -940,6 +972,21 @@ final class ScriptBuilderTests: XCTestCase {
         let partial = try Script.parse(try Data(contentsOf: ranged))
         XCTAssertEqual(partial.vm, "Other")
         XCTAssertEqual(ops(partial), ["vm.type"])
+    }
+
+    func testSaveRefusesAScriptThatStillHoldsTheMaskMarker() async throws {
+        let h = handler()
+        let dir = try recordingDir([
+            entry(1, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("Alcove Fixture", "Button", "<masked>", byName: (1, 0))]),
+        ])
+        let out = try tempDir().appendingPathComponent("flow.json")
+        do {
+            _ = try await h.handle(op: "script.save", params: ["dir": .string(dir.path), "path": .string(out.path)])
+            XCTFail("saved a script with the marker")
+        } catch {
+            XCTAssertTrue("\(error)".hasPrefix("step 1 (vm.ui.click Button \"<masked>\") still holds the mask marker '<masked>' of the trace; "), "\(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: out.path))
     }
 
     func testASavedRecordingReplaysTheRecordedInput() async throws {
