@@ -595,9 +595,9 @@ range.
   responding and while eight earlier `ui.at` calls into that app are still
   waiting.
 - Measured on the test guest: 50 calls on a button of the fixture app took
-  13–14 ms in the median and 16–26 ms at most; on the fixture made to hang, a
-  call with the default limit answered after 252–254 ms and one with
-  `budgetMs: 100` after 110 ms, and `win.list` after it took 1 ms.
+  12–14 ms in the median and 15–26 ms at most; on the fixture made to hang, a
+  call with the default limit answered after 252–270 ms and one with
+  `budgetMs: 100` after 105–116 ms, and `win.list` after it took 1–6 ms.
 
 #### Window events
 
@@ -633,7 +633,7 @@ agent sends one event per difference, each with the window object:
   that moment, and the last event carries the title the window ends with; a
   title that returns to the one last sent sends nothing. The fixture's
   `Titles` button (a new title every 50 ms for 5 s, then the base title)
-  raises 6 events 1.21–1.25 s apart: 5 with a numbered title and the last
+  raises 5 events 1.23–1.26 s apart: 4 with a numbered title and the last
   with the base title.
 - At most one `window.foreground` is sent per window per second. One that
   falls inside that second is sent once the second has passed, when the
