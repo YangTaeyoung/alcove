@@ -15,9 +15,12 @@ protocol VideoSink: Sendable {
     var errorMessage: String? { get }
     /// Adds the last frame of the recording; an encoder that is busy is given a moment, and the frame is not counted as dropped.
     func appendFinal(frame: Frame, at time: Duration) async
+    /// Whether the file this sink's writer created is still there after `finish()`.
+    var keptFile: Bool { get }
 }
 
 extension VideoSink {
+    var keptFile: Bool { false }
     var droppedFrames: Int { 0 }
     var appendedSeconds: Double { 0 }
     var errorMessage: String? { nil }
@@ -50,6 +53,7 @@ final class SummaryDelivery: @unchecked Sendable {
 actor Recording {
     struct Summary: Sendable, Equatable {
         let dir: String
+        /// The video file: the finished video, or the file a failed writer kept because it plays; nil without one.
         let video: String?
         let trace: String
         let frames: Int
@@ -277,7 +281,7 @@ actor Recording {
         if let message = sink.errorMessage { noteWriteError(message) }
         let videoURL = directory.appendingPathComponent("video.mp4")
         let size = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int) ?? nil
-        let hasVideo = video && sink.errorMessage == nil && (size ?? 0) > 0
+        let hasVideo = video && (sink.errorMessage == nil || sink.keptFile) && (size ?? 0) > 0
         return Summary(dir: directory.path, video: hasVideo ? videoURL.path : nil,
                        trace: directory.appendingPathComponent(TraceWriter.traceName).path, frames: frameCount,
                        seconds: (seconds * 10).rounded() / 10, ops: lineCount,

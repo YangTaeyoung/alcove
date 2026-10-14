@@ -262,6 +262,79 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(lines.last, "steps that failed: none")
     }
 
+    func testEveryFileAndFolderOfABundleIsReadableByItsOwnerOnly() async throws {
+        let r = try await rig {
+            $0.dumps = [dumpRow("MyApp.exe.4242.dmp", bytes: 20, time: stamp(Date()))]
+            $0.jobs = [["job": "j1", "pid": 5, "state": "exited", "code": 0, "cmd": "build", "started": "2026-10-14T01:00:00+09:00"]]
+            $0.jobOutput["j1"] = ("built\n", "")
+            $0.tails["C:\\logs\\app.log"] = "one\n"
+            $0.fs["C:\\alcove-dumps\\MyApp.exe.4242.dmp"] = Data(repeating: 7, count: 20)
+        }
+        await r.target.setFrames((0..<300).map { blockFrame(step: $0) })
+        let recording = try await startRecording(r.handler, ["video": true, "fps": 10])
+        _ = try await r.handler.handle(op: "vm.mouse.move", params: ["name": "Win", "x": 10, "y": 10])
+        let playable = await eventually { await VideoRecorder.isPlayable(recording.appendingPathComponent("video.mp4")) }
+        XCTAssertTrue(playable)
+        let result = try await collect(r.handler, ["logFiles": ["C:\\logs\\app.log"]])
+        _ = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertTrue(files(result).contains("video.mp4"), "\(files(result))")
+        XCTAssertTrue(files(result).contains("dumps/MyApp.exe.4242.dmp"), "\(files(result))")
+        XCTAssertTrue(files(result).contains("frames/000001-after.jpg"), "\(files(result))")
+        let root = bundleDirectory()
+        func mode(_ url: URL) throws -> Int? { try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int }
+        XCTAssertEqual(try mode(root), 0o700)
+        for relative in try onDisk() {
+            let url = root.appendingPathComponent(relative)
+            var isDirectory: ObjCBool = false
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory))
+            XCTAssertEqual(try mode(url), isDirectory.boolValue ? 0o700 : 0o600, relative)
+        }
+    }
+
+    func testCopiedTraceMasksSecretAssignmentsInCommandText() async throws {
+        let r = try await rig {
+            $0.jobs = [["job": "j1", "pid": 5, "state": "running", "cmd": "deploy API_TOKEN=tok123 --fast", "started": "2026-10-14T01:00:00+09:00"]]
+        }
+        let recording = try await startRecording(r.handler)
+        _ = try? await r.handler.handle(op: "vm.exec", params: ["name": "Win", "command": "set PASSWORD=hunter2 && run"])
+        _ = try? await r.handler.handle(op: "vm.exec", params: ["name": "Win", "argv": ["tool", "SECRET_KEY=abc", "plain"]])
+        _ = try await r.handler.handle(op: "vm.exec.list", params: ["name": "Win"])
+        let own = String(decoding: try traceBytes(recording.path), as: UTF8.self)
+        XCTAssertTrue(own.contains("hunter2"))
+        _ = try await collect(r.handler)
+        let copied = try read("trace.jsonl")
+        let lines = try copied.split(separator: "\n").map { try JSON.parse(Data($0.utf8)) }
+        XCTAssertEqual(lines.count, 3)
+        XCTAssertEqual(lines[0]["params"]?["command"]?.stringValue, "set PASSWORD=<masked> && run")
+        XCTAssertEqual(lines[1]["params"]?["argv"], ["tool", "SECRET_KEY=<masked>", "plain"])
+        XCTAssertEqual(lines[2]["result"]?["jobs"]?[0]?["cmd"]?.stringValue, "deploy API_TOKEN=<masked> --fast")
+        XCTAssertFalse(copied.contains("hunter2"))
+        XCTAssertFalse(copied.contains("tok123"))
+        _ = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
+    }
+
+    func testRecordingWithoutVideoIsNamedAsSuchInTheSummary() async throws {
+        let r = try await rig()
+        _ = try await startRecording(r.handler)
+        let result = try await collect(r.handler)
+        XCTAssertFalse(files(result).contains { $0.hasPrefix("video") })
+        XCTAssertTrue(try summaryLines(result).contains("video.mp4: the recording was started with video: false"))
+        _ = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
+    }
+
+    func testCancelledCallRemovesTheParentFoldersItCreated() async throws {
+        let r = try await rig { $0.silent = ["proc.list"] }
+        let parent = bundleDirectory("new-parent")
+        let dir = parent.appendingPathComponent("deeper/bundle")
+        let call = collecting(r.handler, dir: dir)
+        let reached = await eventually { agentRequests(r.agent, "proc.list").count == 1 }
+        XCTAssertTrue(reached)
+        call.cancel()
+        do { _ = try await call.value; XCTFail("expected the call to end without a result") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parent.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: scratch.path))
+    }
+
     func testFileListKeepsTheFoldersOfABundleWhoseDirIsGivenWithThePrivatePrefix() async throws {
         let r = try await rig { $0.tails["C:\\logs\\app.log"] = "one\ntwo\n" }
         try XCTSkipUnless(scratch.path.hasPrefix("/var/") || scratch.path.hasPrefix("/tmp/"), "the scratch folder \(scratch.path) has no /private form")
@@ -989,7 +1062,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(plays)
         let lines = try summaryLines(result)
         XCTAssertTrue(lines.contains("recording: \(recording.path) (running)"), "\(lines)")
-        XCTAssertTrue(lines.contains("video.mp4: copied while recording, up to the last second may be missing"), "\(lines)")
+        XCTAssertTrue(lines.contains("video.mp4: copied while recording; its last seconds may be missing"), "\(lines)")
         XCTAssertEqual(lines.last, "steps that failed: none")
 
         let status = try await r.handler.handle(op: "vm.record.status", params: ["name": "Win"])
@@ -1018,7 +1091,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(files(result).contains("video.mp4"))
         let lines = try summaryLines(result)
         XCTAssertTrue(lines.contains("video.mp4: copied up to the point where the video writer failed (the video could not be written: test)"), "\(lines)")
-        XCTAssertFalse(lines.contains { $0.contains("up to the last second may be missing") }, "\(lines)")
+        XCTAssertFalse(lines.contains { $0.contains("its last seconds may be missing") }, "\(lines)")
         _ = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
     }
 
@@ -1036,7 +1109,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(playable)
         try XCTUnwrap(recorder.value).failWriterForTesting("the video could not be written: test")
         let stopped = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
-        XCTAssertNil(stopped["video"])
+        XCTAssertEqual(stopped["video"]?.stringValue, recording.appendingPathComponent("video.mp4").path)
         XCTAssertEqual(stopped["lastWriteError"]?.stringValue, "the video could not be written: test")
 
         let result = try await collect(r.handler)

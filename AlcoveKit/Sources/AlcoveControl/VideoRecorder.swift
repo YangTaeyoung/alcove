@@ -71,6 +71,9 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
         return ((try? await asset.loadTracks(withMediaType: .video))?.count ?? 0) > 0
     }
 
+    /// Whether the file this recorder's writer created is at `url`.
+    var keptFile: Bool { lock.withLock { createdFile } && FileManager.default.fileExists(atPath: url.path) }
+
     /// Frames not appended because the encoder was not ready for them.
     var droppedFrames: Int { lock.withLock { dropped } }
 

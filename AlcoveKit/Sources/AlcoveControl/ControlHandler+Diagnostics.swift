@@ -166,20 +166,23 @@ final class DiagnosticsLog: @unchecked Sendable {
 /// the step that waited for them moves them there.
 struct DiagnosticsBundle: Sendable {
     static let partialName = ".partial"
+    /// The attributes of every folder the bundle creates.
+    static var folderAttributes: [FileAttributeKey: Any] { [.posixPermissions: 0o700] }
 
     let root: URL
 
     var partial: URL { root.appendingPathComponent(DiagnosticsBundle.partialName, isDirectory: true) }
 
-    /// Writes `data` to the path `relative` below the bundle, creating its folder; false with `log` told when it fails.
-    /// Nothing is written from a cancelled task.
+    /// Writes `data` with mode 0600 to the path `relative` below the bundle, creating its folder with mode 0700; false
+    /// with `log` told when it fails. Nothing is written from a cancelled task.
     @discardableResult
     func put(_ data: Data, _ relative: String, step: String, log: DiagnosticsLog) -> Bool {
         guard !Task.isCancelled else { return false }
         let url = root.appendingPathComponent(relative)
         do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: url, options: .atomic)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: DiagnosticsBundle.folderAttributes)
+            _ = try ControlHandler.writeHostFile(data, to: url, replacing: true)
             return true
         } catch {
             log.fail(step, "could not write \(relative): \(ControlHandler.failureReason(error, fallback: "the disk write failed")); free disk space or choose another dir")
@@ -202,12 +205,32 @@ struct DiagnosticsBundle: Sendable {
     /// A path below `.partial/` that no other call returns, ending in `suffix`.
     func scratch(_ suffix: String = "") -> URL { partial.appendingPathComponent(UUID().uuidString + suffix) }
 
-    /// Moves the file or folder at `scratch` to the path `relative` below the bundle, creating its folder.
+    /// Moves the file or folder at `scratch` to the path `relative` below the bundle, creating its folder; what was
+    /// moved gets mode 0700 for each folder and 0600 for each file.
     func adopt(_ scratch: URL, as relative: String) throws {
         try Task.checkCancellation()
         let url = root.appendingPathComponent(relative)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                attributes: DiagnosticsBundle.folderAttributes)
         try FileManager.default.moveItem(at: scratch, to: url)
+        DiagnosticsBundle.restrictModes(url)
+    }
+
+    /// Gives `url` mode 0700 when it is a folder, and every folder below it too, and 0600 to every file; links are left as they are.
+    static func restrictModes(_ url: URL) {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return }
+        switch info.st_mode & S_IFMT {
+        case S_IFDIR:
+            chmod(url.path, 0o700)
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? [] {
+                restrictModes(url.appendingPathComponent(name))
+            }
+        case S_IFREG:
+            chmod(url.path, 0o600)
+        default:
+            break
+        }
     }
 
     /// Renames `.partial/`, then removes it with everything in it.
@@ -290,7 +313,7 @@ extension ControlHandler {
         }
         bundle.removePartial()
         if Task.isCancelled {
-            if place.created { try? FileManager.default.removeItem(at: root) }
+            ControlHandler.removeCreatedFolders(place.created)
             throw CancellationError()
         }
 
@@ -325,9 +348,10 @@ extension ControlHandler {
 
     /// The folder of the bundle, holding only an empty `.partial/`: `dir` when it is missing or empty, otherwise a fresh
     /// `<vm>-<time>` folder below the Diagnostics folder. A `dir` that holds anything, or that another call of this
-    /// handler is writing, is refused. `created` tells whether the folder did not exist before; `key` is the entry the
-    /// folder has in `diagnosticsInProgress` until the caller removes it.
-    private func diagnosticsFolder(_ params: JSON, vm: String) throws -> (root: URL, created: Bool, key: String) {
+    /// handler is writing, is refused. The folders this call creates get mode 0700. `created` lists the folders that
+    /// did not exist before, the bundle folder first and then each folder above it; `key` is the entry the folder has
+    /// in `diagnosticsInProgress` until the caller removes it.
+    private func diagnosticsFolder(_ params: JSON, vm: String) throws -> (root: URL, created: [URL], key: String) {
         var request = params.objectValue ?? [:]
         if request["dir"] == .null { request["dir"] = nil }
         let explicit = request["dir"] != nil
@@ -354,16 +378,29 @@ extension ControlHandler {
                 url = first.deletingLastPathComponent().appendingPathComponent("\(first.lastPathComponent)-\(number)")
             }
         }
-        let created = !fm.fileExists(atPath: url.path)
+        var created: [URL] = []
+        var missing = url
+        while !fm.fileExists(atPath: missing.path), missing.path != "/" {
+            created.append(missing)
+            missing = missing.deletingLastPathComponent()
+        }
         do {
-            try fm.createDirectory(at: url.appendingPathComponent(DiagnosticsBundle.partialName), withIntermediateDirectories: true)
+            try fm.createDirectory(at: url.appendingPathComponent(DiagnosticsBundle.partialName), withIntermediateDirectories: true,
+                                   attributes: DiagnosticsBundle.folderAttributes)
         } catch {
-            if created { try? fm.removeItem(at: url) }
+            ControlHandler.removeCreatedFolders(created)
             throw ControlError.failed("cannot create the diagnostics folder '\(url.path)': \(ControlHandler.failureReason(error, fallback: "the directory could not be written; choose another dir"))")
         }
         let key = url.resolvingSymlinksInPath().path
         diagnosticsInProgress.insert(key)
         return (url, created, key)
+    }
+
+    /// Removes the first of `folders` with everything in it, then each further folder in order while it is empty.
+    nonisolated static func removeCreatedFolders(_ folders: [URL]) {
+        guard let root = folders.first else { return }
+        try? FileManager.default.removeItem(at: root)
+        for folder in folders.dropFirst() where rmdir(folder.path) != 0 { break }
     }
 
     /// The regular files below `root` as paths relative to it, sorted; what lies below a `.partial` folder is left out.
@@ -845,6 +882,7 @@ extension ControlHandler {
             video = r.video
             log.update { $0.recording = "\(r.directory.path) (ending)" }
         }
+        if !video { log.note("video.mp4: the recording was started with video: false") }
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.collectTrace(directory, bundle, log) }
             if video { group.addTask { await self.collectVideo(chosen, bundle, log) } }
@@ -860,7 +898,7 @@ extension ControlHandler {
         let lines: Data
         switch read {
         case .success(let tail):
-            lines = tail.data
+            lines = ControlHandler.maskingCommands(inTrace: tail.data)
             if tail.leftOut > 0 {
                 log.note("trace.jsonl: the first \(tail.leftOut) bytes of the trace are left out; the bundle holds its newest whole lines within \(cap / 1_048_576) MiB")
             }
@@ -895,6 +933,45 @@ extension ControlHandler {
         case .failure(let error):
             bundle.fail("frames", stem: "frames", diagnosticsSentence(error, step: "frames", limit: framesLimit), log: log)
         }
+    }
+
+    /// The keys whose string values hold a command line.
+    nonisolated static let commandKeys: Set<String> = ["command", "cmd"]
+    /// The key whose array holds the words of a command line.
+    nonisolated static let argvKey = "argv"
+
+    /// `data`, the whole lines of a trace, with `TraceSanitizer.maskAssignments` applied at any depth of each line to the
+    /// strings under `commandKeys` and to the strings of an `argvKey` array. A line that is not JSON, and a line without
+    /// such a value, stays as it is.
+    nonisolated static func maskingCommands(inTrace data: Data) -> Data {
+        func masked(_ value: JSON, key: String?) -> JSON {
+            switch value {
+            case .string(let text):
+                guard let key, commandKeys.contains(key) else { return value }
+                return .string(TraceSanitizer.maskAssignments(text))
+            case .array(let items):
+                guard key == argvKey else { return .array(items.map { masked($0, key: nil) }) }
+                return .array(items.map { $0.stringValue.map { .string(TraceSanitizer.maskAssignments($0)) } ?? $0 })
+            case .object(let fields):
+                return .object(Dictionary(uniqueKeysWithValues: fields.map { ($0.key, masked($0.value, key: $0.key)) }))
+            default:
+                return value
+            }
+        }
+        var out = Data()
+        for line in data.split(separator: 0x0A, omittingEmptySubsequences: false).dropLast() {
+            if let entry = try? JSON.parse(Data(line)) {
+                let result = masked(entry, key: nil)
+                if result != entry, let text = try? result.serialized() {
+                    out.append(text)
+                    out.append(0x0A)
+                    continue
+                }
+            }
+            out.append(line)
+            out.append(0x0A)
+        }
+        return out
     }
 
     /// The frame paths the lines of a trace refer to in `before` and `after`, each once, those of the newest line first.
@@ -992,7 +1069,7 @@ extension ControlHandler {
                     if let error = recording.videoError {
                         log.note("video.mp4: copied up to the point where the video writer failed (\(error))")
                     } else {
-                        log.note("video.mp4: copied while recording, up to the last second may be missing")
+                        log.note("video.mp4: copied while recording; its last seconds may be missing")
                     }
                 case .failure(let error):
                     try? FileManager.default.removeItem(at: scratch)
@@ -1029,12 +1106,12 @@ extension ControlHandler {
         }
     }
 
-    /// Writes the first `bytes` bytes of the file at `source` to a new file at `destination`. A cancelled task stops
+    /// Writes the first `bytes` bytes of the file at `source` to a new file of mode 0600 at `destination`. A cancelled task stops
     /// between pieces, removes the file and throws `CancellationError`.
     nonisolated static func copyStart(of source: URL, bytes: Int, to destination: URL) throws {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
-        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: destination.path])
         }
         let output = try FileHandle(forWritingTo: destination)

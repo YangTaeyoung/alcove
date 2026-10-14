@@ -1417,10 +1417,11 @@ sampled before it. The file is written in movie fragments of one second, so a
 copy taken while the recording runs plays up to its last whole fragment; a
 finished file is an ordinary MP4. When the video cannot be written the
 recording continues without it, `vm.record.status` shows `videoError` at
-once, and the summary has no `video` and carries the reason in
-`lastWriteError` (`the video could not be written: …`, or `no frame could be
-recorded for the video` when no frame could be read); a file the failed
-writer left that still plays is kept in the directory. A recording that is
+once, and the summary carries the reason in `lastWriteError` (`the video
+could not be written: …`, or `no frame could be recorded for the video` when
+no frame could be read). A file the failed writer left that still plays is
+kept in the directory and named in `video` (with `videoSeconds` and
+`droppedFrames`); without such a file the summary has no `video`. A recording that is
 not ended before its server goes away leaves `video.mp4` as written so far,
 playable up to its last whole fragment. Measured on Windows
 11 at 1280x800 and `fps` 5: 0.83 MB for 6 s and 35 MB for 192 s of a
@@ -1591,18 +1592,26 @@ Names that come from the guest become single file names without characters
 a host file name cannot hold, and names that differ only in case get `-2`,
 `-3`, …. A step that ran out of time leaves nothing but its error file;
 nothing is written into the folder after the op answered. A call whose client
-went away removes a folder it created and leaves no error files or summary
-in a folder it was given.
+went away removes a folder it created, and each folder above it that it
+created while that folder is empty, and leaves no error files or summary in a
+folder it was given. The folders the call creates have mode 0700, every file
+of the bundle mode 0600.
 
 **The recording** is the VM's running one; else one that is ending (waited
 for up to 30 s); else the one that ended last, when it ended within
 `sinceMinutes`. Of a running recording, `video.mp4` is a copy of what the file
 held when the copy began: it plays up to its last whole fragment (a note in
-the summary says so); in the first seconds of a recording there is none yet
+the summary says so: `video.mp4: copied while recording; its last seconds may
+be missing`); in the first seconds of a recording there is none yet
 and `video.error.txt` says `the recording in <dir> has not written a playable
 part of its video yet; collect again in a few seconds`. Measured: the copy
 lasted 0.04 s to 0.7 s less than the recording's age while the screen
-changed.
+changed. A recording made with `video: false` gives the note `video.mp4: the
+recording was started with video: false`. In the bundle's `trace.jsonl` the
+strings under `command` and `cmd` and the words of `argv` (`vm.exec` params,
+`vm.exec.list` and `vm.process.list` results) have their secret-looking
+`NAME=value` values masked as in `processes.json`; the recording's own trace
+keeps them.
 
 **Without guest tools** (not connected after 5 s), on a paused VM and on a
 stopped one, the bundle holds what needs no guest: screenshot (not for a
@@ -1628,7 +1637,7 @@ jobs exited with a non-zero code: none
 process alcove-fixture: running, pid 3340
 recording: /Users/me/rec (running)
 frames: 10 of 10 copied
-video.mp4: copied while recording, up to the last second may be missing
+video.mp4: copied while recording; its last seconds may be missing
 steps that failed: none
 ```
 
@@ -1855,7 +1864,9 @@ server with a self-signed certificate answers 502 with the reason.
 
 In a recording's trace the six secret headers of `vm.http.request` results
 read `<masked>` (a `<redacted n chars>` value stays as it is), and bodies are
-cut at 2000 characters with `bodyCut: true`.
+cut at 2000 characters with `bodyCut: true`. The same six headers read
+`<masked>` in the `action.headers` of `vm.http.rule.add` params and of the
+rules of `vm.http.rule.list` results.
 
 ### Rules
 
@@ -2102,8 +2113,8 @@ a start and 262,000 ms for a stop.
 `script.run` replays a JSON script of control ops without a model. It runs in
 the concurrent lane.
 
-Parameters: `path` (script file on the host; use an absolute path, a relative
-one resolves against the server's working directory), `name` (VM; overrides the
+Parameters: `path` (absolute path of the script file on the host; another
+path answers `path must be an absolute path`), `name` (VM; overrides the
 script's `vm`), `variables` (object of strings that override the script's
 defaults), `snapshot` (restored before the first step), `lease` and `maxWidth`
 (the width of the failure screenshot, as for `vm.screenshot`: a whole number of
@@ -2161,7 +2172,7 @@ numbers and expectation numbers start at 1. `stepsRun` counts the steps that sta
 
 Each entry of `steps` is `{step, op, label?, seconds, ok, result?, error?}`.
 `result` is a copy of the op's result in which a string under a key named `png`
-becomes `<omitted: N bytes>` and any other string over 2048 characters is cut
+or `jpeg` becomes `<omitted: N bytes>` and any other string over 2048 characters is cut
 to its first 2048 characters followed by `… (N more characters)`. Once the
 encoded entries pass 256 KiB, later entries keep only `{step, op, label?, ok,
 seconds}` (and `error` for the failing step). An entry whose encoded size
@@ -2257,6 +2268,13 @@ Which trace lines become steps:
   <part>}]`; switching between windows with the same part adds nothing.
 - Steps that name a job id or a pid of the recorded session keep them and get
   a warning to change them by hand.
+- `vm.http.*` lines never become steps: a capture is part of the setup of a
+  run. Each line of `vm.http.start`, `vm.http.stop`, `vm.http.clear` and the
+  `vm.http.rule.*` ops that change rules is left out with `seq <n> (<op>) is
+  left out: an HTTP capture and its rules belong to the setup of a run, not
+  to its steps; start the capture and add its rules with the vm.http ops
+  before running the script`. A replay that relies on a mocked answer needs
+  the capture and its rules set up before `script.run`.
 
 Window titles: a script names a window by the stable part of its title, the
 text after the last ` - `, ` – ` or ` — ` when it has at least 3 characters,
