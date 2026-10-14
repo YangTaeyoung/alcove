@@ -47,14 +47,21 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(e.firmwareCode, root + "/pc-bios/edk2-aarch64-code.fd")
         XCTAssertEqual(e.firmwareVarsTemplate, root + "/pc-bios/edk2-arm-vars.fd")
         XCTAssertThrowsError(try EngineLocator(roots: ["/nonexistent"]).locate())
-        XCTAssertTrue(EngineLocator.developmentBuildRoot.hasSuffix("/build/qemu-build"))
+        XCTAssertTrue(EngineLocator.repositoryBuildRoot.hasSuffix("/build/qemu-build"))
+        XCTAssertEqual(EngineLocator.developmentBuildRoot(environment: [:]), EngineLocator.repositoryBuildRoot)
+        XCTAssertEqual(EngineLocator.developmentBuildRoot(environment: ["ALCOVE_QEMU_DIR": ""]), EngineLocator.repositoryBuildRoot)
+        XCTAssertEqual(EngineLocator.developmentBuildRoot(environment: ["ALCOVE_QEMU_DIR": "/env"]), "/env")
+        XCTAssertEqual(EngineLocator.developmentBuildRoot,
+                       EngineLocator.developmentBuildRoot(environment: ProcessInfo.processInfo.environment))
         XCTAssertEqual(EngineLocator.standard(environment: ["ALCOVE_QEMU_DIR": "/env"]).roots.first, "/env")
         // $PATH entries are searched as engine roots (<prefix>/bin -> <prefix>), deduplicated
         let roots = EngineLocator.standard(environment: ["PATH": "/usr/bin:/opt/homebrew/bin:/x/qemu:relative:/opt/homebrew/bin"]).roots
         XCTAssertEqual(roots.filter { $0 == "/opt/homebrew" }.count, 1)
         XCTAssertTrue(roots.contains("/usr") && roots.contains("/x/qemu"))
         XCTAssertFalse(roots.contains("relative"))
-        XCTAssertLessThan(roots.firstIndex(of: EngineLocator.developmentBuildRoot)!, roots.firstIndex(of: "/usr")!)
+        XCTAssertLessThan(roots.firstIndex(of: EngineLocator.repositoryBuildRoot)!, roots.firstIndex(of: "/usr")!)
+        let withEngineDirectory = EngineLocator.standard(environment: ["ALCOVE_QEMU_DIR": "/env"]).roots
+        XCTAssertLessThan(withEngineDirectory.firstIndex(of: "/env")!, withEngineDirectory.firstIndex(of: EngineLocator.repositoryBuildRoot)!)
     }
 
     /// A stock QEMU (Homebrew, $PATH) has binaries and firmware but no `alcove`

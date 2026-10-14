@@ -30,7 +30,7 @@ public struct EngineLocator: Sendable, Equatable {
     public init(roots: [String]) { self.roots = roots }
 
     /// Default search order: `$ALCOVE_QEMU_DIR`, the app bundle's `Resources/qemu`,
-    /// the development build tree next to this package, engines on `$PATH`
+    /// the development build tree next to this package (`repositoryBuildRoot`), engines on `$PATH`
     /// (`<prefix>/bin` entries map to `<prefix>`), then Homebrew. A stock QEMU
     /// found anywhere here is rejected by `locate()` because it lacks the
     /// `alcove` display backend.
@@ -38,7 +38,7 @@ public struct EngineLocator: Sendable, Equatable {
         var roots: [String] = []
         if let env = environment["ALCOVE_QEMU_DIR"] { roots.append(env) }
         if let res = bundle.resourcePath { roots.append(res + "/qemu") }
-        roots.append(developmentBuildRoot)
+        roots.append(repositoryBuildRoot)
         for dir in (environment["PATH"] ?? "").split(separator: ":").map(String.init) where dir.hasPrefix("/") {
             let root = dir.hasSuffix("/bin") ? String(dir.dropLast(4)) : dir
             if !root.isEmpty { roots.append(root) }
@@ -48,8 +48,17 @@ public struct EngineLocator: Sendable, Equatable {
         return EngineLocator(roots: roots.filter { seen.insert($0).inserted })
     }
 
+    /// The engine root of a development checkout: `developmentBuildRoot(environment:)` of this process's environment.
+    public static var developmentBuildRoot: String { developmentBuildRoot(environment: ProcessInfo.processInfo.environment) }
+
+    /// `$ALCOVE_QEMU_DIR` when it is set and not empty, otherwise `repositoryBuildRoot`.
+    public static func developmentBuildRoot(environment: [String: String]) -> String {
+        if let env = environment["ALCOVE_QEMU_DIR"], !env.isEmpty { return env }
+        return repositoryBuildRoot
+    }
+
     /// `<repo>/build/qemu-build`, derived from this source file's location.
-    public static var developmentBuildRoot: String {
+    public static var repositoryBuildRoot: String {
         // .../AlcoveKit/Sources/AlcoveEngine/EngineLocator.swift -> repo root
         let here = URL(fileURLWithPath: #filePath)
         let repo = here.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
