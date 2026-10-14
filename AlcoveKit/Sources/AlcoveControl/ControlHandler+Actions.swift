@@ -234,10 +234,18 @@ extension ControlHandler {
             if let seq = try? KeyNames.typeSequence(text) {
                 try await sendKeys(t, seq, gap: delay, holdBeforeRelease: 0)
             } else {
-                // non-US characters: go through the guest clipboard and paste
+                // Text outside the US layout goes into the guest clipboard and is pasted once the guest reports it there.
                 guard let agent = await t.agent(timeout: .seconds(2)) else { throw ControlError.untypable("this text") }
-                do { try await agent.setClipboard(text: text) } catch { throw agentFailure(error, vm: t.name, op: op) }
-                try await Task.sleep(for: .milliseconds(150))
+                let held: String
+                do {
+                    try await agent.setClipboard(text: text)
+                    held = try await agent.getClipboard()
+                } catch {
+                    throw agentFailure(error, vm: t.name, op: op)
+                }
+                guard held == text else {
+                    throw ControlError.failed("the guest clipboard did not take the text, so nothing was typed; call \(op) again")
+                }
                 try await sendKeys(t, try KeyNames.pressSequence("ctrl+v"), gap: 20, holdBeforeRelease: 0)
             }
         default:

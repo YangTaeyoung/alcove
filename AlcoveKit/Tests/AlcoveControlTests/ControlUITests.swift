@@ -485,13 +485,59 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "ui.rect").count, rects)
     }
 
+    /// Makes `agent` answer `clipboard.get` with the text of the latest `clipboard.set`, or with `held` when given,
+    /// while `answering` is true; other messages go to the handler the agent had.
+    private func giveClipboard(to agent: FakeAgent, holding held: String? = nil, answering: LockedBox<Bool> = LockedBox(true)) {
+        let text = LockedBox<String>("")
+        let inner = agent.handler
+        agent.handler = { m, a in
+            switch m["t"]?.stringValue {
+            case "clipboard.set":
+                text.value = m["text"]?.stringValue ?? ""
+                return inner?(m, a) ?? []
+            case "clipboard.get":
+                return answering.value ? [["t": "clipboard.text", "text": .string(held ?? text.value)]] : []
+            default:
+                return inner?(m, a) ?? []
+            }
+        }
+    }
+
     func testUITypePastesTextOutsideTheUSLayout() async throws {
         let (h, t, agent) = try await rig(["ui.rect": { _, _ in .ok(["node": messageEdit, "cx": 250, "cy": 72, "clickable": true]) }])
+        giveClipboard(to: agent)
         _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "ref": "e4", "text": "스트리밍 \"테스트\" 1"])
         let clipboard = agent.received.first { $0["t"]?.stringValue == "clipboard.set" }
         XCTAssertEqual(clipboard?["text"]?.stringValue, "스트리밍 \"테스트\" 1")
         let sent = await t.sent
         XCTAssertEqual(keys(Array(sent.dropFirst(5))), try keys(KeyNames.pressSequence("ctrl+v")))
+    }
+
+    func testTextOutsideTheUSLayoutIsPastedOnceTheGuestClipboardHoldsIt() async throws {
+        let (h, t, agent) = try await rig()
+        let answering = LockedBox(false)
+        giveClipboard(to: agent, answering: answering)
+        let typing = Task { try await h.handle(op: "vm.type", params: ["name": "Win", "text": "한글"]) }
+        let asked = await eventually { agent.received.contains { $0["t"]?.stringValue == "clipboard.get" } }
+        XCTAssertTrue(asked, "the clipboard was not read back")
+        let order = agent.received.compactMap { $0["t"]?.stringValue }.filter { $0.hasPrefix("clipboard.") }
+        XCTAssertEqual(order, ["clipboard.set", "clipboard.get"])
+        var sent = await t.sent
+        XCTAssertEqual(keys(sent), [])
+        answering.value = true
+        agent.sendLine(["t": "clipboard.text", "text": "한글"])
+        _ = try await completed(typing)
+        sent = await t.sent
+        XCTAssertEqual(keys(sent), try keys(KeyNames.pressSequence("ctrl+v")))
+    }
+
+    func testTextTheGuestClipboardDidNotTakeIsNotPasted() async throws {
+        let (h, t, agent) = try await rig()
+        giveClipboard(to: agent, holding: "what was there before")
+        let message = await failure(h, "vm.type", ["name": "Win", "text": "한글"])
+        XCTAssertEqual(message, "the guest clipboard did not take the text, so nothing was typed; call vm.type again")
+        let sent = await t.sent
+        XCTAssertEqual(keys(sent), [])
     }
 
     func testUIActionPassesValue() async throws {
@@ -2188,6 +2234,7 @@ final class ControlUITests: XCTestCase {
             return [["t": "ev", "name": "window.opened", "window": window("0x81", "Typed", x: 0, y: 0, w: 10, h: 10)],
                     ["t": "ev", "name": "window.title", "window": window("0x81", "Typed more", x: 0, y: 0, w: 10, h: 10)]]
         }
+        giveClipboard(to: agent)
         let batch = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [
             ["op": "vm.key.press", "keys": "a"],
             ["op": "vm.type", "text": "한글"],
