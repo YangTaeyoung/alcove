@@ -18,7 +18,14 @@ const (
 	eventQueueSize = 256
 	// connWriteTimeout closes a connection whose write does not finish in time.
 	connWriteTimeout = 30 * time.Second
+	// maxReplyLine bounds the encoded line of a reply, 64 KiB below the 8 MiB
+	// line the host reads.
+	maxReplyLine = 8<<20 - 64<<10
+	// maxInFlight bounds the requests that run at once for one connection.
+	maxInFlight = 256
 )
+
+const errNoID = "the request has no id; give every req an id to match its answer"
 
 // Handler serves one request; the returned message carries result fields only.
 // The context is cancelled when the connection the request arrived on closes.
@@ -180,23 +187,44 @@ func (s *Server) removeConn(c *conn) {
 	s.connMu.Unlock()
 }
 
-// dispatch runs one "req" message and sends the matching "res".
+// dispatch runs one "req" message and sends the matching "res". A request
+// without an id is not run. A reply whose line would reach maxReplyLine is
+// replaced by an error that asks for less.
 func (s *Server) dispatch(ctx context.Context, req proto.Message, send func(proto.Message)) {
-	res := proto.Message{"t": "res", "id": req["id"]}
-	fields, err := s.invoke(ctx, req)
-	if err != nil {
-		res["ok"] = false
-		res["error"] = err.Error()
-		send(res)
+	if req["id"] == nil {
+		send(proto.Message{"t": "res", "id": nil, "ok": false, "error": errNoID})
 		return
 	}
+	fail := func(text string) proto.Message {
+		return proto.Message{"t": "res", "id": req["id"], "ok": false, "error": text}
+	}
+	fields, err := s.invoke(ctx, req)
+	if err != nil {
+		send(fail(err.Error()))
+		return
+	}
+	res := proto.Message{}
 	for k, v := range fields {
 		res[k] = v
 	}
 	res["t"] = "res"
 	res["id"] = req["id"]
 	res["ok"] = true
+	line, err := proto.Encode(res)
+	switch {
+	case err != nil:
+		s.opt.Logger.Printf("op %s: the answer could not be encoded: %v", req.String("op"), err)
+		res = fail(fmt.Sprintf("the answer to '%s' could not be encoded; see the agent log", req.String("op")))
+	case len(line) >= maxReplyLine:
+		res = fail(fmt.Sprintf("the answer to '%s' is larger than the 8 MiB line the host reads; ask for less (a lower max, depth or limit, a narrower path or a name filter)", req.String("op")))
+	}
 	send(res)
+}
+
+// tooManyRequests is the error of a request that arrives while maxInFlight
+// requests of its connection run.
+func tooManyRequests() string {
+	return fmt.Sprintf("%d requests are running on this connection; wait for an answer before sending another", maxInFlight)
 }
 
 func (s *Server) invoke(ctx context.Context, req proto.Message) (out proto.Message, err error) {

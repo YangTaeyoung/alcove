@@ -97,6 +97,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - Requests on one connection run at the same time; replies arrive in the
   order the operations finish. The host matches them by `id`.
 - An unknown `op` answers `unknown op '<op>'; update alcove-agent`.
+- A `req` without `id` (or with `id: null`) is not run; it answers
+  `{"t":"res","id":null,"ok":false,"error":"the request has no id; give every req an id to match its answer"}`.
 - The `exec.*`, `proc.*` and `fs.*` operations and `app.launch` answer
   `exec disabled; start alcove-agent with --allow-exec` unless the agent was
   started with `--allow-exec`. `ping`, `win.*` and `ui.*` do not need it.
@@ -782,10 +784,15 @@ agent sends one event per difference, each with the window object:
 | Node `value` | 200 characters, then `…` |
 | Refs kept by a helper | 20000; beyond that the least recently used half is forgotten |
 | Waiting for the helper | 60 s per request |
+| One `res` line written by the agent | under 8 MiB minus 64 KiB; a larger answer is replaced by `the answer to '<op>' is larger than the 8 MiB line the host reads; ask for less (a lower max, depth or limit, a narrower path or a name filter)` |
+| Requests running at once on one connection | 256; one more answers `256 requests are running on this connection; wait for an answer before sending another` without running |
 
 The host reads lines of up to 8 MiB and does not send a `req` longer than
-1 MiB. JSON escaping can expand text (a NUL byte becomes six characters), so a
-reply can be several megabytes long. What bounds each reply the agent writes:
+1 MiB. JSON escaping can expand text (a NUL byte becomes six characters; `<`,
+`>` and `&` are written as they are), so a reply can be several megabytes
+long. The agent encodes every `res` before it writes it and answers with the
+error above when the line would reach 8 MiB minus 64 KiB, so no `res` makes
+the host close the connection. What bounds the replies before that check:
 
 - `exec.run`, `exec.read`, `fs.read` and `fs.tail` carry at most the payload
   limits in the table.
@@ -799,7 +806,7 @@ reply can be several megabytes long. What bounds each reply the agent writes:
   characters on the supported file systems, which keeps a listing of one
   folder under 8 MiB unless the names consist mostly of control characters.
   With `recursive` a name is a relative path and a tree of 5000 entries with
-  very long paths can pass 8 MiB; the host then closes the connection.
+  very long paths can pass the limit; it then answers the error above.
 
 ### Known limitations
 

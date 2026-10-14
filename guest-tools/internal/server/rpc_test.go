@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,14 @@ func startServerS(t *testing.T, opt Options) (*Server, *proto.Reader, *proto.Wri
 	c.SetDeadline(time.Now().Add(10 * time.Second))
 	t.Cleanup(func() { c.Close(); l.Close() })
 	return s, proto.NewReader(c), proto.NewWriter(c), c
+}
+
+// send writes m and fails the test when the write fails.
+func send(t *testing.T, w *proto.Writer, m proto.Message) {
+	t.Helper()
+	if err := w.Send(m); err != nil {
+		t.Fatalf("send %v: %v", m, err)
+	}
 }
 
 func capSet(m proto.Message) map[string]bool {
@@ -62,7 +71,7 @@ func TestHelloAnnouncesRPC(t *testing.T) {
 func TestReqResRoundTrip(t *testing.T) {
 	_, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 7, "op": "ping"})
+	send(t, w, proto.Message{"t": "req", "id": 7, "op": "ping"})
 	res := expect(t, r, "res")
 	if res.Int("id") != 7 || res["ok"] != true || res["pong"] != true {
 		t.Fatalf("res %v", res)
@@ -72,7 +81,7 @@ func TestReqResRoundTrip(t *testing.T) {
 func TestUnknownOp(t *testing.T) {
 	_, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 1, "op": "nope"})
+	send(t, w, proto.Message{"t": "req", "id": 1, "op": "nope"})
 	res := expect(t, r, "res")
 	if res["ok"] != false || res.String("error") != "unknown op 'nope'; update alcove-agent" {
 		t.Fatalf("res %v", res)
@@ -85,7 +94,7 @@ func TestGatedOpWithoutAllowExec(t *testing.T) {
 		return proto.Message{"ran": true}, nil
 	})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 2, "op": "t.gated"})
+	send(t, w, proto.Message{"t": "req", "id": 2, "op": "t.gated"})
 	res := expect(t, r, "res")
 	if res["ok"] != false || res.String("error") != "exec disabled; start alcove-agent with --allow-exec" || res.Has("ran") {
 		t.Fatalf("res %v", res)
@@ -98,7 +107,7 @@ func TestGatedOpWithAllowExec(t *testing.T) {
 		return proto.Message{"echo": req.String("v")}, nil
 	})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 3, "op": "t.gated", "v": "hi"})
+	send(t, w, proto.Message{"t": "req", "id": 3, "op": "t.gated", "v": "hi"})
 	res := expect(t, r, "res")
 	if res["ok"] != true || res.String("echo") != "hi" {
 		t.Fatalf("res %v", res)
@@ -111,10 +120,85 @@ func TestHandlerErrorBecomesFailure(t *testing.T) {
 		return nil, errors.New("no such thing; check the name")
 	})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 4, "op": "t.fail"})
+	send(t, w, proto.Message{"t": "req", "id": 4, "op": "t.fail"})
 	res := expect(t, r, "res")
 	if res.Int("id") != 4 || res["ok"] != false || res.String("error") != "no such thing; check the name" {
 		t.Fatalf("res %v", res)
+	}
+}
+
+func TestAReplyOverTheHostLineLimitBecomesAnError(t *testing.T) {
+	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
+	size := 0
+	s.register("t.big", false, func(context.Context, proto.Message) (proto.Message, error) {
+		return proto.Message{"text": strings.Repeat("<", size)}, nil
+	})
+	var got proto.Message
+	capture := func(m proto.Message) { got = m }
+
+	size = 4 << 20
+	s.dispatch(context.Background(), proto.Message{"t": "req", "id": 1, "op": "t.big"}, capture)
+	if got["ok"] != true || len(got.String("text")) != size {
+		t.Fatalf("a reply of %d characters '<' answered ok %v", size, got["ok"])
+	}
+
+	size = maxReplyLine
+	s.dispatch(context.Background(), proto.Message{"t": "req", "id": 2, "op": "t.big"}, capture)
+	want := "the answer to 't.big' is larger than the 8 MiB line the host reads; ask for less (a lower max, depth or limit, a narrower path or a name filter)"
+	if got["ok"] != false || got.Int("id") != 2 || got.String("error") != want || got.Has("text") {
+		t.Fatalf("a reply of %d bytes answered %v %q", size, got["ok"], got.String("error"))
+	}
+	line, err := proto.Encode(got)
+	if err != nil || len(line) >= maxReplyLine {
+		t.Fatalf("the error line is %d bytes: %v", len(line), err)
+	}
+}
+
+func TestARequestWithoutAnIdIsNotRun(t *testing.T) {
+	s, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
+	ran := make(chan struct{}, 1)
+	s.register("t.run", false, func(context.Context, proto.Message) (proto.Message, error) {
+		ran <- struct{}{}
+		return proto.Message{}, nil
+	})
+	expect(t, r, "hello")
+	send(t, w, proto.Message{"t": "req", "op": "t.run"})
+	res := expect(t, r, "res")
+	if res["ok"] != false || res.String("error") != "the request has no id; give every req an id to match its answer" || res["id"] != nil {
+		t.Fatalf("res %v", res)
+	}
+	select {
+	case <-ran:
+		t.Fatal("the op ran")
+	default:
+	}
+}
+
+func TestRequestsOverTheInFlightLimitAreRefused(t *testing.T) {
+	s, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
+	release := make(chan struct{})
+	s.register("t.wait", false, func(context.Context, proto.Message) (proto.Message, error) {
+		<-release
+		return proto.Message{}, nil
+	})
+	expect(t, r, "hello")
+	for id := 1; id <= maxInFlight+1; id++ {
+		send(t, w, proto.Message{"t": "req", "id": id, "op": "t.wait"})
+	}
+	res := expect(t, r, "res")
+	want := "256 requests are running on this connection; wait for an answer before sending another"
+	if res.Int("id") != maxInFlight+1 || res["ok"] != false || res.String("error") != want {
+		t.Fatalf("res %v", res)
+	}
+	close(release)
+	for i := 0; i < maxInFlight; i++ {
+		if res := expect(t, r, "res"); res["ok"] != true {
+			t.Fatalf("res %v", res)
+		}
+	}
+	send(t, w, proto.Message{"t": "req", "id": 1000, "op": "ping"})
+	if res := expect(t, r, "res"); res.Int("id") != 1000 || res["ok"] != true {
+		t.Fatalf("res after the limit %v", res)
 	}
 }
 
@@ -129,8 +213,8 @@ func TestRequestsRunConcurrently(t *testing.T) {
 		return proto.Message{"which": "fast"}, nil
 	})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 1, "op": "t.slow"})
-	w.Send(proto.Message{"t": "req", "id": 2, "op": "t.fast"})
+	send(t, w, proto.Message{"t": "req", "id": 1, "op": "t.slow"})
+	send(t, w, proto.Message{"t": "req", "id": 2, "op": "t.fast"})
 	first := expect(t, r, "res")
 	if first.Int("id") != 2 || first.String("which") != "fast" {
 		t.Fatalf("first res %v", first)
@@ -148,12 +232,12 @@ func TestHandlerPanicBecomesError(t *testing.T) {
 		panic("boom")
 	})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 1, "op": "t.panic"})
+	send(t, w, proto.Message{"t": "req", "id": 1, "op": "t.panic"})
 	res := expect(t, r, "res")
 	if res.Int("id") != 1 || res["ok"] != false || res.String("error") == "" {
 		t.Fatalf("res %v", res)
 	}
-	w.Send(proto.Message{"t": "req", "id": 2, "op": "ping"})
+	send(t, w, proto.Message{"t": "req", "id": 2, "op": "ping"})
 	res = expect(t, r, "res")
 	if res.Int("id") != 2 || res["ok"] != true {
 		t.Fatalf("ping after panic %v", res)
@@ -205,9 +289,9 @@ func TestV1MessagesStillWork(t *testing.T) {
 	cb := &fakeClipboard{text: "v1 text"}
 	_, r, w, _ := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 1, "op": "ping"})
+	send(t, w, proto.Message{"t": "req", "id": 1, "op": "ping"})
 	expect(t, r, "res")
-	w.Send(proto.Message{"t": "clipboard.get"})
+	send(t, w, proto.Message{"t": "clipboard.get"})
 	if got := expect(t, r, "clipboard.text"); got.String("text") != "v1 text" {
 		t.Fatalf("clipboard.text %v", got)
 	}

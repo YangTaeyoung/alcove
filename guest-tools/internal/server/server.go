@@ -210,6 +210,7 @@ func (s *Server) handle(c net.Conn) {
 		}
 	}()
 
+	inFlight := make(chan struct{}, maxInFlight)
 	xfers := map[string]*fileXfer{}
 	r := proto.NewReader(c)
 	for {
@@ -225,7 +226,15 @@ func (s *Server) handle(c net.Conn) {
 			send(proto.Message{"t": "pong"})
 		case "pong", "welcome":
 		case "req":
-			go s.dispatch(ctx, m, send)
+			select {
+			case inFlight <- struct{}{}:
+				go func(m proto.Message) {
+					defer func() { <-inFlight }()
+					s.dispatch(ctx, m, send)
+				}(m)
+			default:
+				send(proto.Message{"t": "res", "id": m["id"], "ok": false, "error": tooManyRequests()})
+			}
 		case "clipboard.get":
 			text, err := s.opt.Clipboard.Text()
 			if err != nil {
