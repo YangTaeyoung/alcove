@@ -306,13 +306,14 @@ func (s *Server) handle(c net.Conn) {
 			}
 			send(proto.Message{"t": "file.done", "id": id, "path": x.path})
 		case "shutdown":
-			s.Close()
 			fn := s.opt.Shutdown
 			if fn == nil {
 				fn = platformShutdown
 			}
 			if err := fn(); err != nil {
 				lg.Printf("shutdown: %v", err)
+			} else {
+				s.Close()
 			}
 		case "exec":
 			if !s.opt.AllowExec {

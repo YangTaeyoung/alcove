@@ -145,6 +145,49 @@ func TestHelloClipboardAndFiles(t *testing.T) {
 	expect(t, r, "pong")
 }
 
+// closingUI records Close calls.
+type closingUI struct {
+	fakeUI
+	closed chan struct{}
+}
+
+func (c *closingUI) Close() { close(c.closed) }
+
+func TestShutdownClosesTheUIHelperOnlyAfterTheShutdownStarted(t *testing.T) {
+	for _, failed := range []bool{true, false} {
+		ui := &closingUI{closed: make(chan struct{})}
+		ran := make(chan struct{})
+		_, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: ui,
+			Shutdown: func() error {
+				defer close(ran)
+				select {
+				case <-ui.closed:
+					t.Error("the helper was closed before the shutdown ran")
+				default:
+				}
+				if failed {
+					return errors.New("the shutdown was cancelled")
+				}
+				return nil
+			}})
+		expect(t, r, "hello")
+		send(t, w, proto.Message{"t": "shutdown"})
+		<-ran
+		send(t, w, proto.Message{"t": "ping"})
+		expect(t, r, "pong")
+		select {
+		case <-ui.closed:
+			if failed {
+				t.Fatal("a failed shutdown closed the helper")
+			}
+		default:
+			if !failed {
+				t.Fatal("a shutdown that started left the helper open")
+			}
+		}
+	}
+}
+
 func TestExecDisabledByDefault(t *testing.T) {
 	r, w, c := startServer(t, Options{Token: "x", Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
 	c.SetDeadline(time.Now().Add(5 * time.Second))
