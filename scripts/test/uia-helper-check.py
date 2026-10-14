@@ -2,7 +2,8 @@
 """Checks the agent's win.*, ui.* and app.launch operations and its window
 events against a running Windows VM.
 
-Talks docs/agent-protocol.md directly on the forwarded agent port and drives
+Talks docs/agent-protocol.md directly on the forwarded agent port, after it
+paired or authenticated with the agentKey of the VM's config.json (--vm), and drives
 Notepad, File Explorer and the fixture app (build/alcove-fixture-windows-arm64.exe,
 built by scripts/test/all.sh) in the guest. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py) and neither Notepad nor the
@@ -20,7 +21,7 @@ Notepad's saved tabs back, closes the File Explorer window the script opened
 and deletes the files it wrote. The host copy is deleted after the tabs were
 put back; when that fails it stays and the script prints how to restore them.
 
-Usage: uia-helper-check.py [--agent-port N] [--only N[,N...]] [--kill-helper]
+Usage: uia-helper-check.py [--vm NAME] [--agent-port N] [--only N[,N...]] [--kill-helper]
 
 The last check reads every message of the run, so with --only it covers the
 selected checks.
@@ -33,6 +34,7 @@ import argparse, base64, hashlib, json, ntpath, os, re, select, shutil, signal, 
 
 sys.dont_write_bytecode = True
 from alcove_ctl import ignore_stop_signals, stop_signal_handlers
+from agent_key import AgentKeyError, agent_key, check_answer, first_message
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FIXTURE_BUILD = os.path.join(ROOT, "build", "alcove-fixture-windows-arm64.exe")
@@ -80,7 +82,7 @@ def expect(cond, reason):
 
 
 class Agent:
-    def __init__(self, port):
+    def __init__(self, port, key):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=10)
         self.buf = b""
         self.next_id = 0
@@ -89,6 +91,13 @@ class Agent:
         self.leaks = []
         self.hello = self._next(10)
         expect(self.hello and self.hello.get("t") == "hello", f"expected hello, got {self.hello!r}")
+        first = first_message(self.hello, key)
+        if first:
+            self.send(first)
+            try:
+                check_answer(self._next(10))
+            except AgentKeyError as e:
+                raise Failure(str(e)) from None
         self.send({"t": "welcome", "v": 1})
 
     def send(self, m):
@@ -1153,7 +1162,7 @@ def restore_notepad(a, run):
     return None
 
 
-def cleanup(port, run):
+def cleanup(port, key, run):
     """On a new connection: ends the fixture and Notepad processes the run
     started, puts Notepad's saved tabs back, closes the File Explorer windows
     the run opened and deletes the files it wrote. Returns the sentences that
@@ -1161,7 +1170,7 @@ def cleanup(port, run):
     ignore_stop_signals()
     problems = []
     try:
-        a = Agent(port)
+        a = Agent(port, key)
     except Exception as e:
         problems.append(f"cleanup did not run: {e}; the fixture, Notepad, a File Explorer window and files under {E2E} may remain in the guest")
         if run.notepad_copy:
@@ -1252,6 +1261,7 @@ def restart_helper(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--vm", default="Windows 11", help="the VM whose config.json holds the agentKey")
     ap.add_argument("--agent-port", type=int, default=7646)
     ap.add_argument("--only", default="", help="comma-separated check numbers")
     ap.add_argument("--kill-helper", action="store_true", help="end the running UI helper before the checks")
@@ -1259,7 +1269,12 @@ def main():
     only = {int(n) for n in args.only.split(",") if n}
 
     try:
-        a = Agent(args.agent_port)
+        key = agent_key(args.vm)
+    except AgentKeyError as e:
+        print(f"FAIL 0: {e}")
+        sys.exit(1)
+    try:
+        a = Agent(args.agent_port, key)
     except (OSError, Failure) as e:
         print(f"FAIL 0: cannot talk to the agent on port {args.agent_port}: {e}; run scripts/test/install-agent.py")
         sys.exit(1)
@@ -1318,7 +1333,7 @@ def main():
         ignore_stop_signals()
         if interrupted:
             print("interrupted; cleaning up...", flush=True)
-        problems = cleanup(args.agent_port, run)
+        problems = cleanup(args.agent_port, key, run)
         for problem in problems:
             failed = True
             print(f"FAIL cleanup: {problem}", flush=True)

@@ -2,7 +2,8 @@
 """Checks the agent's request/response operations against a running Windows VM.
 
 Talks docs/agent-protocol.md directly on the forwarded agent port: reads hello,
-sends welcome, then req/res with ids. Needs the agent installed with
+pairs or authenticates with the agentKey of the VM's config.json (--vm), sends
+welcome, then req/res with ids. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py). Each check prints
 `PASS <n> <title>`; the first failing check prints `FAIL <n>: <reason>` and the
 script exits 1. Files go under C:\\alcove-e2e\\rpc. However the run ends, a
@@ -13,12 +14,13 @@ start when C:\\alcove-e2e exists. SIGTERM, SIGHUP and SIGINT print
 signal's number (143, 129, 130); SIGHUP stays ignored when the script was
 started with it ignored (nohup).
 
-Usage: agent-rpc-windows.py [--agent-port N] [--only N[,N...]]
+Usage: agent-rpc-windows.py [--vm NAME] [--agent-port N] [--only N[,N...]]
 """
 import argparse, base64, hashlib, json, ntpath, os, select, signal, socket, sys, time
 
 sys.dont_write_bytecode = True
 from alcove_ctl import ignore_stop_signals, stop_signal_handlers
+from agent_key import AgentKeyError, agent_key, check_answer, first_message
 
 BASE = r"C:\alcove-e2e\rpc"
 CHUNK = 262144
@@ -41,7 +43,7 @@ def expect(cond, reason):
 
 
 class Agent:
-    def __init__(self, port):
+    def __init__(self, port, key):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=10)
         self.buf = b""
         self.next_id = 0
@@ -50,6 +52,13 @@ class Agent:
         self.other = []
         self.hello = self._next(10)
         expect(self.hello and self.hello.get("t") == "hello", f"expected hello, got {self.hello!r}")
+        first = first_message(self.hello, key)
+        if first:
+            self.send(first)
+            try:
+                check_answer(self._next(10))
+            except AgentKeyError as e:
+                raise Failure(str(e)) from None
         self.send({"t": "welcome", "v": 1})
 
     def send(self, m):
@@ -119,8 +128,9 @@ class Agent:
 
 
 class Run:
-    def __init__(self, agent):
+    def __init__(self, agent, key):
         self.a = agent
+        self.key = key
         self.home = ""
         self.user = ""
         self.jobs = []
@@ -165,7 +175,7 @@ class Run:
 
     def cleanup_steps(self, port):
         try:
-            a = Agent(port)
+            a = Agent(port, self.key)
         except (Failure, OSError, ValueError) as e:
             print(f"cleanup did not run: {e}; jobs {self.jobs} and {BASE} may remain in the guest", file=sys.stderr)
             return
@@ -505,13 +515,19 @@ def _(a, run):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--vm", default="Windows 11", help="the VM whose config.json holds the agentKey")
     ap.add_argument("--agent-port", type=int, default=7646)
     ap.add_argument("--only", default="", help="comma-separated check numbers")
     args = ap.parse_args()
     only = {int(n) for n in args.only.split(",") if n}
 
     try:
-        a = Agent(args.agent_port)
+        key = agent_key(args.vm)
+    except AgentKeyError as e:
+        print(f"FAIL 0: {e}")
+        sys.exit(1)
+    try:
+        a = Agent(args.agent_port, key)
     except (OSError, Failure) as e:
         print(f"FAIL 0: cannot talk to the agent on port {args.agent_port}: {e}; run scripts/test/install-agent.py")
         sys.exit(1)
@@ -520,7 +536,7 @@ def main():
         print(f"FAIL 0: the agent reports proto {a.hello.get('proto')!r} and caps {caps!r}; run scripts/test/install-agent.py")
         sys.exit(1)
 
-    run = Run(a)
+    run = Run(a, key)
     try:
         run.home = a.call("fs.stat", path="~")["path"]
         run.user = ntpath.basename(run.home)

@@ -13,7 +13,10 @@ install.log during this run. The script then requires, in this order:
 2. the agent process at the installed path started after the installer was
    launched and owns the listening agent port in the guest,
 3. hello on the forwarded agent port matches
-   guest-tools/internal/server/server.go.
+   guest-tools/internal/server/server.go and asks for the host key,
+4. a second connection pairs the agent with the agentKey of the VM's
+   config.json, or proves that key to an agent paired before, and the agent
+   answers authed.
 
 Usage: install-agent.py [--vm NAME] [--user NAME] [--ssh-port N] [--agent-port N]
 """
@@ -21,6 +24,7 @@ import argparse, hashlib, json, os, re, socket, subprocess, sys, time
 
 sys.dont_write_bytecode = True
 from alcove_ctl import Client, ControlError
+from agent_key import AgentKeyError, agent_key, check_answer, first_message
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 AGENT = os.path.join(ROOT, "build", "alcove-agent-windows-arm64.exe")
@@ -212,6 +216,32 @@ def read_hello(port):
         s.close()
 
 
+def authenticate(port, key):
+    """Pairs with or authenticates to the agent on port with key; returns whether it was paired before, or
+    fails the run with the agent's answer."""
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    except OSError as e:
+        fail(f"cannot connect to the agent port {port} to authenticate: {e}")
+    try:
+        s.settimeout(10)
+        f = s.makefile("rb")
+        hello = json.loads(f.readline() or b"null")
+        first = first_message(hello or {}, key)
+        if not first:
+            fail(f"the agent on port {port} does not ask for the host key: {hello!r}")
+        s.sendall((json.dumps(first) + "\n").encode())
+        line = f.readline()
+        check_answer(json.loads(line) if line else None)
+        return bool(hello.get("paired"))
+    except AgentKeyError as e:
+        fail(str(e))
+    except (OSError, ValueError) as e:
+        fail(f"the agent on port {port} broke the connection while authenticating: {e}")
+    finally:
+        s.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--vm", default="Windows 11")
@@ -225,6 +255,10 @@ def main():
     for p in (AGENT, KEY):
         if not os.path.exists(p):
             fail(f"missing {p}")
+    try:
+        agent_secret = agent_key(args.vm)
+    except AgentKeyError as e:
+        fail(str(e))
     want = source_version()
     digest = hashlib.sha256(open(AGENT, "rb").read()).hexdigest()
     ensure_running(args.vm, args.ssh_port)
@@ -253,6 +287,10 @@ def main():
     missing = [c for c in REQUIRED_CAPS if c not in hello.get("caps", [])]
     if missing:
         fail(f"hello.caps lacks {', '.join(missing)}")
+    if hello.get("auth") != "key":
+        fail(f"hello.auth is {hello.get('auth')!r}, expected 'key'")
+    paired_before = authenticate(args.agent_port, agent_secret)
+    log("authenticated with the agentKey of", repr(args.vm) if paired_before else f"{args.vm!r}; the agent was paired now")
     print("PASS")
 
 

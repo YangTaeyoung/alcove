@@ -6,9 +6,13 @@ Requires the "Windows 11" bundle in the app VM directory with port forwards
 ~/Library/Application Support/Alcove/test_id_ed25519, and the agent binary at
 build/alcove-agent-windows-arm64.exe. Boots the VM through alcovectl, installs
 the agent over SSH (scheduled task in the interactive session), then talks the
-agent protocol from the host: clipboard both ways, file push, exec.
+agent protocol from the host, after it paired or authenticated with the
+agentKey of the bundle's config.json: clipboard both ways, file push, exec.
 """
 import base64, hashlib, json, os, socket, subprocess, sys, time
+
+sys.dont_write_bytecode = True
+from agent_key import AgentKeyError, agent_key, check_answer, first_message
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CTL = os.path.join(ROOT, "AlcoveKit", ".build-ctl", "debug", "alcovectl")
@@ -17,6 +21,7 @@ KEY = os.path.expanduser("~/Library/Application Support/Alcove/test_id_ed25519")
 SSH = ["ssh", "-i", KEY, "-p", "2222", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR", "alcove@127.0.0.1"]
 AGENT_PORT = 7646
+VM = "Windows 11"
 
 
 def log(*a):
@@ -39,6 +44,12 @@ class Agent:
 
     def send(self, m):
         self.s.sendall((json.dumps(m) + "\n").encode())
+
+    def next(self):
+        line = self.f.readline()
+        if not line:
+            fail("agent closed the connection")
+        return json.loads(line)
 
     def recv(self, typ, timeout=30):
         self.s.settimeout(timeout)
@@ -101,6 +112,13 @@ def main():
         log("hello:", {k: hello[k] for k in ("os", "agent", "caps")})
         if hello.get("os") != "windows" or "clipboard" not in hello.get("caps", []):
             fail("unexpected hello")
+        try:
+            first = first_message(hello, agent_key(VM))
+            if first:
+                agent.send(first)
+                check_answer(agent.next())
+        except AgentKeyError as e:
+            fail(str(e))
         agent.send({"t": "welcome", "v": 1})
 
         # exec runs in the interactive session (scheduled task), so it sees the real clipboard

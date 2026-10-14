@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """End-to-end test of the guest agent inside the Ubuntu 24.04 bundle
-(ssh forward 2223->22 with the test key, agent forward 7647->7645)."""
+(ssh forward 2223->22 with the test key, agent forward 7647->7645). The host
+side pairs or authenticates with the agentKey of the bundle's config.json."""
 import base64, hashlib, json, os, socket, subprocess, sys, time
+
+sys.dont_write_bytecode = True
+from agent_key import AgentKeyError, agent_key, check_answer, first_message
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CTL = os.path.join(ROOT, "AlcoveKit", ".build-ctl", "debug", "alcovectl")
@@ -10,6 +14,7 @@ KEY = os.path.expanduser("~/Library/Application Support/Alcove/test_id_ed25519")
 SSH = ["ssh", "-i", KEY, "-p", "2223", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR", "alcove@127.0.0.1"]
 AGENT_PORT = 7647
+VM = "Ubuntu 24.04"
 
 
 def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
@@ -21,6 +26,10 @@ class Agent:
     def __init__(self, port):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=30); self.f = self.s.makefile("rb")
     def send(self, m): self.s.sendall((json.dumps(m) + "\n").encode())
+    def next(self):
+        line = self.f.readline()
+        if not line: fail("agent closed")
+        return json.loads(line)
     def recv(self, typ, timeout=30):
         end = time.time() + timeout
         while time.time() < end:
@@ -35,7 +44,7 @@ class Agent:
 
 
 def main():
-    vm = subprocess.Popen([CTL, "run", "Ubuntu 24.04", "--seconds", "400"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    vm = subprocess.Popen([CTL, "run", VM, "--seconds", "400"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         for _ in range(60):
             if ssh("hostname").returncode == 0: break
@@ -58,6 +67,13 @@ def main():
         hello = agent.recv("hello")
         log("hello:", {k: hello.get(k) for k in ("os", "agent", "caps", "token")})
         if hello.get("os") != "linux": fail("unexpected hello")
+        try:
+            first = first_message(hello, agent_key(VM))
+            if first:
+                agent.send(first)
+                check_answer(agent.next())
+        except AgentKeyError as e:
+            fail(str(e))
         agent.send({"t": "welcome", "v": 1})
         code, out = agent.exec("id -un; uname -m")
         log("exec:", code, out.strip().replace("\n", " | "))
