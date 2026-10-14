@@ -18,6 +18,12 @@ extension ControlHandler {
     /// What a `vm.batch` step may name besides the action ops.
     static let batchOnlyStepOps: Set<String> = ["vm.wait_idle", "vm.wait_for", "sleep"]
     static let maxBatchSteps = 50
+    /// Milliseconds a click or a key press may hold its button or key.
+    static let holdRange = 0...10_000
+    /// Milliseconds `vm.type` may wait after each key event.
+    static let keyDelayRange = 0...1_000
+    /// Wheel notches one `vm.mouse.scroll` may turn on each axis.
+    static let notchRange = -1_000...1_000
 
     struct ObserveOptions {
         var level = ObserveLevel.none
@@ -180,13 +186,15 @@ extension ControlHandler {
     func send(_ op: String, to t: VMTarget, _ params: JSON, caller: String? = nil) async throws {
         switch op {
         case "vm.mouse.move":
-            try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t))
+            let (x, y) = (try coordinate(params, "x"), try coordinate(params, "y"))
+            try await move(t, x: x, y: y, in: try await frameSize(of: t))
             await t.sendDisplay(.sync)
         case "vm.mouse.click":
             let button = try button(params["button"]?.stringValue)
             let count = max(1, min(3, params["count"]?.intValue ?? 1))
-            let hold = params["hold"]?.intValue ?? 60
-            try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t))
+            let hold = try integer(params, "hold", in: ControlHandler.holdRange, fallback: 60)
+            let (x, y) = (try coordinate(params, "x"), try coordinate(params, "y"))
+            try await move(t, x: x, y: y, in: try await frameSize(of: t))
             for i in 0..<count {
                 await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
                 try await Task.sleep(for: .milliseconds(hold))
@@ -198,12 +206,16 @@ extension ControlHandler {
             guard (params["x"] == nil) == (params["y"] == nil) else {
                 throw ControlError.failed("\(op) takes 'x' and 'y' together; pass both or neither")
             }
-            if params["x"] != nil { try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t)) }
+            if params["x"] != nil {
+                let (x, y) = (try coordinate(params, "x"), try coordinate(params, "y"))
+                try await move(t, x: x, y: y, in: try await frameSize(of: t))
+            }
             guard await t.sendDisplay(.btn(con: 0, button: button, down: op == "vm.mouse.down")) else { throw ControlError.noDisplay(t.name) }
             await t.sendDisplay(.sync)
         case "vm.mouse.drag":
             let button = try button(params["button"]?.stringValue)
-            let (fx, fy, tx, ty) = (try int(params, "fromX"), try int(params, "fromY"), try int(params, "toX"), try int(params, "toY"))
+            let (fx, fy) = (try coordinate(params, "fromX"), try coordinate(params, "fromY"))
+            let (tx, ty) = (try coordinate(params, "toX"), try coordinate(params, "toY"))
             let size = try await frameSize(of: t)
             try await move(t, x: fx, y: fy, in: size); await t.sendDisplay(.sync)
             await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
@@ -215,15 +227,17 @@ extension ControlHandler {
             }
             await t.sendDisplay(.btn(con: 0, button: button, down: false)); await t.sendDisplay(.sync)
         case "vm.mouse.scroll":
-            try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t)); await t.sendDisplay(.sync)
-            let dy = params["dy"]?.intValue ?? 0, dx = params["dx"]?.intValue ?? 0
+            let (x, y) = (try coordinate(params, "x"), try coordinate(params, "y"))
+            let dy = try integer(params, "dy", in: ControlHandler.notchRange, fallback: 0)
+            let dx = try integer(params, "dx", in: ControlHandler.notchRange, fallback: 0)
+            try await move(t, x: x, y: y, in: try await frameSize(of: t)); await t.sendDisplay(.sync)
             for _ in 0..<abs(dy) { await wheel(t, dy > 0 ? .wheelDown : .wheelUp) }
             for _ in 0..<abs(dx) { await wheel(t, dx > 0 ? .wheelRight : .wheelLeft) }
         case "vm.key.press":
             guard let spec = params["keys"]?.stringValue, !spec.isEmpty else { throw ControlError.missing("keys") }
             let seq: [(code: Int, down: Bool)]
             do { seq = try KeyNames.pressSequence(spec) } catch { throw ControlError.failed("bad key spec '\(spec)': \(ControlHandler.failureReason(error, fallback: "the keys could not be read"))") }
-            let hold = params["hold"]?.intValue ?? 0
+            let hold = try integer(params, "hold", in: ControlHandler.holdRange, fallback: 0)
             try await sendKeys(t, seq, gap: 20, holdBeforeRelease: hold)
         case "vm.key.down", "vm.key.up":
             guard let name = params["key"]?.stringValue else { throw ControlError.missing("key") }
@@ -232,7 +246,7 @@ extension ControlHandler {
             await t.sendDisplay(.key(mac: key.code, q: nil, down: op == "vm.key.down"))
         case "vm.type":
             guard let text = params["text"]?.stringValue else { throw ControlError.missing("text") }
-            let delay = params["delay"]?.intValue ?? 12
+            let delay = try integer(params, "delay", in: ControlHandler.keyDelayRange, fallback: 12)
             if let seq = try? KeyNames.typeSequence(text) {
                 try await sendKeys(t, seq, gap: delay, holdBeforeRelease: 0)
             } else {

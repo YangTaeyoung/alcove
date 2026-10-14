@@ -86,13 +86,13 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.pause` / `vm.resume` | `name` | `{state}` |
 | `vm.screenshot` | `name`, `region?`, `scale?`, `format?`, `quality?`, `maxWidth?`, `window?`, `marks?` | `{png | jpeg, mime, width, height, sentWidth, sentHeight, x, y, areaWidth, areaHeight, scale, window?, marks?, marksTruncated?}` — see [Screenshots](#screenshots) |
 | `vm.mouse.move` | `name`, `x`, `y`, observe params | `{}` or `{observation}` |
-| `vm.mouse.click` | `name`, `x`, `y`, `button?` ("left"/"right"/"middle"), `count?` (1 to 3), `hold?` ms (default 60), observe params | `{}` or `{observation}` — moves, presses, releases |
+| `vm.mouse.click` | `name`, `x`, `y`, `button?` ("left"/"right"/"middle"), `count?` (1 to 3), `hold?` ms (0 to 10000, default 60), observe params | `{}` or `{observation}` — moves, presses, releases |
 | `vm.mouse.drag` | `name`, `fromX`, `fromY`, `toX`, `toY`, `button?`, observe params | `{}` or `{observation}` |
-| `vm.mouse.scroll` | `name`, `x`, `y`, `dx?`, `dy?` (notches, +down), observe params | `{}` or `{observation}` |
+| `vm.mouse.scroll` | `name`, `x`, `y`, `dx?`, `dy?` (notches, +down, -1000 to 1000), observe params | `{}` or `{observation}` |
 | `vm.mouse.down` / `vm.mouse.up` | `name`, `button?` ("left" default), `x?` and `y?` together, observe params | `{}` or `{observation}` — presses or releases the button and leaves it so; with `x`/`y` the pointer moves there first |
-| `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms, observe params | `{}` or `{observation}` — presses modifiers then the key, releases in reverse |
+| `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms (0 to 10000, default 0), observe params | `{}` or `{observation}` — presses modifiers then the key, releases in reverse |
 | `vm.key.down` / `vm.key.up` | `name`, `key`, observe params | `{}` or `{observation}` |
-| `vm.type` | `name`, `text`, `delay?` ms per key (default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content (the guest reports the first 700,000 bytes of UTF-8 of a longer text, and those are compared), otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again` (`vm.ui.type` names itself). Guest tools without a clipboard answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs wl-copy or xclip in its session), so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only`; text whose message to the guest tools would reach 1 MiB answers `the text is too large for the guest clipboard (<n> bytes of UTF-8; one message to the guest tools holds less than 1 MiB); split it over several vm.type calls`. The guest clipboard holds the text afterwards |
+| `vm.type` | `name`, `text`, `delay?` ms per key (0 to 1000, default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content (the guest reports the first 700,000 bytes of UTF-8 of a longer text, and those are compared), otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again` (`vm.ui.type` names itself). Guest tools without a clipboard answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs wl-copy or xclip in its session), so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only`; text whose message to the guest tools would reach 1 MiB answers `the text is too large for the guest clipboard (<n> bytes of UTF-8; one message to the guest tools holds less than 1 MiB); split it over several vm.type calls`. The guest clipboard holds the text afterwards |
 | `vm.batch` | `name`, `steps`, observe params | `{completed, results, failedStep?, error?, observation?}` — see [Batches](#batches) |
 | `vm.find_text` | `name`, `query?`, `regex?`, `region?`, `languages?` | `{matches, lines}` — see [Finding text](#finding-text) |
 | `vm.wait_for` | `name`, `conditions`, `timeout?`, observe params | `{matched, waited, type?, detail?, problems?, observation?}` — see [Waiting for conditions](#waiting-for-conditions) |
@@ -112,7 +112,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.fs.read` | `name`, `path`, `offset?`, `length?` (≤ 262144), `tail?` (lines) | `{text, size, eof}` |
 | `vm.fs.write` | `name`, `path`, `text`, `append?` | `{size}` |
 | `vm.fs.delete` | `name`, `path`, `recursive?` | `{deleted}` |
-| `vm.wait_idle` | `name`, `seconds?` (stable period, default 2), `timeout?` (default 30) | `{idle: bool}` — `true` when fewer than 0.5% of the frame's 32x32 tiles changed between samples 250 ms apart for the whole period, `false` at the timeout |
+| `vm.wait_idle` | `name`, `seconds?` (stable period, 0 to 600, default 2), `timeout?` (1 to 600, default 30) | `{idle: bool}` — `true` when fewer than 0.5% of the frame's 32x32 tiles changed between samples 250 ms apart for the whole period, `false` at the timeout |
 | `vm.snapshot.list` | `name` | `{snapshots: [{name, date, vmStateBytes}]}` — see [Snapshots](#snapshots) |
 | `vm.snapshot.create` | `name`, `snapshot` | `{snapshot}` |
 | `vm.snapshot.restore` | `name`, `snapshot`, `waitTools?` s (default 30) | `{snapshot, tools: bool, clockSynced: bool, captureEnded?, staleProxyCleared?}` |
@@ -166,6 +166,11 @@ printscreen`, modifiers `ctrl control alt option shift win cmd meta super`,
 punctuation by character (`-` `=` `[` `]` `;` `'` `,` `.` `/` `` ` `` `\`).
 Combos use `+`. Names are case-insensitive.
 
+Pointer coordinates (`x`, `y`, `fromX`, `fromY`, `toX`, `toY`) are integers
+from -65536 to 65536; a point outside the frame moves the pointer to the
+nearest edge. An integer parameter outside its range is refused before any
+input is sent, with `<param> must be an integer between <low> and <high>`.
+
 ## Screenshots
 
 `vm.screenshot` reads the current guest frame and returns it, optionally
@@ -176,8 +181,10 @@ surface is mapped it asks the engine for a `screendump` instead.
 `ALCOVE_FRAME_SOURCE=screendump` in the environment of the server process
 makes it use the `screendump` always.
 
-- `region` `{x, y, w, h}` (guest pixels, `w` and `h` above 0) crops to the part
-  inside the frame; a region partly outside is cut to the frame, one fully
+- `region` `{x, y, w, h}` (guest pixels; `x` and `y` from -65536 to 65536, `w`
+  and `h` from 1 to 65536, otherwise `region needs integer x, y, w, h with x
+  and y between -65536 and 65536 and w and h between 1 and 65536`) crops to the
+  part inside the frame; a region partly outside is cut to the frame, one fully
   outside answers `region is outside the <W>x<H> frame`.
 - `scale` is a number from 0.1 to 1 (default 1) applied to the cropped area.
 - `maxWidth` shrinks the image to that width when it is below the scaled

@@ -440,8 +440,60 @@ final class ControlHandlerTests: XCTestCase {
             do {
                 _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": region])
                 XCTFail()
-            } catch let e as ControlHandler.ControlError { XCTAssertTrue(e.description.contains("region needs integer x, y, w, h with w and h above 0"), e.description) }
+            } catch let e as ControlHandler.ControlError { XCTAssertEqual(e.description, ControlHandler.regionSentence) }
         }
+    }
+
+    func testRegionSentenceNamesTheRanges() {
+        XCTAssertEqual(ControlHandler.regionSentence,
+                       "region needs integer x, y, w, h with x and y between -65536 and 65536 and w and h between 1 and 65536")
+    }
+
+    func testExtremeIntegerParametersAreRefusedWithTheirRangeBeforeAnyInput() async throws {
+        let (h, t) = setup()
+        let huge = JSON.int(Int64.max), tiny = JSON.int(Int64.min)
+        let cases: [(String, JSON, String)] = [
+            ("vm.mouse.scroll", ["name": "Win", "x": 5, "y": 5, "dy": tiny], "dy must be an integer between -1000 and 1000"),
+            ("vm.mouse.scroll", ["name": "Win", "x": 5, "y": 5, "dx": huge], "dx must be an integer between -1000 and 1000"),
+            ("vm.mouse.scroll", ["name": "Win", "x": tiny, "y": 5, "dy": 1], "x must be an integer between -65536 and 65536"),
+            ("vm.mouse.drag", ["name": "Win", "fromX": tiny, "fromY": 0, "toX": huge, "toY": 0], "fromX must be an integer between -65536 and 65536"),
+            ("vm.mouse.drag", ["name": "Win", "fromX": 0, "fromY": 0, "toX": huge, "toY": 0], "toX must be an integer between -65536 and 65536"),
+            ("vm.mouse.move", ["name": "Win", "x": 5, "y": huge], "y must be an integer between -65536 and 65536"),
+            ("vm.mouse.down", ["name": "Win", "x": huge, "y": 0], "x must be an integer between -65536 and 65536"),
+            ("vm.mouse.click", ["name": "Win", "x": 5, "y": 5, "hold": huge], "hold must be an integer between 0 and 10000"),
+            ("vm.mouse.click", ["name": "Win", "x": 5, "y": 5, "hold": -1], "hold must be an integer between 0 and 10000"),
+            ("vm.key.press", ["name": "Win", "keys": "a", "hold": huge], "hold must be an integer between 0 and 10000"),
+            ("vm.type", ["name": "Win", "text": "a", "delay": huge], "delay must be an integer between 0 and 1000"),
+            ("vm.type", ["name": "Win", "text": "a", "delay": "fast"], "delay must be an integer between 0 and 1000"),
+            ("vm.screenshot", ["name": "Win", "region": ["x": huge, "y": 0, "w": 1, "h": 1]], ControlHandler.regionSentence),
+            ("vm.screenshot", ["name": "Win", "region": ["x": 0, "y": 0, "w": huge, "h": 1]], ControlHandler.regionSentence),
+            ("vm.find_text", ["name": "Win", "region": ["x": 0, "y": tiny, "w": 1, "h": 1]], ControlHandler.regionSentence),
+            ("vm.wait_idle", ["name": "Win", "seconds": huge], "seconds must be an integer between 0 and 600"),
+            ("vm.wait_idle", ["name": "Win", "timeout": tiny], "timeout must be an integer between 1 and 600"),
+        ]
+        for (op, params, expected) in cases {
+            do {
+                _ = try await h.handle(op: op, params: params)
+                XCTFail("\(op) \(params) succeeded")
+            } catch let e as ControlHandler.ControlError {
+                XCTAssertEqual(e.description, expected, "\(op) \(params)")
+            }
+        }
+        let sent = await t.sent
+        XCTAssertEqual(sent, [])
+        let batch = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.mouse.scroll", "x": 5, "y": 5, "dy": tiny]]])
+        XCTAssertEqual(batch["error"]?.stringValue, "dy must be an integer between -1000 and 1000")
+    }
+
+    func testBoundaryIntegerParametersAreAccepted() async throws {
+        let (h, t) = setup()
+        _ = try await h.handle(op: "vm.mouse.scroll", params: ["name": "Win", "x": -65536, "y": 65536, "dy": -2, "dx": 1])
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 65536, "y": -65536, "hold": 0])
+        _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": "a", "delay": 0])
+        let shot = try await h.handle(op: "vm.screenshot", params: ["name": "Win", "region": ["x": -100, "y": -100, "w": 65536, "h": 65536]])
+        XCTAssertEqual(shot["areaWidth"]?.intValue, 800)
+        let sent = await t.sent
+        XCTAssertEqual(sent.filter { if case .btn(_, .wheelUp, true) = $0 { return true }; return false }.count, 2)
     }
 
     func testScreenshotParameterErrors() async throws {

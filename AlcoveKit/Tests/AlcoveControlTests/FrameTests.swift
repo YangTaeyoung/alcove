@@ -51,6 +51,14 @@ final class FrameTests: XCTestCase {
         } }
     }
 
+    func testClampOfAnExtremeRectangleIsNilOrInsideTheFrame() {
+        let frame = Frame(width: 4, height: 3, pixels: Data(count: 48))
+        XCTAssertNil(frame.clamp(Frame.Rect(x: Int.max, y: 0, w: 1, h: 1)))
+        XCTAssertNil(frame.clamp(Frame.Rect(x: 0, y: Int.max - 1, w: 5, h: Int.max)))
+        XCTAssertEqual(frame.clamp(Frame.Rect(x: Int.min, y: Int.min, w: Int.max, h: Int.max)), nil)
+        XCTAssertEqual(frame.clamp(Frame.Rect(x: -2, y: -1, w: Int.max, h: Int.max)), Frame.Rect(x: 0, y: 0, w: 4, h: 3))
+    }
+
     func testScaledSize() {
         let s = gradient(100, 50).scaled(by: 0.5)
         XCTAssertEqual(s.width, 50); XCTAssertEqual(s.height, 25)

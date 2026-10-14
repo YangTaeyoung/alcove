@@ -190,10 +190,8 @@ enum WaitCondition: Sendable {
         }
         func region() throws -> Frame.Rect? {
             guard let v = fields["region"], v != .null else { return nil }
-            guard let x = v["x"]?.intValue, let y = v["y"]?.intValue, let w = v["w"]?.intValue, let h = v["h"]?.intValue, w > 0, h > 0 else {
-                throw fail("region needs integer x, y, w, h with w and h above 0")
-            }
-            return Frame.Rect(x: x, y: y, w: w, h: h)
+            guard let rect = ControlHandler.requestedRect(v) else { throw fail(ControlHandler.regionSentence) }
+            return rect
         }
         func screenText() throws -> WaitText {
             let query = try text("text")!

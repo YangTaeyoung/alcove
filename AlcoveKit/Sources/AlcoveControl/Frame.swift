@@ -14,7 +14,9 @@ public struct Frame: Sendable, Equatable {
     public static let maxDimension = 16384
 
     public init(width: Int, height: Int, pixels: Data) {
-        precondition(width > 0 && height > 0 && pixels.count == width * height * 4)
+        let area = width.multipliedReportingOverflow(by: height)
+        let bytes = area.partialValue.multipliedReportingOverflow(by: 4)
+        precondition(width > 0 && height > 0 && !area.overflow && !bytes.overflow && pixels.count == bytes.partialValue)
         self.width = width
         self.height = height
         self.pixels = pixels
@@ -36,10 +38,15 @@ public struct Frame: Sendable, Equatable {
 
     public var bounds: Rect { Rect(x: 0, y: 0, w: width, h: height) }
 
-    /// Intersection with the frame; nil when empty.
+    /// Intersection with the frame; nil when empty. A right or bottom edge past the range of `Int` counts as the end
+    /// of that range on its side.
     public func clamp(_ r: Rect) -> Rect? {
+        func end(_ start: Int, _ length: Int) -> Int {
+            let sum = start.addingReportingOverflow(length)
+            return sum.overflow ? (length > 0 ? Int.max : Int.min) : sum.partialValue
+        }
         let x0 = max(r.x, 0), y0 = max(r.y, 0)
-        let x1 = min(r.x + r.w, width), y1 = min(r.y + r.h, height)
+        let x1 = min(end(r.x, r.w), width), y1 = min(end(r.y, r.h), height)
         guard x1 > x0, y1 > y0 else { return nil }
         return Rect(x: x0, y: y0, w: x1 - x0, h: y1 - y0)
     }

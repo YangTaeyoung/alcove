@@ -383,18 +383,19 @@ public actor ControlHandler {
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of the frame's tiles changing between samples 250 ms apart
+            let stable = Duration.seconds(try integer(params, "seconds", in: 0...WaitCondition.maxSeconds, fallback: 2))
+            let limit = try integer(params, "timeout", in: 1...WaitCondition.maxSeconds, fallback: 30)
             let t = try await running(params)
-            let stable = Duration.seconds(params["seconds"]?.intValue ?? 2)
-            let deadline = ContinuousClock.now + .seconds(params["timeout"]?.intValue ?? 30)
+            let deadline = clock() + .seconds(limit)
             var last = try await screenshot(t)
-            var since = ContinuousClock.now
-            while ContinuousClock.now < deadline {
+            var since = clock()
+            while clock() < deadline {
                 try await Task.sleep(for: .milliseconds(250))
                 let now = try await screenshot(t)
                 if FrameDiff.between(last, now).fraction < 0.005 {
-                    if ContinuousClock.now - since >= stable { return ["idle": true] }
+                    if clock() - since >= stable { return ["idle": true] }
                 } else {
-                    since = ContinuousClock.now
+                    since = clock()
                 }
                 last = now
             }
@@ -574,13 +575,45 @@ public actor ControlHandler {
         return frame
     }
 
-    private func regionParam(_ params: JSON) throws -> Frame.Rect? {
-        guard let value = params["region"] else { return nil }
-        guard let x = value["x"]?.intValue, let y = value["y"]?.intValue,
-              let w = value["w"]?.intValue, let h = value["h"]?.intValue, w > 0, h > 0 else {
-            throw ControlError.failed("region needs integer x, y, w, h with w and h above 0")
+    /// The largest distance from 0 that a guest pixel coordinate, or the width or height of a rectangle, may have in a
+    /// request.
+    static let maxCoordinate = Frame.maxDimension * 4
+    static let coordinateRange = -maxCoordinate...maxCoordinate
+
+    static let regionSentence = "region needs integer x, y, w, h with x and y between \(-maxCoordinate) and \(maxCoordinate) and w and h between 1 and \(maxCoordinate)"
+
+    /// The rectangle `value` names: integer `x` and `y` in `coordinateRange` and integer `w` and `h` from 1 to
+    /// `maxCoordinate`; nil for anything else.
+    static func requestedRect(_ value: JSON) -> Frame.Rect? {
+        guard let x = value["x"]?.intValue, let y = value["y"]?.intValue, let w = value["w"]?.intValue, let h = value["h"]?.intValue,
+              coordinateRange.contains(x), coordinateRange.contains(y), (1...maxCoordinate).contains(w), (1...maxCoordinate).contains(h) else {
+            return nil
         }
         return Frame.Rect(x: x, y: y, w: w, h: h)
+    }
+
+    /// The integer parameter `key`, which must lie in `range`; `fallback` when the parameter is absent or null, and
+    /// `ControlError.missing` when it is absent without a fallback.
+    nonisolated func integer(_ params: JSON, _ key: String, in range: ClosedRange<Int>, fallback: Int? = nil) throws -> Int {
+        guard let value = params[key], value != .null else {
+            guard let fallback else { throw ControlError.missing(key) }
+            return fallback
+        }
+        guard let number = value.intValue, range.contains(number) else {
+            throw ControlError.failed("\(key) must be an integer between \(range.lowerBound) and \(range.upperBound)")
+        }
+        return number
+    }
+
+    /// The guest pixel coordinate `key`, an integer in `coordinateRange`.
+    nonisolated func coordinate(_ params: JSON, _ key: String) throws -> Int {
+        try integer(params, key, in: ControlHandler.coordinateRange)
+    }
+
+    private func regionParam(_ params: JSON) throws -> Frame.Rect? {
+        guard let value = params["region"] else { return nil }
+        guard let rect = ControlHandler.requestedRect(value) else { throw ControlError.failed(ControlHandler.regionSentence) }
+        return rect
     }
 
     private func findText(_ t: VMTarget, _ params: JSON) async throws -> JSON {
