@@ -94,6 +94,8 @@ public actor VMController {
 
     /// Upper bound for loading a suspend-to-disk state (RAM-sized, so slow disks take a while).
     public static let resumeTimeout: Duration = .seconds(600)
+    /// Time limit of the `quit` command that `shutdown` and `suspendToDisk` send.
+    static let quitTimeout: Duration = .seconds(10)
 
     /// `tpm-tis-device` aborts under HVF in this engine build: its 0x5000-byte MMIO
     /// region is not 16 KiB aligned and `hv_vm_unmap` fails with HV_BAD_ARGUMENT
@@ -284,6 +286,9 @@ public actor VMController {
     }
 
     /// ACPI/PSCI power-button shutdown; falls back to `quit` after `gracePeriod`.
+    /// A guest the engine reports as not running is resumed before the power button is
+    /// pressed; the status query, the resume and the button press share the grace period
+    /// as their time limit.
     /// While starting (including a resume still loading its state) it aborts the
     /// start; while suspending only `force` is accepted and drops the partial state.
     public func shutdown(force: Bool = false, gracePeriod: Duration = .seconds(60)) async throws {
@@ -312,12 +317,15 @@ public actor VMController {
         state = .stopping
         expectingExit = true
         if !force, let qmp {
+            let deadline = ContinuousClock.now + gracePeriod
+            func remaining() -> Duration { max(.zero, deadline - ContinuousClock.now) }
             // stopped vCPUs cannot act on the power button
-            if wasPaused { try? await qmp.cont() }
-            try? await qmp.systemPowerdown()
-            if await q.waitForExit(timeout: gracePeriod) != nil { await finalizeExpectedExit(generation: gen); return }
+            let running = (try? await qmp.queryStatus(timeout: remaining()))?.running ?? !wasPaused
+            if !running { try? await qmp.cont(timeout: remaining()) }
+            try? await qmp.systemPowerdown(timeout: remaining())
+            if await q.waitForExit(timeout: remaining()) != nil { await finalizeExpectedExit(generation: gen); return }
         }
-        if let qmp { try? await qmp.quit() }
+        if let qmp { try? await qmp.quit(timeout: Self.quitTimeout) }
         if await q.waitForExit(timeout: .seconds(10)) == nil {
             q.kill()
             _ = await q.waitForExit()
@@ -370,7 +378,7 @@ public actor VMController {
             state = (s?.running ?? (previous == .running)) ? .running : .paused
             throw error
         }
-        try? await qmp.quit()
+        try? await qmp.quit(timeout: Self.quitTimeout)
         if await q.waitForExit(timeout: .seconds(15)) == nil {
             q.kill()
             _ = await q.waitForExit()
@@ -431,40 +439,47 @@ public actor VMController {
         guard Self.isValidSnapshotName(name) else { throw ControllerError.invalidSnapshotName(name) }
     }
 
+    /// Saves a snapshot of the running or paused guest; waits for a restore that runs to end first.
     public func createSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
+        await waitForRestore()
         guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks, let vmstate = disks.first?.id else {
             throw ControllerError.notRunning
         }
         try await qmp.snapshotSave(tag: name, vmstate: vmstate, devices: disks.map(\.id))
     }
 
-    /// Load a snapshot; a running guest is stopped for the load and resumed
-    /// afterwards, also when the load fails. Once the guest is touched, the
-    /// stop, load and resume run to their end in a task of their own, also
-    /// when the caller is cancelled. A restore asked for while another one runs
-    /// waits for it to end first. When a stop or a suspend takes over the VM
-    /// during the load, the restore leaves the state and the guest to it and
-    /// throws `notRunning`.
+    /// Load a snapshot; a guest that runs when the load task begins is stopped
+    /// for the load and resumed afterwards, also when the load fails. Once the
+    /// guest is touched, the stop, load and resume run to their end in a task
+    /// of their own, also when the caller is cancelled. A restore asked for
+    /// while another one runs waits for it to end first. When a stop or a
+    /// suspend takes over the VM before or during the load, the restore leaves
+    /// the state and the guest to it and throws `notRunning`.
     public func restoreSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
-        while let inFlight = restoreInFlight { _ = await inFlight.result }
+        await waitForRestore()
         guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks, let vmstate = disks.first?.id else {
             throw ControllerError.notRunning
         }
         try Task.checkCancellation()
-        let wasRunning = state == .running
         let gen = generation
         let load = Task {
-            try await self.loadSnapshot(name, qmp: qmp, vmstate: vmstate, devices: disks.map(\.id), resume: wasRunning, generation: gen)
+            try await self.loadSnapshot(name, qmp: qmp, vmstate: vmstate, devices: disks.map(\.id), generation: gen)
         }
         restoreInFlight = load
         try await load.value
     }
 
-    private func loadSnapshot(_ name: String, qmp: QMPClient, vmstate: String, devices: [String], resume wasRunning: Bool,
-                              generation gen: Int) async throws {
+    /// Returns once no restore is in flight.
+    private func waitForRestore() async {
+        while let inFlight = restoreInFlight { _ = await inFlight.result }
+    }
+
+    private func loadSnapshot(_ name: String, qmp: QMPClient, vmstate: String, devices: [String], generation gen: Int) async throws {
         defer { restoreInFlight = nil }
+        try checkRestoreOwnsState(gen)
+        let wasRunning = state == .running
         try await qmp.stop()
         try checkRestoreOwnsState(gen)
         state = .paused
@@ -492,8 +507,10 @@ public actor VMController {
         guard restoreOwnsState(gen) else { throw ControllerError.notRunning }
     }
 
+    /// Deletes a snapshot of the running or paused guest; waits for a restore that runs to end first.
     public func deleteSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
+        await waitForRestore()
         guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks else { throw ControllerError.notRunning }
         try await qmp.snapshotDelete(tag: name, devices: disks.map(\.id))
     }

@@ -12,8 +12,8 @@ extension QMPClient {
     }
 
     /// `query-status` (qapi/run-state.json).
-    public func queryStatus() async throws -> Status {
-        let r = try await execute("query-status")
+    public func queryStatus(timeout: Duration = .seconds(30)) async throws -> Status {
+        let r = try await execute("query-status", timeout: timeout)
         guard let running = r["running"]?.boolValue, let state = r["status"]?.stringValue else {
             throw QMPError.unexpectedReturn(command: "query-status", value: r)
         }
@@ -23,13 +23,13 @@ extension QMPClient {
     /// `stop`: pause all vCPUs (qapi/misc.json).
     public func stop() async throws { _ = try await execute("stop") }
     /// `cont`: resume (qapi/misc.json).
-    public func cont() async throws { _ = try await execute("cont") }
+    public func cont(timeout: Duration = .seconds(30)) async throws { _ = try await execute("cont", timeout: timeout) }
     /// `system_powerdown`: ACPI/PSCI power button (qapi/machine.json).
-    public func systemPowerdown() async throws { _ = try await execute("system_powerdown") }
+    public func systemPowerdown(timeout: Duration = .seconds(30)) async throws { _ = try await execute("system_powerdown", timeout: timeout) }
     /// `system_reset` (qapi/machine.json).
     public func systemReset() async throws { _ = try await execute("system_reset") }
     /// `quit`: terminate QEMU (qapi/control.json).
-    public func quit() async throws { _ = try await execute("quit") }
+    public func quit(timeout: Duration = .seconds(30)) async throws { _ = try await execute("quit", timeout: timeout) }
 
     // MARK: monitor and network (qapi/misc.json, net.json)
 

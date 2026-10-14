@@ -100,6 +100,8 @@ final class VMControllerFakeEngineTests: XCTestCase {
         s = await vm.state; XCTAssertEqual(s, .stopped)
         XCTAssertNil(VMController.pidfileLockHolder(vm.bundle.pidFileURL.path))
         let after = await vm.runningConfig; XCTAssertNil(after)
+        let observed = await waitUntil { await log.states.last == .stopped }
+        XCTAssertTrue(observed, "the observer did not see .stopped")
         let states = await log.states
         XCTAssertEqual(states, [.starting, .running, .paused, .running, .paused, .running, .stopping, .stopped])
     }
@@ -363,6 +365,8 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertEqual(state, .stopped)
         let result = await restore.result
         XCTAssertThrowsError(try result.get()) { XCTAssertEqual($0 as? VMController.ControllerError, .notRunning, "\($0)") }
+        let observed = await waitUntil { await log.states.last == .stopped }
+        XCTAssertTrue(observed, "the observer did not see .stopped")
         let states = await log.states
         XCTAssertEqual(Array(states.drop { $0 != .stopping }), [.stopping, .stopped], "\(states)")
     }
@@ -383,6 +387,56 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertEqual(state, .running)
         let status = try await vm.qmp!.queryStatus()
         XCTAssertTrue(status.running, "the engine reports \(status) after both restores")
+        try await vm.shutdown(force: true)
+    }
+
+    func testGracefulStopWhileTheRestoreStopsTheGuestPowersItOffWithoutQuit() async throws {
+        let vm = try makeVM(mode: "slow-stop")
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        let restore = Task { try await vm.restoreSnapshot(named: "base") }
+        let stopSent = await waitUntil { (try? self.qmpCommands(vm))?.contains("stop") == true }
+        XCTAssertTrue(stopSent, "the restore did not send stop")
+        try await vm.shutdown(force: false, gracePeriod: .seconds(5))
+        let state = await vm.state
+        XCTAssertEqual(state, .stopped)
+        let result = await restore.result
+        XCTAssertThrowsError(try result.get()) { XCTAssertEqual($0 as? VMController.ControllerError, .notRunning, "\($0)") }
+        let commands = try qmpCommands(vm)
+        XCTAssertTrue(commands.contains("system_powerdown"), "\(commands)")
+        XCTAssertFalse(commands.contains("quit"), "\(commands)")
+        XCTAssertFalse(commands.contains("snapshot-load"), "\(commands)")
+    }
+
+    func testASnapshotCreatedDuringALoadIsSavedAfterTheRestoreResumesTheGuest() async throws {
+        let vm = try makeVM(mode: "slow-load")
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        let restore = Task { try await vm.restoreSnapshot(named: "base") }
+        let loading = await waitUntil { await vm.state == .paused }
+        XCTAssertTrue(loading, "the restore did not stop the guest")
+        try await vm.createSnapshot(named: "after")
+        try await restore.value
+        let commands = try qmpCommands(vm).filter { ["stop", "snapshot-load", "snapshot-save", "cont"].contains($0) }
+        XCTAssertEqual(commands, ["snapshot-save", "stop", "snapshot-load", "cont", "snapshot-save"])
+        let state = await vm.state
+        XCTAssertEqual(state, .running)
+        try await vm.shutdown(force: true)
+    }
+
+    func testASnapshotDeletedDuringALoadIsDeletedAfterTheRestore() async throws {
+        let vm = try makeVM(mode: "slow-load")
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        let restore = Task { try await vm.restoreSnapshot(named: "base") }
+        let loading = await waitUntil { await vm.state == .paused }
+        XCTAssertTrue(loading, "the restore did not stop the guest")
+        try await vm.deleteSnapshot(named: "base")
+        try await restore.value
+        let commands = try qmpCommands(vm).filter { ["stop", "snapshot-load", "snapshot-delete", "cont"].contains($0) }
+        XCTAssertEqual(commands, ["stop", "snapshot-load", "cont", "snapshot-delete"])
+        let state = await vm.state
+        XCTAssertEqual(state, .running)
         try await vm.shutdown(force: true)
     }
 
@@ -932,9 +986,9 @@ final class VMControllerFakeEngineTests: XCTestCase {
 }
 
 /// See the class comment. `FAKE_QEMU_MODE`: "" or a comma-separated list of exit-early |
-/// bad-status | migrate-fails | incoming-fails | slow-incoming | ignore-powerdown | slow-load.
+/// bad-status | migrate-fails | incoming-fails | slow-incoming | ignore-powerdown | slow-load | slow-stop.
 /// slow-load: `snapshot-load` holds the QMP connection for 1 s before its job events,
-/// and no other command is answered meanwhile.
+/// and no other command is answered meanwhile. slow-stop: `stop` does the same for 0.5 s before it pauses the guest.
 private let fakeQEMUSource = #"""
 #!/usr/bin/env python3
 import fcntl, json, os, socket, sys, threading, time
@@ -1010,6 +1064,8 @@ def handle(req):
     elif cmd == "query-status":
         ok({"bogus": True} if "bad-status" in modes else dict(st))
     elif cmd == "stop":
+        if "slow-stop" in modes:
+            time.sleep(0.5)
         st.update(running=False, status="paused"); ok(); event("STOP")
     elif cmd == "cont":
         if st["status"] == "inmigrate":
