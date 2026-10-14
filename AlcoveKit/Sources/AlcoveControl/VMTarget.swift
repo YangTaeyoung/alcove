@@ -25,6 +25,8 @@ public protocol VMTarget: Sendable {
     func screenshotPNG() async throws -> Data
     /// The current guest frame as BGRA pixels.
     func frame() async throws -> Frame
+    /// Width and height of the current guest frame in pixels.
+    func frameSize() async throws -> (width: Int, height: Int)
     /// Send a display-protocol message (input) to the engine; false when no display.
     @discardableResult func sendDisplay(_ message: ToQEMU) async -> Bool
     /// The guest agent, connecting on demand; nil when the VM is not running
@@ -294,6 +296,17 @@ public actor ControllerTarget: VMTarget {
         }
         guard let frame = Frame(png: try await screenshotPNG()) else { throw FrameError.undecodable }
         return frame
+    }
+
+    /// The size of the display's current surface; without a mapped surface, and with
+    /// `ALCOVE_FRAME_SOURCE=screendump`, the size of a frame read for it.
+    public func frameSize() async throws -> (width: Int, height: Int) {
+        if ProcessInfo.processInfo.environment["ALCOVE_FRAME_SOURCE"] != "screendump",
+           let surface = await controller.display?.currentSurface, surface.isValid {
+            return (surface.w, surface.h)
+        }
+        let frame = try await frame()
+        return (frame.width, frame.height)
     }
 
     public func screenshotPNG() async throws -> Data {

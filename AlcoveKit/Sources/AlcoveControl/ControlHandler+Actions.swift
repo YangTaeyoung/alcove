@@ -254,10 +254,10 @@ extension ControlHandler {
         }
     }
 
-    /// Moves the pointer to guest pixel (x, y), clamped to the frame.
+    /// Moves the pointer to guest pixel (x, y), clamped to the frame as it is at this moment.
     private func move(_ t: VMTarget, x: Int, y: Int) async throws {
-        if lastSize[t.name] == nil { _ = try await screenshot(t) }
-        guard let (w, h) = lastSize[t.name], w > 1, h > 1 else { throw ControlError.noDisplay(t.name) }
+        let (w, h) = try await frameSize(of: t)
+        guard w > 1, h > 1 else { throw ControlError.noDisplay(t.name) }
         let ax = Int((Double(max(0, min(x, w - 1))) / Double(w - 1) * Double(ToQEMU.absoluteMax)).rounded())
         let ay = Int((Double(max(0, min(y, h - 1))) / Double(h - 1) * Double(ToQEMU.absoluteMax)).rounded())
         guard await t.sendDisplay(.abs(con: 0, x: ax, y: ay)) else { throw ControlError.noDisplay(t.name) }

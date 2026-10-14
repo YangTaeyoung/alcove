@@ -178,7 +178,7 @@ final class ObservationTests: XCTestCase {
         let key = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "a", "observe": "none"])
         XCTAssertEqual(key, ["eventSeq": 0])
         let frameCalls = await t.frameCalls
-        XCTAssertEqual(frameCalls, 1)
+        XCTAssertEqual(frameCalls, 0)
     }
 
     func testClickWithObserveReturnsObservation() async throws {

@@ -77,6 +77,12 @@ actor FakeTarget: VMTarget {
         guard let f = Frame(png: png) else { throw NSError(domain: "FakeTarget", code: 1) }
         return f
     }
+    /// The size of the frame the next `frame()` call serves; the call is not counted in `frameCalls`.
+    func frameSize() async throws -> (width: Int, height: Int) {
+        if let next = frames.first { return (next.width, next.height) }
+        guard let f = Frame(png: png) else { throw NSError(domain: "FakeTarget", code: 1) }
+        return (f.width, f.height)
+    }
     @discardableResult func sendDisplay(_ message: ToQEMU) async -> Bool { sent.append(message); return true }
     func agent(timeout: Duration) async -> AgentClient? {
         agentTimeouts.append(timeout)
@@ -237,6 +243,43 @@ final class ControlHandlerTests: XCTestCase {
         XCTAssertEqual(after.filter { if case .btn(_, .left, true) = $0 { return true }; return false }.count, 2)
         do { _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 1]); XCTFail() }
         catch let e as ControlHandler.ControlError { XCTAssertTrue(e.description.contains("'y'")) }
+    }
+
+    func testStatusReportsTheSizeOfTheCurrentFrame() async throws {
+        let (h, t) = setup(size: (640, 480))
+        let booting = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(booting["width"]?.intValue, 640); XCTAssertEqual(booting["height"]?.intValue, 480)
+        await t.setPNG(makePNG(width: 1280, height: 800))
+        let later = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(later["width"]?.intValue, 1280); XCTAssertEqual(later["height"]?.intValue, 800)
+        let listed = try await h.handle(op: "vm.list", params: [:])
+        XCTAssertEqual(listed["vms"]?[0]?["width"]?.intValue, 1280); XCTAssertEqual(listed["vms"]?[0]?["height"]?.intValue, 800)
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 0)
+    }
+
+    func testPointerCoordinatesAreScaledToTheCurrentFrame() async throws {
+        let (h, t) = setup(size: (640, 480))
+        _ = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        await t.setPNG(makePNG(width: 1280, height: 800))
+        func expected(_ x: Int, _ y: Int) -> ToQEMU {
+            .abs(con: 0, x: Int((Double(x) / 1279 * Double(ToQEMU.absoluteMax)).rounded()),
+                 y: Int((Double(y) / 799 * Double(ToQEMU.absoluteMax)).rounded()))
+        }
+        _ = try await h.handle(op: "vm.mouse.move", params: ["name": "Win", "x": 1000, "y": 700])
+        var sent = await t.sent
+        XCTAssertEqual(sent.first, expected(1000, 700))
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 300, "y": 200])
+        sent = Array(await t.sent.dropFirst(sent.count))
+        XCTAssertEqual(sent.first, expected(300, 200))
+
+        await t.setPNG(makePNG(width: 800, height: 600))
+        let before = await t.sent.count
+        _ = try await h.handle(op: "vm.mouse.drag", params: ["name": "Win", "fromX": 799, "fromY": 599, "toX": 0, "toY": 0])
+        sent = Array(await t.sent.dropFirst(before))
+        XCTAssertEqual(sent.first, .abs(con: 0, x: ToQEMU.absoluteMax, y: ToQEMU.absoluteMax))
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 0)
     }
 
     func testScrollDragAndMove() async throws {

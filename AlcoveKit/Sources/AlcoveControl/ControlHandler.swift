@@ -49,7 +49,7 @@ public actor ControlHandler {
 
     public let registry: VMRegistry
     public let hostKind: String
-    /// Guest frame size per VM from the latest screenshot (for coordinate scaling).
+    /// Guest frame size per VM as last read, for the rows of `vm.list`.
     var lastSize: [String: (Int, Int)] = [:]
     let inputGate = InputGate()
     /// One `vm.deploy` per VM at a time.
@@ -460,8 +460,8 @@ public actor ControlHandler {
         if let template = await t.cloneOf() { obj["cloneOf"] = .string(template) }
         if await t.isEphemeral() { obj["ephemeral"] = true }
         if !quick, st == .running || st == .paused {
-            if lastSize[t.name] == nil, let frame = try? await screenshot(t) {
-                obj["width"] = .int(Int64(frame.width)); obj["height"] = .int(Int64(frame.height))
+            if let (width, height) = try? await frameSize(of: t) {
+                obj["width"] = .int(Int64(width)); obj["height"] = .int(Int64(height))
             }
             if let agent = await t.agent(timeout: .seconds(2)), let hello = await agent.hello {
                 obj["tools"] = true
@@ -471,6 +471,18 @@ public actor ControlHandler {
             }
         }
         return .object(obj)
+    }
+
+    /// Width and height of the current guest frame of `t`, which `vm.list` reports for the VM from then on.
+    func frameSize(of t: VMTarget) async throws -> (Int, Int) {
+        let size: (width: Int, height: Int)
+        do {
+            size = try await t.frameSize()
+        } catch {
+            throw ControlError.failed("the size of the guest screen could not be read: \(ControlHandler.failureReason(error, fallback: "the display gave no image; check vm.status"))")
+        }
+        lastSize[t.name] = (size.width, size.height)
+        return (size.width, size.height)
     }
 
     func screenshot(_ t: VMTarget) async throws -> Frame {
