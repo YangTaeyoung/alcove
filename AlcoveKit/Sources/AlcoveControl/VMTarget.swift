@@ -294,6 +294,8 @@ public actor ControllerTarget: VMTarget {
     public nonisolated let name: String
     public let controller: VMController
     private let frameSource = FrameSource()
+    /// Whether `ALCOVE_FRAME_SOURCE=screendump` was in the environment when the process first asked for a frame.
+    private static let screendumpOnly = ProcessInfo.processInfo.environment["ALCOVE_FRAME_SOURCE"] == "screendump"
     private let guestEvents = EventBuffer()
     private let link: AgentLink
 
@@ -325,7 +327,7 @@ public actor ControllerTarget: VMTarget {
     public func resume() async throws { try await controller.resume() }
 
     public func frame() async throws -> Frame {
-        if ProcessInfo.processInfo.environment["ALCOVE_FRAME_SOURCE"] != "screendump",
+        if !ControllerTarget.screendumpOnly,
            let frame = frameSource.frame(for: await controller.display?.currentSurface) {
             return frame
         }
@@ -336,7 +338,7 @@ public actor ControllerTarget: VMTarget {
     /// The size of the display's current surface; without a mapped surface, and with
     /// `ALCOVE_FRAME_SOURCE=screendump`, the size of a frame read for it.
     public func frameSize() async throws -> (width: Int, height: Int) {
-        if ProcessInfo.processInfo.environment["ALCOVE_FRAME_SOURCE"] != "screendump",
+        if !ControllerTarget.screendumpOnly,
            let surface = await controller.display?.currentSurface, surface.isValid {
             return (surface.w, surface.h)
         }
