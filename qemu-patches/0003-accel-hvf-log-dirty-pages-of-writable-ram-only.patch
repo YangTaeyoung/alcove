@@ -7,9 +7,9 @@ index 8bd9154..3db79a6 100644
  }
  
 +/*
-+ * True for the sections hvf_set_phys_mem() maps with write access: RAM that
-+ * is neither read-only nor a ROM device. Dirty logging changes the protection
-+ * of these sections only.
++ * True for a section whose memory region is RAM that is neither read-only
++ * nor a ROM device. Dirty logging changes the protection of these sections
++ * only.
 + */
 +static bool hvf_section_is_writable_ram(MemoryRegionSection *section)
 +{
