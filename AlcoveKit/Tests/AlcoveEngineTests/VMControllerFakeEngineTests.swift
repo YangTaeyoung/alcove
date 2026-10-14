@@ -60,6 +60,16 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try JSONDecoder().decode([String].self, from: Data(contentsOf: vm.bundle.runURL.appendingPathComponent("fake-argv.json")))
     }
 
+    /// The QMP commands the fake engine of `vm` received, in order (from the `qmp<` lines of its log).
+    private func qmpCommands(_ vm: VMController) throws -> [String] {
+        let log = try String(contentsOf: vm.bundle.qemuLogURL, encoding: .utf8)
+        return log.split(separator: "\n").compactMap { line -> String? in
+            guard line.hasPrefix("qmp< "),
+                  let object = try? JSONSerialization.jsonObject(with: Data(line.dropFirst(5).utf8)) as? [String: Any] else { return nil }
+            return object["execute"] as? String
+        }
+    }
+
     private func waitUntil(timeout: Duration = .seconds(10), _ condition: () async -> Bool) async -> Bool {
         let deadline = ContinuousClock.now + timeout
         while ContinuousClock.now < deadline {
@@ -308,14 +318,71 @@ final class VMControllerFakeEngineTests: XCTestCase {
         let restore = Task { try await vm.restoreSnapshot(named: "base") }
         let loading = await waitUntil { await vm.state == .paused }
         XCTAssertTrue(loading, "the restore did not stop the guest")
-        try await Task.sleep(for: .milliseconds(200))
         restore.cancel()
-        _ = await restore.result
-        let resumed = await waitUntil(timeout: .seconds(5)) { await vm.state == .running }
+        let result = await restore.result
+        XCTAssertNoThrow(try result.get(), "the cancelled caller gets the result of the load")
         let state = await vm.state
-        XCTAssertTrue(resumed, "the controller state is \(state) after the cancelled restore")
+        XCTAssertEqual(state, .running, "the controller state after the cancelled restore")
         let status = try await vm.qmp!.queryStatus()
         XCTAssertTrue(status.running, "the engine reports \(status) after the cancelled restore")
+        try await vm.shutdown(force: true)
+    }
+
+    func testRestoreWhoseCallerIsCancelledBeforeItStartsDoesNotTouchTheGuest() async throws {
+        let vm = try makeVM()
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        let restore = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await vm.restoreSnapshot(named: "base")
+        }
+        let result = await restore.result
+        XCTAssertThrowsError(try result.get()) { XCTAssertTrue($0 is CancellationError, "\($0)") }
+        let commands = try qmpCommands(vm)
+        XCTAssertFalse(commands.contains("stop"), "\(commands)")
+        XCTAssertFalse(commands.contains("snapshot-load"), "\(commands)")
+        let state = await vm.state
+        XCTAssertEqual(state, .running)
+        let status = try await vm.qmp!.queryStatus()
+        XCTAssertTrue(status.running)
+        try await vm.shutdown(force: true)
+    }
+
+    func testShutdownDuringARestoreEndsStoppedAndTheRestoreDoesNotResumeTheGuest() async throws {
+        let vm = try makeVM(mode: "slow-load,ignore-powerdown")
+        let log = StateLog()
+        let observer = Task { for await s in vm.states { await log.append(s) } }
+        defer { observer.cancel() }
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        let restore = Task { try await vm.restoreSnapshot(named: "base") }
+        let loading = await waitUntil { await vm.state == .paused }
+        XCTAssertTrue(loading, "the restore did not stop the guest")
+        try await vm.shutdown(force: false, gracePeriod: .seconds(3))
+        let state = await vm.state
+        XCTAssertEqual(state, .stopped)
+        let result = await restore.result
+        XCTAssertThrowsError(try result.get()) { XCTAssertEqual($0 as? VMController.ControllerError, .notRunning, "\($0)") }
+        let states = await log.states
+        XCTAssertEqual(Array(states.drop { $0 != .stopping }), [.stopping, .stopped], "\(states)")
+    }
+
+    func testASecondRestoreDuringALoadWaitsForItAndResumesTheGuest() async throws {
+        let vm = try makeVM(mode: "slow-load")
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        let first = Task { try await vm.restoreSnapshot(named: "base") }
+        let loading = await waitUntil { await vm.state == .paused }
+        XCTAssertTrue(loading, "the first restore did not stop the guest")
+        let second = Task { try await vm.restoreSnapshot(named: "base") }
+        try await first.value
+        try await second.value
+        let commands = try qmpCommands(vm).filter { ["stop", "snapshot-load", "cont"].contains($0) }
+        XCTAssertEqual(commands, ["stop", "snapshot-load", "cont", "stop", "snapshot-load", "cont"])
+        let state = await vm.state
+        XCTAssertEqual(state, .running)
+        let status = try await vm.qmp!.queryStatus()
+        XCTAssertTrue(status.running, "the engine reports \(status) after both restores")
         try await vm.shutdown(force: true)
     }
 
@@ -864,13 +931,15 @@ final class VMControllerFakeEngineTests: XCTestCase {
     }
 }
 
-/// See the class comment. `FAKE_QEMU_MODE`: "" | exit-early | bad-status |
-/// migrate-fails | incoming-fails | slow-incoming | ignore-powerdown.
+/// See the class comment. `FAKE_QEMU_MODE`: "" or a comma-separated list of exit-early |
+/// bad-status | migrate-fails | incoming-fails | slow-incoming | ignore-powerdown | slow-load.
+/// slow-load: `snapshot-load` holds the QMP connection for 1 s before its job events,
+/// and no other command is answered meanwhile.
 private let fakeQEMUSource = #"""
 #!/usr/bin/env python3
 import fcntl, json, os, socket, sys, threading, time
 
-mode = os.environ.get("FAKE_QEMU_MODE", "")
+modes = set(filter(None, os.environ.get("FAKE_QEMU_MODE", "").split(",")))
 args = sys.argv[1:]
 
 def opt(name):
@@ -882,7 +951,7 @@ def opt(name):
 def err(msg):
     sys.stderr.write("qemu-system-aarch64: " + msg + "\n"); sys.stderr.flush()
 
-if mode == "exit-early":
+if "exit-early" in modes:
     err("-drive if=pflash,format=raw,file=efi-vars.fd: Could not open 'efi-vars.fd': No such file or directory")
     sys.exit(1)
 
@@ -919,9 +988,9 @@ def die(code, delay):
     threading.Thread(target=run, daemon=True).start()
 
 def finish_incoming():
-    time.sleep(3.0 if mode == "slow-incoming" else 0.4)
+    time.sleep(3.0 if "slow-incoming" in modes else 0.4)
     path = incoming[len("file:"):]
-    if mode == "incoming-fails" or not (os.path.exists(path) and os.path.getsize(path) > 0):
+    if "incoming-fails" in modes or not (os.path.exists(path) and os.path.getsize(path) > 0):
         err("load of migration failed: Invalid argument")
         os._exit(1)
     st.update(running=False, status="paused")   # the saved run state
@@ -939,7 +1008,7 @@ def handle(req):
     if cmd == "qmp_capabilities":
         ok()
     elif cmd == "query-status":
-        ok({"bogus": True} if mode == "bad-status" else dict(st))
+        ok({"bogus": True} if "bad-status" in modes else dict(st))
     elif cmd == "stop":
         st.update(running=False, status="paused"); ok(); event("STOP")
     elif cmd == "cont":
@@ -952,7 +1021,7 @@ def handle(req):
                 event("SHUTDOWN", {"guest": True, "reason": "guest-shutdown"}); die(0, 0.2)
     elif cmd == "system_powerdown":
         ok(); event("POWERDOWN")
-        if mode == "ignore-powerdown":
+        if "ignore-powerdown" in modes:
             pass
         elif st["running"]:
             event("SHUTDOWN", {"guest": True, "reason": "guest-shutdown"}); die(0, 0.2)
@@ -964,7 +1033,7 @@ def handle(req):
         ok(); event("SHUTDOWN", {"guest": False, "reason": "host-qmp-quit"}); die(0, 0.1)
     elif cmd == "migrate":
         path = a["uri"][len("file:"):]
-        if mode == "migrate-fails":
+        if "migrate-fails" in modes:
             open(path, "wb").close()   # QEMU creates the file before failing
             migration.update({"status": "failed", "error-desc": "fake: no space left on device"})
         else:
@@ -986,16 +1055,11 @@ def handle(req):
             snapshots.discard(tag)
         jobs[jid] = e
         ok()
-        if cmd == "snapshot-load" and mode == "slow-load":
-            def load():
-                orig = dict(st)
-                st.update(running=False, status="restore-vm")
-                time.sleep(1.0)
-                st.update(orig)
-                for s in ("created", "running", "waiting", "pending", "concluded"):
-                    event("JOB_STATUS_CHANGE", {"id": jid, "status": s})
-            threading.Thread(target=load, daemon=True).start()
-            return
+        if cmd == "snapshot-load" and "slow-load" in modes:
+            orig = dict(st)
+            st.update(running=False, status="restore-vm")
+            time.sleep(1.0)
+            st.update(orig)
         for s in ("created", "running", "waiting", "pending", "concluded"):
             event("JOB_STATUS_CHANGE", {"id": jid, "status": s})
     elif cmd == "query-jobs":

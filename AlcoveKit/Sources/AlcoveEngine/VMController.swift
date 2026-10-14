@@ -89,6 +89,8 @@ public actor VMController {
     private var expectingExit = false
     private var generation = 0
     private var usbHotplugSerial = 0
+    /// The stop, load and resume of the snapshot restore that is running.
+    private var restoreInFlight: Task<Void, Error>?
 
     /// Upper bound for loading a suspend-to-disk state (RAM-sized, so slow disks take a while).
     public static let resumeTimeout: Duration = .seconds(600)
@@ -440,31 +442,54 @@ public actor VMController {
     /// Load a snapshot; a running guest is stopped for the load and resumed
     /// afterwards, also when the load fails. Once the guest is touched, the
     /// stop, load and resume run to their end in a task of their own, also
-    /// when the caller is cancelled.
+    /// when the caller is cancelled. A restore asked for while another one runs
+    /// waits for it to end first. When a stop or a suspend takes over the VM
+    /// during the load, the restore leaves the state and the guest to it and
+    /// throws `notRunning`.
     public func restoreSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
+        while let inFlight = restoreInFlight { _ = await inFlight.result }
         guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks, let vmstate = disks.first?.id else {
             throw ControllerError.notRunning
         }
         try Task.checkCancellation()
         let wasRunning = state == .running
-        try await Task { try await self.loadSnapshot(name, qmp: qmp, vmstate: vmstate, devices: disks.map(\.id), resume: wasRunning) }.value
+        let gen = generation
+        let load = Task {
+            try await self.loadSnapshot(name, qmp: qmp, vmstate: vmstate, devices: disks.map(\.id), resume: wasRunning, generation: gen)
+        }
+        restoreInFlight = load
+        try await load.value
     }
 
-    private func loadSnapshot(_ name: String, qmp: QMPClient, vmstate: String, devices: [String], resume wasRunning: Bool) async throws {
+    private func loadSnapshot(_ name: String, qmp: QMPClient, vmstate: String, devices: [String], resume wasRunning: Bool,
+                              generation gen: Int) async throws {
+        defer { restoreInFlight = nil }
         try await qmp.stop()
+        try checkRestoreOwnsState(gen)
         state = .paused
         do {
             try await qmp.snapshotLoad(tag: name, vmstate: vmstate, devices: devices)
         } catch {
-            if wasRunning, (try? await qmp.cont()) != nil { state = .running }
+            if wasRunning, restoreOwnsState(gen), (try? await qmp.cont()) != nil, restoreOwnsState(gen) { state = .running }
             throw error
         }
+        try checkRestoreOwnsState(gen)
         display?.send(.refresh(con: 0))
         if wasRunning {
             try await qmp.cont()
+            try checkRestoreOwnsState(gen)
             state = .running
         }
+    }
+
+    /// Whether the engine of generation `gen` still runs and no stop or suspend has taken over the state.
+    private func restoreOwnsState(_ gen: Int) -> Bool {
+        gen == generation && (state == .running || state == .paused)
+    }
+
+    private func checkRestoreOwnsState(_ gen: Int) throws {
+        guard restoreOwnsState(gen) else { throw ControllerError.notRunning }
     }
 
     public func deleteSnapshot(named name: String) async throws {
