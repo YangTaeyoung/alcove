@@ -11,8 +11,10 @@ import (
 // one direction reaches EOF the peer connection is half-closed and the other
 // direction continues until it ends or stays idle for tunnelIdleAfterHalfClose;
 // a read or write error closes both connections. A tunnel row with the byte
-// counts is recorded when both directions have finished.
-func (p *Proxy) tunnel(client *bufConn, host, authority string) {
+// counts is recorded when both directions have finished. With replied the
+// client has already been told the connection is established, and a failed
+// dial closes it without an answer.
+func (p *Proxy) tunnel(client *bufConn, authority string, replied bool) {
 	start := time.Now()
 	ex := &Exchange{
 		Time:   start,
@@ -24,8 +26,10 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 	}
 	up, err := net.DialTimeout("tcp", dialAddress(authority), dialTimeout)
 	if err != nil {
-		_, _ = io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-		ex.Status = 502
+		if !replied {
+			_, _ = io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+			ex.Status = 502
+		}
 		ex.Error = "cannot reach " + authority + ": " + err.Error() + "; check the address and that the Mac can reach it"
 		p.record(ex)
 		return
@@ -35,8 +39,10 @@ func (p *Proxy) tunnel(client *bufConn, host, authority string) {
 		return
 	}
 	defer p.untrackAux(up)
-	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		return
+	if !replied {
+		if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
 	}
 	ex.Status = 200
 	var up2down, down2up atomic.Int64

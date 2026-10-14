@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,10 @@ func dialAddress(addr string) string {
 // firstBytesTimeout bounds how long a new client connection may take to send
 // its first bytes and its CONNECT or request header.
 var firstBytesTimeout = 30 * time.Second
+
+// clientFirstWait bounds how long an intercepted CONNECT connection waits for
+// the client's first byte before it is tunnelled unchanged.
+var clientFirstWait = 5 * time.Second
 
 type config struct {
 	hosts   []string
@@ -238,13 +243,46 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	host, port := splitAuthority(req.Host, "443")
 	authority := net.JoinHostPort(host, port)
 	if !p.intercepts(host) {
-		p.tunnel(bc, host, authority)
+		p.tunnel(bc, authority, false)
 		return
 	}
 	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
-	p.interceptTLS(bc, host, port)
+	_ = conn.SetReadDeadline(time.Now().Add(clientFirstWait))
+	first, err := br.Peek(1)
+	var ne net.Error
+	switch {
+	case err == nil && first[0] == tlsHandshakeRecord:
+		_ = conn.SetReadDeadline(time.Time{})
+		p.interceptTLS(bc, host, port)
+	case err == nil && startsWithRequestLine(br):
+		_ = conn.SetReadDeadline(time.Time{})
+		p.serveHTTP(bc, "http", hostPort(host, port, "80"))
+	case err == nil || errors.As(err, &ne) && ne.Timeout():
+		_ = conn.SetReadDeadline(time.Time{})
+		p.tunnel(bc, authority, true)
+	}
+}
+
+// tlsHandshakeRecord is the first byte of a TLS handshake record.
+const tlsHandshakeRecord = 0x16
+
+var requestLine = regexp.MustCompile(`^[A-Z]+ [^ ]+ HTTP/1\.[01]\r?\n$`)
+
+// startsWithRequestLine reports whether the client's first line, read ahead
+// into br until the connection's read deadline, is an HTTP/1 request line.
+func startsWithRequestLine(br *bufio.Reader) bool {
+	for n := 1; n <= br.Size(); n++ {
+		b, err := br.Peek(n)
+		if err != nil {
+			return false
+		}
+		if b[n-1] == '\n' {
+			return requestLine.Match(b)
+		}
+	}
+	return false
 }
 
 func splitAuthority(authority, defaultPort string) (host, port string) {
