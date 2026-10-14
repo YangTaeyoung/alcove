@@ -119,7 +119,8 @@ private func runInProcess(_ options: RunScriptOptions, socketPath: String) -> Ne
 
     let registry = HeadlessRegistry(directory: vmDir, engine: engine)
     let handler = ControlHandler(registry: registry, hostKind: "headless", captureDirectory: ProxyProcess.defaultCADirectory,
-                                 engineDescription: engine.qemuSystem)
+                                 engineDescription: engine.qemuSystem,
+                                 log: ControlHandler.standardErrorAndSystemLog())
     let flag = InterruptFlag()
     let run = Task.detached { try await handler.handle(op: "script.run", params: .object(options.params)) }
     let vmName = options.vm ?? ScriptReport.vmName(ofScriptAt: options.file) ?? "the VM"
@@ -133,6 +134,7 @@ private func runInProcess(_ options: RunScriptOptions, socketPath: String) -> Ne
     }
     Task.detached {
         let outcome = await run.result
+        await handler.shutdown()
         let stopFailures = await registry.stopAll()
         lock?.release()
         withExtendedLifetime(sources) {}
