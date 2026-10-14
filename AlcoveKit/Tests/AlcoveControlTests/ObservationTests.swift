@@ -303,13 +303,13 @@ final class ObservationTests: XCTestCase {
         XCTAssertTrue(r["error"]?.stringValue?.hasPrefix("bad key spec 'hyper+x'") ?? false, "\(r)")
         XCTAssertEqual(r["observationError"]?.stringValue, observationError)
         var sent = await t.sent
-        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true)])
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
 
         await t.setFailingFrameCalls([3])
         let finished = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.up", "key": "shift"]], "observe": "diff", "settleMs": 60])
         XCTAssertEqual(finished, ["completed": 1, "results": [[:]], "observationError": .string(observationError), "eventSeq": 0])
         sent = await t.sent
-        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false), .key(mac: shift, q: nil, down: false)])
     }
 
     func testFailedBeforeCaptureSendsNoInput() async throws {
@@ -426,7 +426,7 @@ final class ObservationTests: XCTestCase {
         XCTAssertEqual(r["failedStep"]?.intValue, 1)
         XCTAssertTrue(r["error"]?.stringValue?.hasPrefix("bad key spec 'hyper+x'") ?? false, "\(r)")
         var sent = await t.sent
-        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true)])
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
 
         let observed = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": steps, "observe": "summary", "settleMs": 60])
         XCTAssertEqual(observed["failedStep"]?.intValue, 1)
@@ -515,7 +515,8 @@ final class ObservationTests: XCTestCase {
         do { _ = try await batch.value; XCTFail("expected cancellation") } catch is CancellationError {}
         _ = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "a"])
         let sent = await t.sent
-        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: a, q: nil, down: true), .key(mac: a, q: nil, down: false)])
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false),
+                              .key(mac: a, q: nil, down: true), .key(mac: a, q: nil, down: false)])
     }
 
     func testObservationHoldsInputGate() async throws {

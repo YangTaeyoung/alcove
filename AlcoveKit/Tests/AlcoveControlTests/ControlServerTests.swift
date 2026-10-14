@@ -169,7 +169,8 @@ final class ControlServerTests: XCTestCase {
         let find = Task { try await handler.handle(op: "vm.find_text", params: ["name": "Win", "languages": ["en-US"]]) }
         let queued = await eventually { RecognitionQueue.shared.load.waiting == 1 }
         XCTAssertTrue(queued)
-        XCTAssertEqual(widths.value, [400])
+        let warming = await eventually { widths.value == [400] }
+        XCTAssertTrue(warming, "\(widths.value)")
         gate.open()
         let found = try await find.value
         XCTAssertEqual(found["lines"]?.intValue, 0)

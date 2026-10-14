@@ -396,8 +396,11 @@ final class ControlHandlerTests: XCTestCase {
 
     func testToolsRequiredOps() async throws {
         let (h, _) = setup()
+        let local = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("tools-required-\(UUID().uuidString).bin")
+        try Data("x".utf8).write(to: local)
+        addTeardownBlock { try? FileManager.default.removeItem(at: local) }
         for (op, params) in [("vm.exec", ["name": "Win", "command": "hostname"] as JSON), ("vm.clipboard.get", ["name": "Win"]),
-                             ("vm.clipboard.set", ["name": "Win", "text": "x"]), ("vm.push_file", ["name": "Win", "path": "/tmp/x"])] {
+                             ("vm.clipboard.set", ["name": "Win", "text": "x"]), ("vm.push_file", ["name": "Win", "path": .string(local.path)])] {
             do { _ = try await h.handle(op: op, params: params); XCTFail(op) }
             catch let e as ControlHandler.ControlError { XCTAssertTrue(e.description.contains("guest tools"), op) }
         }
