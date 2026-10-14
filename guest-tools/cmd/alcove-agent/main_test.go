@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -99,6 +100,34 @@ func TestDataFoldersNameNoFolderWithoutProgramData(t *testing.T) {
 	}
 	if alcoveDir != "" || uiaDir != "" {
 		t.Fatalf("folders %q and %q", alcoveDir, uiaDir)
+	}
+}
+
+func TestInstallLogIsNotWrittenThroughALink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links need a privilege on Windows")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("kept\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "install.log")); err != nil {
+		t.Fatal(err)
+	}
+	writeInstallLog(dir, "installed")
+	if got, _ := os.ReadFile(target); string(got) != "kept\n" {
+		t.Fatalf("the link target holds %q", got)
+	}
+}
+
+func TestInstallLogIsAppended(t *testing.T) {
+	dir := t.TempDir()
+	writeInstallLog(dir, "one")
+	writeInstallLog(dir, "two")
+	got, _ := os.ReadFile(filepath.Join(dir, "install.log"))
+	if lines := strings.Split(strings.TrimSpace(string(got)), "\n"); len(lines) != 2 || !strings.HasSuffix(lines[0], " one") || !strings.HasSuffix(lines[1], " two") {
+		t.Fatalf("install.log %q", got)
 	}
 }
 

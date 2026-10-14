@@ -138,7 +138,7 @@ func (n noHelper) CallContext(context.Context, string, map[string]any, time.Dura
 
 // openLog opens the log file for appending after creating its folder. A log
 // file inside lockedDir is not opened when locking that folder failed with
-// lockErr, and a log file that is a reparse point is not opened.
+// lockErr, and a log file that is a reparse point or a symbolic link is not opened.
 func openLog(path, lockedDir string, lockErr error) (*os.File, error) {
 	if lockErr != nil && insideDir(lockedDir, path) {
 		return nil, fmt.Errorf("%s is not opened because its folder is not locked (%v)", path, lockErr)
@@ -149,7 +149,7 @@ func openLog(path, lockedDir string, lockErr error) (*os.File, error) {
 	if err := refuseReparse(path); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|openNoFollow, 0o644)
 }
 
 // insideDir reports whether path lies in dir or below it; names are compared
@@ -212,14 +212,14 @@ func mask(t string) string {
 
 // writeInstallLog appends the install result to install.log in dir, where the
 // result of a build without a console can be read afterwards. It does nothing
-// when the file is a reparse point.
+// when the file is a reparse point or a symbolic link.
 func writeInstallLog(dir, msg string) {
 	path := filepath.Join(dir, "install.log")
 	_ = os.MkdirAll(dir, 0o755)
 	if refuseReparse(path) != nil {
 		return
 	}
-	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|openNoFollow, 0o644); err == nil {
 		fmt.Fprintf(f, "%s %s\n", timeNow(), msg)
 		f.Close()
 	}

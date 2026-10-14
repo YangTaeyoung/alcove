@@ -3,19 +3,53 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"syscall"
 )
 
-// refuseReparse never refuses outside Windows; there are no junctions to plant.
-func refuseReparse(string) error { return nil }
+// openNoFollow makes an open fail when the last element of the path is a
+// symbolic link.
+const openNoFollow = syscall.O_NOFOLLOW
 
-// lockDataFolder returns the folder of install.log; there is nothing to lock
-// outside Windows.
+// installLogFolder is the folder of install.log outside Windows.
+const installLogFolder = "/var/log/alcove"
+
+// refuseReparse reports an error when path is a symbolic link.
+func refuseReparse(path string) error {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return errors.New(path + " is a symbolic link; remove it")
+	}
+	return nil
+}
+
+// lockDataFolder returns installLogFolder after ownLogFolder made it.
 func lockDataFolder() (string, error) {
-	return filepath.Join(os.TempDir(), "Alcove"), nil
+	return ownLogFolder(installLogFolder)
+}
+
+// ownLogFolder creates dir with access for its owner only, or narrows an
+// existing dir to that access, and returns it. A dir that is a symbolic link,
+// not a directory or owned by another user than the effective one is refused.
+func ownLogFolder(dir string) (string, error) {
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return "", err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !fi.IsDir() || !ok || int(st.Uid) != os.Geteuid() {
+		return "", fmt.Errorf("%s is not a plain folder owned by this user; remove it and run alcove-agent --install again", dir)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
 }
 
 // installAtLogon installs a systemd system unit on Linux whose command line

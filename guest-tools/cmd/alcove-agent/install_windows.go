@@ -16,6 +16,10 @@ import (
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/uia"
 )
 
+// openNoFollow adds nothing to an open on Windows; refuseReparse checks the
+// path before it.
+const openNoFollow = 0
+
 // refuseReparse reports an error when path is a reparse point (a junction or
 // symbolic link), so a log file is not opened through a planted link.
 func refuseReparse(path string) error {
