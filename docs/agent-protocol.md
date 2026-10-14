@@ -405,8 +405,17 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, in
   order), then `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\<name>`
   and the 32-bit view `HKLM\SOFTWARE\WOW6432Node\…\App Paths\<name>`, so
-  `msedge.exe` starts Edge; a `REG_EXPAND_SZ` value has its `%VAR%`
-  references expanded. A name found in none of them answers
+  `msedge.exe` starts Edge. `%VAR%` references in these values are expanded
+  from the machine, never from the agent's environment: `%SystemDrive%`,
+  `%SystemRoot%` and `%windir%` from the system's Windows folder
+  (`GetSystemWindowsDirectoryW`), and `%ProgramFiles%`, `%ProgramFiles(x86)%`,
+  `%ProgramW6432%`, `%CommonProgramFiles%`, `%CommonProgramFiles(x86)%` and
+  `%CommonProgramW6432%` from their `…Dir` values under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion`. A folder or program that
+  names any other variable, or does not start with a drive, is skipped. When
+  the system's Windows folder cannot be read the answer is
+  `the system folders could not be read (<system error>); pass the full path of the program`.
+  A name found in none of them answers
   `'<name>' is not in the system folders of PATH or under HKLM App Paths; pass the full path of the program`.
 - The program starts directly with `args` as its arguments and with a normal
   window. Without `cwd` it runs in the directory of the program file; `cwd`

@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/sysfolder"
 )
 
 const createNoWindow = 0x08000000
@@ -108,75 +110,43 @@ func killByName(name string, tree bool) (int, error) {
 	return killed, nil
 }
 
+// sessionEnvironmentKey holds the machine's PATH.
+const sessionEnvironmentKey = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+
 // resolveProgram returns systemProgramPath of path with the folders of the
-// machine's PATH, read from the registry, and the HKLM App Paths keys.
+// machine's PATH, read from the registry, and the HKLM App Paths keys. Their
+// values are expanded with sysfolder.MachineVars; a folder or program that
+// names any other variable is left out.
 func resolveProgram(path string) (string, error) {
+	if strings.ContainsAny(path, `\/:`) {
+		return path, nil
+	}
+	vars, err := sysfolder.MachineVars()
+	if err != nil {
+		return "", fmt.Errorf("the system folders could not be read (%v); pass the full path of the program", err)
+	}
+	raw, _ := sysfolder.MachineString(sessionEnvironmentKey, "Path")
 	var dirs []string
-	for _, dir := range strings.Split(registryString(syscall.HKEY_LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, "Path"), ";") {
-		dirs = append(dirs, strings.TrimSpace(dir))
+	for _, dir := range strings.Split(raw, ";") {
+		if full, err := sysfolder.Expand(strings.TrimSpace(dir), vars); err == nil {
+			dirs = append(dirs, full)
+		}
 	}
 	exists := func(p string) bool {
 		fi, err := os.Stat(p)
 		return err == nil && fi.Mode().IsRegular()
 	}
 	return systemProgramPath(path, dirs, exists, func(key string) string {
-		return registryString(syscall.HKEY_LOCAL_MACHINE, key, "")
+		raw, err := sysfolder.MachineString(key, "")
+		if err != nil {
+			return ""
+		}
+		full, err := sysfolder.Expand(strings.Trim(strings.TrimSpace(raw), `"`), vars)
+		if err != nil {
+			return ""
+		}
+		return full
 	})
-}
-
-var procExpandEnvironmentStrings = syscall.NewLazyDLL("kernel32.dll").NewProc("ExpandEnvironmentStringsW")
-
-// expandEnv replaces %VAR% references in a REG_EXPAND_SZ value with their
-// environment values.
-func expandEnv(s string) string {
-	src, err := syscall.UTF16PtrFromString(s)
-	if err != nil {
-		return s
-	}
-	n, _, _ := procExpandEnvironmentStrings.Call(uintptr(unsafe.Pointer(src)), 0, 0)
-	if n == 0 {
-		return s
-	}
-	buf := make([]uint16, n)
-	r, _, _ := procExpandEnvironmentStrings.Call(uintptr(unsafe.Pointer(src)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-	if r == 0 {
-		return s
-	}
-	return syscall.UTF16ToString(buf)
-}
-
-// registryString reads a string value; it returns "" when the key or the
-// value is missing. A REG_EXPAND_SZ value has its %VAR% references expanded.
-func registryString(root syscall.Handle, key, value string) string {
-	keyPtr, err := syscall.UTF16PtrFromString(key)
-	if err != nil {
-		return ""
-	}
-	var h syscall.Handle
-	if syscall.RegOpenKeyEx(root, keyPtr, 0, syscall.KEY_READ, &h) != nil {
-		return ""
-	}
-	defer syscall.RegCloseKey(h)
-	valuePtr, err := syscall.UTF16PtrFromString(value)
-	if err != nil {
-		return ""
-	}
-	var kind, size uint32
-	if syscall.RegQueryValueEx(h, valuePtr, nil, &kind, nil, &size) != nil || size == 0 {
-		return ""
-	}
-	if kind != syscall.REG_SZ && kind != syscall.REG_EXPAND_SZ {
-		return ""
-	}
-	buf := make([]uint16, size/2+1)
-	if syscall.RegQueryValueEx(h, valuePtr, nil, &kind, (*byte)(unsafe.Pointer(&buf[0])), &size) != nil {
-		return ""
-	}
-	out := syscall.UTF16ToString(buf)
-	if kind == syscall.REG_EXPAND_SZ {
-		out = expandEnv(out)
-	}
-	return out
 }
 
 // processParents maps each running process to its parent.

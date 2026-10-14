@@ -781,8 +781,8 @@ still shows responding false after 10 s`.
 
 **`vm.app.launch`** starts the program `path` in the guest (a full path, or a
 bare name found in a folder of the machine's `PATH` or registered under the
-HKLM `App Paths` key, such as `msedge.exe`; the user's own `PATH` is not
-searched, and another bare name answers `'<name>' is not in the system
+HKLM `App Paths` key, such as `msedge.exe`; the user's own `PATH` and
+environment are not read, and another bare name answers `'<name>' is not in the system
 folders of PATH or under HKLM App Paths; pass the full path of the program`) with `args` (array of strings), `cwd` and `env` (object of
 strings), and waits up to `waitWindow` seconds (0 to 300, default 15; 0 does
 not wait) for the window it opens. It needs guest tools that run commands and
