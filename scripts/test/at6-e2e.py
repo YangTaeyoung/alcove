@@ -29,7 +29,8 @@ server. Every VM start needs 10 GiB free on the data volume.
 
 However the run ends, the cleanup ends the run-script and alcovectl serve
 processes the run started, starts the VM through the control server when the
-run left it stopped, stops the recording of the run, ends the processes that
+run left it stopped, waits up to 120 s until the VM runs with its tools
+connected and no lease, stops the recording of the run, ends the processes that
 run from the two guest folders, puts the clipboard text back, deletes the
 snapshot at6-base when the run took it, deletes the two folders and the host
 directory of the run. When a
@@ -427,9 +428,14 @@ class Run:
         end = time.time() + 120
         while True:
             status = c.call("vm.status", 60, name=self.vm)
-            if status.get("state") != "running" or status.get("tools") is True or time.time() > end:
+            settled = status.get("state") == "running" and status.get("tools") is True and not status.get("leasedBy")
+            if status.get("state") not in ("running", "paused") or settled or time.time() > end:
                 break
             time.sleep(1)
+        if status.get("state") == "running" and status.get("leasedBy"):
+            self.cleanup_error(f"'{self.vm}' is still leased by {status['leasedBy']!r} 120 s after the run-script processes ended, "
+                               f"so the guest was not cleaned; wait for the lease to end, then {by_hand}")
+            return False
         if status.get("state") != "running" or status.get("tools") is not True:
             self.cleanup_error(f"'{self.vm}' is {status.get('state')} with tools {status.get('tools')!r}, so the guest was not cleaned; start it, {by_hand}")
             return False
