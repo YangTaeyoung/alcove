@@ -116,7 +116,7 @@ private func blockFrame(step: Int) -> Frame {
     let width = 160, height = 120
     var pixels = Data(repeating: 0x40, count: width * height * 4)
     let blockX = (step * 7) % (width - 30)
-    pixels.withUnsafeMutableBytes { raw in
+    pixels.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
         for y in 40..<70 {
             for x in blockX * 4..<(blockX + 30) * 4 { raw[y * width * 4 + x] = 255 }
         }

@@ -619,7 +619,7 @@ private func noisyFrame(_ width: Int, _ height: Int, step: Int) -> Frame {
     var pixels = Data(repeating: 0x40, count: width * height * 4)
     let blockX = (step * 12) % max(1, width - 200)
     var seed = UInt32(truncatingIfNeeded: step &* 2_654_435_761)
-    pixels.withUnsafeMutableBytes { raw in
+    pixels.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
         for y in height / 4..<min(height, height / 4 + 200) {
             for x in blockX * 4..<min(width, blockX + 200) * 4 { raw[y * width * 4 + x] = 255 }
         }
@@ -637,7 +637,7 @@ private func noisyFrame(_ width: Int, _ height: Int, step: Int) -> Frame {
 private func movingFrame(_ width: Int, _ height: Int, step: Int) -> Frame {
     var pixels = Data(repeating: 0x40, count: width * height * 4)
     let blockX = (step * 12) % max(1, width - 40)
-    pixels.withUnsafeMutableBytes { raw in
+    pixels.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
         for y in height / 3..<min(height, height / 3 + 40) {
             for x in blockX..<min(width, blockX + 40) {
                 let offset = (y * width + x) * 4
