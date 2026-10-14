@@ -250,6 +250,42 @@ final class ProxyProcessTests: XCTestCase {
         _ = await stops(proxy)
     }
 
+    func testProxyProcessNamesWhatEndedAChildThatExitedOnItsOwn() async throws {
+        let script = try standIn(Self.ready + "\nIFS= read -r line\necho 'the proxy listener stopped: boom' >&2\nexit 3")
+        let proxy = ProxyProcess(executable: script.path, caDirectory: script.dir)
+        let before = await proxy.exitReason()
+        XCTAssertNil(before)
+        _ = try await proxy.start()
+        let running = await proxy.exitReason()
+        XCTAssertNil(running)
+        _ = await proxyFailure { _ = try await proxy.call("list", [:]) }
+        let reason = await proxy.exitReason()
+        XCTAssertEqual(reason, "alcove-proxy exited with status 3: the proxy listener stopped: boom")
+        await proxy.stop()
+        let afterStop = await proxy.exitReason()
+        XCTAssertEqual(afterStop, "alcove-proxy exited with status 3: the proxy listener stopped: boom")
+    }
+
+    func testProxyProcessNamesAClosedOutputAsWhatEndedIt() async throws {
+        let script = try standIn(Self.ready + "\nexec >&-\n" + Self.idle)
+        let proxy = ProxyProcess(executable: script.path, caDirectory: script.dir, limits: .init(exit: .milliseconds(100)))
+        _ = try await proxy.start()
+        let named = await eventually("the proxy names its closed output") { await proxy.exitReason() != nil }
+        XCTAssertTrue(named)
+        let reason = await proxy.exitReason()
+        XCTAssertEqual(reason, "alcove-proxy closed its output and gives no more answers")
+        _ = await stops(proxy)
+    }
+
+    func testProxyProcessStoppedByItsOwnerHasNoExitReason() async throws {
+        let script = try standIn(Self.ready + "\n" + Self.echo)
+        let proxy = ProxyProcess(executable: script.path, caDirectory: script.dir)
+        _ = try await proxy.start()
+        _ = await stops(proxy)
+        let reason = await proxy.exitReason()
+        XCTAssertNil(reason)
+    }
+
     func testProxyProcessKeepsNoBytesItHasSent() async throws {
         let answer = #"{ if (match($0, /"id":[0-9]+/)) { printf "{\"id\":%s,\"ok\":true}\n", substr($0, RSTART + 5, RLENGTH - 5); fflush() } }"#
         let script = try standIn(Self.ready + "\nexec awk '\(answer)'")

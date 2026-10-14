@@ -193,6 +193,7 @@ extension ControlHandler {
         if let live = captures[vm] {
             throw ControlError.failed("'\(vm)' is already capturing on port \(live.port); call vm.http.stop first")
         }
+        lostCaptures[vm] = nil
         let state = await t.state()
         guard state == .running else {
             throw state == .paused ? ControlError.failed("VM '\(vm)' is paused; call vm.resume first") : ControlError.notRunning(vm, state)
@@ -262,7 +263,7 @@ extension ControlHandler {
             capture.env = ControlHandler.proxyEnvironment(port: started.port, caFile: capture.guestCAPath, bundle: bundle,
                                                           trustStoreVariables: replacesTrustStore)
             if capture.guestCAPath != nil, !replacesTrustStore { warnings.append(ControlHandler.hostsTrustWarning) }
-            capture.watcher = watch(t, capture: capture.id, instance: capture.instance)
+            capture.watcher = watch(t, capture: capture.id, instance: capture.instance, proxy: proxy)
             captures[vm] = capture
             var out: [String: JSON] = [
                 "proxy": .string("\(GuestRecipes.proxyHost):\(started.port)"),
@@ -350,10 +351,10 @@ extension ControlHandler {
         return env
     }
 
-    /// Adds the proxy variables of the VM's capture to the `env` of a launch request. A name the request already
-    /// holds, in any letter case, keeps the request's value and gets no second spelling.
-    func addProxyEnvironment(to request: inout [String: JSON], vm: String) {
-        guard let capture = captures[vm] else { return }
+    /// Adds the proxy variables of the VM's capture to the `env` of a launch request while its proxy runs. A name the
+    /// request already holds, in any letter case, keeps the request's value and gets no second spelling.
+    func addProxyEnvironment(to request: inout [String: JSON], vm: String) async {
+        guard let capture = captures[vm], await capture.proxy.exitReason() == nil else { return }
         var env = request["env"]?.objectValue ?? [:]
         let given = Set(env.keys.map { $0.lowercased() })
         for (name, value) in capture.env where !given.contains(name.lowercased()) { env[name] = .string(value) }
@@ -404,17 +405,19 @@ extension ControlHandler {
     /// `vm.http.stop` for a VM without a capture: clears what an earlier capture left in the guest.
     private func stopStaleCapture(_ t: VMTarget) async throws -> JSON {
         let vm = t.name
+        let notCapturing = notCapturingSentence(vm)
+        lostCaptures[vm] = nil
         let owner = await journalVM(t)
         let recorded = captureJournal.entry(for: owner)
         guard await t.state() == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.staleToolsWait) else {
-            guard recorded != nil else { throw ControlError.failed("'\(vm)' is not capturing; call vm.http.start first") }
+            guard recorded != nil else { throw ControlError.failed(notCapturing) }
             throw ControlError.failed("'\(vm)' is not capturing, and what an earlier capture left in its guest cannot be restored while its guest "
                                       + "tools are not reachable; call vm.http.stop again once vm.status shows tools")
         }
         let stale = await restoreGuest(t, agent, os: await t.guestOS(), thumbprint: recorded?.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
         if let failure = stale.failure { throw ControlError.failed(failure) }
         try? captureJournal.remove(vm: owner, now: wallClock())
-        guard stale.cleared else { throw ControlError.failed("'\(vm)' is not capturing; call vm.http.start first") }
+        guard stale.cleared else { throw ControlError.failed(notCapturing) }
         var out: [String: JSON] = ["exchanges": 0, "staleCleared": true]
         if let warning = stale.warning { out["warning"] = .string(warning) }
         return .object(out)
@@ -640,16 +643,16 @@ extension ControlHandler {
         await capture.proxy.stop()
     }
 
-    /// Restores the guest of the capture of `t` before its VM goes away, with `HTTPTiming.undo` for each recipe, when
-    /// its guest tools are connected right now. Returns nil when the guest holds nothing of the capture afterwards,
-    /// otherwise why it still does.
-    func restoreCaptureGuest(_ t: VMTarget) async -> String? {
+    /// Restores the guest of the capture of `t` on behalf of `op`, with `limit` for each recipe (by default
+    /// `HTTPTiming.undo`), when its guest tools are connected right now. Returns nil when the guest holds nothing of
+    /// the capture afterwards, otherwise why it still does.
+    func restoreCaptureGuest(_ t: VMTarget, op: String = "vm.stop", limit: RecipeLimit? = nil) async -> String? {
         guard let capture = captures[t.name], capture.guestChanged else { return nil }
         let state = await t.state()
         guard state == .running, case .ready(let agent) = await guestAccess(t, wait: .zero) else {
             return state == .paused ? "the VM was paused" : "its guest tools were not connected"
         }
-        let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: "vm.stop", limit: httpTiming.undo)
+        let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: op, limit: limit ?? httpTiming.undo)
         if let failure = restored.failure { return failure }
         try? captureJournal.remove(vm: capture.owner, now: wallClock())
         return nil
@@ -683,19 +686,48 @@ extension ControlHandler {
         await finished.wait()
     }
 
-    /// Looks at the VM every `HTTPTiming.vmPoll` and ends capture `id` once the VM is in a state that does not keep a
-    /// capture (`keepsCapture`), or runs in another engine process than `instance`.
-    private func watch(_ t: VMTarget, capture id: UUID, instance: Int) -> Task<Void, Never> {
+    /// Looks at the VM and the capture's proxy every `HTTPTiming.vmPoll`. Ends capture `id` through `proxyEnded` once
+    /// `proxy` ended on its own, and at once when the VM is in a state that does not keep a capture (`keepsCapture`) or
+    /// runs in another engine process than `instance`.
+    private func watch(_ t: VMTarget, capture id: UUID, instance: Int, proxy: ProxyControlling) -> Task<Void, Never> {
         let poll = httpTiming.vmPoll
         return Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: poll)
                 guard !Task.isCancelled, let handler = self else { return }
+                if let reason = await proxy.exitReason() {
+                    await handler.proxyEnded(t, capture: id, reason: reason)
+                    return
+                }
                 if ControlHandler.keepsCapture(await t.state()), await t.engineInstance() == instance { continue }
                 await handler.endCapture(t.name, id: id)
                 return
             }
         }
+    }
+
+    /// Ends capture `id` of `t`, whose proxy ended on its own for `reason`, under the capture gate of the VM: restores
+    /// the guest with `HTTPTiming.recipe` for each recipe when its guest tools are connected, stops the proxy, keeps
+    /// `reason` for the next `vm.http.*` op of the VM and writes one line to `log`. A guest that is not restored keeps
+    /// its journal entry, so the cleanup restores it when its guest tools next connect.
+    func proxyEnded(_ t: VMTarget, capture id: UUID, reason: String) async {
+        await captureGate.withLock(t.name) { await self.endLostCapture(t, id, reason: reason) }
+    }
+
+    private func endLostCapture(_ t: VMTarget, _ id: UUID, reason: String) async {
+        let vm = t.name
+        guard let capture = captures[vm], capture.id == id else { return }
+        let unrestored = await restoreCaptureGuest(t, op: "vm.http.stop", limit: httpTiming.recipe)
+        await endCapture(vm, id: id)
+        lostCaptures[vm] = reason
+        let guest = unrestored.map { "; " + ControlHandler.unrestoredWarning($0) } ?? ""
+        log("the HTTP capture of '\(vm)' ended because \(reason)\(guest)")
+    }
+
+    /// The sentence of a `vm.http.*` op that needs a capture of `vm` while it has none.
+    func notCapturingSentence(_ vm: String) -> String {
+        guard let reason = lostCaptures[vm] else { return "'\(vm)' is not capturing; call vm.http.start first" }
+        return "the HTTP capture of '\(vm)' ended because \(reason); call vm.http.start to capture again"
     }
 
     // MARK: - requests, rules
@@ -719,9 +751,7 @@ extension ControlHandler {
         }
         for key in required where request[key]?.intValue == nil { throw ControlError.missing(key) }
         let t = try await running(params)
-        guard let capture = captures[t.name] else {
-            throw ControlError.failed("'\(t.name)' is not capturing; call vm.http.start first")
-        }
+        guard let capture = captures[t.name] else { throw ControlError.failed(notCapturingSentence(t.name)) }
         do { return try await capture.proxy.call(proxyOp, request) } catch { throw ControlError.failed(proxyReason(error)) }
     }
 
@@ -744,6 +774,10 @@ extension ControlHandler {
         if enabled, let port = ControlHandler.capturePort(in: server) { ports.append(port) }
         if let port = read["winhttpPort"]?.intValue, port > 0 { ports.append(port) }
         if let live = captures[t.name] {
+            if let reason = await live.proxy.exitReason() {
+                return check("proxy", false, "the capture through \(host):\(live.port) is broken: \(reason)",
+                             hint: "call vm.http.stop, then vm.http.start")
+            }
             if live.systemProxySet, let other = ports.first(where: { $0 != live.port }) {
                 return check("proxy", false, "the system proxy points at \(host):\(other), but the capture listens on port \(live.port)",
                              hint: "call vm.http.stop, then vm.http.start")

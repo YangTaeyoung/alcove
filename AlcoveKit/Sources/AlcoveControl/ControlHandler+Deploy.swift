@@ -289,7 +289,7 @@ extension ControlHandler {
             let exe = plan.path(launching.exe)
             request["path"] = .string(exe)
             if request["cwd"] == nil { request["cwd"] = .string(guestDir) }
-            addProxyEnvironment(to: &request, vm: t.name)
+            await addProxyEnvironment(to: &request, vm: t.name)
             do {
                 for (key, value) in try await launch(agent, request, waitMs: plan.waitMs).objectValue ?? [:] { out[key] = value }
             } catch is CancellationError {

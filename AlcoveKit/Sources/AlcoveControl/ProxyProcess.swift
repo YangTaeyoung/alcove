@@ -10,6 +10,9 @@ public protocol ProxyControlling: Sendable {
     func call(_ op: String, _ params: [String: JSON]) async throws -> JSON
     /// Ends the proxy and returns once it has ended.
     func stop() async
+    /// What ended the proxy when it ended without `stop()`, as a sentence part such as `alcove-proxy exited with
+    /// status 2`; nil while it runs, before it was started and after `stop()`.
+    func exitReason() async -> String?
 }
 
 /// One `alcove-proxy` child process. Requests go to its standard input and answers come from its standard output,
@@ -95,6 +98,8 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
     private var discarding = false
     private var errorTail = Data()
     private var fatalText: String?
+    /// What ended a ready child without `stop()`.
+    private var unexpectedEnd: String?
     private var startWaiter: CheckedContinuation<(port: Int, caPath: String), Error>?
     private var pending: [Int: PendingCall] = [:]
     private var nextID = 1
@@ -133,6 +138,12 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
     public func call(_ op: String, _ params: [String: JSON]) async throws -> JSON {
         try await withCheckedThrowingContinuation { (waiter: CheckedContinuation<JSON, Error>) in
             queue.async { self.request(op, params, waiter) }
+        }
+    }
+
+    public func exitReason() async -> String? {
+        await withCheckedContinuation { (answer: CheckedContinuation<String?, Never>) in
+            queue.async { answer.resume(returning: self.unexpectedEnd) }
         }
     }
 
@@ -351,6 +362,7 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             switch self.phase {
             case .starting: self.failStart(text)
             case .ready:
+                self.unexpectedEnd = "alcove-proxy closed its output and gives no more answers"
                 self.phase = .ended(text)
                 self.failPending(text)
                 self.closeInput()
@@ -479,7 +491,9 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             startWaiter?.resume(throwing: ProxyError.failed(text))
             startWaiter = nil
         case .ready:
-            phase = .ended("alcove-proxy is not running (it \(how)\(said.isEmpty ? "" : ": \(said)")); \(ProxyProcess.restart)")
+            let what = "\(how)\(said.isEmpty ? "" : ": \(said)")"
+            unexpectedEnd = "alcove-proxy \(what)"
+            phase = .ended("alcove-proxy is not running (it \(what)); \(ProxyProcess.restart)")
         case .idle, .ended:
             break
         }

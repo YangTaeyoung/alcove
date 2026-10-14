@@ -1603,6 +1603,11 @@ capture's rules like the guest's. HTTPS is intercepted with certificates the
 proxy signs with the Alcove CA; the guest trusts that CA while the capture
 runs.
 
+The listener asks for no credentials. Every process on the Mac can send
+requests through it, and so can every guest whose user-mode network reaches
+the Mac, the guests of other VMs included: they reach any capture's proxy at
+`10.0.2.2:<port>`, and what they send through it is recorded in that capture.
+
 The server looks for `alcove-proxy` in this order: the file `$ALCOVE_PROXY`
 names (and only that file when the variable is set), `alcove-proxy` next to
 the running executable (the app bundle carries it in `Contents/MacOS`, next
@@ -1827,7 +1832,13 @@ with `remaining: 0` and no longer applies. **`vm.http.rule.remove`** deletes
 body, delayMs or drop`.
 
 The ops other than `vm.http.start` and `vm.http.stop` answer `'<vm>' is not
-capturing; call vm.http.start first` on a VM without a capture.
+capturing; call vm.http.start first` on a VM without a capture. After a
+capture that ended because its proxy ended on its own they answer `the HTTP
+capture of '<vm>' ended because <reason>; call vm.http.start to capture
+again` instead, `<reason>` being e.g. `alcove-proxy exited with status 2:
+<its last error line>`, `alcove-proxy was ended by signal 9` or
+`alcove-proxy closed its output and gives no more answers`; the next
+`vm.http.start` or `vm.http.stop` of the VM drops that reason.
 
 ### Stopping a capture
 
@@ -1888,7 +1899,15 @@ A capture also ends when:
 - `alcovectl serve` ends on SIGTERM or SIGINT, or the app quits: the guests
   whose tools are connected are restored (the app waits at most 20 s);
 - the control server dies: the proxy exits when its input closes, and the
-  guest keeps the capture's settings until the cleanup below.
+  guest keeps the capture's settings until the cleanup below;
+- the proxy ends on its own (checked every 2 s): with connected guest tools
+  the guest is restored (25 s per recipe), the proxy is stopped and the server
+  writes one line to its log (see below): `the HTTP capture of '<vm>' ended
+  because <reason>`, followed by `; the guest keeps the proxy settings and
+  the CA certificate of the capture (<reason>); Alcove restores them when its
+  guest tools next connect` when the guest was not restored. Until the server
+  notices, `vm.app.launch` and `vm.deploy` add no proxy variables and the
+  doctor's `proxy` row is not ok.
 
 ### Cleanup after an earlier capture
 
@@ -1941,7 +1960,8 @@ server.
 The `proxy` row reads the guest's proxy settings: `capturing through
 10.0.2.2:<port>, system proxy set|not set` while a capture runs (not ok when
 the system proxy points at another port: hint `call vm.http.stop, then
-vm.http.start`); `no system proxy` or `system proxy <server>` when nothing of
+vm.http.start`; `the capture through 10.0.2.2:<port> is broken: <reason>`
+with that hint when the proxy ended on its own); `no system proxy` or `system proxy <server>` when nothing of
 a capture is left, with ` (not set by Alcove; if a capture left it, change it
 by hand)` for a server at `10.0.2.2:<port>` without a state file. It is not ok
 with the hint `vm.http.stop clears stale proxy settings` when no capture runs
