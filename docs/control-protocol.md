@@ -1069,6 +1069,12 @@ image for later writes, and the image file keeps its size.
   they connected, `clockSynced` whether the clock was set. With
   `clockSynced: false`, call `vm.set_environment` with `clock: "host"` once
   `vm.status` shows the tools. Runtime port forwards stay in place.
+  Once the guest is stopped for the load, a restore whose client disconnects
+  or whose request is cancelled still runs to its end, up to the 600 s limit
+  of the load, and a guest that was running runs again. A second restore of
+  the same VM waits until the first has ended. A `vm.stop` during the load
+  stops the VM, and the restore then answers `snapshot restore failed: the VM
+  is not running; check vm.status`.
 - `vm.snapshot.delete` deletes `snapshot`.
 - `vm.snapshot.restore` and `vm.snapshot.delete` of a name that is not listed
   answer `no snapshot '<s>' in '<vm>'; call vm.snapshot.list`.
@@ -1968,7 +1974,10 @@ fails when it matches nothing. The run stops at the first failing step.
 Errors and results: everything that prevents step 1 from starting answers with
 an error (`ok: false`): an unreadable, oversized (over 4 MiB) or malformed
 script, an undefined variable, a condition that does not parse, no VM, a lease
-refusal, a failed snapshot restore, a cancellation before step 1. Otherwise the
+refusal, a failed snapshot restore, a cancellation before step 1. A run
+cancelled during the restore of `snapshot` ends when the restore has ended
+(see `vm.snapshot.restore` in [Snapshots](#snapshots)) and holds its lease
+until then. Otherwise the
 op answers with `{passed, stepsRun, steps, failedStep?, label?, error?, warning?,
 seconds, failure?: {png, width, height}}`; `passed: false` means a step ran and
 failed (or the run was cancelled or lost its lease before its last step
@@ -2198,6 +2207,9 @@ FAILED: step 2 failed after 0.7 s
 - SIGINT, SIGTERM and SIGHUP stop the run: through a server, the command
   closes its connection, the server cancels the run before its next step and
   releases the run's lease, and the command prints `INTERRUPTED` at once.
+  When the signal arrives during the restore of `--snapshot`, the restore
+  runs to its end (up to the 600 s limit of the load) and the guest is
+  resumed; the run keeps its lease until then.
   In-process, the run is cancelled, the VM is stopped, the step lines up to
   the interrupted step are printed and the last line is `INTERRUPTED`. A
   second signal while the VM is being stopped ends the command at once.
