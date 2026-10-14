@@ -1182,6 +1182,10 @@ final class ControlUITests: XCTestCase {
                 + "so another user may have changed what it holds; \(fix)"),
             (["exists": true, "dir": true, "owner": "S-1-5-21-1-2-3-1001"], "'C:\\alcove-apps' in the guest belongs to S-1-5-21-1-2-3-1001, "
                 + "not to Administrators or SYSTEM, so another user may have changed what it holds; \(fix)"),
+            (["exists": true, "dir": true, "owner": "unknown"], "'C:\\alcove-apps' in the guest has an owner that alcove-agent cannot read, "
+                + "so another user may have changed what it holds; \(fix)"),
+            (["exists": true, "dir": true, "owner": "administrators", "locked": false], "'C:\\alcove-apps' in the guest is not locked against "
+                + "other users, so another user may have changed what it holds; \(fix)"),
         ]
         for (stat, sentence) in refused {
             root.value = stat
@@ -1194,6 +1198,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(fs.written(), [])
 
         for stat: [String: JSON] in [["exists": true, "dir": true, "owner": "administrators"], ["exists": true, "dir": true, "owner": "system"],
+                                     ["exists": true, "dir": true, "owner": "administrators", "locked": true],
                                      ["exists": true, "dir": true], ["exists": false]] {
             root.value = stat
             let r = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path)])
@@ -1202,6 +1207,27 @@ final class ControlUITests: XCTestCase {
         root.value = ["exists": true, "dir": true, "link": true]
         let outside = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "guestDir": "D:\\apps"])
         XCTAssertEqual(outside["guestDir"], "D:\\apps")
+    }
+
+    func testDeployChecksADefaultRootItsMarkerCreatedBeforeItCopiesAnyFile() async throws {
+        let dir = try tempDir("app")
+        try Data("x".utf8).write(to: dir.appendingPathComponent("app.exe"))
+        let stats = LockedBox(0)
+        let fs = FakeFS()
+        let (h, agent) = try await deployRig(fs: fs, [
+            "proc.list": { _, _ in .ok(["procs": []]) },
+            "fs.stat": { m, _ in
+                guard m["path"]?.stringValue == "C:\\alcove-apps" else { return .fileSystem }
+                stats.value += 1
+                return stats.value == 1 ? .ok(["exists": false]) : .ok(["exists": true, "dir": true, "owner": "administrators", "locked": false])
+            },
+        ])
+        let text = await failure(h, "vm.deploy", ["name": "Win", "path": .string(dir.path)])
+        XCTAssertEqual(text, "'C:\\alcove-apps' in the guest is not locked against other users, so another user may have changed what it holds; "
+                       + "restart the guest, so that alcove-agent moves it aside and creates the folder again when it starts, or pass a guestDir outside it")
+        XCTAssertEqual(stats.value, 2)
+        XCTAssertEqual(fs.written(), ["C:\\alcove-apps\\app\\.alcove-deploy"])
+        XCTAssertEqual(agentRequests(agent, "fs.rename").count, 0)
     }
 
     func testDeployRefusesAHostFileWhoseNameWindowsCannotUse() async throws {

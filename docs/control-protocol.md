@@ -881,6 +881,8 @@ Rules for `guestDir`, checked before any file is written:
 | a marker path that is a folder or a link | `'<dir>\.alcove-deploy' is not a plain file; remove it or deploy to another folder` |
 | Windows, a `guestDir` below `C:\alcove-apps`: `C:\alcove-apps` is a link | `'C:\alcove-apps' is a link in the guest; restart the guest, so that alcove-agent moves it aside and creates the folder again when it starts, or pass a guestDir outside it` |
 | Windows, a `guestDir` below `C:\alcove-apps`: `fs.stat` names an owner of `C:\alcove-apps` other than the Administrators group or SYSTEM | `'C:\alcove-apps' in the guest belongs to <owner>, not to Administrators or SYSTEM, so another user may have changed what it holds; restart the guest, …` (`<owner>` is `a user` or a SID) |
+| Windows, a `guestDir` below `C:\alcove-apps`: `fs.stat` names the owner of `C:\alcove-apps` `unknown` | `'C:\alcove-apps' in the guest has an owner that alcove-agent cannot read, so another user may have changed what it holds; restart the guest, …` |
+| Windows, a `guestDir` below `C:\alcove-apps`: `fs.stat` reports `C:\alcove-apps` with `locked: false` (the agent could not give it its access list) | `'C:\alcove-apps' in the guest is not locked against other users, so another user may have changed what it holds; restart the guest, …` |
 | a link, or a file, in the guest where the host directory has a folder | `'<path>' in the guest is a link; remove it or deploy to another folder` (`… is not a folder; …` for a file) |
 
 `<example>` is `C:\alcove-apps\<name>` on a Windows guest and `/opt/<name>`
@@ -888,7 +890,10 @@ on others. A folder that does
 not exist, an empty folder, a folder below `C:\alcove-apps` and a folder with
 the marker are accepted. A link in a parent of `guestDir` is not looked for,
 except `C:\alcove-apps` itself; an agent whose `fs.stat` names no owner
-leaves its owner unchecked. The agent creates `C:\alcove-apps` when it
+leaves its owner unchecked, and one whose `fs.stat` has no `locked` leaves its
+access list unchecked. A `C:\alcove-apps` that does not exist is created by
+the marker's write, and is checked again right after it, before any other
+file is copied. The agent creates `C:\alcove-apps` when it
 starts, writable only by Administrators and SYSTEM, so what the install and
 launch steps run there with the agent's elevated token can only be changed by
 an elevated process. A `guestDir` outside it is used as it is: a guest user

@@ -273,7 +273,8 @@ extension ControlHandler {
         let guestDir = plan.guestDir
         var out: [String: JSON] = ["guestDir": .string(guestDir)]
         do {
-            if plan.windows, DeployTarget.isUnderDefaultRoot(guestDir) { try await checkDefaultRoot(agent) }
+            let underRoot = plan.windows && DeployTarget.isUnderDefaultRoot(guestDir)
+            let rootExisted = underRoot ? try await checkDefaultRoot(agent) : true
             let marked = try await checkFolder(plan, agent)
             if plan.killRunning { try await stopProcesses(plan, agent) }
             if !marked {
@@ -281,6 +282,7 @@ extension ControlHandler {
                                                       "data": .string(Data(DeployTarget.markerText.utf8).base64EncodedString()),
                                                       "truncate": true, "mkdirs": true])
             }
+            if !rootExisted { try await checkDefaultRoot(agent) }
             if plan.isDirectory {
                 let r = try await agent.syncDirectory(plan.source, toGuestPath: guestDir, deleteExtras: true, preserving: [DeployTarget.marker],
                                                       refusingObstacles: true)
@@ -371,21 +373,29 @@ extension ControlHandler {
 
     // MARK: - steps
 
-    /// Refuses `DeployTarget.defaultRoot` when the agent reports it as a link, or as owned by anyone but the
-    /// Administrators group or SYSTEM. An agent that reports no owner leaves the owner unchecked; a root that does not
-    /// exist is accepted.
-    private func checkDefaultRoot(_ agent: AgentClient) async throws {
+    /// Refuses `DeployTarget.defaultRoot` when the agent reports it as a link, as owned by anyone but the
+    /// Administrators group or SYSTEM (also an owner it reports as `unknown`), or with `locked: false`. An agent that
+    /// reports no owner leaves the owner unchecked, and one that reports no `locked` leaves the access list unchecked.
+    /// Returns whether the root exists; a root that does not exist is accepted.
+    @discardableResult
+    private func checkDefaultRoot(_ agent: AgentClient) async throws -> Bool {
         let root = DeployTarget.defaultRoot
         let found = try await agent.call("fs.stat", ["path": .string(root)])
         let fix = "restart the guest, so that alcove-agent moves it aside and creates the folder again when it starts, or pass a guestDir outside it"
+        let risk = "so another user may have changed what it holds; \(fix)"
         if found["link"]?.boolValue == true {
             throw ControlError.failed("'\(root)' is a link in the guest; \(fix)")
         }
-        guard found["exists"]?.boolValue == true, let owner = found["owner"]?.stringValue,
-              !DeployTarget.trustedOwners.contains(owner) else { return }
-        let who = owner == "user" ? "a user" : owner
-        throw ControlError.failed("'\(root)' in the guest belongs to \(who), not to Administrators or SYSTEM, so another user may have "
-                                  + "changed what it holds; \(fix)")
+        guard found["exists"]?.boolValue == true else { return false }
+        if let owner = found["owner"]?.stringValue, !DeployTarget.trustedOwners.contains(owner) {
+            if owner == "unknown" { throw ControlError.failed("'\(root)' in the guest has an owner that alcove-agent cannot read, \(risk)") }
+            let who = owner == "user" ? "a user" : owner
+            throw ControlError.failed("'\(root)' in the guest belongs to \(who), not to Administrators or SYSTEM, \(risk)")
+        }
+        if found["locked"]?.boolValue == false {
+            throw ControlError.failed("'\(root)' in the guest is not locked against other users, \(risk)")
+        }
+        return true
     }
 
     /// Accepts the guest folder when it does not exist, is empty, lies below the default root or holds the deploy marker
