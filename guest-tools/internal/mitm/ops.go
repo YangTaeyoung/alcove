@@ -58,7 +58,7 @@ func (p *Proxy) Handle(op string, params map[string]any) (map[string]any, error)
 		p.rules.clear()
 		return map[string]any{}, nil
 	}
-	return nil, fmt.Errorf("unknown op '%s'", op)
+	return nil, fmt.Errorf("unknown op '%s'; use config, list, get, clear, rule.add, rule.list, rule.remove or rule.clear", op)
 }
 
 func intParam(params map[string]any, name string) (int, bool, error) {

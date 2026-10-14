@@ -349,13 +349,27 @@ func (p *Proxy) interceptTLS(conn *bufConn, host, port string) {
 			URL:    "https://" + hostPort(host, port, "443"),
 			Host:   hostPort(host, port, "443"),
 			Path:   "/",
-			Error:  err.Error(),
+			Error:  handshakeError(err),
 			Method: "CONNECT",
 		})
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
 	p.serveHTTP(tc, "https", hostPort(host, port, "443"))
+}
+
+// handshakeError describes a failed TLS handshake with the client and names
+// the next step.
+func handshakeError(err error) string {
+	msg := err.Error()
+	var ne net.Error
+	switch {
+	case strings.Contains(msg, "certificate"):
+		return msg + "; the program does not trust the Alcove CA: install the CA where it looks for trusted certificates, or exclude this host with hosts"
+	case errors.As(err, &ne) && ne.Timeout():
+		return msg + "; the program sent no TLS handshake in time: exclude this host with hosts if it does not speak TLS to it"
+	}
+	return msg + "; if the program pins certificates or does not speak TLS to this host, exclude the host with hosts"
 }
 
 func hostPort(host, port, defaultPort string) string {

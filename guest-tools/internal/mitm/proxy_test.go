@@ -346,7 +346,7 @@ func TestClientRejectingCAIsRecorded(t *testing.T) {
 		t.Fatal("expected a certificate error")
 	}
 	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "tlsError" })
-	if x["error"] == nil || x["error"] == "" || !strings.Contains(x["url"].(string), "127.0.0.1") {
+	if !strings.HasSuffix(x["error"].(string), "; the program does not trust the Alcove CA: install the CA where it looks for trusted certificates, or exclude this host with hosts") || !strings.Contains(x["url"].(string), "127.0.0.1") {
 		t.Fatalf("exchange %v", x)
 	}
 }
@@ -488,9 +488,13 @@ func TestParameterTypeErrorsNameTheParameter(t *testing.T) {
 			t.Errorf("%s %v: error %v should mention %q", c.op, c.params, err, c.want)
 		}
 	}
-	if _, err := env.proxy.Handle("nope", nil); err == nil || err.Error() != "unknown op 'nope'" {
+	if _, err := env.proxy.Handle("nope", nil); err == nil || err.Error() != unknownOpText("nope") {
 		t.Errorf("unknown op error %v", err)
 	}
+}
+
+func unknownOpText(op string) string {
+	return "unknown op '" + op + "'; use config, list, get, clear, rule.add, rule.list, rule.remove or rule.clear"
 }
 
 func mustURL(s string) *url.URL {

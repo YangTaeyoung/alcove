@@ -89,7 +89,7 @@ func TestControlLoop(t *testing.T) {
 		t.Fatalf("get reply %v", r)
 	}
 	send(`{"id":3,"op":"frobnicate"}`)
-	if r := readLine(); r["ok"] != false || r["error"] != "unknown op 'frobnicate'" || r["id"].(float64) != 3 {
+	if r := readLine(); r["ok"] != false || r["error"] != unknownOpText("frobnicate") || r["id"].(float64) != 3 {
 		t.Fatalf("unknown op reply %v", r)
 	}
 	send(`{"id":4,"op":"config","bodies":"no"}`)
@@ -97,7 +97,7 @@ func TestControlLoop(t *testing.T) {
 		t.Fatalf("type error reply %v", r)
 	}
 	send(`not json`)
-	if r := readLine(); r["ok"] != false {
+	if r := readLine(); r["ok"] != false || !strings.HasSuffix(r["error"].(string), "; send one JSON object per line") {
 		t.Fatalf("garbage reply %v", r)
 	}
 	send(`{"id":5,"op":"list","since":0}`)
@@ -191,7 +191,7 @@ func TestControlLoopReportsListenerFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("RunControl should return the listener error")
 	}
-	if !strings.Contains(out.String(), `"ev":"fatal"`) || !strings.Contains(out.String(), "accept failed") {
+	if !strings.Contains(out.String(), `"ev":"fatal"`) || !strings.Contains(out.String(), "the proxy stopped accepting connections (accept failed); stop the capture and start a new one") {
 		t.Fatalf("output %q", out.String())
 	}
 }

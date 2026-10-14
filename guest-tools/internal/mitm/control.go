@@ -64,7 +64,7 @@ func RunControl(p *Proxy, l net.Listener, in io.Reader, out io.Writer) error {
 			}
 			return err
 		case err := <-serveErr:
-			_ = enc.Encode(map[string]any{"ev": "fatal", "error": "the proxy listener stopped: " + err.Error()})
+			_ = enc.Encode(map[string]any{"ev": "fatal", "error": "the proxy stopped accepting connections (" + err.Error() + "); stop the capture and start a new one"})
 			return err
 		}
 	}
@@ -73,7 +73,7 @@ func RunControl(p *Proxy, l net.Listener, in io.Reader, out io.Writer) error {
 func dispatch(p *Proxy, line []byte) map[string]any {
 	var req map[string]any
 	if err := json.Unmarshal(line, &req); err != nil {
-		return map[string]any{"ok": false, "error": "the request is not a JSON object: " + err.Error()}
+		return map[string]any{"ok": false, "error": "the request is not a JSON object (" + err.Error() + "); send one JSON object per line"}
 	}
 	reply := map[string]any{}
 	if id, ok := req["id"]; ok {
