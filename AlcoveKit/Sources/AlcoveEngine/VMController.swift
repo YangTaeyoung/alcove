@@ -688,8 +688,13 @@ public actor VMController {
     /// launchd (pid 1) and this one, is alive; nil when no engine holds the lock or the engine is an orphan
     /// or this process's own.
     func engineOfAnotherHost() -> String? {
-        guard let pid = Self.pidfileLockHolder(bundle.pidFileURL.path), let parent = Self.parentPID(of: pid),
-              parent != 1, parent != getpid() else { return nil }
+        Self.pidfileLockHolder(bundle.pidFileURL.path).flatMap(anotherHostRefusal(holder:))
+    }
+
+    /// The refusal for the pidfile lock holder `pid` when its parent is alive and is neither launchd (pid 1)
+    /// nor this process; nil otherwise.
+    private func anotherHostRefusal(holder pid: pid_t) -> String? {
+        guard let parent = Self.parentPID(of: pid), parent != 1, parent != getpid() else { return nil }
         return "'\(config.name)' is running in another Alcove host (\(Self.processName(parent)) pid \(parent)); "
             + "stop the VM there or quit that host, then start it here"
     }
@@ -700,16 +705,22 @@ public actor VMController {
     /// parent is launchd or this process is stopped (SIGTERM, then SIGKILL)
     /// before touching the run directory; swtpm follows on its own
     /// (`--ctrl ...,terminate`). An engine of another live host is refused
-    /// (`engineOfAnotherHost()`).
+    /// (`anotherHostRefusal(holder:)`). Signals go only to the holder pid that was checked; a different
+    /// holder that appears while waiting is checked the same way and, unless refused, stopped in turn.
     private func stopOrphanedEngine() async throws {
         let path = bundle.pidFileURL.path
-        if let refusal = engineOfAnotherHost() { throw ControllerError.engineDidNotStart(refusal) }
-        guard let pid = Self.pidfileLockHolder(path) else { return }
-        Darwin.kill(pid, SIGTERM)
-        var deadline = ContinuousClock.now + .seconds(10)
+        var holder = Self.pidfileLockHolder(path)
+        var pid: pid_t = 0
+        var deadline = ContinuousClock.now
         var killed = false
-        while Self.pidfileLockHolder(path) != nil {
-            if ContinuousClock.now >= deadline {
+        while let current = holder {
+            if current != pid {
+                if let refusal = anotherHostRefusal(holder: current) { throw ControllerError.engineDidNotStart(refusal) }
+                pid = current
+                Darwin.kill(pid, SIGTERM)
+                deadline = ContinuousClock.now + .seconds(10)
+                killed = false
+            } else if ContinuousClock.now >= deadline {
                 guard !killed else {
                     throw ControllerError.engineDidNotStart("an engine from a previous session (pid \(pid)) still owns this VM and could not be stopped")
                 }
@@ -718,6 +729,7 @@ public actor VMController {
                 deadline = ContinuousClock.now + .seconds(5)
             }
             try await Task.sleep(for: .milliseconds(100))
+            holder = Self.pidfileLockHolder(path)
         }
     }
 

@@ -253,24 +253,76 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertFalse(old.isActive, "the old controller observed its engine's exit: \(old)")
     }
 
-    /// A process that write-locks the VM's pidfile as a child of `sh`, which waits for it: the lock holder's
-    /// parent is the live `sh`, not the test process. Returns `sh` and the lock holder; both are killed on teardown.
-    private func holdPidfileFromAGrandchild(_ vm: VMController) async throws -> (shell: Process, holder: pid_t) {
+    /// Starts `sh`, which runs a stand-in that write-locks byte `byte` of the VM's pidfile and waits: the
+    /// stand-in's parent is the live `sh`, not the test process. `sh` runs in a process group of its own,
+    /// which is killed on teardown together with the stand-in.
+    private func startPidfileLocker(_ vm: VMController, byte: Int = 0) throws -> Process {
         let holder = tmp.appendingPathComponent("hold-pidfile.py")
-        try "import fcntl, sys, time\npf = open(sys.argv[1], 'w')\nfcntl.lockf(pf, fcntl.LOCK_EX | fcntl.LOCK_NB)\ntime.sleep(600)\n"
+        try "import fcntl, sys, time\npf = open(sys.argv[1], 'a')\nfcntl.lockf(pf, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, int(sys.argv[2]))\ntime.sleep(600)\n"
             .write(to: holder, atomically: true, encoding: .utf8)
         try FileManager.default.createDirectory(at: vm.bundle.runURL, withIntermediateDirectories: true)
         let shell = Process()
         shell.executableURL = URL(fileURLWithPath: "/bin/sh")
-        shell.arguments = ["-c", "/usr/bin/env python3 \"$0\" \"$1\" & wait", holder.path, vm.bundle.pidFileURL.path]
+        shell.arguments = ["-c", "/usr/bin/env python3 \"$0\" \"$1\" \"$2\" & wait", holder.path, vm.bundle.pidFileURL.path, String(byte)]
         try shell.run()
-        let pidfile = vm.bundle.pidFileURL.path
+        let group = shell.processIdentifier
+        XCTAssertEqual(getpgid(group), group, "sh does not lead a process group of its own")
         addTeardownBlock {
-            if let pid = VMController.pidfileLockHolder(pidfile) { kill(pid, SIGKILL) }
-            if shell.isRunning { kill(shell.processIdentifier, SIGKILL) }
+            if kill(-group, 0) == 0 { kill(-group, SIGKILL) }
         }
-        _ = await waitUntil { VMController.pidfileLockHolder(pidfile) != nil }
-        return (shell, try XCTUnwrap(VMController.pidfileLockHolder(pidfile), "the stand-in did not take the pidfile lock"))
+        return shell
+    }
+
+    /// The pid holding a write lock on byte `byte` of `path` (F_GETLK), or nil when that byte is unlocked.
+    private func byteLockHolder(_ path: String, byte: Int) -> pid_t? {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var lock = flock()
+        lock.l_type = Int16(F_WRLCK)
+        lock.l_whence = Int16(SEEK_SET)
+        lock.l_start = off_t(byte)
+        lock.l_len = 1
+        guard fcntl(fd, F_GETLK, &lock) == 0, lock.l_type != Int16(F_UNLCK) else { return nil }
+        return lock.l_pid
+    }
+
+    /// `startPidfileLocker` that returns once the stand-in holds the lock. Returns `sh` and the lock holder.
+    private func holdPidfileFromAGrandchild(_ vm: VMController, byte: Int = 0) async throws -> (shell: Process, holder: pid_t) {
+        let shell = try startPidfileLocker(vm, byte: byte)
+        let pidfile = vm.bundle.pidFileURL.path
+        _ = await waitUntil { self.byteLockHolder(pidfile, byte: byte) != nil }
+        return (shell, try XCTUnwrap(byteLockHolder(pidfile, byte: byte), "the stand-in did not take the pidfile lock"))
+    }
+
+    /// An orphan holds byte 0 of the pidfile and a process of another live host holds byte 1, so the lock
+    /// passes to the other host's process when the orphan exits.
+    func testOrphanStopRefusesALockHolderOfAnotherHostThatTakesOverTheLock() async throws {
+        let vm = try makeVM()
+        let pidfile = vm.bundle.pidFileURL.path
+        let (first, orphan) = try await holdPidfileFromAGrandchild(vm)
+        kill(first.processIdentifier, SIGKILL)
+        let orphaned = await waitUntil { VMController.parentPID(of: orphan) == 1 }
+        XCTAssertTrue(orphaned, "the lock holder was not re-parented to launchd")
+        let (other, successor) = try await holdPidfileFromAGrandchild(vm, byte: 1)
+        XCTAssertEqual(VMController.pidfileLockHolder(pidfile), orphan, "the whole-file lock query names the orphan first")
+        let name = VMController.processName(other.processIdentifier)
+        let sentence = "'Fake' is running in another Alcove host (\(name) pid \(other.processIdentifier)); "
+            + "stop the VM there or quit that host, then start it here"
+        let t0 = ContinuousClock.now
+        do {
+            try await vm.start()
+            XCTFail("the start went ahead while another host's engine held the pidfile")
+        } catch {
+            XCTAssertEqual(error as? VMController.ControllerError, .engineDidNotStart(sentence))
+        }
+        XCTAssertLessThan(ContinuousClock.now - t0, .seconds(10), "the refusal came at or after the SIGKILL deadline")
+        let gone = await waitUntil { kill(orphan, 0) != 0 }
+        XCTAssertTrue(gone, "the orphan pid \(orphan) is gone")
+        XCTAssertEqual(VMController.pidfileLockHolder(pidfile), successor)
+        XCTAssertEqual(kill(successor, 0), 0, "the other host's engine keeps running")
+        XCTAssertFalse(launched(vm))
+        let s = await vm.state; XCTAssertEqual(s, .failed(sentence))
     }
 
     func testStartRefusesAnEngineOfAnotherLiveHostAndStopsItOnceItIsAnOrphan() async throws {
