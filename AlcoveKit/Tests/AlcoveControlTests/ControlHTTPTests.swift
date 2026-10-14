@@ -2233,6 +2233,7 @@ final class ControlHTTPTests: XCTestCase {
               foreach ($attempt in 1, 2, 3) {
                 try { $text = [System.IO.File]::ReadAllText($statePath); break } catch { Start-Sleep -Milliseconds 200 }
               }
+              if (($null -eq $text) -and (-not [System.IO.File]::Exists($statePath))) { return $null }
               $s = $null
               try { $s = ConvertFrom-Json $text } catch { $s = $null }
               if (($s -is [System.Management.Automation.PSCustomObject]) -and ([string]$s.version -ceq '1') -and ([string]$s.thumbprint -match '^[0-9A-Fa-f]{40}\\z') -and ([string]$s.port -match '^[1-9][0-9]{0,4}\\z') -and ($s.systemProxy -is [bool])) {

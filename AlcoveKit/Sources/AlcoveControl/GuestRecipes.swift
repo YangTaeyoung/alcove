@@ -503,7 +503,7 @@ enum GuestRecipes {
 
     /// `AlcoveState`: the object stored in `$statePath`; nothing when the file is missing; the text `unreadable` when
     /// the file is there and does not hold a version 1 state with a thumbprint, a port and `systemProxy`. A read that
-    /// fails is tried three times, 200 ms apart.
+    /// fails is tried three times, 200 ms apart; a file that is gone after the last failed read counts as missing.
     /// `AlcoveSafe`: a string of base64 characters as it is, nothing for any other value.
     /// `AlcoveKindText`: `String`, `ExpandString` or `DWord` when the value is one of these names, nothing otherwise.
     private static let proxyStateReader = #"""
@@ -513,6 +513,7 @@ enum GuestRecipes {
           foreach ($attempt in 1, 2, 3) {
             try { $text = [System.IO.File]::ReadAllText($statePath); break } catch { Start-Sleep -Milliseconds 200 }
           }
+          if (($null -eq $text) -and (-not [System.IO.File]::Exists($statePath))) { return $null }
           $s = $null
           try { $s = ConvertFrom-Json $text } catch { $s = $null }
           if (($s -is [System.Management.Automation.PSCustomObject]) -and ([string]$s.version -ceq '1') -and ([string]$s.thumbprint -match '^[0-9A-Fa-f]{40}\z') -and ([string]$s.port -match '^[1-9][0-9]{0,4}\z') -and ($s.systemProxy -is [bool])) {
@@ -824,11 +825,10 @@ enum GuestRecipes {
     }
 
     /// Windows only: puts back what the state file remembers and deletes the file and a `<state file>.new` left by a
-    /// write that did not finish. With `systemProxy` in the state
-    /// file, the WinINET values come back, with their kinds, when `ProxyServer` is still exactly
-    /// `10.0.2.2:<port of the state file>`, and the raw `WinHttpSettings` value when it still holds exactly that
-    /// address; a value remembered as absent is deleted. Settings that are anything else stay as they are, and
-    /// without a state file nothing is changed.
+    /// write that did not finish. With `systemProxy` in the state file, the WinINET values come back, with their kinds,
+    /// when `ProxyServer` is still exactly `10.0.2.2:<port of the state file>`, and the raw `WinHttpSettings` value
+    /// when it still holds exactly that address; a value remembered as absent is deleted. Settings that are anything
+    /// else stay as they are, and without a state file nothing is changed.
     /// Prints `{"state":<bool>,"restored":<bool>,"thumbprint":"<of the state file, or empty>","refreshed":<bool>}`:
     /// whether a state file was there, whether a registry value was put back, and whether WinINET was told.
     /// A failure prints one sentence on stderr and exits with 2; an unreadable state file is left as it is.
