@@ -244,6 +244,50 @@ final class ControlStateTests: XCTestCase {
         XCTAssertTrue((1024...65535).contains(try XCTUnwrap(absent["hostPort"]?.intValue)))
     }
 
+    func testForwardAddThatRacesAStopOrARestartRecordsNothing() async throws {
+        let (h, t) = setup()
+        await t.setMonitorHook { target in await target.setState(.stopped) }
+        let stopped = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 80, "hostPort": 18080])
+        XCTAssertEqual(stopped, "VM 'Win' stopped or restarted while the forward was added; call vm.forward.add again once it runs")
+        await t.setState(.running)
+        await t.setMonitorHook { target in await target.setInstance(2) }
+        let restarted = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 80, "hostPort": 18081])
+        XCTAssertEqual(restarted, "VM 'Win' stopped or restarted while the forward was added; call vm.forward.add again once it runs")
+        let list = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(list["forwards"], [["hostPort": 40000, "guestPort": 7645, "kind": "agent"]])
+        _ = try await h.handle(op: "vm.forward.add", params: ["name": "Win", "guestPort": 80, "hostPort": 18082])
+        let added = try await h.handle(op: "vm.forward.list", params: ["name": "Win"])
+        XCTAssertEqual(added["forwards"]?.arrayValue?.count, 2)
+    }
+
+    func testLeaseReleaseWithoutATokenNamesTheParameter() async throws {
+        let (h, _) = setup()
+        _ = try await h.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "a"])
+        let text = await failure(h, "vm.lease.release", ["name": "Win"])
+        XCTAssertEqual(text, "missing or invalid parameter 'lease'")
+    }
+
+    func testSetResolutionWaitsByTheHandlersClock() async throws {
+        let agent = FakeAgent()
+        _ = agent.start()
+        addTeardownBlock { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        await t.setAgent(client)
+        let calls = LockedBox(0)
+        let base = ContinuousClock.now
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory,
+                               clock: {
+                                   calls.value += 1
+                                   return base + .seconds(9 * calls.value)
+                               })
+        let began = ContinuousClock.now
+        let r = try await h.handle(op: "vm.set_resolution", params: ["name": "Win", "width": 1024, "height": 768])
+        XCTAssertEqual(r["width"]?.intValue, 800)
+        XCTAssertLessThan(ContinuousClock.now - began, .seconds(4))
+    }
+
     func testForwardAddReportsMonitorError() async throws {
         let (h, t) = setup()
         await t.setMonitorReplies(["Could not set up host forwarding rule 'tcp:127.0.0.1:8080-:80'\r\n", "something else\r\n"])

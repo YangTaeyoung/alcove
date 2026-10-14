@@ -1160,7 +1160,10 @@ shows three kinds:
   `config`, `agent` or `runtime` forward of the VM uses, or that the engine
   cannot listen on, answers `host port <n> is taken; pass hostPort: 0 to let
   Alcove choose`. Out-of-range values answer `guestPort must be between 1 and
-  65535` / `hostPort must be between 1 and 65535`.
+  65535` / `hostPort must be between 1 and 65535`. A VM that stops or starts
+  again while the forward is being added answers `VM '<vm>' stopped or
+  restarted while the forward was added; call vm.forward.add again once it
+  runs` and keeps no record of the forward.
 - `vm.forward.remove` removes the runtime forward on `hostPort` (1 to 65535).
   Any other port answers `no runtime forward on host port <n> in '<vm>'; call
   vm.forward.list (forwards from the VM configuration cannot be removed while
@@ -1209,7 +1212,8 @@ VM '<vm>' is leased by <owner> for another <n> s; pass its lease token, wait, or
   token, or with another one, it answers the refusal above.
 - `vm.lease.release` with the token ends the lease. On a VM without a lease it
   does nothing; with a token that is not the holder's it answers `lease token
-  does not match; only the holder can release '<vm>'`.
+  does not match; only the holder can release '<vm>'`. Without `lease` it
+  answers `missing or invalid parameter 'lease'`.
 - A lease ends by itself when its time is up. Leases live in the server: a
   server restart ends them all, and `vm.delete` ends the lease of the VM it
   deletes.

@@ -50,7 +50,8 @@ extension ControlHandler {
             return ["lease": .string(lease.token), "expiresIn": .int(Int64(seconds))]
         case "vm.lease.release":
             let t = try await target(params)
-            try leases.release(vm: t.name, token: params["lease"]?.stringValue ?? "", now: clock())
+            guard let token = params["lease"]?.stringValue else { throw ControlError.missing("lease") }
+            try leases.release(vm: t.name, token: token, now: clock())
             return [:]
         default:
             return try await setResolution(params)
@@ -67,13 +68,13 @@ extension ControlHandler {
         let first = try await screenshot(t)
         let before = [first.width, first.height]
         await agent.setResolution(width: width, height: height)
-        let deadline = ContinuousClock.now + .seconds(8)
+        let deadline = clock() + .seconds(8)
         var size = before
         while true {
             try await Task.sleep(for: .milliseconds(500))
             let now = try await screenshot(t)
             size = [now.width, now.height]
-            if size != before || size == [width, height] || ContinuousClock.now >= deadline { break }
+            if size != before || size == [width, height] || clock() >= deadline { break }
         }
         return ["width": .int(Int64(size[0])), "height": .int(Int64(size[1]))]
     }
@@ -129,6 +130,7 @@ extension ControlHandler {
                 hostPort = port
             }
             await discardStaleForwards(t)
+            let instance = await t.engineInstance()
             if hostPort == 0 {
                 hostPort = try freeHostPort()
             } else if try await isReserved(hostPort, in: t) {
@@ -139,7 +141,9 @@ extension ControlHandler {
                 throw ControlError.failed("host port \(hostPort) is taken; pass hostPort: 0 to let Alcove choose")
             }
             guard added.isEmpty else { throw ControlError.failed("port forward failed: \(added)") }
-            forwardInstances[t.name] = await t.engineInstance()
+            guard await t.state() == .running, await t.engineInstance() == instance, forwardInstances[t.name] == instance else {
+                throw ControlError.failed("VM '\(t.name)' stopped or restarted while the forward was added; call vm.forward.add again once it runs")
+            }
             runtimeForwards[t.name, default: []].append(Forward(hostPort: hostPort, guestPort: guestPort))
             return ["hostPort": .int(Int64(hostPort)), "guestPort": .int(Int64(guestPort))]
         case "vm.forward.remove":
