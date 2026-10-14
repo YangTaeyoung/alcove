@@ -17,6 +17,12 @@ public final class FakeAgent: @unchecked Sendable {
     public var proto: Int? = 2
     public var caps: [String] = ["clipboard", "files", "exec"]
     public var handler: (@Sendable (JSON, FakeAgent) -> [JSON])?
+    /// Fields added to the hello.
+    public var helloExtra: [String: JSON] = [:]
+    /// Whether the hello is sent on connect.
+    public var sendsHello = true
+    /// Runs on connect after the hello was sent (or would have been).
+    public var onConnect: (@Sendable (FakeAgent) -> Void)?
 
     public init() {
         let lfd = socket(AF_INET, SOCK_STREAM, 0)
@@ -39,7 +45,9 @@ public final class FakeAgent: @unchecked Sendable {
         lock.lock(); clientFD = fd; lock.unlock()
         var hello: JSON = ["t": "hello", "v": 1, "os": "windows", "agent": "0.1.0", "token": .string(token), "caps": .array(caps.map(JSON.string))]
         if let proto, case .object(var o) = hello { o["proto"] = .int(Int64(proto)); hello = .object(o) }
-        sendLine(hello)
+        if case .object(var o) = hello { for (k, v) in helloExtra { o[k] = v }; hello = .object(o) }
+        if sendsHello { sendLine(hello) }
+        onConnect?(self)
         var pending = Data(); var buf = [UInt8](repeating: 0, count: 65536)
         while true {
             let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }

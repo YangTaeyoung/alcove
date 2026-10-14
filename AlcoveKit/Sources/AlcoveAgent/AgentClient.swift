@@ -1,8 +1,10 @@
 import Foundation
+import CryptoKit
 import AlcoveQMP
 
 /// Host side of the guest agent protocol (docs/agent-protocol.md): connects
-/// to the forwarded agent port, validates the token, and exchanges messages.
+/// to the forwarded agent port, validates the token, pairs with or authenticates
+/// to an agent that asks for the VM's agent key, and exchanges messages.
 public actor AgentClient {
     public enum AgentError: Error, Equatable, Sendable {
         case connect(String)
@@ -13,6 +15,8 @@ public actor AgentClient {
         case timeout(String)
         case remote(String)
         case unsupported(String)
+        /// The agent's `refused` line: a sentence that names the next step.
+        case refused(String)
     }
 
     public struct Hello: Sendable, Equatable {
@@ -21,7 +25,16 @@ public actor AgentClient {
         public let agentVersion: String
         public let capabilities: [String]
         public let rpcVersion: Int
+        /// Whether the connection paired with or authenticated to the agent with the VM's agent key.
+        public let authenticated: Bool
     }
+
+    /// The handshake reason when the agent asks for the VM's agent key and `connect` was given none.
+    public static let noAgentKey = "the guest tools ask for the VM's agent key and none was given"
+    /// The handshake reason when the given agent key is not 64 hexadecimal digits.
+    public static let badAgentKey = "the agentKey in the VM's config.json is not 64 hexadecimal digits; restore config.json from a backup"
+    /// The handshake reason when the agent asks for a MAC without a nonce of 64 hexadecimal digits.
+    public static let badNonce = "the guest tools sent no usable nonce; reinstall alcove-agent in the guest"
 
     public enum Event: Sendable, Equatable {
         case clipboardChanged(text: String)
@@ -45,6 +58,12 @@ public actor AgentClient {
     /// Handles the transport's lines and its end one at a time in the order they arrived.
     private var readerTask: Task<Void, Never>?
     private var helloWaiter: CheckedContinuation<JSON, Error>?
+    /// The caller of `connect` waiting for the agent's `authed`.
+    private var authWaiter: CheckedContinuation<Void, Error>?
+    /// Set when the time `connect` allows for the handshake has passed.
+    private var handshakeExpired = false
+    /// The sentence of the agent's `refused` line on this connection.
+    private var refusal: String?
     private var pendingCalls: [Int: CheckedContinuation<JSON, Error>] = [:]
     private var nextCallID = 1
     /// The callers of `request` by the message type they wait for, oldest first, each with its own number.
@@ -65,9 +84,13 @@ public actor AgentClient {
     }
 
     /// Connect to `127.0.0.1:port`, wait for `hello`, check the token (when
-    /// `expectedToken` is non-nil) and answer `welcome`.
-    public func connect(port: Int, expectedToken: String?, timeout: Duration = .seconds(10)) async throws {
+    /// `expectedToken` is non-nil), pair with or authenticate to an agent whose hello carries `auth: "key"` with
+    /// `agentKey` and wait for its `authed`, then answer `welcome` and mark the connection ready. The whole
+    /// handshake runs within `timeout`. An agent's `refused` line throws `.refused` with its sentence.
+    public func connect(port: Int, expectedToken: String?, agentKey: String? = nil, timeout: Duration = .seconds(10)) async throws {
         guard transport == nil else { return }
+        handshakeExpired = false
+        refusal = nil
         let (inbound, feed) = AsyncStream<Inbound>.makeStream(bufferingPolicy: .unbounded)
         let t: TCPLineTransport
         do {
@@ -88,8 +111,8 @@ public actor AgentClient {
             }
         }
         let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
-            await self?.failHello(AgentError.timeout("hello"))
+            do { try await Task.sleep(for: timeout) } catch { return }
+            await self?.expireHandshake()
         }
         let h: JSON
         do {
@@ -99,17 +122,84 @@ public actor AgentClient {
             disconnect()
             throw error
         }
-        timeoutTask.cancel()
-        guard h["v"]?.intValue == 1 else { disconnect(); throw AgentError.handshake("unsupported version") }
+        guard h["v"]?.intValue == 1 else { timeoutTask.cancel(); disconnect(); throw AgentError.handshake("unsupported version") }
         if let expectedToken, h["token"]?.stringValue != expectedToken {
+            timeoutTask.cancel()
             disconnect()
             throw AgentError.tokenMismatch
         }
+        let authenticates = h["auth"]?.stringValue == "key"
+        if authenticates {
+            do {
+                try await authenticate(hello: h, agentKey: agentKey)
+            } catch {
+                timeoutTask.cancel()
+                disconnect()
+                throw error
+            }
+        }
+        timeoutTask.cancel()
         hello = Hello(version: 1, os: h["os"]?.stringValue ?? "?", agentVersion: h["agent"]?.stringValue ?? "?",
                       capabilities: h["caps"]?.arrayValue?.compactMap(\.stringValue) ?? [],
-                      rpcVersion: h["proto"]?.intValue ?? 1)
+                      rpcVersion: h["proto"]?.intValue ?? 1, authenticated: authenticates)
         send(["t": "welcome", "v": 1])
         isConnected = true
+    }
+
+    /// Sends `pair` with `agentKey` to an agent whose hello says `paired: false`, otherwise `auth` with the
+    /// HMAC-SHA256 of the hello's nonce under the key, and waits for `authed`.
+    private func authenticate(hello h: JSON, agentKey: String?) async throws {
+        guard let agentKey else { throw AgentError.handshake(AgentClient.noAgentKey) }
+        guard let key = AgentClient.hexBytes(agentKey), key.count == 32 else { throw AgentError.handshake(AgentClient.badAgentKey) }
+        let message: JSON
+        if h["paired"]?.boolValue == true {
+            guard let nonce = h["nonce"]?.stringValue.flatMap(AgentClient.hexBytes), nonce.count == 32 else {
+                throw AgentError.handshake(AgentClient.badNonce)
+            }
+            message = ["t": "auth", "mac": .string(AgentClient.mac(key: key, nonce: nonce))]
+        } else {
+            message = ["t": "pair", "key": .string(agentKey)]
+        }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            if let refusal {
+                cont.resume(throwing: AgentError.refused(refusal))
+            } else if transport == nil {
+                cont.resume(throwing: AgentError.disconnected)
+            } else if handshakeExpired {
+                cont.resume(throwing: AgentError.timeout("authed"))
+            } else {
+                authWaiter = cont
+                send(message)
+            }
+        }
+    }
+
+    /// The lower-case hexadecimal HMAC-SHA256 of `nonce` under `key`.
+    nonisolated static func mac(key: Data, nonce: Data) -> String {
+        HMAC<SHA256>.authenticationCode(for: nonce, using: SymmetricKey(data: key)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The bytes an even number of hexadecimal digits encode, or nil.
+    nonisolated static func hexBytes(_ text: String) -> Data? {
+        let digits = Array(text.utf8)
+        guard digits.count % 2 == 0 else { return nil }
+        var out = Data(capacity: digits.count / 2)
+        var index = 0
+        while index < digits.count {
+            guard let high = hexValue(digits[index]), let low = hexValue(digits[index + 1]) else { return nil }
+            out.append(high << 4 | low)
+            index += 2
+        }
+        return out
+    }
+
+    private nonisolated static func hexValue(_ c: UInt8) -> UInt8? {
+        switch c {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return c - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return c - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return c - UInt8(ascii: "A") + 10
+        default: return nil
+        }
     }
 
     public func disconnect() {
@@ -262,6 +352,13 @@ public actor AgentClient {
         switch t {
         case "hello":
             if let w = helloWaiter { helloWaiter = nil; w.resume(returning: m) }
+        case "authed":
+            if let w = authWaiter { authWaiter = nil; w.resume() }
+        case "refused":
+            let text = m["error"]?.stringValue ?? "the guest tools refused the connection"
+            refusal = text
+            if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: AgentError.refused(text)) }
+            if let w = authWaiter { authWaiter = nil; w.resume(throwing: AgentError.refused(text)) }
         case "ping":
             send(["t": "pong"])
         case "pong", "welcome":
@@ -284,13 +381,15 @@ public actor AgentClient {
         }
     }
 
-    /// Fails every waiting caller: with `.remote(replyTooLong)` when the agent sent a line longer than the transport
-    /// reads, otherwise with `.disconnected`.
+    /// Fails every waiting caller: with `.refused` and its sentence when the agent sent a `refused` line, with
+    /// `.remote(replyTooLong)` when the agent sent a line longer than the transport reads, otherwise with `.disconnected`.
     private func handleEnd(_ reason: String) {
         transport = nil
         isConnected = false
-        let failure = reason == TCPLineTransport.lineTooLong ? AgentError.remote(AgentClient.replyTooLong) : AgentError.disconnected
+        let failure = refusal.map(AgentError.refused)
+            ?? (reason == TCPLineTransport.lineTooLong ? AgentError.remote(AgentClient.replyTooLong) : AgentError.disconnected)
         if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: failure) }
+        if let w = authWaiter { authWaiter = nil; w.resume(throwing: failure) }
         for (_, list) in waiters { for c in list { c.continuation.resume(throwing: failure) } }
         waiters.removeAll()
         let calls = pendingCalls
@@ -299,8 +398,11 @@ public actor AgentClient {
         eventContinuation.yield(.disconnected)
     }
 
-    private func failHello(_ error: AgentError) {
-        if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: error) }
+    /// Ends the handshake time: the caller waiting for the hello or for `authed` fails with a timeout naming it.
+    private func expireHandshake() {
+        handshakeExpired = true
+        if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: AgentError.timeout("hello")) }
+        if let w = authWaiter { authWaiter = nil; w.resume(throwing: AgentError.timeout("authed")) }
     }
 
     private func timeOutCall(id: Int, op: String) {
@@ -317,5 +419,13 @@ public actor AgentClient {
         let c = list.remove(at: index)
         waiters[key] = list.isEmpty ? nil : list
         c.continuation.resume(throwing: AgentError.timeout(type))
+    }
+}
+
+extension AgentClient.AgentError: LocalizedError {
+    /// The agent's sentence for `.refused`; nil for the other cases.
+    public var errorDescription: String? {
+        if case .refused(let text) = self { return "the guest tools refused the connection: \(text)" }
+        return nil
     }
 }
