@@ -4,7 +4,7 @@ import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, eventSeqLine, observeParams, observePayload, type ObserveArgs } from "../observation.js";
 import { selectorParams, toSelector } from "../selector.js";
-import { clip, fail, text, typeMs, vmName, DEPLOY_TIMEOUT_MS, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
+import { clip, fail, text, typeMs, vmName, withoutEnvelope, DEPLOY_TIMEOUT_MS, STRUCTURED_LIST_MAX, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -356,7 +356,9 @@ export function register(r: Registrar, client: ControlClient): void {
       if (reply.windowTimedOut === true) lines.push(`no window appeared within ${a.wait_window_s ?? DEPLOY_WAIT_WINDOW_S} s; check alcove_list_windows`);
       const seq = eventSeqLine(reply);
       if (seq) lines.push(seq);
-      return text(lines.join("\n"), reply);
+      const structured = withoutEnvelope(reply);
+      if (Array.isArray(sent)) Object.assign(structured, { sent: sent.slice(0, STRUCTURED_LIST_MAX), sentCount: sent.length });
+      return text(lines.join("\n"), structured);
     } catch (e) {
       return fail(e);
     }

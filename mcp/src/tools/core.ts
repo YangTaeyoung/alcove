@@ -4,13 +4,16 @@ import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, changeResult, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
 import { clip, commandParams, commandPayload, fail, regionSchema, startTimeout, stdinParam, streamSections, text, typeMs, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
 
+/** What the text of a clipped command output says to read the rest. */
+const EXEC_CUT_HINT = "write the output to a file in the guest and read it in parts with alcove_fs_read, or run the command with alcove_exec_start and page it with alcove_exec_read";
+
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("core",
     "alcove_list_vms",
     {
       title: "List Alcove VMs",
       description:
-        "List the virtual machines managed by Alcove with their guest OS (windows/linux), state (stopped, running, paused, suspended...) and, when known, screen size. Call this first to learn VM names.",
+        "List the virtual machines managed by Alcove with their guest OS (windows/linux), state (stopped, starting, running, paused, suspending, stopping, failed), whether a session is suspended to disk and, when known, screen size. Call this first to learn VM names.",
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -50,7 +53,7 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Start VM",
       description:
-        "Boot a VM (or resume it from suspend). A resumed session is reported with whether the guest tools reconnected and the guest clock was synced. By default waits until the guest tools connect (the OS has booted and a user is logged in), up to wait_timeout_s; when the guest has no tools it returns after the wait and you should use alcove_wait_idle / screenshots to judge readiness.",
+        "Boot a VM (or resume it from suspend). A resumed session is reported with whether the guest tools reconnected and the guest clock was synced. By default waits until the guest tools connect (the OS has booted and a user is logged in), up to wait_timeout_s; when the guest has no tools it returns after the wait and you should use alcove_wait_idle / screenshots to judge readiness. When neither the Alcove app nor another control server answers, this MCP session starts a headless control server, and the VMs it runs shut down when the session ends.",
       inputSchema: {
         name: vmName,
         wait_for_tools: z.boolean().optional().describe("Wait for the guest tools to connect (default true)"),
@@ -98,7 +101,7 @@ export function register(r: Registrar, client: ControlClient): void {
     "alcove_stop_vm",
     {
       title: "Stop VM",
-      description: "Shut a VM down. Graceful (ACPI power button) by default; force=true kills the engine immediately (unsaved guest work is lost).",
+      description: "Shut a VM down. By default it presses the ACPI power button and, when the guest has not shut down after 60 s, ends the engine (unsaved guest work is lost); force=true ends the engine at once.",
       inputSchema: { name: vmName, force: z.boolean().optional().describe("Kill immediately instead of a graceful shutdown") },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -117,7 +120,7 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Screenshot",
       description:
-        "Capture the VM screen as a PNG or JPEG image. Coordinates for click/move/drag tools are guest pixels in the full-resolution frame. The text part gives the guest frame size and where the returned image sits: guest = origin + image_pixel / scale. Use region to capture one rectangle, window to capture one window (Windows guests), marks to number the interactive elements on the image and list them in the text, scale or max_width to shrink the image.",
+        "Capture the VM screen as a PNG or JPEG image. Coordinates for click/move/drag tools are guest pixels in the full-resolution frame. The text part gives the guest frame size and where the returned image sits: guest = origin + image_pixel / scale. Use region to capture one rectangle or window to capture one window (Windows guests); region and window exclude each other. marks numbers the interactive elements on the image and lists them in the text; scale or max_width shrink the image.",
       inputSchema: {
         name: vmName,
         region: regionSchema.optional().describe("Capture only this guest-pixel rectangle {x, y, w, h}; not together with window"),
@@ -292,7 +295,7 @@ export function register(r: Registrar, client: ControlClient): void {
         const stderr = String(r.stderr ?? "");
         const output = String(r.output ?? "");
         const head = `exit code ${r.code}${r.timedOut ? " (timed out)" : ""}${r.truncated ? " (output truncated)" : ""}`;
-        const body = hasStreams ? streamSections(stdout, stderr) : output ? `output:\n${clip(output)}` : "";
+        const body = hasStreams ? streamSections(stdout, stderr, EXEC_CUT_HINT) : output ? `output:\n${clip(output, 60000, EXEC_CUT_HINT)}` : "";
         return changeResult(head, r, { code: r.code, stdout, stderr, output, timedOut: r.timedOut === true, truncated: r.truncated === true }, body);
       } catch (e) {
         return fail(e);
@@ -340,7 +343,7 @@ export function register(r: Registrar, client: ControlClient): void {
     "alcove_push_file",
     {
       title: "Copy a file into the guest",
-      description: "Copy a file from the Mac into the guest (needs guest tools). Without guest_path the file lands in the guest's Desktop or Downloads folder; with guest_path it is written to that exact path inside the guest. Returns the path inside the guest.",
+      description: "Copy a file from the Mac into the guest (needs guest tools). Without guest_path the file lands in the guest's Desktop or Downloads folder; with guest_path it is written to that exact path inside the guest, and overwrite replaces a file already there. Returns the path inside the guest.",
       inputSchema: {
         name: vmName,
         path: z.string().describe("Absolute path on the Mac"),
@@ -348,7 +351,7 @@ export function register(r: Registrar, client: ControlClient): void {
         guest_path: z.string().optional().describe("Exact destination path inside the guest; replaces dest"),
         overwrite: z.boolean().optional().describe("Replace an existing file at guest_path"),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ name, path: p, dest, guest_path, overwrite }) => {
       try {

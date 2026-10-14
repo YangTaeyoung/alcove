@@ -85,15 +85,40 @@ export function saveLines(reply: Obj): string[] {
   ];
 }
 
-/** The `variables` defaults of the script file at `path`; empty when it cannot be read as a script. */
-export function scriptDefaults(path: string): Record<string, string> {
+/** The top-level object of the script file at `path`; empty when it cannot be read as JSON. */
+function scriptFile(path: string): { variables?: unknown; vm?: unknown } {
   try {
-    const variables = (JSON.parse(fs.readFileSync(path, "utf8")) as { variables?: unknown }).variables;
-    if (!variables || typeof variables !== "object") return {};
-    return Object.fromEntries(Object.entries(variables).filter((e): e is [string, string] => typeof e[1] === "string"));
+    const parsed = JSON.parse(fs.readFileSync(path, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as { variables?: unknown; vm?: unknown }) : {};
   } catch {
     return {};
   }
+}
+
+/** The `variables` defaults of the script file at `path`; empty when it cannot be read as a script. */
+export function scriptDefaults(path: string): Record<string, string> {
+  const variables = scriptFile(path).variables;
+  if (!variables || typeof variables !== "object") return {};
+  return Object.fromEntries(Object.entries(variables).filter((e): e is [string, string] => typeof e[1] === "string"));
+}
+
+/** The `vm` the script file at `path` names; undefined when it names none or cannot be read. */
+export function scriptVM(path: string): string | undefined {
+  const vm = scriptFile(path).vm;
+  return typeof vm === "string" && vm !== "" ? vm : undefined;
+}
+
+/** `value` with every `png` and `jpeg` string replaced by its length, through objects and arrays. */
+export function withoutImages<T>(value: T): T {
+  const walk = (item: unknown, key?: string): unknown => {
+    if (typeof item === "string") {
+      return (key === "png" || key === "jpeg") && !item.startsWith("<omitted") ? `<omitted: ${item.length} characters>` : item;
+    }
+    if (Array.isArray(item)) return item.map((i) => walk(i));
+    if (item && typeof item === "object") return Object.fromEntries(Object.entries(item).map(([k, v]) => [k, walk(v, k)]));
+    return item;
+  };
+  return walk(value) as T;
 }
 
 export function register(r: Registrar, client: ControlClient): void {
@@ -109,7 +134,7 @@ export function register(r: Registrar, client: ControlClient): void {
       to: z.number().int().min(1).optional().describe("Last trace seq to use (default: the end)"),
       overwrite: z.boolean().optional().describe("Replace an existing file at path (default false)"),
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   }, async (a): Promise<ToolResult> => {
     try {
       const reply = await client.call("script.save", {
@@ -129,7 +154,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("replay", "alcove_script_run", {
     title: "Replay a script",
-    description: "Replay a script file (made by alcove_script_save) on the VM without a model: it runs the steps in order, checks each step's expectations and stops at the first failure. It sends real mouse and keyboard input to the guest and, with `snapshot`, first restores that snapshot, which discards the guest's current state. Returns one line per step (ok or FAIL, number, label, milliseconds; markers: `fallback` = the element was not found and the recorded coordinates were clicked, `alt selector` = the element was found by its second selector, `positional` = the selector picks \"whatever is at that position\" and nothing checks that it is the same element), the warnings and a final PASSED or FAILED line. A failed run also returns the screenshot taken at that moment. Variables of the script without a default, such as the `password` that alcove_script_save leaves for text typed into password fields, must be passed in `variables`; a variable whose name contains password, key, token or secret is never printed. Pass `name` when this session holds a lease on the VM so the run uses it.",
+    description: "Replay a script file (made by alcove_script_save) on the VM without a model: it runs the steps in order, checks each step's expectations and stops at the first failure. It sends real mouse and keyboard input to the guest and, with `snapshot`, first restores that snapshot, which discards the guest's current state. Returns one line per step (ok or FAIL, number, label, milliseconds; markers: `fallback` = the element was not found and the recorded coordinates were clicked, `alt selector` = the element was found by its second selector, `positional` = the selector picks \"whatever is at that position\" and nothing checks that it is the same element), the warnings and a final PASSED or FAILED line. A failed run also returns the screenshot taken at that moment. Step numbers count from 1. Variables of the script without a default, such as the `password` that alcove_script_save leaves for text typed into password fields, must be passed in `variables`; a variable whose name contains password, key, token or secret is never printed. The run carries this session's lease on its VM (`name`, or the VM the script names). This call waits at most two hours for the steps; a longer run goes on in the control server after the call has failed.",
     inputSchema: {
       path: z.string().min(1).describe("Absolute path of the script file on the Mac"),
       variables: z.record(z.string()).optional().describe("Values for ${name} in the script, overriding its defaults; required for variables without a default"),
@@ -140,10 +165,11 @@ export function register(r: Registrar, client: ControlClient): void {
   }, async (a): Promise<ToolResult> => {
     const passed = (a.variables ?? {}) as Record<string, string>;
     const variables = { ...scriptDefaults(a.path), ...passed };
+    const vm = a.name ?? scriptVM(a.path);
     try {
       const reply = await client.call("script.run", {
         path: a.path,
-        ...(a.name !== undefined ? { name: a.name } : {}),
+        ...(vm !== undefined ? { name: vm } : {}),
         ...(a.variables !== undefined ? { variables: a.variables } : {}),
         ...(a.snapshot !== undefined ? { snapshot: a.snapshot } : {}),
         maxWidth: MODEL_IMAGE_MAX_WIDTH,
@@ -154,7 +180,7 @@ export function register(r: Registrar, client: ControlClient): void {
         passed: reply.passed,
         stepsRun: reply.stepsRun,
         seconds: reply.seconds,
-        steps: reply.steps,
+        steps: withoutImages(reply.steps),
         ...(reply.failedStep !== undefined ? { failedStep: reply.failedStep } : {}),
         ...(reply.error !== undefined ? { error: reply.error } : {}),
         ...(reply.warning !== undefined ? { warning: reply.warning } : {}),

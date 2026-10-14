@@ -37,6 +37,34 @@ export function selectedToolsets(env: string | undefined): Set<Toolset> {
   return out;
 }
 
+/** The instructions the server gives MCP clients: one sentence per enabled toolset, naming only tools of enabled toolsets. */
+export function serverInstructions(enabled: Set<Toolset>): string {
+  const on = (set: Toolset) => enabled.has(set);
+  const textTools = [on("core") ? "alcove_exec" : "", on("files") ? "alcove_fs_*" : "", on("shell") ? "alcove_process_*" : ""].filter(Boolean);
+  const parts = ["Alcove drives virtual machines."];
+  if (textTools.length) {
+    parts.push(`Text tools (${textTools.join(", ")}) are cheaper and more reliable than screenshots: prefer them whenever the guest tools are connected.`);
+  }
+  if (on("shell")) {
+    parts.push(`Run long commands such as builds and test suites with alcove_exec_start and follow them with alcove_exec_read${on("core") ? " instead of blocking in alcove_exec" : ""}.`);
+  }
+  if (on("core")) {
+    parts.push("Action tools report what changed on screen; ask for observe: \"diff\" or \"image\" only when the text summary is not enough, and use alcove_find_text to read the screen.");
+  }
+  if (on("files")) parts.push("Move build output into the guest with alcove_sync_dir.");
+  if (on("ui")) {
+    parts.push(`On Windows guests read the UI with alcove_ui_tree before taking screenshots and act with alcove_ui_click and alcove_ui_type${on("core") ? "; wait for streamed output with alcove_wait_for ui_text_stable" : ""}.`);
+  }
+  if (on("state")) {
+    parts.push("Take a snapshot with alcove_snapshot_create before risky changes and return to it with alcove_snapshot_restore; alcove_clone_vm gives a linked clone for parallel work; alcove_lease_acquire keeps other agents off a VM.");
+  }
+  if (on("evidence")) parts.push("alcove_record_start captures a test run as a trace and video, and alcove_collect_diagnostics gathers evidence when something fails.");
+  if (on("http")) parts.push("alcove_http_capture_start records the guest's HTTP(S) traffic for alcove_http_requests, and alcove_http_rule fakes server answers.");
+  if (on("replay")) parts.push("alcove_script_save turns a recording into a script and alcove_script_run replays it without a model.");
+  parts.push("When neither the Alcove app nor another control server answers, this server starts a headless control server, and the VMs it runs shut down when this session ends.");
+  return parts.join(" ");
+}
+
 export function text(t: string, structured?: Record<string, unknown>): ToolResult {
   return { content: [{ type: "text", text: t }], ...(structured ? { structuredContent: structured } : {}) };
 }
@@ -45,6 +73,15 @@ export function fail(e: unknown): ToolResult {
   const msg = e instanceof ControlError ? e.message : `unexpected error: ${String(e)}`;
   return { content: [{ type: "text", text: msg }], isError: true };
 }
+
+/** A control reply without the envelope fields `ok` and `id`. */
+export function withoutEnvelope(reply: Record<string, unknown>): Record<string, unknown> {
+  const { ok: _ok, id: _id, ...rest } = reply;
+  return rest;
+}
+
+/** The most entries of a file list that structured content carries. */
+export const STRUCTURED_LIST_MAX = 50;
 
 /** Truncates to `max` characters and appends a line naming the paging parameter. */
 export function clip(s: string, max = 60000, hint?: string): string {
@@ -188,10 +225,10 @@ export function commandPayload(a: CommandArgs, withStdin = true): Record<string,
   return p;
 }
 
-/** `stdout:` and `stderr:` sections, each omitted when empty and clipped at 60000 characters. */
-export function streamSections(stdout: string, stderr: string): string {
+/** `stdout:` and `stderr:` sections, each omitted when empty and clipped at 60000 characters with `hint` on the cut. */
+export function streamSections(stdout: string, stderr: string, hint?: string): string {
   const parts: string[] = [];
-  if (stdout) parts.push(`stdout:\n${clip(stdout)}`);
-  if (stderr) parts.push(`stderr:\n${clip(stderr)}`);
+  if (stdout) parts.push(`stdout:\n${clip(stdout, 60000, hint)}`);
+  if (stderr) parts.push(`stderr:\n${clip(stderr, 60000, hint)}`);
   return parts.join("\n");
 }

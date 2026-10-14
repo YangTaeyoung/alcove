@@ -66,7 +66,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_snapshot_list",
     {
       title: "List snapshots",
-      description: "List the snapshots of a VM with their date and saved memory-state size.",
+      description: "List the snapshots of a running VM with their date and saved memory-state size.",
       inputSchema: { name: vmName },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -86,7 +86,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_snapshot_create",
     {
       title: "Create snapshot",
-      description: "Save the VM's disk and memory state under a name so alcove_snapshot_restore can return to it.",
+      description: "Save a running VM's disk and memory state under a name so alcove_snapshot_restore can return to it.",
       inputSchema: { name: vmName, snapshot: snapshotName },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
@@ -105,7 +105,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     {
       title: "Restore snapshot",
       description:
-        "Return a VM to a snapshot. Everything since the snapshot is lost. Waits for the guest tools to reconnect and syncs the guest clock when they do.",
+        "Return a running VM to a snapshot. Everything since the snapshot is lost. Waits for the guest tools to reconnect and syncs the guest clock when they do.",
       inputSchema: {
         name: vmName,
         snapshot: snapshotName,
@@ -140,7 +140,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_snapshot_delete",
     {
       title: "Delete snapshot",
-      description: "Delete a snapshot of a VM.",
+      description: "Delete a snapshot of a running VM.",
       inputSchema: { name: vmName, snapshot: snapshotName },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
@@ -275,7 +275,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_port_forward_remove",
     {
       title: "Remove a port forward",
-      description: "Remove a port forward added with alcove_port_forward_add.",
+      description: "Remove a port forward of a running VM added with alcove_port_forward_add.",
       inputSchema: { name: vmName, host_port: z.number().int().min(1).max(65535).describe("Host port of the forward") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -293,7 +293,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_port_forward_list",
     {
       title: "List port forwards",
-      description: "List the port forwards of a VM; kind is config (saved with the VM), agent (the forward the guest tools use) or runtime (added with alcove_port_forward_add, until the VM stops).",
+      description: "List the port forwards of a running VM; kind is config (saved with the VM), agent (the forward the guest tools use) or runtime (added with alcove_port_forward_add, until the VM stops).",
       inputSchema: { name: vmName },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -313,7 +313,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_set_network",
     {
       title: "Set guest network link",
-      description: "Bring the guest's network link up or down, e.g. to test offline behavior.",
+      description: "Bring the network link of a running VM's guest up or down, e.g. to test offline behavior.",
       inputSchema: { name: vmName, up: z.boolean().describe("true connects the guest network, false disconnects it") },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },

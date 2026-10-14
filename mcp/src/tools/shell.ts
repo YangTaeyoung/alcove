@@ -140,7 +140,7 @@ export function register(r: Registrar, client: ControlClient): void {
         const res = await client.call("vm.process.list", { name, ...(filter ? { filter } : {}) });
         const procs = (res.processes as Array<Record<string, unknown>>) ?? [];
         const lines = procs.map((p) => `${p.pid}  ppid ${p.ppid}  ${p.name}  ${p.memoryKB} KB${p.command ? `  ${p.command}` : ""}`);
-        return text(lines.length ? clip(lines.join("\n")) : "no matching processes", { processes: procs });
+        return text(lines.length ? clip(lines.join("\n"), 60000, "narrow with filter") : "no matching processes", { processes: procs });
       } catch (e) {
         return fail(e);
       }

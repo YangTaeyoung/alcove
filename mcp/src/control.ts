@@ -181,15 +181,19 @@ export class ControlClient {
   }
 }
 
-export function findAlcovectl(): string | null {
-  const candidates = [
+/** The paths where `findAlcovectl` looks for alcovectl, in order. */
+export function alcovectlCandidates(): string[] {
+  return [
     process.env.ALCOVE_CTL,
     "/Applications/Alcove.app/Contents/MacOS/alcovectl",
     path.join(os.homedir(), "Applications", "Alcove.app", "Contents", "MacOS", "alcovectl"),
-    // development checkouts: <repo>/mcp/dist/index.js -> <repo>/AlcoveKit/.build*/debug/alcovectl
-    ...["", "-ctl", "-app", "-wp4"].map((suffix) => path.resolve(new URL(".", import.meta.url).pathname, "..", "..", "AlcoveKit", `.build${suffix}`, "debug", "alcovectl")),
-  ];
-  for (const c of candidates) {
+    // development checkout: <repo>/mcp/dist/index.js -> <repo>/AlcoveKit/.build/debug/alcovectl
+    path.resolve(new URL(".", import.meta.url).pathname, "..", "..", "AlcoveKit", ".build", "debug", "alcovectl"),
+  ].filter((c): c is string => Boolean(c));
+}
+
+export function findAlcovectl(): string | null {
+  for (const c of alcovectlCandidates()) {
     if (c && fs.existsSync(c)) {
       try {
         fs.accessSync(c, fs.constants.X_OK);

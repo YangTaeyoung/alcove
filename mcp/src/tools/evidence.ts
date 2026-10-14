@@ -2,7 +2,7 @@
 // dumps and the one-call diagnostics bundle.
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
-import { clip, fail, text, vmName, type Registrar } from "../toolkit.js";
+import { clip, fail, text, vmName, withoutEnvelope, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -27,6 +27,11 @@ function summaryLines(r: Obj): string[] {
   if (r.frames !== undefined) lines.push(`frames: ${r.frames}`);
   if (r.ops !== undefined) lines.push(`ops: ${r.ops}`);
   if (r.seconds !== undefined) lines.push(`seconds: ${r.seconds}`);
+  const errors = Number(r.writeErrors ?? 0);
+  if (errors > 0) lines.push(`write errors: ${errors}${typeof r.lastWriteError === "string" ? ` (last: ${r.lastWriteError})` : ""}`);
+  if (r.videoSeconds !== undefined) lines.push(`video seconds: ${r.videoSeconds}`);
+  const dropped = Number(r.droppedFrames ?? 0);
+  if (dropped > 0) lines.push(`dropped video frames: ${dropped}`);
   return lines;
 }
 
@@ -59,13 +64,13 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("evidence", "alcove_record_stop", {
     title: "Stop recording",
-    description: "Stop the recording of a VM and finish the video file. Returns the directory, the trace and video paths, and the number of operations, frames and seconds recorded.",
+    description: "Stop the recording of a VM and finish the video file. Returns the directory, the trace and video paths, the number of operations, frames and seconds recorded, and failed writes, video seconds and dropped video frames; a recording with failed writes misses trace lines or frames.",
     inputSchema: { name: vmName },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, async ({ name }) => {
     try {
       const reply = await client.call("vm.record.stop", { name }, 300000);
-      return text(summaryLines(reply).join("\n"), reply);
+      return text(summaryLines(reply).join("\n"), withoutEnvelope(reply));
     } catch (e) {
       return fail(e);
     }
@@ -73,14 +78,26 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("evidence", "alcove_record_status", {
     title: "Recording status",
-    description: "Say whether a VM is being recorded and, if so, the directory, the seconds recorded so far and the number of operations traced. Use it to check that a recording is still running before relying on it.",
+    description: "Say whether a VM is being recorded and, if so, the directory, the seconds recorded so far, the number of operations traced, failed writes and a video that stopped. Use it to check that a recording is still running before relying on it.",
     inputSchema: { name: vmName },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ name }) => {
     try {
       const reply = await client.call("vm.record.status", { name }, 60000);
       if (reply.recording !== true) return text("not recording", { recording: false });
-      return text(`recording to ${reply.dir}; ${reply.seconds ?? 0} s, ${reply.ops ?? 0} operations so far`, { recording: true, dir: reply.dir, seconds: reply.seconds, ops: reply.ops });
+      const errors = Number(reply.writeErrors ?? 0);
+      const notes = [
+        `recording to ${reply.dir}`,
+        `${reply.seconds ?? 0} s, ${reply.ops ?? 0} operations so far`,
+        ...(errors > 0 ? [`${errors} write errors${typeof reply.lastWriteError === "string" ? ` (last: ${reply.lastWriteError})` : ""}`] : []),
+        ...(typeof reply.videoError === "string" ? [`video: ${reply.videoError}`] : []),
+      ];
+      return text(notes.join("; "), {
+        recording: true, dir: reply.dir, seconds: reply.seconds, ops: reply.ops,
+        ...(reply.writeErrors !== undefined ? { writeErrors: reply.writeErrors } : {}),
+        ...(reply.lastWriteError !== undefined ? { lastWriteError: reply.lastWriteError } : {}),
+        ...(reply.videoError !== undefined ? { videoError: reply.videoError } : {}),
+      });
     } catch (e) {
       return fail(e);
     }
@@ -121,7 +138,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("evidence", "alcove_crash_dumps", {
     title: "Collect crash dumps",
-    description: "Manage crash dumps of a Windows guest. enable (needs exe) makes Windows write a dump when that program crashes, into C:\\alcove-dumps (Windows keeps the newest 5 dumps of that folder, counted over all enabled programs); disable (needs exe) turns it off; list shows the dumps taken; pull (needs file and path) copies one dump to the Mac. Enable before the run that may crash.",
+    description: "Manage crash dumps of a Windows guest. enable (needs exe) makes Windows write a dump when that program crashes, into C:\\alcove-dumps (Windows keeps the newest 5 dumps of that folder, counted over all enabled programs); disable (needs exe) turns it off; list shows the dumps taken; pull (needs file and path) copies one dump to the Mac and replaces a file already at path. Enable before the run that may crash.",
     inputSchema: {
       name: vmName,
       action: z.enum(["enable", "disable", "list", "pull"]),
@@ -130,7 +147,7 @@ export function register(r: Registrar, client: ControlClient): void {
       file: z.string().optional().describe("pull: dump file name as listed by the list action, without a folder"),
       path: z.string().optional().describe("pull: destination path on the Mac"),
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async (a) => {
     try {
       const needs = (field: "exe" | "file" | "path") => {

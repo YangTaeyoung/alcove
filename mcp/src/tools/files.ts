@@ -1,7 +1,7 @@
 // The files toolset: transfers between the Mac and the guest, and guest file access.
 import { z } from "zod";
 import type { ControlClient } from "../control.js";
-import { clip, fail, text, vmName, type Registrar } from "../toolkit.js";
+import { clip, fail, text, vmName, STRUCTURED_LIST_MAX, type Registrar } from "../toolkit.js";
 
 const guestPath = (what: string) => z.string().min(1).describe(`${what} inside the guest; \`~\` is the guest user's home`);
 
@@ -11,9 +11,9 @@ export function register(r: Registrar, client: ControlClient): void {
     "alcove_pull_file",
     {
       title: "Copy a file out of the guest",
-      description: "Copy a file from the guest to the Mac (needs guest tools with exec allowed). Returns the Mac path, size and SHA-256.",
+      description: "Copy a file from the guest to the Mac (needs guest tools with exec allowed). A file already at path is replaced. Returns the Mac path, size and SHA-256.",
       inputSchema: { name: vmName, guest_path: guestPath("Path of the file"), path: z.string().min(1).describe("Destination path on the Mac") },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ name, guest_path, path: p }) => {
       try {
@@ -50,7 +50,10 @@ export function register(r: Registrar, client: ControlClient): void {
         if (sent.length > 50) lines.push(`  ...and ${sent.length - 50} more`);
         if (deleted.length) lines.push("deleted:", ...deleted.slice(0, 50).map((s) => `  ${s}`));
         if (deleted.length > 50) lines.push(`  ...and ${deleted.length - 50} more`);
-        return text(lines.join("\n"), { sent, skipped: res.skipped, deleted, bytes: res.bytes });
+        return text(lines.join("\n"), {
+          sent: sent.slice(0, STRUCTURED_LIST_MAX), sentCount: sent.length, skipped: res.skipped,
+          deleted: deleted.slice(0, STRUCTURED_LIST_MAX), deletedCount: deleted.length, bytes: res.bytes,
+        });
       } catch (e) {
         return fail(e);
       }
@@ -72,7 +75,7 @@ export function register(r: Registrar, client: ControlClient): void {
         const entries = (res.entries as Array<Record<string, unknown>>) ?? [];
         const lines = entries.map((e) => `${e.dir ? "d" : "-"} ${e.size} ${e.mtime} ${e.name}`);
         if (res.truncated) lines.push("...[list truncated; list a subfolder to see more]");
-        return text(lines.length ? clip(lines.join("\n")) : "empty folder", { entries, truncated: res.truncated === true });
+        return text(lines.length ? clip(lines.join("\n"), 60000, "list a subfolder, or leave out recursive") : "empty folder", { entries, truncated: res.truncated === true });
       } catch (e) {
         return fail(e);
       }
