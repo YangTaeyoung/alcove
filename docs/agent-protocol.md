@@ -123,7 +123,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `proc.list` | `name` (case-insensitive substring of the process name) | `procs`: [{`pid`, `ppid`, `name`, `path`, `cmd`, `mem_kb`}] |
 | `proc.kill` | `pid`, or `name` (exact process name); `tree` (bool) | `killed` (int) |
 | `fs.stat` | `path`; `sha256` (bool) | `exists`, `path` (absolute); for an existing entry also `dir`, `size`, `mtime` (RFC 3339, UTC), and `sha256` when asked for a file; `link: true` when the entry at `path` is a link; `owner` on Windows |
-| `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`}], `truncated` (more than 5000 entries) |
+| `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`}], `truncated` (more than 5000 entries), `skipped` (entries that could not be read, when above 0) |
 | `fs.read` | `path`, `offset` (default 0), `length` (default and cap 262144) | `data` (base64), `size` (of the file), `eof`, `encoding` |
 | `fs.tail` | `path`, `lines` (default 200) | `data` (base64 of the last lines, taken from at most the last 262144 bytes), `size`, `encoding` |
 | `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool) | `size` (of the file afterwards) |
@@ -744,7 +744,12 @@ agent sends one event per difference, each with the window object:
 ### Files (`fs.*`)
 
 - Paths: `~`, `~/x`, `~\x` and relative paths resolve against the home
-  directory of the agent's user; results report absolute paths.
+  directory of the agent's user; results report absolute paths. On Windows a
+  drive without a separator after it (`C:foo`) and a path that starts at the
+  root of the current drive (`\x`) are refused with a sentence that names the
+  full form to pass.
+- `fs.stat` of a path that goes through a file (`f.txt/inner`) answers
+  `exists: false`.
 - `fs.stat` of a missing path answers `exists: false` without an error.
   `fs.list`, `fs.read` and `fs.tail` of a missing path are errors that name
   the path.
@@ -753,7 +758,8 @@ agent sends one event per difference, each with the window object:
   reparse point that is not a plain directory; a link to nothing answers
   `exists: false` with `link: true`. `fs.list` marks such entries with
   `link: true`, lists them with `dir: false` and does not list what is below
-  them.
+  them; `fs.list` of a path that is itself a link answers
+  `'<path>' is a link and fs.list does not follow links; list the folder it leads to`.
 - On Windows `fs.stat` adds `owner`, the owner of the entry at the path
   itself (a link is not followed), also for a link to nothing:
   `"administrators"` (`BUILTIN\Administrators`), `"system"`
@@ -764,14 +770,19 @@ agent sends one event per difference, each with the window object:
 - `fs.list` lists the direct children, or with `recursive` the whole tree, in
   lexical order, at most 5000 entries. `sha256` (lower-case hex) is present
   only when asked for, and only for regular files the agent could read: a
-  file another process holds open is listed without it.
+  file another process holds open is listed without it. Entries the agent
+  cannot read (a folder without access, below which nothing is listed) are
+  left out and counted in `skipped`, present only when above 0.
+- `fs.read`, `fs.tail` and `fs.stat` with `sha256` refuse what is neither a
+  regular file nor a directory, such as a FIFO:
+  `'<path>' is not a regular file; fs.read, fs.tail and sha256 read regular files only`.
 - `fs.read` returns up to `length` bytes from `offset`; `eof` is true when
   the piece reaches the end of the file.
 - `fs.tail` returns the last `lines` lines found in the last 262144 bytes.
   When that window begins inside a line, the partial line is left out.
 - `encoding` is `"utf-16le"` for a file that begins with the bytes `FF FE`
-  and absent otherwise. `fs.tail` of such a file starts on a code unit after
-  the byte order mark and ends lines at the code unit `0A 00`; the returned
+  but not `FF FE 00 00` (the UTF-32LE mark), and absent otherwise. `fs.tail`
+  of such a file starts on a code unit after the byte order mark and ends lines at the code unit `0A 00`; the returned
   bytes do not include the mark.
 - `fs.write` creates the file when needed. With `append` the bytes go to the
   end and `offset` is not used; otherwise they are written at `offset`, after
@@ -788,7 +799,11 @@ agent sends one event per difference, each with the window object:
 - `fs.delete` of a missing path answers `deleted: false`. A directory with
   entries needs `recursive`. It refuses, before touching anything, the home
   directory, a file-system root (`/`, `C:\`) and any ancestor of the home
-  directory, whether or not `recursive` is set.
+  directory, whether or not `recursive` is set. The path is compared as given
+  and with a `\\?\` prefix removed and the links, junctions and short names of
+  its parent folder resolved; the home directory as given and with its links
+  resolved. A link itself is deleted without what it leads to. Other names
+  for the same folder, such as `\\localhost\C$\…`, are not recognised.
 - The host transfers a file as `fs.write` pieces to `<path>.alcove-part`,
   compares `fs.stat` with `sha256` against its own digest and then renames;
   downloads use `fs.stat` with `sha256` and `fs.read` pieces.

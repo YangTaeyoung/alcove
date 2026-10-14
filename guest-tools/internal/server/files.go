@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
@@ -44,7 +45,26 @@ func (s *Server) resolvePath(p string) (string, error) {
 	return filepath.Join(home, p), nil
 }
 
+// windowsPathFormError refuses the Windows path forms that depend on a
+// current folder the caller cannot see: a drive with no separator after it
+// ("C:foo") and a path that starts at the root of the current drive ("\x").
+// Other paths answer nil.
+func windowsPathFormError(p string) error {
+	if len(p) >= 2 && p[1] == ':' && (len(p) == 2 || p[2] != '\\' && p[2] != '/') {
+		return fmt.Errorf("'%s' is relative to the current folder of drive %s; pass a full path such as %s\\%s", p, p[:2], p[:2], p[2:])
+	}
+	if p != "" && (p[0] == '\\' || p[0] == '/') && !(len(p) >= 2 && (p[1] == '\\' || p[1] == '/')) {
+		return fmt.Errorf("'%s' starts at the root of the agent's current drive; pass a full path with its drive, such as C:%s", p, strings.ReplaceAll(p, "/", `\`))
+	}
+	return nil
+}
+
 func (s *Server) pathArg(req proto.Message, key string) (string, error) {
+	if runtime.GOOS == "windows" {
+		if err := windowsPathFormError(req.String(key)); err != nil {
+			return "", err
+		}
+	}
 	return s.resolvePath(req.String(key))
 }
 
@@ -52,7 +72,23 @@ func mtimeString(fi os.FileInfo) string {
 	return fi.ModTime().UTC().Format(time.RFC3339)
 }
 
+// notRegular is the error for a path that is neither a regular file nor a
+// directory, such as a FIFO, whose reading could block.
+func notRegular(path string) error {
+	return fmt.Errorf("'%s' is not a regular file; fs.read, fs.tail and sha256 read regular files only", path)
+}
+
+// isIrregular reports whether path leads to something other than a regular
+// file or a directory.
+func isIrregular(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir() && !fi.Mode().IsRegular()
+}
+
 func fileDigest(path string) (string, error) {
+	if isIrregular(path) {
+		return "", notRegular(path)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -116,7 +152,7 @@ func (s *Server) fsStat(_ context.Context, req proto.Message) (proto.Message, er
 		owner, hasOwner = entryOwner(path)
 	}
 	fi, err := os.Stat(path)
-	if errors.Is(err, fs.ErrNotExist) {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		out := proto.Message{"exists": false, "path": path}
 		if link {
 			out["link"] = true
@@ -170,11 +206,15 @@ func (s *Server) fsList(_ context.Context, req proto.Message) (proto.Message, er
 	if !fi.IsDir() {
 		return nil, fmt.Errorf("'%s' is not a directory; use fs.stat or fs.read for files", root)
 	}
+	if li, err := os.Lstat(root); err == nil && isLink(li.Mode()) {
+		return nil, fmt.Errorf("'%s' is a link and fs.list does not follow links; list the folder it leads to", root)
+	}
 	recursive := req.Bool("recursive")
 	withSum := req.Bool("sha256")
 
 	entries := []any{}
 	truncated := false
+	skipped := 0
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if p == root {
 			if err != nil {
@@ -183,6 +223,7 @@ func (s *Server) fsList(_ context.Context, req proto.Message) (proto.Message, er
 			return nil
 		}
 		if err != nil {
+			skipped++
 			if d != nil && d.IsDir() {
 				return fs.SkipDir
 			}
@@ -194,6 +235,7 @@ func (s *Server) fsList(_ context.Context, req proto.Message) (proto.Message, er
 		}
 		info, err := d.Info()
 		if err != nil {
+			skipped++
 			return nil
 		}
 		rel, err := filepath.Rel(root, p)
@@ -226,10 +268,17 @@ func (s *Server) fsList(_ context.Context, req proto.Message) (proto.Message, er
 	if walkErr != nil {
 		return nil, fmt.Errorf("cannot list '%s': %v", root, walkErr)
 	}
-	return proto.Message{"entries": entries, "truncated": truncated}, nil
+	out := proto.Message{"entries": entries, "truncated": truncated}
+	if skipped > 0 {
+		out["skipped"] = skipped
+	}
+	return out, nil
 }
 
 func openRegular(path string) (*os.File, os.FileInfo, error) {
+	if isIrregular(path) {
+		return nil, nil, notRegular(path)
+	}
 	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil, fmt.Errorf("'%s' does not exist", path)
@@ -249,11 +298,15 @@ func openRegular(path string) (*os.File, os.FileInfo, error) {
 	return f, fi, nil
 }
 
-// startsWithUTF16BOM reports whether the file begins with the bytes FF FE.
+// startsWithUTF16BOM reports whether the file begins with the bytes FF FE
+// and not with FF FE 00 00, the UTF-32LE byte order mark.
 func startsWithUTF16BOM(f *os.File) bool {
-	var head [2]byte
+	var head [4]byte
 	n, _ := f.ReadAt(head[:], 0)
-	return n == 2 && head[0] == 0xFF && head[1] == 0xFE
+	if n < 2 || head[0] != 0xFF || head[1] != 0xFE {
+		return false
+	}
+	return n < 4 || head[2] != 0 || head[3] != 0
 }
 
 // withEncoding adds "encoding": "utf-16le" to out for a file that begins with
@@ -552,14 +605,48 @@ func pathContains(dir, target string, sep byte, fold bool) bool {
 	return true
 }
 
+// protectedFromDelete reports whether path is a file-system root, the home
+// directory or one of its ancestors, compared with the home directory as
+// given and with its links resolved.
+func (s *Server) protectedFromDelete(path string) bool {
+	if isFileSystemRoot(path, filepath.VolumeName(path), filepath.Separator) {
+		return true
+	}
+	if s.opt.HomeDir == "" {
+		return false
+	}
+	fold := runtime.GOOS == "windows"
+	home := filepath.Clean(s.opt.HomeDir)
+	if pathContains(path, home, filepath.Separator, fold) {
+		return true
+	}
+	real, err := filepath.EvalSymlinks(home)
+	return err == nil && pathContains(path, real, filepath.Separator, fold)
+}
+
+// resolveParent returns path without a \\?\ prefix before a drive letter and
+// with the links, junctions and short names of its parent folder resolved,
+// so that it names the entry itself; it returns path when the parent cannot
+// be resolved.
+func resolveParent(path string) string {
+	p := path
+	if strings.HasPrefix(p, `\\?\`) && len(p) >= 6 && p[5] == ':' {
+		p = p[4:]
+	}
+	p = filepath.Clean(p)
+	dir, err := filepath.EvalSymlinks(filepath.Dir(p))
+	if err != nil {
+		return p
+	}
+	return filepath.Join(dir, filepath.Base(p))
+}
+
 func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
 	}
-	home := filepath.Clean(s.opt.HomeDir)
-	if s.opt.HomeDir != "" && pathContains(path, home, filepath.Separator, runtime.GOOS == "windows") ||
-		isFileSystemRoot(path, filepath.VolumeName(path), filepath.Separator) {
+	if s.protectedFromDelete(path) || s.protectedFromDelete(resolveParent(path)) {
 		return nil, fmt.Errorf("refusing to delete '%s': it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended", path)
 	}
 	fi, err := os.Lstat(path)

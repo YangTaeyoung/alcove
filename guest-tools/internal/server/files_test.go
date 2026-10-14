@@ -341,9 +341,10 @@ func TestFsListMarksLinksAndDoesNotEnterThem(t *testing.T) {
 		}
 	}
 
-	res = c.ok("fs.list", proto.Message{"path": "t/sub/out", "recursive": true})
-	if list, _ := res["entries"].([]any); len(list) != 0 {
-		t.Fatalf("entries below a link %v", list)
+	res = c.call("fs.list", proto.Message{"path": "t/sub/out", "recursive": true})
+	want := fmt.Sprintf("'%s' is a link and fs.list does not follow links; list the folder it leads to", filepath.Join(home, "t", "sub", "out"))
+	if res["ok"] != false || res.String("error") != want {
+		t.Fatalf("listing a link %v", res)
 	}
 }
 
