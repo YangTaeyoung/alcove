@@ -19,3 +19,6 @@ func currentResolution() (int, int, bool) { return 0, 0, false }
 func setResolution(w, h int) error {
 	return errors.New("resolution change not supported on this platform")
 }
+
+// platformEntryOwner reports no owners on this system.
+func platformEntryOwner(string) (string, bool) { return "", false }

@@ -155,6 +155,62 @@ func TestFsStat(t *testing.T) {
 	}
 }
 
+func TestOwnerName(t *testing.T) {
+	const user = "S-1-5-21-1-2-3-1001"
+	cases := map[string]string{
+		"S-1-5-32-544":        "administrators",
+		"S-1-5-18":            "system",
+		user:                  "user",
+		"S-1-5-21-1-2-3-1002": "S-1-5-21-1-2-3-1002",
+		"S-1-5-32-545":        "S-1-5-32-545",
+	}
+	for sid, want := range cases {
+		if got := ownerName(sid, user); got != want {
+			t.Errorf("ownerName(%q) = %q, expected %q", sid, got, want)
+		}
+	}
+	if got := ownerName("S-1-5-21-1-2-3-1001", ""); got != "S-1-5-21-1-2-3-1001" {
+		t.Errorf("without a user SID: %q", got)
+	}
+}
+
+func TestFsStatReportsTheOwnerOfTheEntryItself(t *testing.T) {
+	c, home := fsHome(t)
+	var asked []string
+	saved := entryOwner
+	entryOwner = func(path string) (string, bool) {
+		asked = append(asked, path)
+		return "administrators", true
+	}
+	t.Cleanup(func() { entryOwner = saved })
+	os.WriteFile(filepath.Join(home, "f.txt"), []byte("x"), 0o644)
+	symlink(t, filepath.Join(home, "gone"), filepath.Join(home, "dangling"))
+
+	for _, name := range []string{"f.txt", "dangling"} {
+		if res := c.ok("fs.stat", proto.Message{"path": name}); res.String("owner") != "administrators" {
+			t.Fatalf("%s: %v", name, res)
+		}
+	}
+	if res := c.ok("fs.stat", proto.Message{"path": "missing"}); res.Has("owner") {
+		t.Fatalf("missing: %v", res)
+	}
+	want := []string{filepath.Join(home, "f.txt"), filepath.Join(home, "dangling")}
+	if strings.Join(asked, "|") != strings.Join(want, "|") {
+		t.Fatalf("owners read of %q, expected %q", asked, want)
+	}
+}
+
+func TestFsStatHasNoOwnerOutsideWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows reports owners")
+	}
+	c, home := fsHome(t)
+	os.WriteFile(filepath.Join(home, "f.txt"), []byte("x"), 0o644)
+	if res := c.ok("fs.stat", proto.Message{"path": "f.txt"}); res.Has("owner") {
+		t.Fatalf("stat %v", res)
+	}
+}
+
 func TestIsLink(t *testing.T) {
 	links := []os.FileMode{os.ModeSymlink | 0o777, os.ModeSymlink | 0o666, os.ModeIrregular | 0o666}
 	for _, m := range links {

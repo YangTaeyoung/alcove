@@ -83,22 +83,46 @@ func isLink(mode os.FileMode) bool {
 	return mode&os.ModeSymlink != 0 || mode&os.ModeIrregular != 0 && !mode.IsDir()
 }
 
+// entryOwner returns the owner of the entry at path itself, without following
+// a link, as ownerName gives it; false means the system reports no owners.
+var entryOwner = platformEntryOwner
+
+// ownerName names the owner SID sid: "administrators" for the Administrators
+// group, "system" for LocalSystem, "user" for the account the agent runs as
+// (userSID), and the SID string for any other owner.
+func ownerName(sid, userSID string) string {
+	switch {
+	case sid == "S-1-5-32-544":
+		return "administrators"
+	case sid == "S-1-5-18":
+		return "system"
+	case userSID != "" && sid == userSID:
+		return "user"
+	}
+	return sid
+}
+
 // fsStat describes what path leads to. "link" is set when the entry at path
-// itself is a link, also when what it points to does not exist.
+// itself is a link, also when what it points to does not exist. "owner" names
+// the owner of the entry at path itself where entryOwner reports one.
 func (s *Server) fsStat(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
 		return nil, err
 	}
-	link := false
+	link, owner, hasOwner := false, "", false
 	if li, err := os.Lstat(path); err == nil {
 		link = isLink(li.Mode())
+		owner, hasOwner = entryOwner(path)
 	}
 	fi, err := os.Stat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		out := proto.Message{"exists": false, "path": path}
 		if link {
 			out["link"] = true
+		}
+		if hasOwner {
+			out["owner"] = owner
 		}
 		return out, nil
 	}
@@ -114,6 +138,9 @@ func (s *Server) fsStat(_ context.Context, req proto.Message) (proto.Message, er
 	}
 	if link {
 		out["link"] = true
+	}
+	if hasOwner {
+		out["owner"] = owner
 	}
 	if !fi.IsDir() {
 		out["size"] = fi.Size()

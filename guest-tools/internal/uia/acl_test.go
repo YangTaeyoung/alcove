@@ -160,7 +160,7 @@ func TestRemoveRetryingStopsAtTheFirstSuccess(t *testing.T) {
 			return errors.New("access is denied")
 		}
 		return nil
-	}, 5, func() { pauses++ })
+	}, 5, func() { pauses++ }, func(error) bool { return true })
 	if err != nil || calls != 3 || pauses != 2 {
 		t.Fatalf("err %v after %d calls and %d pauses", err, calls, pauses)
 	}
@@ -171,11 +171,78 @@ func TestRemoveRetryingReturnsTheLastErrorAfterItsAttempts(t *testing.T) {
 	err := removeRetrying(func() error {
 		calls++
 		return errors.New("access is denied")
-	}, 4, func() { pauses++ })
+	}, 4, func() { pauses++ }, func(error) bool { return true })
 	if err == nil || err.Error() != "access is denied" || calls != 4 || pauses != 3 {
 		t.Fatalf("err %v after %d calls and %d pauses", err, calls, pauses)
 	}
-	if err := removeRetrying(func() error { return errors.New("unused") }, 0, func() {}); err != nil {
+	if err := removeRetrying(func() error { return errors.New("unused") }, 0, func() {}, func(error) bool { return true }); err != nil {
 		t.Fatalf("no attempt returned %v", err)
+	}
+}
+
+func TestRemoveRetryingStopsAtAnErrorThatIsNotRetried(t *testing.T) {
+	calls, pauses := 0, 0
+	denied := errors.New("access is denied")
+	err := removeRetrying(func() error {
+		calls++
+		if calls == 1 {
+			return denied
+		}
+		return errors.New("the name is not valid")
+	}, 40, func() { pauses++ }, func(err error) bool { return err == denied })
+	if err == nil || err.Error() != "the name is not valid" || calls != 2 || pauses != 1 {
+		t.Fatalf("err %v after %d calls and %d pauses", err, calls, pauses)
+	}
+}
+
+func TestIsDeployLockedSDDL(t *testing.T) {
+	cases := []struct {
+		sddl string
+		want bool
+	}{
+		{deployRootSDDL, true},
+		{"O:BAD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)", true},
+		{"O:SYD:P(A;OICI;0x1200A9;;;BU)(A;OICI;0x1f01ff;;;SY)(A;OICI;FA;;;BA)", true},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BU)", true},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FXFR;;;BU)", true},
+		{"O:BAD:(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;BU)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FRFW;;;BU)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1301bf;;;AU)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;AU)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;CI;0x1200a9;;;BU)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0xzz;;;BU)", false},
+		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;XX;;;BU)", false},
+		{"O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)", false},
+		{lockedSDDL, false},
+	}
+	for _, c := range cases {
+		if got := isDeployLockedSDDL(c.sddl); got != c.want {
+			t.Errorf("isDeployLockedSDDL(%q) = %v, expected %v", c.sddl, got, c.want)
+		}
+	}
+}
+
+func TestADeployRootIsKeptOnlyAsALockedPlainDirectory(t *testing.T) {
+	const dir = fileAttributeDirectory
+	cases := []struct {
+		what       string
+		attributes uint32
+		sddl       string
+		want       bool
+	}{
+		{"a locked folder", dir, deployRootSDDL, true},
+		{"a locked junction", dir | fileAttributeReparse, deployRootSDDL, false},
+		{"a locked file", 0x20, deployRootSDDL, false},
+		{"a folder with the inherited access list", dir, "O:BAD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)(A;OICIID;0x1301bf;;;AU)(A;OICIID;0x1200a9;;;BU)", false},
+		{"a folder of another owner", dir, "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)", false},
+		{"a folder whose access list was not read", dir, "", false},
+		{"an entry whose attributes were not read", invalidFileAttributes, deployRootSDDL, false},
+	}
+	for _, c := range cases {
+		if got := keepDeployRoot(c.attributes, c.sddl); got != c.want {
+			t.Errorf("%s: keepDeployRoot = %v, expected %v", c.what, got, c.want)
+		}
 	}
 }

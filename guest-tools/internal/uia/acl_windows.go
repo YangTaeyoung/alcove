@@ -3,6 +3,7 @@
 package uia
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,16 +45,16 @@ const (
 	fileReadAttributes     = 0x00000080
 )
 
-// lockedDescriptor is lockedSDDL as a security descriptor with its owner and
-// DACL; free releases it.
+// lockedDescriptor is a security descriptor in SDDL form converted, with its
+// owner and DACL; free releases it.
 type lockedDescriptor struct {
 	sd    uintptr
 	owner uintptr
 	dacl  unsafe.Pointer
 }
 
-func newLockedDescriptor() (*lockedDescriptor, error) {
-	text, err := syscall.UTF16PtrFromString(lockedSDDL)
+func newLockedDescriptor(sddl string) (*lockedDescriptor, error) {
+	text, err := syscall.UTF16PtrFromString(sddl)
 	if err != nil {
 		return nil, err
 	}
@@ -128,12 +129,98 @@ func fileAttributes(path string) uint32 {
 // LockHelperFolders locks the uia folder and the parent Alcove folder to
 // Administrators and SYSTEM. The parent keeps its files (the agent logs) and
 // leaves the uia entry to the lock of the uia folder; the uia folder keeps
-// only its logs. An error means a folder is not known to be locked.
-func LockHelperFolders(parent, dir string) error {
-	if err := secureDir(parent, nil, map[string]bool{strings.ToLower(filepath.Base(dir)): true}); err != nil {
-		return err
+// only its logs. moved names the paths a folder of another owner was renamed
+// to. An error means a folder is not known to be locked.
+func LockHelperFolders(parent, dir string) (moved []string, err error) {
+	aside, err := secureDir(parent, nil, map[string]bool{strings.ToLower(filepath.Base(dir)): true})
+	if aside != "" {
+		moved = append(moved, aside)
 	}
-	return secureDir(dir, map[string]bool{"helper.log": true, "helper.log.1": true}, nil)
+	if err != nil {
+		return moved, err
+	}
+	aside, err = secureDir(dir, map[string]bool{"helper.log": true, "helper.log.1": true}, nil)
+	if aside != "" {
+		moved = append(moved, aside)
+	}
+	return moved, err
+}
+
+// LockDeployRoot makes dir a directory that Administrators and SYSTEM control
+// and Users can only read and run, as deployRootSDDL says, and returns the
+// path an existing entry at dir was renamed to, or "" when none was. A new
+// directory is created that way. An existing entry is kept when keepDeployRoot
+// says so, read through a handle opened without following a reparse point;
+// any other entry, also one that cannot be opened, is renamed to
+// untrustedName and a new directory is created in its place. An error means
+// the directory is not known to be locked.
+func LockDeployRoot(dir string) (moved string, err error) {
+	d, err := newLockedDescriptor(deployRootSDDL)
+	if err != nil {
+		return "", err
+	}
+	defer d.free()
+	name, err := syscall.UTF16PtrFromString(dir)
+	if err != nil {
+		return "", err
+	}
+	sa := syscall.SecurityAttributes{SecurityDescriptor: d.sd}
+	sa.Length = uint32(unsafe.Sizeof(sa))
+	err = syscall.CreateDirectory(name, &sa)
+	if err != nil && err != errorAlreadyExists {
+		return "", fmt.Errorf("create %s: %v", dir, err)
+	}
+	if err == errorAlreadyExists {
+		if keepExistingDeployRoot(dir) {
+			return "", nil
+		}
+		moved = untrustedName(dir, time.Now())
+		if err := os.Rename(dir, moved); err != nil {
+			if le, ok := err.(*os.LinkError); ok {
+				err = le.Err
+			}
+			return "", fmt.Errorf("%s is a link, belongs to another owner or lets other users change it, and could not be moved aside (%v); close the programs that use files in it, remove it as an administrator and restart alcove-agent", dir, err)
+		}
+		if err := syscall.CreateDirectory(name, &sa); err != nil {
+			return moved, fmt.Errorf("create %s: %v", dir, err)
+		}
+	}
+	h, have, err := openPlainDir(dir)
+	if err != nil {
+		return moved, err
+	}
+	defer syscall.CloseHandle(h)
+	if !isDeployLockedSDDL(have) {
+		return moved, fmt.Errorf("%s has the access list %s; remove it as an administrator and restart alcove-agent", dir, have)
+	}
+	return moved, nil
+}
+
+// keepExistingDeployRoot reports what keepDeployRoot says of the entry at dir,
+// read through a handle opened without following a reparse point; an entry
+// that cannot be opened or read is not kept.
+func keepExistingDeployRoot(dir string) bool {
+	h, err := openDir(dir)
+	if err != nil {
+		return false
+	}
+	defer syscall.CloseHandle(h)
+	var info syscall.ByHandleFileInformation
+	if err := syscall.GetFileInformationByHandle(h, &info); err != nil {
+		return false
+	}
+	have, err := handleOwnerAndDACL(h)
+	if err != nil {
+		return false
+	}
+	return keepDeployRoot(info.FileAttributes, have)
+}
+
+// isRetriedRemoveError reports whether a deletion failed because the entry or
+// something below it is in use or about to be deleted: access denied, a
+// sharing violation or a directory that is not empty yet.
+func isRetriedRemoveError(err error) bool {
+	return errors.Is(err, syscall.ERROR_ACCESS_DENIED) || errors.Is(err, syscall.Errno(32)) || errors.Is(err, syscall.Errno(145))
 }
 
 // openDir opens what is at path itself, without following a reparse point,
@@ -199,71 +286,75 @@ func ownerAccount(h syscall.Handle, fallback string) string {
 }
 
 // secureDir makes dir a directory that only Administrators and SYSTEM can read
-// or change. A new directory is created that way. An existing one is opened
-// without following a reparse point and checked on that handle to be a
+// or change and returns the path an existing directory was renamed to, or ""
+// when none was. A new directory is created that way. An existing one is
+// opened without following a reparse point and checked on that handle to be a
 // directory and not a reparse point. When its owner, read through the handle,
 // is neither Administrators nor SYSTEM, it is renamed to untrustedName and a
 // new directory is created in its place. Any other owner or access list is
 // replaced by lockedSDDL on the handle. The entries are handled as entryAction
-// says; deleting one is tried removeAttempts times, removePause apart. An error
-// means the directory is not known to be locked.
-func secureDir(dir string, keep, leave map[string]bool) error {
-	d, err := newLockedDescriptor()
+// says; deleting one is tried up to removeAttempts times, removePause apart,
+// while isRetriedRemoveError holds for its error. An error means the directory
+// is not known to be locked.
+func secureDir(dir string, keep, leave map[string]bool) (moved string, err error) {
+	d, err := newLockedDescriptor(lockedSDDL)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer d.free()
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
-		return err
+		return "", err
 	}
 	name, err := syscall.UTF16PtrFromString(dir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	sa := syscall.SecurityAttributes{SecurityDescriptor: d.sd}
 	sa.Length = uint32(unsafe.Sizeof(sa))
 	err = syscall.CreateDirectory(name, &sa)
 	existed := err == errorAlreadyExists
 	if err != nil && !existed {
-		return fmt.Errorf("create %s: %v", dir, err)
+		return "", fmt.Errorf("create %s: %v", dir, err)
 	}
 	h, have, err := openPlainDir(dir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { syscall.CloseHandle(h) }()
 	if existed && !isTrustedOwner(sddlOwner(have)) {
 		owner := ownerAccount(h, sddlOwner(have))
 		syscall.CloseHandle(h)
 		h = syscall.InvalidHandle
-		moved := os.Rename(dir, untrustedName(dir, time.Now()))
-		if le, ok := moved.(*os.LinkError); ok {
-			moved = le.Err
+		aside := untrustedName(dir, time.Now())
+		failed := os.Rename(dir, aside)
+		if le, ok := failed.(*os.LinkError); ok {
+			failed = le.Err
 		}
-		if moved == nil {
-			moved = syscall.CreateDirectory(name, &sa)
+		if failed == nil {
+			moved = aside
+			failed = syscall.CreateDirectory(name, &sa)
 		}
-		if moved != nil {
-			return fmt.Errorf("%s belongs to %s and could not be moved aside (%v); remove it as an administrator and restart alcove-agent", dir, owner, moved)
+		if failed != nil {
+			return moved, fmt.Errorf("%s belongs to %s and could not be moved aside (%v); close the programs that use files in it, remove it as an administrator and restart alcove-agent", dir, owner, failed)
 		}
 		if h, have, err = openPlainDir(dir); err != nil {
-			return err
+			return moved, err
 		}
 	}
 	if !isLockedSDDL(have) {
 		if err := setHandleSecurity(h, ownerSecurityInfo|daclSecurityInfo|protectedDaclInfo, d.owner, d.dacl); err != nil {
-			return fmt.Errorf("%s: %v", dir, err)
+			return moved, fmt.Errorf("%s: %v", dir, err)
 		}
 		if have, err = handleOwnerAndDACL(h); err != nil {
-			return err
+			return moved, err
 		}
 		if !isLockedSDDL(have) {
-			return fmt.Errorf("%s still has the access list %s; fix it with icacls and restart alcove-agent", dir, have)
+			return moved, fmt.Errorf("%s still has the access list %s; fix it with icacls and restart alcove-agent", dir, have)
 		}
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return err
+		return moved, err
 	}
 	emptyACL := [2]uint32{emptyACLRevisionAndLen, 0}
 	for _, e := range entries {
@@ -274,7 +365,8 @@ func secureDir(dir string, keep, leave map[string]bool) error {
 				err = nil
 			}
 		case entryRemove:
-			err = removeRetrying(func() error { return os.RemoveAll(path) }, removeAttempts, func() { time.Sleep(removePause) })
+			err = removeRetrying(func() error { return os.RemoveAll(path) }, removeAttempts,
+				func() { time.Sleep(removePause) }, isRetriedRemoveError)
 		case entryLeave:
 			err = nil
 		default:
@@ -282,10 +374,10 @@ func secureDir(dir string, keep, leave map[string]bool) error {
 			runtime.KeepAlive(&emptyACL)
 		}
 		if err != nil {
-			return err
+			return moved, err
 		}
 	}
-	return nil
+	return moved, nil
 }
 
 // systemDirectory returns the Windows system directory.

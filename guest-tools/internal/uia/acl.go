@@ -1,6 +1,7 @@
 package uia
 
 import (
+	"strconv"
 	"strings"
 	"time"
 )
@@ -10,11 +11,37 @@ import (
 // from the parent directory.
 const lockedSDDL = "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)"
 
+// deployRootSDDL gives Administrators and SYSTEM full control of a directory
+// and everything created in it and Users read and execute access; it takes no
+// entries from the parent directory.
+const deployRootSDDL = "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"
+
+const (
+	fileAllAccess   = 0x1f01ff
+	fileReadExecute = 0x1200a9
+)
+
 // isLockedSDDL reports whether an owner-and-DACL descriptor in SDDL form is
 // owned by Administrators or SYSTEM, takes no entries from its parent and
 // grants full control to exactly Administrators and SYSTEM, for the
 // directory and what is created in it.
 func isLockedSDDL(sddl string) bool {
+	return hasExactlyACEs(sddl, map[string]uint32{"BA": fileAllAccess, "SY": fileAllAccess})
+}
+
+// isDeployLockedSDDL reports whether an owner-and-DACL descriptor in SDDL form
+// is owned by Administrators or SYSTEM, takes no entries from its parent and
+// grants full control to exactly Administrators and SYSTEM and read and
+// execute access to Users, for the directory and what is created in it.
+func isDeployLockedSDDL(sddl string) bool {
+	return hasExactlyACEs(sddl, map[string]uint32{"BA": fileAllAccess, "SY": fileAllAccess, "BU": fileReadExecute})
+}
+
+// hasExactlyACEs reports whether an owner-and-DACL descriptor in SDDL form is
+// owned by Administrators or SYSTEM, has a protected DACL and holds one
+// allow entry for objects and containers per trustee of want, with the access
+// mask want gives it, and no other entry.
+func hasExactlyACEs(sddl string, want map[string]uint32) bool {
 	dacl := strings.Index(sddl, "D:")
 	if dacl < 0 || !isTrustedOwner(sddlOwner(sddl)) {
 		return false
@@ -31,19 +58,54 @@ func isLockedSDDL(sddl string) bool {
 	if !strings.HasSuffix(aces, ")") {
 		return false
 	}
-	want := map[string]bool{"BA": false, "SY": false}
+	seen := map[string]bool{}
 	for _, ace := range strings.Split(strings.TrimSuffix(strings.TrimPrefix(aces, "("), ")"), ")(") {
 		f := strings.Split(ace, ";")
-		if len(f) != 6 || f[0] != "A" || f[1] != "OICI" || (f[2] != "FA" && !strings.EqualFold(f[2], "0x1f01ff")) || f[3] != "" || f[4] != "" {
+		if len(f) != 6 || f[0] != "A" || f[1] != "OICI" || f[3] != "" || f[4] != "" {
 			return false
 		}
-		seen, known := want[f[5]]
-		if !known || seen {
+		mask, known := want[f[5]]
+		if !known || seen[f[5]] {
 			return false
 		}
-		want[f[5]] = true
+		if got, ok := sddlRights(f[2]); !ok || got != mask {
+			return false
+		}
+		seen[f[5]] = true
 	}
-	return want["BA"] && want["SY"]
+	return len(seen) == len(want)
+}
+
+// sddlFileRights holds the SDDL abbreviations of file access rights.
+var sddlFileRights = map[string]uint32{"FA": fileAllAccess, "FR": 0x120089, "FW": 0x120116, "FX": 0x1200a0}
+
+// sddlRights returns the access mask of the rights field of an SDDL entry:
+// a hexadecimal number or a run of the abbreviations in sddlFileRights.
+func sddlRights(field string) (uint32, bool) {
+	if len(field) > 2 && strings.EqualFold(field[:2], "0x") {
+		v, err := strconv.ParseUint(field[2:], 16, 32)
+		return uint32(v), err == nil
+	}
+	if field == "" || len(field)%2 != 0 {
+		return 0, false
+	}
+	var mask uint32
+	for i := 0; i < len(field); i += 2 {
+		r, ok := sddlFileRights[field[i:i+2]]
+		if !ok {
+			return 0, false
+		}
+		mask |= r
+	}
+	return mask, true
+}
+
+// keepDeployRoot reports whether an existing deploy root with the given
+// attribute bits and owner-and-DACL descriptor stays as it is: a directory
+// that is not a reparse point and is locked as deployRootSDDL says. Any other
+// entry is moved aside.
+func keepDeployRoot(attributes uint32, sddl string) bool {
+	return isPlainDirAttributes(attributes) && isDeployLockedSDDL(sddl)
 }
 
 // sddlOwner returns the owner of a descriptor in SDDL form: an alias such as
@@ -124,16 +186,17 @@ const (
 	removePause = 50 * time.Millisecond
 )
 
-// removeRetrying calls remove until it returns nil or has failed attempts
-// times, running pause between two calls, and returns the last error.
-func removeRetrying(remove func() error, attempts int, pause func()) error {
+// removeRetrying calls remove until it returns nil, returns an error for which
+// retry is false, or has failed attempts times, running pause between two
+// calls, and returns the last error.
+func removeRetrying(remove func() error, attempts int, pause func(), retry func(error) bool) error {
 	var err error
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			pause()
 		}
-		if err = remove(); err == nil {
-			return nil
+		if err = remove(); err == nil || !retry(err) {
+			return err
 		}
 	}
 	return err

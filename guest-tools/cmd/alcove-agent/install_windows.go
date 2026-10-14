@@ -40,7 +40,7 @@ func lockDataFolder() (string, error) {
 		return "", errors.New("the ProgramData environment variable is empty, so the Alcove data folder cannot be located; set it (normally C:\\ProgramData) and run alcove-agent --install again")
 	}
 	dir := filepath.Join(base, "Alcove")
-	if err := uia.LockHelperFolders(dir, filepath.Join(dir, "uia")); err != nil {
+	if _, err := uia.LockHelperFolders(dir, filepath.Join(dir, "uia")); err != nil {
 		return "", fmt.Errorf("the Alcove data folder %s could not be locked (%v); fix its owner and access list with icacls, then run alcove-agent --install again", dir, err)
 	}
 	return dir, nil

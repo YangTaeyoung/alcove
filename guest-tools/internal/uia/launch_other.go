@@ -11,10 +11,13 @@ import (
 func Available() bool { return false }
 
 // LockHelperFolders does nothing on systems without the helper.
-func LockHelperFolders(parent, dir string) error { return nil }
+func LockHelperFolders(parent, dir string) ([]string, error) { return nil, nil }
+
+// LockDeployRoot does nothing on systems without the helper.
+func LockDeployRoot(dir string) (string, error) { return "", nil }
 
 // DefaultLauncher returns a launcher that always fails on this system.
-func DefaultLauncher(dir string) Launcher {
+func DefaultLauncher(dir string, logf func(format string, args ...any)) Launcher {
 	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
 		return nil, nil, nil, errors.New("UI Automation is only available on Windows guests")
 	}

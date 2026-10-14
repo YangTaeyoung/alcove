@@ -49,13 +49,15 @@ func main() {
 		return
 	}
 
-	var alcoveDir, uiaDir string
-	var dataErr, lockErr error
+	var alcoveDir, uiaDir, movedApps string
+	var movedData []string
+	var dataErr, lockErr, appsErr error
 	if uia.Available() {
 		alcoveDir, uiaDir, dataErr = dataFolders(os.Getenv("ProgramData"))
 		if dataErr == nil {
-			lockErr = uia.LockHelperFolders(alcoveDir, uiaDir)
+			movedData, lockErr = uia.LockHelperFolders(alcoveDir, uiaDir)
 		}
+		movedApps, appsErr = uia.LockDeployRoot(deployRoot)
 	}
 	logger := log.Default()
 	if *logPath != "" {
@@ -70,8 +72,17 @@ func main() {
 	if dataErr != nil {
 		logger.Print(dataErr)
 	}
+	for _, m := range movedData {
+		logger.Printf("a data folder of another owner was moved to %s; remove it as an administrator", m)
+	}
 	if lockErr != nil {
 		logger.Printf("the helper folders are not locked (%v); the UI helper will not start until they can be locked", lockErr)
+	}
+	if movedApps != "" {
+		logger.Printf("%s was a link, belonged to another owner or let other users change it; it was moved to %s, which an administrator may remove after checking it", deployRoot, movedApps)
+	}
+	if appsErr != nil {
+		logger.Printf("the deploy root is not locked (%v)", appsErr)
 	}
 	if *tok == "" {
 		*tok = token.Read()
@@ -87,7 +98,7 @@ func main() {
 	if dataErr != nil {
 		ui = noHelper{dataErr}
 	} else if uia.Available() {
-		helper := uia.New(uia.DefaultLauncher(uiaDir),
+		helper := uia.New(uia.DefaultLauncher(uiaDir, logger.Printf),
 			func(name string, fields map[string]any) { s.HandleUIEvent(name, fields) })
 		helper.SetOnStart(func() { s.HandleUIStart() })
 		helper.SetLogger(logger)
@@ -99,6 +110,10 @@ func main() {
 	s.Close()
 	logger.Fatal(err)
 }
+
+// deployRoot is the default folder of the apps vm.deploy copies into a
+// Windows guest.
+const deployRoot = `C:\alcove-apps`
 
 // errNoProgramData is the answer of every UI operation of an agent that was
 // started without %ProgramData%.

@@ -32,14 +32,19 @@ func Available() bool { return true }
 // SYSTEM, writes the embedded files into dir and starts Windows PowerShell
 // from the system directory without a console window. The helper is not
 // started when the previous process still runs after previousExitWait or when
-// the folders cannot be locked. Each start passes the number of helpers this
+// the folders cannot be locked; a folder moved aside by the lock is named
+// through logf. Each start passes the number of helpers this
 // launcher started before it as ALCOVE_UIA_START. The helper's environment is
 // helperEnv of the system's folders, with the tmp folder inside dir as its
 // temporary directory; nothing of the agent's environment is passed on.
-func DefaultLauncher(dir string) Launcher {
+func DefaultLauncher(dir string, logf func(format string, args ...any)) Launcher {
 	tmp := filepath.Join(dir, "tmp")
 	prepare := func() error {
-		if err := LockHelperFolders(filepath.Dir(dir), dir); err != nil {
+		moved, err := LockHelperFolders(filepath.Dir(dir), dir)
+		for _, m := range moved {
+			logf("a helper folder of another owner was moved to %s; remove it as an administrator", m)
+		}
+		if err != nil {
 			return fmt.Errorf("the UI helper folder %s could not be locked (%v); fix its owner and access list, then retry", dir, err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "bootstrap.ps1"), bootstrapScript, 0o644); err != nil {

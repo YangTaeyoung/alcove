@@ -120,7 +120,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `exec.list` | — | `jobs`: [{`job`, `pid`, `state`, `code` (when exited), `cmd`, `started` (RFC 3339)}] |
 | `proc.list` | `name` (case-insensitive substring of the process name) | `procs`: [{`pid`, `ppid`, `name`, `path`, `cmd`, `mem_kb`}] |
 | `proc.kill` | `pid`, or `name` (exact process name); `tree` (bool) | `killed` (int) |
-| `fs.stat` | `path`; `sha256` (bool) | `exists`, `path` (absolute); for an existing entry also `dir`, `size`, `mtime` (RFC 3339, UTC), and `sha256` when asked for a file; `link: true` when the entry at `path` is a link |
+| `fs.stat` | `path`; `sha256` (bool) | `exists`, `path` (absolute); for an existing entry also `dir`, `size`, `mtime` (RFC 3339, UTC), and `sha256` when asked for a file; `link: true` when the entry at `path` is a link; `owner` on Windows |
 | `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`}], `truncated` (more than 5000 entries) |
 | `fs.read` | `path`, `offset` (default 0), `length` (default and cap 262144) | `data` (base64), `size` (of the file), `eof`, `encoding` |
 | `fs.tail` | `path`, `lines` (default 200) | `data` (base64 of the last lines, taken from at most the last 262144 bytes), `size`, `encoding` |
@@ -288,7 +288,8 @@ and access list are checked and set on that handle (`SetSecurityInfo`). The
 lock is applied first thing at install and at agent start, before a log file
 is opened, and again at every helper start; the parent keeps the agent's logs,
 the uia folder keeps only its logs (every other entry is deleted at each
-start; a deletion that fails is tried again every 50 ms for 2 s), and a
+start; a deletion refused because something is in use, access is denied or
+a folder is not empty yet is tried again every 50 ms for 2 s), and a
 reparse point in either folder, including one at the uia path, is removed
 rather than followed and the uia folder is created again.
 
@@ -297,10 +298,32 @@ A folder that exists and whose owner, read through that handle, is neither
 renamed to `<name>.untrusted-<yyyyMMddHHmmss>` (UTC) beside it and a new,
 locked folder is created in its place, so a handle someone kept on the old
 folder names the renamed one. This applies to `C:\ProgramData\Alcove` and to
-its `uia` folder; the renamed folder is left for an administrator to remove.
+its `uia` folder; the renamed folder is left for an administrator to remove,
+and the agent log names it
+(`a data folder of another owner was moved to <path>; remove it as an administrator`,
+or `a helper folder of another owner was moved to <path>; remove it as an administrator`
+at a helper start).
 When the rename fails (a handle is open on something inside the folder, or on
 the folder without delete sharing) the folder is not locked, with the reason
-`<dir> belongs to <owner> and could not be moved aside (<error>); remove it as an administrator and restart alcove-agent`.
+`<dir> belongs to <owner> and could not be moved aside (<error>); close the programs that use files in it, remove it as an administrator and restart alcove-agent`.
+
+**Deploy root.** At start a Windows agent also locks `C:\alcove-apps`, the
+default root of `vm.deploy`, whose files the host installs and launches with
+the agent's elevated token: owner Administrators, "Administrators and
+SYSTEM: full control, Users: read and execute" with inheritance removed
+(`O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)`). A missing
+root is created that way. An existing root is kept only when it is a
+directory, not a reparse point, owned by Administrators or SYSTEM and has
+exactly that access list. Anything else (a junction or other link, another
+owner, or an access list that lets other users change it, such as the one a
+folder under `C:\` inherits) is renamed to
+`C:\alcove-apps.untrusted-<yyyyMMddHHmmss>` (UTC) with what it holds, and a new
+locked root is created; the agent log says
+`C:\alcove-apps was a link, belonged to another owner or let other users change it; it was moved to <path>, which an administrator may remove after checking it`.
+The host deploys again into the new root. When the rename or the lock
+fails, the agent logs `the deploy root is not locked (<reason>)` and serves
+as usual; the reason for a failed rename is
+`C:\alcove-apps is a link, belongs to another owner or lets other users change it, and could not be moved aside (<error>); close the programs that use files in it, remove it as an administrator and restart alcove-agent`.
 
 The agent opens no log file that is a reparse point and none inside a folder
 it could not lock; it then writes
@@ -313,7 +336,7 @@ The reasons:
 - `C:\ProgramData\Alcove is a reparse point; remove it` (a reparse point at
   the folder itself),
 - `<dir> is not a directory; remove it and restart alcove-agent`,
-- `<dir> belongs to <owner> and could not be moved aside (<error>); remove it as an administrator and restart alcove-agent`,
+- `<dir> belongs to <owner> and could not be moved aside (<error>); close the programs that use files in it, remove it as an administrator and restart alcove-agent`,
 - `open <dir>: <system error>`,
 - `<dir>: SetSecurityInfo: <system error>`,
 - `<dir> still has the access list <sddl>; fix it with icacls and restart alcove-agent`,
@@ -703,6 +726,13 @@ agent sends one event per difference, each with the window object:
   `exists: false` with `link: true`. `fs.list` marks such entries with
   `link: true`, lists them with `dir: false` and does not list what is below
   them.
+- On Windows `fs.stat` adds `owner`, the owner of the entry at the path
+  itself (a link is not followed), also for a link to nothing:
+  `"administrators"` (`BUILTIN\Administrators`), `"system"`
+  (`NT AUTHORITY\SYSTEM`), `"user"` (the account the agent runs as), any
+  other owner as its SID string (`"S-1-5-21-…"`), or `"unknown"` when the
+  owner cannot be read. Agents on other systems, and older agents, send no
+  `owner`.
 - `fs.list` lists the direct children, or with `recursive` the whole tree, in
   lexical order, at most 5000 entries. `sha256` (lower-case hex) is present
   only when asked for, and only for regular files the agent could read: a
