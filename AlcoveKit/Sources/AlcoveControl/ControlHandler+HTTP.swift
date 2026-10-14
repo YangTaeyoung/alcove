@@ -113,12 +113,21 @@ extension ControlHandler {
         case unavailable(reason: String, fix: String)
     }
 
-    /// What a restore of the guest did: whether it found anything of a capture, the sentences of the steps that
-    /// failed, and a warning about a step that worked in part.
+    /// What a restore of the guest did: whether it found anything of a capture, the steps that failed with their
+    /// sentences, whether a step failed because the guest gave no answer, and a warning about a step that worked in part.
     struct GuestRestore: Sendable {
         var cleared = false
-        var failure: String?
+        var failures: [(step: String, sentence: String)] = []
+        var unanswered = false
         var warning: String?
+
+        /// The sentences of the steps that failed, in order; nil when none failed.
+        var failure: String? { failures.isEmpty ? nil : failures.map(\.sentence).joined(separator: "; ") }
+
+        mutating func add(_ result: RecipeOutput, step: String, sentence: String) {
+            failures.append((step, sentence))
+            if !result.answered { unanswered = true }
+        }
     }
 
     /// Whether a capture goes on while its VM is in `state`: the engine process runs. In the other states it has
@@ -232,7 +241,11 @@ extension ControlHandler {
                         try? captureJournal.remove(vm: capture.owner, now: wallClock())
                         throw error
                     }
-                    if ControlHandler.failureReason(error, fallback: "") == GuestRecipes.unreadableProxyState { throw error }
+                    let reason = ControlHandler.failureReason(error, fallback: "")
+                    if reason == GuestRecipes.unreadableProxyState {
+                        let others = undone.failures.map(\.sentence).filter { $0 != reason }
+                        throw others.isEmpty ? error : ControlError.failed(([reason] + others).joined(separator: "; "))
+                    }
                     throw ControlError.failed("\(ControlHandler.failureReason(error, fallback: "vm.http.start failed in the guest")); the guest keeps what this "
                         + "attempt changed, and Alcove restores it when its guest tools next connect; call vm.http.stop to restore it now")
                 }
@@ -413,7 +426,6 @@ extension ControlHandler {
     func restoreGuest(_ t: VMTarget, _ agent: AgentClient, os: VMConfig.GuestOS, thumbprint: String?, op: String,
                       limit: RecipeLimit) async -> GuestRestore {
         var out = GuestRestore()
-        var failures: [String] = []
         var thumbprints: [String] = thumbprint.map { [$0.uppercased()] } ?? []
         if let script = GuestRecipes.clearSystemProxy(os: os) {
             let result = await runRecipeOutput(agent, script, vm: t.name, op: op, limit: limit)
@@ -426,11 +438,9 @@ extension ControlHandler {
                     thumbprints.append(stored.uppercased())
                 }
             } else {
-                failures.append(recipeFailure(result, doing: "restore the proxy settings", limit: limit, retry: "vm.http.stop"))
-                guard result.answered, !result.timedOut else {
-                    out.failure = failures.joined(separator: "; ")
-                    return out
-                }
+                let step = "restore the proxy settings"
+                out.add(result, step: step, sentence: recipeFailure(result, doing: step, limit: limit, retry: "vm.http.stop"))
+                guard result.answered, !result.timedOut else { return out }
             }
         }
         let removals: [String?] = thumbprints.isEmpty ? [nil] : thumbprints
@@ -438,13 +448,13 @@ extension ControlHandler {
             guard let script = GuestRecipes.removeProxyCA(thumbprint: thumbprint, os: os), os == .windows || index == 0 else { break }
             let result = await runRecipeOutput(agent, script, vm: t.name, op: op, limit: limit)
             guard result.ok else {
-                failures.append(recipeFailure(result, doing: "remove the proxy CA", limit: limit, retry: "vm.http.stop"))
+                let step = "remove the proxy CA"
+                out.add(result, step: step, sentence: recipeFailure(result, doing: step, limit: limit, retry: "vm.http.stop"))
                 break
             }
             let reply = ControlHandler.lastJSONObject(result.stdout)
             if reply?["removed"]?.boolValue == true || reply?["fileRemoved"]?.boolValue == true { out.cleared = true }
         }
-        if !failures.isEmpty { out.failure = failures.joined(separator: "; ") }
         return out
     }
 
@@ -453,9 +463,17 @@ extension ControlHandler {
     /// Called when a connection to the guest tools of `vm` that the control target does not hold, such as the app
     /// window's, is made. When the capture journal holds an entry for the VM and no capture of it is live, the control
     /// target connects its own tools, and that connection starts the cleanup as every connection it adopts does; a
-    /// connection the target holds already starts it at once. Without an entry nothing is connected.
+    /// connection the target holds already starts it at once. Without an entry of that VM name the VM is not looked
+    /// up and nothing is connected.
     public func guestToolsSeen(vm: String) async {
-        guard captures[vm] == nil, let t = await lookUp(vm), captureJournal.entry(for: await journalVM(t)) != nil, captures[vm] == nil else { return }
+        guard captures[vm] == nil, captureJournal.entry(for: CaptureJournal.VM(name: vm, path: nil)) != nil, let t = await lookUp(vm) else { return }
+        await connectForCleanup(t)
+    }
+
+    /// Makes the control target of `t` connect its tools when the capture journal holds an entry for the VM and no
+    /// capture of it is live; a connection the target holds already starts the cleanup at once.
+    private func connectForCleanup(_ t: VMTarget) async {
+        guard captures[t.name] == nil, captureJournal.entry(for: await journalVM(t)) != nil, captures[t.name] == nil else { return }
         if case .connected(let agent) = await t.agentLink() { await toolsConnected(t, agent) }
     }
 
@@ -473,18 +491,22 @@ extension ControlHandler {
     }
 
     /// The cleanup of `t` that is running, or a new one: under the capture gate of the VM it restores the guest from
-    /// the VM's journal entry, with `HTTPTiming.recipe` for each recipe, and removes the entry when every step worked. Its value tells whether it removed
-    /// anything of a capture from the guest.
+    /// the VM's journal entry, with `HTTPTiming.recipe` for each recipe, and removes the entry when every step worked.
+    /// A failed cleanup writes one line to `log`. When a step failed because the guest gave no answer, the cleanup then
+    /// drops `agent` and asks the target for its agent connection once more, unless it runs over a connection asked
+    /// for that way. Its value tells whether it removed anything of a capture from the guest.
     func staleCleanup(_ t: VMTarget, _ agent: AgentClient) -> Task<Bool, Never> {
         let vm = t.name
         if let running = staleCleanups[vm] { return running.task }
         let id = UUID()
         let gate = captureGate
+        let mayReconnect = staleRetries.remove(vm) == nil
         let task = Task { [weak self] () -> Bool in
             guard let handler = self else { return false }
-            let cleaned = await gate.withLock(vm) { await handler.cleanStale(t, agent) }
-            await handler.cleanupEnded(vm, id, cleaned: cleaned)
-            return cleaned
+            let outcome = await gate.withLock(vm) { await handler.cleanStale(t, agent) }
+            await handler.cleanupEnded(vm, id, cleaned: outcome.cleaned)
+            if outcome.unanswered, mayReconnect { await handler.reconnect(t, droppingUnanswered: agent) }
+            return outcome.cleaned
         }
         staleCleanups[vm] = (id, task)
         return task
@@ -525,15 +547,46 @@ extension ControlHandler {
         if staleCleanups[vm]?.id == id { staleCleanups[vm] = nil }
     }
 
-    private func cleanStale(_ t: VMTarget, _ agent: AgentClient) async -> Bool {
+    /// How a cleanup after an earlier capture ended: whether it removed anything of a capture from the guest, and
+    /// whether a step failed because the guest gave no answer.
+    private struct StaleOutcome: Sendable {
+        var cleaned = false
+        var unanswered = false
+    }
+
+    private func cleanStale(_ t: VMTarget, _ agent: AgentClient) async -> StaleOutcome {
         let vm = t.name
         let owner = await journalVM(t)
-        guard captures[vm] == nil, let entry = captureJournal.entry(for: owner), await t.state() == .running,
-              case .ready(let ready) = await guestAccess(agent, vm: vm) else { return false }
+        guard captures[vm] == nil, let entry = captureJournal.entry(for: owner), await t.state() == .running else { return StaleOutcome() }
+        let ready: AgentClient
+        switch await guestAccess(agent, vm: vm) {
+        case .ready(let client):
+            ready = client
+        case .unavailable(let reason, let fix):
+            log(ControlHandler.cleanupFailureLine(vm: vm, [("run its recipes", "\(reason); \(fix)")]))
+            return StaleOutcome()
+        }
         let restored = await restoreGuest(t, ready, os: await t.guestOS(), thumbprint: entry.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
-        guard restored.failure == nil else { return false }
+        guard restored.failures.isEmpty else {
+            log(ControlHandler.cleanupFailureLine(vm: vm, restored.failures))
+            return StaleOutcome(unanswered: restored.unanswered)
+        }
         try? captureJournal.remove(vm: owner, now: wallClock())
-        return restored.cleared
+        return StaleOutcome(cleaned: restored.cleared)
+    }
+
+    /// The log line of a cleanup of `vm` whose `failures` failed.
+    static func cleanupFailureLine(vm: String, _ failures: [(step: String, sentence: String)]) -> String {
+        "the cleanup after an earlier HTTP capture of '\(vm)' failed to "
+            + failures.map { "\($0.step) (\($0.sentence))" }.joined(separator: " and to ")
+    }
+
+    /// Drops `agent` when the target of `t` still holds it, and asks the target for its agent connection; the next
+    /// cleanup of the VM does not ask again.
+    private func reconnect(_ t: VMTarget, droppingUnanswered agent: AgentClient) async {
+        staleRetries.insert(t.name)
+        await t.dropAgent(agent)
+        if case .connected(let fresh) = await t.agentLink() { await toolsConnected(t, fresh) }
     }
 
     // MARK: - the capture's life

@@ -1,10 +1,14 @@
 import Foundation
+import os
 import AlcoveEngine
 import AlcoveAgent
 import AlcoveQMP
 
 /// Executes control-protocol operations (docs/control-protocol.md) against a registry.
 public actor ControlHandler {
+    /// Where the lines of a handler without its own `log` go.
+    static let systemLog = Logger(subsystem: "io.github.yangtaeyoung.Alcove", category: "control")
+
     /// The JSON type of an optional boolean or integer parameter.
     public enum ParamType: Sendable {
         case boolean, integer
@@ -118,17 +122,25 @@ public actor ControlHandler {
     var endedCleanups: [String: (id: UUID, cleaned: Bool)] = [:]
     /// Per VM: the target object this handler observes the agent connections of.
     var observedTargets: [String: EventMark] = [:]
+    /// The VMs whose next cleanup after an earlier capture runs over the connection asked for after a cleanup whose
+    /// guest did not answer.
+    var staleRetries: Set<String> = []
+    /// Receives one line for each event of the handler that no op reports.
+    let log: @Sendable (String) -> Void
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
     /// `captureDirectory` is the folder of the proxy's CA certificate and of the capture journal; a handler that serves
     /// a user's VMs gets `ProxyProcess.defaultCADirectory`. Without `makeProxy` a capture runs `alcove-proxy` as found
-    /// by `ToolLocator`, with `captureDirectory` as its CA directory.
+    /// by `ToolLocator`, with `captureDirectory` as its CA directory. Without `log` the handler's lines go to the system
+    /// log under the subsystem `io.github.yangtaeyoung.Alcove`, category `control`.
     public init(registry: VMRegistry, hostKind: String, captureDirectory: URL,
                 clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
                 engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() },
                 recordingsDirectory: URL? = nil, diagnosticsDirectory: URL? = nil, httpTiming: HTTPTiming = HTTPTiming(),
-                makeProxy: (@Sendable () -> ProxyControlling)? = nil) {
+                makeProxy: (@Sendable () -> ProxyControlling)? = nil,
+                log: (@Sendable (String) -> Void)? = nil) {
+        self.log = log ?? { line in ControlHandler.systemLog.notice("\(line, privacy: .public)") }
         self.makeProxy = makeProxy ?? { ProxyProcess(executable: ToolLocator.proxy(), caDirectory: captureDirectory) }
         self.httpTiming = httpTiming
         self.captureJournal = CaptureJournal(directory: captureDirectory)
@@ -402,9 +414,11 @@ public actor ControlHandler {
         return t
     }
 
-    /// Drops the lease, the runtime forwards, the cached frame size, the event positions and the agent mark of `vm`.
+    /// Drops the lease, the runtime forwards, the cached frame size, the event positions, the agent mark and the
+    /// pending cleanup reconnect of `vm`.
     func forget(vm: String) {
         observedTargets[vm] = nil
+        staleRetries.remove(vm)
         leases.forget(vm: vm)
         runtimeForwards[vm] = nil
         forwardInstances[vm] = nil
