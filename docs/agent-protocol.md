@@ -16,8 +16,7 @@ An agent serves a connection only when both of these hold:
    on to the scheduled task or the systemd unit) adds a range, for tests and
    for guests on another network.
 2. The host proved that it holds the VM's agent key by signing the
-   connection's nonce ([Host key](#host-key)).
-   Agents without key support skip this step.
+   connection's nonce and the VM's token ([Host key](#host-key)).
 
 A peer outside the ranges gets one line and the connection closes; it gets no
 `hello`:
@@ -39,33 +38,31 @@ The host key is the trust boundary. The agent runs elevated on Windows (a
 scheduled task with the highest run level) and as root on Linux, and every
 connection it serves can use every operation its capabilities name: with
 `--allow-exec` that is running commands, writing files and starting programs
-with the agent's rights. An agent with key support serves only a peer that
-holds the VM's agent key; on the host that is every process that can read
-the VM's `config.json` and connect to the forwarded loopback port. An agent
-without key support serves every peer that passes the address check,
-including guest programs that connect through `10.0.2.2`. A range given with
+with the agent's rights. The agent serves only a peer that holds the VM's
+agent key; on the host that is every process that can read the VM's
+`config.json` and connect to the forwarded loopback port. An agent that
+found no host key in SMBIOS serves nobody. A range given with
 `--allow-peer` adds every program at those addresses to the peers that pass
-the address check.
+the address check; they still have to prove the key.
 
 ## Handshake
 
 Agent → host on connect:
 
 ```
-{"t":"hello","v":1,"proto":2,"os":"windows"|"linux","agent":"0.2.0","token":"<uuid>","caps":["files","shutdown","resolution","clipboard","exec","rpc","jobs","proc","fs","ui"],"auth":"key","nonce":"<64 hex digits>","paired":true}
+{"t":"hello","v":1,"proto":2,"os":"windows"|"linux","agent":"0.2.0","token":"<uuid>","caps":["files","shutdown","resolution","clipboard","exec","rpc","jobs","proc","fs","ui"],"auth":"key","nonce":"<64 hex digits>"}
 ```
 
 `token` is read by the agent from the SMBIOS OEM strings (type 11) that the
 engine passes with `-smbios type=11,value=alcove-token=<uuid>`. The app
 compares it with the token stored in the VM's `config.json` and drops the
 connection on mismatch. The token names the VM and is not a secret: guest
-programs can read the SMBIOS strings.
+programs can read the SMBIOS strings. The host's signature covers it
+([Host key](#host-key)).
 
-When the hello carries `auth: "key"`, the host pairs or authenticates next
-([Host key](#host-key)) and waits for `authed`; it then sends
-`{"t":"welcome","v":1}` and the connection is ready. A hello without `auth`
-comes from an agent without key support: the host sends `welcome` at once
-and uses the agent without authentication.
+The host then sends `auth` ([Host key](#host-key)) and waits for `authed`;
+it then sends `{"t":"welcome","v":1}` and the connection is ready. The host
+refuses a hello without `auth: "key"`.
 
 `v` stays 1. `proto` is the revision of the request/response layer described
 under [Requests and responses](#requests-and-responses); an agent without the
@@ -90,138 +87,143 @@ lower-case hexadecimal digits of random bytes. Every 32 bytes are a seed, so
 every stored `agentKey` of 64 hexadecimal digits is used as it is. The app
 creates it with the VM, and adds it to the `config.json` of a VM created
 before the field existed when it first loads that file; a stored key is
-never replaced by a save. A linked clone takes its template's key, because
-its disk starts from the template's disk and with it the public key the
-template's agent stored. The private key never leaves the host: the `pair`
-message below carries the public key, and `auth` a signature.
+never replaced by a save. Every VM has its own key and its own `agentToken`:
+a linked clone gets a new key and a new token when it is created. The
+private key never leaves the host.
 
-The agent stores the public key of the host it is paired with:
+**Where the agent gets the public key.** The engine passes the public key to
+the guest as a second SMBIOS OEM string (type 11), next to the token:
 
-- Windows: `%ProgramData%\Alcove\host.key`, in the data folder that is locked
-  to Administrators and SYSTEM at every start
-  ([Windows and UI Automation](#windows-and-ui-automation-win-ui)). The file
-  is created new with `CREATE_NEW`, never through an existing entry or link,
-  with the owner Administrators and the access list "Administrators and
-  SYSTEM: full control" with inheritance removed. It is read only when it is
-  not a reparse point.
-- Linux and other systems: `/etc/alcove/host.key`, created new with
-  `O_EXCL|O_NOFOLLOW` and mode 0600 in the folder `/etc/alcove` of mode 0700.
-  Both belong to the user the agent runs as (root). The file is read with
-  `O_NOFOLLOW` and used only when it is a regular file of that user that no
-  other user can read or write.
+```
+-smbios type=11,value=alcove-token=<agentToken>
+-smbios type=11,value=alcove-hostkey=<public key, 64 lower-case hexadecimal digits>
+```
 
-The file holds the 32 bytes of the public key as 64 hexadecimal digits and
-a newline. The agent reads it
-for every connection, so `--forget-host-key` takes effect on the next
-connection without a restart.
+QEMU puts both values into one type 11 structure. The agent reads the
+SMBIOS table once at start (Windows: `GetSystemFirmwareTable('RSMB')`;
+Linux: `/sys/firmware/dmi/tables/DMI`) and keeps the token and the public
+key in memory; it stores no key on disk. A program in the guest can read the
+strings but cannot change them: they are set by the host when the VM starts.
+`--token` replaces the SMBIOS token; there is no option that replaces the
+host key.
 
-**Hello fields.** An agent with key support adds to its hello:
+An agent whose SMBIOS strings lack `alcove-hostkey` (a VM started by Alcove
+before 0.2, or by QEMU without the string), whose `alcove-hostkey` is not 64
+hexadecimal digits, or that has no token serves nothing. It answers every
+connection that passes the address check with one line instead of the hello,
+and the connection closes:
+
+```
+{"t":"refused","error":"this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later"}
+```
+
+**Hello fields.** The agent adds to its hello:
 
 | Field | Value |
 |---|---|
 | `auth` | `"key"` |
-| `nonce` | 64 lower-case hexadecimal digits: 32 random bytes, new for every connection |
-| `paired` | `true` when the agent holds a stored key, `false` otherwise |
+| `nonce` | 64 lower-case hexadecimal digits: 32 random bytes from `crypto/rand`, new for every connection |
 
-**Host → agent.** The host's first message after such a hello is one of:
+**Host → agent.** The host's first message after the hello is
 
-| `t` | Fields | Sent when |
-|---|---|---|
-| `pair` | `publicKey`: the Ed25519 public key of the VM's `agentKey`, 64 lower-case hexadecimal digits | `paired` is false |
-| `auth` | `signature`: 128 lower-case hexadecimal digits | `paired` is true |
+```
+{"t":"auth","signature":"<128 lower-case hexadecimal digits>"}
+```
 
 `signature` is the Ed25519 signature (RFC 8032, pure Ed25519) by the VM's
-`agentKey` of the 20 ASCII bytes `alcove-agent-auth-v1` followed by the 32
-bytes of the hello's `nonce` (hex-decoded). The agent verifies it with the
-stored public key (`crypto/ed25519`), and compares a `pair` public key with
-the stored one in constant time (`crypto/subtle`). A signature answers one
-nonce only; a signature sent on another connection is refused. The host may
-sign with random per-signature data (CryptoKit does); every valid signature
-is accepted.
+`agentKey` of this message:
+
+| Bytes | Content |
+|---|---|
+| 20 | the ASCII bytes `alcove-agent-auth-v2` |
+| any | the VM's `agentToken` as UTF-8 (on the host: the token in `config.json`, which it compared with the hello's `token` first; in the agent: its SMBIOS token) |
+| 32 | the hello's `nonce`, hex-decoded |
+
+The nonce has a fixed length at the end, so the token is the part between
+the context and the nonce. The agent verifies the signature with the public
+key from SMBIOS (`crypto/ed25519`). A signature answers one nonce of one VM:
+it is refused on another connection, by an agent with another token (another
+VM, a clone of the same template) and by an agent with another public key.
+The host may sign with random per-signature data (CryptoKit does); every
+valid signature is accepted.
+
+The host refuses a hello without `auth: "key"`. Such an agent was built
+before this version and does not check the host; the host sends nothing to
+it, closes the connection and reports
+`the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)`
+as the refusal of the guest tools (vm.status `toolsRefused`, the app's
+"Tools refused" label). The scripts that speak the protocol refuse it with
+the same sentence.
 
 Scripts that speak the protocol sign through the host's `alcovectl`:
 `alcovectl agent-sign --vm <name> --nonce <hex>` prints the signature of
-that nonce, and with `--public-key` also the public key (one per line,
-signature first); `--public-key` alone prints the public key. It reads the
-`agentKey` of the VM whose `config.json` has that `name` in the VM folder
-(`--dir`, `ALCOVE_VM_DIR`, or `~/Library/Application Support/Alcove/VMs`).
+that nonce under the VM's token; `--public-key` adds the public key and
+`--token` adds the VM's `agentToken`, one per line in that order
+(signature, public key, token). It reads the `agentKey` and `agentToken` of
+the VM whose `config.json` has that `name` in the VM folder (`--dir`,
+`ALCOVE_VM_DIR`, or `~/Library/Application Support/Alcove/VMs`). A script
+compares the hello's `token` with the printed token before it signs.
 
 **Agent → host.** The agent answers with one line:
 
-- `{"t":"authed"}`: the connection is served from now on. A `pair` stores the
-  public key before this line. A `pair` whose public key equals the stored
-  one also answers `authed`, so two connections that pair at the same time
-  both succeed.
+- `{"t":"authed"}`: the connection is served from now on.
 - `{"t":"refused","error":"<sentence>"}`, and the connection closes.
 
 Until `authed` the agent sends nothing else: no keepalive, no events, no
 `clipboard.changed`, no `resolution`. It ignores `welcome`, `ping` and `pong`.
-Any other message gets the refusal
-`this alcove-agent serves only a host that pairs with it or proves its key; update the Alcove app on the host`
+Any other message, `pair` of earlier hosts included, gets the refusal
+`this alcove-agent serves only a host that proves the VM's key; update the Alcove app on the host`
 and the connection closes. Before that line a `req` is answered with a `res`
 that carries the sentence as `error`, an `exec` with an `exec.result` of
 `code` -1 that carries it as `out`, and a `file.end` with a `file.done` that
-carries it as `error`, so a host without key support shows the sentence. A
-connection that sends neither `pair` nor `auth` within 30 s gets the refusal
-`no pair or auth message arrived within 30 s; the host pairs or authenticates right after the hello`.
+carries it as `error`, so a host without key support shows the sentence.
 
-The refusals of `pair` and `auth`:
+The other refusals before `authed`:
 
 | Case | `error` |
 |---|---|
-| `auth` with a wrong or malformed `signature` | `the host did not prove the key this alcove-agent is paired with; when the VM's agentKey changed (a re-created VM, or a disk taken from another VM), run alcove-agent --forget-host-key as an administrator in the guest and connect again` |
-| `pair` with a public key other than the stored one | `this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again` |
-| `auth` while no key is stored | `this alcove-agent holds no host key; connect again to pair it` |
-| `pair` whose `publicKey` is not 64 hexadecimal digits | `the publicKey in pair is not 64 hexadecimal digits; send the public key of the VM's agentKey` |
-| the stored key cannot be read, or the key cannot be stored | `this alcove-agent cannot use its host key: <reason>` |
+| `auth` with a wrong or malformed `signature` | `the host's signature does not match this VM's alcove-hostkey and alcove-token; restart the VM with Alcove so the guest reads the key and token in its config.json` |
+| no `auth` within 30 s of the hello | `no auth message arrived within 30 s; the host authenticates right after the hello` |
+| a line longer than 64 KiB before `authed` | `a line before auth is longer than 65536 bytes; the host sends only auth before authed` |
+| 16 other connections are between their hello and `authed` | `16 connections are authenticating; connect again when one of them ended` (sent instead of the hello) |
+| no random nonce could be read | none: the connection closes after a log line |
 
-The reasons of the last row:
-
-- `<path> is not a regular file of this user that only it can read; run alcove-agent --forget-host-key as an administrator and connect again`
-  (Linux; also a link),
-- `<path> is a reparse point; run alcove-agent --forget-host-key as an administrator and connect again`
-  (Windows),
-- `<path> does not hold 64 hexadecimal digits; run alcove-agent --forget-host-key as an administrator and connect again`,
-- `<path> could not be read or written (<system error>); run alcove-agent as an administrator (root on Linux)`,
-- `/etc/alcove is not a folder of this user; remove it and connect again` (Linux),
-- `the data folder <dir> is not locked (<reason>); fix its owner and access list as an administrator and restart alcove-agent`
-  (Windows),
-- `%ProgramData% is not set; start alcove-agent through its scheduled task`
-  (Windows).
-
-**Resetting the pairing.** `alcove-agent --forget-host-key`, run as an
-administrator (Windows) or as root (Linux), deletes the stored key and exits
-with 0, printing
-`the host key was removed; the next host that connects pairs with this agent`
-or `no host key was stored`. When the file cannot be removed it prints
-`cannot remove <path> (<system error>); run alcove-agent --forget-host-key as an administrator (root on Linux)`
-on stderr and exits with 1. The next connection that sends `pair` then pairs
-the agent; the app does that within seconds while the VM runs.
-
-**What it does not prevent.** Pairing trusts the first `pair`, like the first
-use of an ssh host key. A guest program that pairs the agent before the host
-first connects is not prevented: the host then gets the mismatch refusal and
-shows it, and an administrator resets the pairing. The `pair` message and
-the signatures carry nothing that proves the key on another connection: a
-guest program that receives them (for example one that listens on port 7645
-while the agent is not running) cannot authenticate to the agent with them.
+**What it does not prevent.** The host authenticates to the agent; the
+agent does not authenticate to the host. A guest program that listens on
+port 7645 while the agent is not running (see [Listening](#listening))
+receives the host's requests. The signatures it receives answer its own
+nonces under this VM's token: no agent of another VM accepts them, and the
+agent of this VM accepts none of them, because every connection to it has a
+new nonce.
 
 **Agent log.** The agent writes a served connection to its log as
 `connection from <address>` once it is served (after `authed`), and a
-refused one (the address check, `pair`, `auth` or the 30 s deadline) as
-`refused the connection from <address>: <sentence>`. The same sentence is
-written at most once per minute; the next line written for it ends with
-`(<n> more refused for this reason since the last line)` when connections
-were refused in between.
+refused one as `refused the connection from <address>: <sentence>`. Each
+reason of a refusal (the address check, a missing host key, a wrong
+signature, a message other than `auth`, the 30 s deadline, a long line,
+the handshake limit) is written at most once per minute, with the address
+and sentence of the connection it writes; refusals for the address check
+from different addresses count as one reason. The next line written for a
+reason ends with `(<n> more refused for this reason since the last line)`
+when connections were refused for it in between.
+
+## Listening
+
+The agent listens on `0.0.0.0:<port>` (7645 unless `--port` is given). On
+Windows the socket is bound with `SO_EXCLUSIVEADDRUSE`, so no other program
+can bind the same port on a specific address of the guest while the agent
+holds it. When the port cannot be bound (another program holds it), the
+agent logs `listen on 0.0.0.0:<port> failed (<system error>); trying again in <n> s`
+and tries again after 1 s, then after twice the previous pause, up to 30 s
+between attempts, until the bind succeeds.
 
 ## Messages
 
 | Direction | `t` | Fields | Meaning |
 |---|---|---|---|
 | agent → host | `refused` | `error` | the last line to a peer that is not served ([Who is served](#who-is-served), [Host key](#host-key)); the connection closes |
-| host → agent | `pair` | `publicKey` | pair an agent whose hello says `paired: false` ([Host key](#host-key)) |
-| host → agent | `auth` | `signature` | prove the key to an agent whose hello says `paired: true` ([Host key](#host-key)) |
-| agent → host | `authed` | — | the `pair` or `auth` succeeded; the connection is served |
+| host → agent | `auth` | `signature` | prove the VM's key ([Host key](#host-key)) |
+| agent → host | `authed` | — | the `auth` succeeded; the connection is served |
 | both | `ping` / `pong` | — | keepalive every 10 s |
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
 | host → agent | `clipboard.get` | — | ask for the current text; answered with `clipboard.text` |
@@ -457,7 +459,10 @@ does not start on connect, so a wait for a window event must be preceded by
 helper runs in the agent's logon session. Its files are in
 `C:\ProgramData\Alcove\uia`: `bootstrap.ps1`, `helper.cs`, `helper.log` and
 `helper.log.1` (1 MiB each), and a `tmp` folder the compile uses. Every start
-compiles `helper.cs` in memory; no compiled helper is stored. That
+compiles `helper.cs` in memory; no compiled helper is stored.
+`C:\ProgramData` stands for the folder Windows names as ProgramData
+(`SHGetKnownFolderPath(FOLDERID_ProgramData)`); the agent and `--install` do
+not read the `ProgramData` environment variable. That
 folder and its parent `C:\ProgramData\Alcove` are given the owner
 Administrators and the access list "Administrators and SYSTEM: full control"
 with inheritance removed (`icacls` reads it back as
@@ -534,14 +539,15 @@ The reasons:
 - `SetNamedSecurityInfo(<path>): <system error>` and the system error of a
   deletion, for an entry of the folder.
 
-An agent started without `%ProgramData%` uses no other folder: it opens no log
-file (`log: <path> is not opened because %ProgramData% is not set` on stderr),
-logs to stderr, starts no helper, and answers every `ui.*` and `win.*`
-operation with
-`the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task`.
+An agent for which Windows names no ProgramData folder uses no other folder:
+it logs `the ProgramData folder could not be located (<system error>)`, opens
+no log file (`log: <path> is not opened because the ProgramData folder could not be located`
+on stderr), logs to stderr, starts no helper, and answers every `ui.*` and
+`win.*` operation with
+`the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task`.
 An `app.launch` that waits for a window (`wait_window_ms` above 0, the
 default) starts nothing and answers
-`'<path>' was not started because the windows could not be listed: the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task`;
+`'<path>' was not started because the windows could not be listed: the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task`;
 with `wait_window_ms: 0` it starts the program.
 
 Before a start the agent waits up to 10 s for the previous helper process to
@@ -587,8 +593,8 @@ locks the folders in the same way before it copies or registers anything and
 fails, with exit code 1 and a line on stderr that begins `install failed: `,
 when they cannot be locked
 (`the Alcove data folder <dir> could not be locked (<reason>); fix its owner and access list with icacls, then run alcove-agent --install again`)
-or when `%ProgramData%` is empty
-(`the ProgramData environment variable is empty, so the Alcove data folder cannot be located; set it (normally C:\ProgramData) and run alcove-agent --install again`);
+or when Windows names no ProgramData folder
+(`the ProgramData folder could not be located (<system error>), so the Alcove data folder cannot be located; run alcove-agent --install again as an administrator`);
 it then writes no `install.log`.
 
 **One request at a time.** The agent hands requests to the helper one by one
@@ -1007,7 +1013,9 @@ agent sends one event per difference, each with the window object:
 | Refs kept by a helper | 20000; beyond that the least recently used half is forgotten |
 | Waiting for the helper | 60 s per request |
 | One `res` line written by the agent | under 8 MiB minus 64 KiB; a larger answer is replaced by `the answer to '<op>' is larger than the 8 MiB line the host reads; ask for less (a lower max, depth or limit, a narrower path or a name filter)` |
-| Time from the hello to `pair` or `auth` | 30 s, then `refused` |
+| Time from the hello to `auth` | 30 s, then `refused` |
+| One line read before `authed` | 64 KiB (65536 bytes); a longer line is refused |
+| Connections between their hello and `authed` | 16; one more is refused before its hello |
 | Requests running at once on one connection | 256; one more answers `256 requests are running on this connection; wait for an answer before sending another` without running |
 
 The host reads lines of up to 8 MiB and does not send a `req` longer than
