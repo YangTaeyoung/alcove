@@ -2010,8 +2010,10 @@ final class ControlHTTPTests: XCTestCase {
         _ = try await c.h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "C:\\app\\app.exe", "waitWindow": 0])
         XCTAssertNil(c.launches.value.last?["env"])
 
-        let stop = await c.failure("vm.http.stop")
-        XCTAssertEqual(stop, sentence)
+        let stop = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["exchanges"]?.intValue, 0)
+        XCTAssertNil(stop["staleCleared"])
+        XCTAssertEqual(stop["warning"]?.stringValue, "the HTTP capture of 'Win' had already ended because alcove-proxy exited with status 2: listener failed")
         let again = await c.failure("vm.http.requests")
         XCTAssertEqual(again, "'Win' is not capturing; call vm.http.start first")
 
@@ -2042,6 +2044,41 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.hostLog.value, ["the HTTP capture of 'Win' ended because alcove-proxy exited with status 2; the guest keeps the proxy "
                                          + "settings and the CA certificate of the capture (its guest tools were not connected); Alcove restores "
                                          + "them when its guest tools next connect"])
+    }
+
+    func testAStopAfterALostCaptureWhoseGuestToolsAreGoneSaysWhatEndedItAndWhatTheGuestKeeps() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        await c.t.setAgent(nil)
+        c.factory.latest.end("alcove-proxy exited with status 2")
+        _ = await c.factory.latest.stopped()
+        let stop = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["exchanges"]?.intValue, 0)
+        XCTAssertEqual(stop["warning"]?.stringValue, "the HTTP capture of 'Win' had already ended because alcove-proxy exited with status 2; "
+                       + "the guest keeps the capture's proxy settings and CA certificate because its guest tools are not reachable; "
+                       + "call vm.http.stop again once vm.status shows tools")
+        XCTAssertEqual(c.journal.entry(for: "Win")?.port, 49152)
+        let again = await c.failure("vm.http.stop")
+        XCTAssertEqual(again, "'Win' is not capturing, and what an earlier capture left in its guest cannot be restored while its guest tools "
+                       + "are not reachable; call vm.http.stop again once vm.status shows tools")
+    }
+
+    func testAStopAfterALostCaptureClearsWhatTheGuestKept() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        let client = await c.t.agentClient
+        await c.t.setAgent(nil)
+        c.factory.latest.end("alcove-proxy exited with status 2")
+        _ = await c.factory.latest.stopped()
+        await c.t.setAgent(client)
+        c.outputs.value["recipe.clearProxy"] = restoredState(caThumbprint)
+        c.log.clear()
+        let stop = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["exchanges"]?.intValue, 0)
+        XCTAssertEqual(stop["staleCleared"]?.boolValue, true)
+        XCTAssertEqual(stop["warning"]?.stringValue, "the HTTP capture of 'Win' had already ended because alcove-proxy exited with status 2")
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
     }
 
     func testDoctorAndLaunchesSeeAProxyThatEndedBeforeTheCaptureIsEnded() async throws {

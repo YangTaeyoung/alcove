@@ -1912,7 +1912,11 @@ capture of '<vm>' ended because <reason>; call vm.http.start to capture
 again` instead, `<reason>` being e.g. `alcove-proxy exited with status 2:
 <its last error line>`, `alcove-proxy was ended by signal 9` or
 `alcove-proxy closed its output and gives no more answers`; the next
-`vm.http.start` or `vm.http.stop` of the VM drops that reason.
+`vm.http.start` or `vm.http.stop` of the VM drops that reason. Between the
+proxy's end and the moment the server notices it (checked every 2 s) they
+answer `alcove-proxy is not running (<why>); call vm.http.stop, then
+vm.http.start to capture again`; either way `vm.http.stop` answers `ok`, so
+that sequence works whichever sentence a caller saw.
 
 ### Stopping a capture
 
@@ -1945,6 +1949,13 @@ state file and a leftover `proxy-previous.json.new` are deleted. WinINET
 itself stores `ProxyEnable` as `REG_DWORD` and `ProxyOverride` as `REG_SZ`
 whenever it rereads its settings, and it advances the change counter of the
 `DefaultConnectionSettings` blob; the values themselves are the recorded ones.
+
+After a capture that ended because its proxy ended on its own, `vm.http.stop`
+answers `{exchanges: 0, warning}` with the warning `the HTTP capture of
+'<vm>' had already ended because <reason>`, followed by `; ` and what the
+guest still keeps when it cannot be restored now (the sentences above, or a
+recipe's sentence); it clears what that capture left in the guest as below
+and then also carries `staleCleared: true` when it found anything.
 
 On a VM without a capture, `vm.http.stop` clears what an earlier capture left
 in the guest (the state file, the journal's entry, the CA file) and answers

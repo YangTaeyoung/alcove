@@ -424,15 +424,26 @@ extension ControlHandler {
         }
     }
 
-    /// `vm.http.stop` for a VM without a capture: clears what an earlier capture left in the guest.
+    /// `vm.http.stop` for a VM without a capture: clears what an earlier capture left in the guest. After a capture that
+    /// ended because its proxy ended, it answers like a stop of a live capture: `exchanges: 0` and a warning that names
+    /// what ended it, followed by what the guest keeps.
     private func stopStaleCapture(_ t: VMTarget) async throws -> JSON {
         let vm = t.name
         let notCapturing = notCapturingSentence(vm)
+        let lost = lostCaptures[vm].map { "the HTTP capture of '\(vm)' had already ended because \($0)" }
         lostCaptures[vm] = nil
+        func ended(_ warnings: [String?], cleared: Bool = false) -> JSON {
+            var out: [String: JSON] = ["exchanges": 0]
+            if cleared { out["staleCleared"] = true }
+            let text = warnings.compactMap { $0 }
+            if !text.isEmpty { out["warning"] = .string(text.joined(separator: "; ")) }
+            return .object(out)
+        }
         let owner = await journalVM(t)
         let recorded = captureJournal.entry(for: owner)
         let state = await t.state()
         guard state == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.staleToolsWait) else {
+            if let lost { return ended([lost, recorded == nil ? nil : ControlHandler.unreachableGuestWarning(state)]) }
             guard recorded != nil else { throw ControlError.failed(notCapturing) }
             let why = state == .paused ? "while the VM is paused; call vm.resume, then vm.http.stop again"
                 : state == .running ? "while its guest tools are not reachable; call vm.http.stop again once vm.status shows tools"
@@ -442,12 +453,14 @@ extension ControlHandler {
         let os = await t.guestOS()
         let limit = httpTiming.recipe
         let stale = await Task { await self.restoreGuest(t, agent, os: os, thumbprint: recorded?.thumbprint, op: "vm.http.stop", limit: limit) }.value
-        if let failure = stale.failure { throw ControlError.failed(failure) }
+        if let failure = stale.failure {
+            if let lost { return ended([lost, failure, stale.warning]) }
+            throw ControlError.failed(failure)
+        }
         if let recorded { try? captureJournal.remove(recorded, now: wallClock()) }
+        if let lost { return ended([lost, stale.warning], cleared: stale.cleared) }
         guard stale.cleared else { throw ControlError.failed(notCapturing) }
-        var out: [String: JSON] = ["exchanges": 0, "staleCleared": true]
-        if let warning = stale.warning { out["warning"] = .string(warning) }
-        return .object(out)
+        return ended([stale.warning], cleared: true)
     }
 
     /// Puts back the proxy settings a capture left in the guest, deletes its state file, and removes the CA
