@@ -52,7 +52,7 @@ clipboard and file sharing.
 | **Guest tools** | A small Go agent for Windows and Linux: clipboard both ways, file drop, shell commands and background jobs, processes, file access, display modes that follow the window. |
 | **Snapshots and suspend** | qcow2 snapshots with VM state, plus suspend-to-disk that resumes where you left off. |
 | **USB passthrough** | Hot-plug host USB devices into a running guest. |
-| **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell commands and background jobs, processes, clipboard, file push, pull and folder sync, guest file read and write, recordings with a trace and a video, the guest event log, crash dumps and a one-call diagnostics bundle. |
+| **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell commands and background jobs, processes, clipboard, file push, pull and folder sync, guest file read and write, recordings with a trace and a video, the guest event log, crash dumps, a one-call diagnostics bundle, and HTTP and HTTPS capture with canned, delayed or dropped answers. |
 | **No black boxes** | The engine is a pinned QEMU tag plus three readable patches (`qemu-patches/`). Build it yourself in one command. |
 
 Tested on an M3 Pro running macOS 26 with Windows 11 Pro ARM 25H2 and Ubuntu
@@ -142,8 +142,8 @@ headless engine when it is not.
 | `evidence` | `alcove_event_log` / `alcove_crash_dumps` | Entries of the guest's event log; crash dumps of a Windows program, copied to the Mac |
 | `evidence` | `alcove_collect_diagnostics` | Screenshot, windows, UI tree, processes, logs and dumps of a VM in one directory |
 | `replay` | `alcove_script_save` / `alcove_script_run` | Turn a recording into a script; replay it without a model |
-| `http` | `alcove_http_capture_start` / `alcove_http_capture_stop` | Capture the HTTP and HTTPS traffic of a VM through a proxy on the Mac (listed now; the control ops they call arrive with AT7, until then they answer an unknown-op error) |
-| `http` | `alcove_http_requests` / `alcove_http_rule` | List and read captured exchanges; answer, delay or drop matching requests (listed now; the control ops arrive with AT7) |
+| `http` | `alcove_http_capture_start` / `alcove_http_capture_stop` | Capture the HTTP and HTTPS traffic of a VM through a proxy on the Mac: the guest trusts the proxy's CA and uses it as its system proxy until the capture stops, and apps started with `alcove_launch_app` or `alcove_deploy` get the proxy environment |
+| `http` | `alcove_http_requests` / `alcove_http_rule` | List captured exchanges and read their headers and bodies, streams included; answer, delay or drop matching requests to test error handling |
 
 </details>
 
@@ -231,6 +231,7 @@ python3 scripts/test/agent-rpc-windows.py   # agent operations on the forwarded 
 python3 scripts/test/at1-e2e.py             # control socket -> agent -> guest, and MCP server -> control socket
 python3 scripts/test/at5-e2e.py             # recordings, event log, crash dumps and diagnostics bundles in the guest
 python3 scripts/test/at6-e2e.py             # a recording saved as a script and replayed with alcovectl run-script and alcove_script_run
+python3 scripts/test/at7-e2e.py             # HTTP capture: CA and system proxy in the guest, rules, a stream, restore, MCP tools
 ```
 
 `scripts/test/alcove_ctl.py` is the control-socket client these scripts import;
