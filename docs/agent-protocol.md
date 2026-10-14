@@ -670,7 +670,10 @@ range.
 - Errors: `no element at (<x>, <y>); take a screenshot to see what is there`
   (a point outside every screen, on the desktop window itself, or in a window
   that refuses UI Automation), `no element has the keyboard focus; click the field first`,
-  `element <ref> no longer exists; call ui.tree again`.
+  `element <ref> no longer exists; call ui.tree again`. A point on the
+  wallpaper or on a desktop icon lies in the shell's `Progman`/`WorkerW`
+  window and answers its element (a `List` named `Desktop`, or the icon),
+  not this error.
 - The UI Automation calls run on a thread the helper abandons at the time
   limit, so the reply comes within `budgetMs` + 100 ms and the helper serves
   the next request at once. An app that did not answer in time gives
