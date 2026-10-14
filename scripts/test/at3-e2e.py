@@ -447,8 +447,10 @@ def _(run):
 def _(run):
     width, height = run.frame()
     run.notepad(pristine=True)
+    calm = run.wait_for([{"type": "screen_idle", "seconds": 2}], timeout=30)
+    expect(calm["matched"] == 0, f"the screen did not stand still for 2 s within 30 s of Notepad's start: {calm!r}")
     match = run.find_one(KOREAN)
-    clicked = run.call("vm.mouse.click", x=match["cx"], y=match["cy"], observe="summary")
+    clicked = run.call("vm.mouse.click", x=match["cx"], y=match["cy"], observe="summary", settleTimeoutMs=8000)
     seen = clicked["observation"]
     expect(seen["settled"] is True and (seen["width"], seen["height"]) == (width, height) and 0 <= seen["changedFraction"] <= 1
            and not {"png", "imageRect", "imageScale"} & set(seen),
@@ -484,6 +486,8 @@ def _(run):
     line = run.find_one(ENGLISH, languages=LATIN)
     run.call("vm.mouse.click", x=line["cx"], y=line["cy"])
     run.notepad_dirty = True
+    width, height = run.frame()
+    run.call("vm.mouse.move", x=width - 2, y=height - 2)
     began = time.monotonic()
     done = run.call("vm.batch", steps=[{"op": "vm.key.press", "keys": "ctrl+a"}, {"op": "vm.type", "text": "batch works"}, {"op": "vm.wait_idle"}])
     took = time.monotonic() - began
