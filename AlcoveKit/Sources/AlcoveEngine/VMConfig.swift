@@ -107,6 +107,9 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public var agentToken: String
     /// Host loopback port forwarded to the guest agent (guest port 7645).
     public var agentHostPort: Int
+    /// The key the guest agent is paired with: 32 random bytes as 64 lower-case hexadecimal digits
+    /// (docs/agent-protocol.md, Host key). It never reaches the guest except in the agent's `pair` message.
+    public var agentKey: String
     /// Name of the template this VM was cloned from; nil for a VM that is not a clone.
     public var cloneOf: String?
     /// Counts writable starts of a VM that has been cloned. A clone runs only while its
@@ -128,7 +131,8 @@ public struct VMConfig: Codable, Sendable, Equatable {
                 memoryMiB: Int, disks: [Disk], cdroms: [CDROM] = [], network: Network = .user(portForwards: []),
                 display: DisplayDevice, tpm: Bool = false, usbPassthrough: [USBSelector] = [],
                 sharedFolders: [SharedFolder] = [], macAddress: String = VMConfig.randomMAC(), createdAt: Date = Date(),
-                agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil, cloneOf: String? = nil,
+                agentToken: String = UUID().uuidString.lowercased(), agentHostPort: Int? = nil,
+                agentKey: String = VMConfig.randomAgentKey(), cloneOf: String? = nil,
                 diskEpoch: Int? = nil, templateEpoch: Int? = nil, templatePath: String? = nil,
                 diskID: String? = nil, templateDiskID: String? = nil) {
         self.schemaVersion = schemaVersion; self.name = name; self.guestOS = guestOS; self.cpuCount = cpuCount
@@ -137,6 +141,7 @@ public struct VMConfig: Codable, Sendable, Equatable {
         self.sharedFolders = sharedFolders; self.macAddress = macAddress; self.createdAt = createdAt
         self.agentToken = agentToken
         self.agentHostPort = agentHostPort ?? VMConfig.agentPort(for: agentToken)
+        self.agentKey = agentKey
         self.cloneOf = cloneOf
         self.diskEpoch = diskEpoch; self.templateEpoch = templateEpoch; self.templatePath = templatePath
         self.diskID = diskID; self.templateDiskID = templateDiskID
@@ -195,6 +200,12 @@ public struct VMConfig: Codable, Sendable, Equatable {
         }
     }
 
+    /// 32 random bytes from the system's generator as 64 lower-case hexadecimal digits.
+    public static func randomAgentKey() -> String {
+        var generator = SystemRandomNumberGenerator()
+        return (0..<32).map { _ in String(format: "%02x", UInt8.random(in: 0...255, using: &generator)) }.joined()
+    }
+
     /// A random locally administered unicast MAC (`52:54:00:xx:xx:xx`, the QEMU OUI).
     public static func randomMAC() -> String {
         String(format: "52:54:00:%02x:%02x:%02x", Int.random(in: 0...255), Int.random(in: 0...255), Int.random(in: 0...255))
@@ -243,7 +254,7 @@ extension VMConfig {
     public func encoded() throws -> Data { try VMConfig.encoder.encode(self) }
 
     /// Decode, migrating older schema versions forward. Configs written before
-    /// the agent fields existed get a fresh token and port.
+    /// the agent fields existed get a fresh token, port and key.
     public static func decode(_ data: Data) throws -> VMConfig {
         var config = try decoder.decode(VMConfig.self, from: data)
         if config.schemaVersion < currentSchemaVersion {
@@ -257,12 +268,12 @@ extension VMConfig {
     /// so the caller should save the migrated config back.
     public static func needsMigration(_ data: Data) -> Bool {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        return object["agentToken"] == nil || object["agentHostPort"] == nil
+        return object["agentToken"] == nil || object["agentHostPort"] == nil || object["agentKey"] == nil
     }
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, name, guestOS, cpuCount, memoryMiB, disks, cdroms, network, display, tpm,
-             usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort, cloneOf,
+             usbPassthrough, sharedFolders, macAddress, createdAt, agentToken, agentHostPort, agentKey, cloneOf,
              diskEpoch, templateEpoch, templatePath, diskID, templateDiskID
     }
 
@@ -285,6 +296,7 @@ extension VMConfig {
         let token = try c.decodeIfPresent(String.self, forKey: .agentToken) ?? UUID().uuidString.lowercased()
         agentToken = token
         agentHostPort = try c.decodeIfPresent(Int.self, forKey: .agentHostPort) ?? VMConfig.agentPort(for: token)
+        agentKey = try c.decodeIfPresent(String.self, forKey: .agentKey) ?? VMConfig.randomAgentKey()
         cloneOf = try c.decodeIfPresent(String.self, forKey: .cloneOf)
         diskEpoch = try c.decodeIfPresent(Int.self, forKey: .diskEpoch)
         templateEpoch = try c.decodeIfPresent(Int.self, forKey: .templateEpoch)

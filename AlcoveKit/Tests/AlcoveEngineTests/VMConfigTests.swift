@@ -71,6 +71,25 @@ final class VMConfigTests: XCTestCase {
         XCTAssertEqual(try VMConfig.decode(try c.encoded()).agentToken, c.agentToken)
     }
 
+    func testAgentKeyIsGeneratedAndAddedToAConfigWithoutOne() throws {
+        let c = VMConfig.defaults(name: "K", guestOS: .windows)
+        XCTAssertEqual(c.agentKey.count, 64)
+        XCTAssertTrue(c.agentKey.allSatisfy { "0123456789abcdef".contains($0) }, c.agentKey)
+        XCTAssertNotEqual(c.agentKey, VMConfig.defaults(name: "K", guestOS: .windows).agentKey)
+        var obj = try JSONSerialization.jsonObject(with: try c.encoded()) as! [String: Any]
+        XCTAssertEqual(obj["agentKey"] as? String, c.agentKey)
+        XCTAssertEqual(try VMConfig.decode(try c.encoded()).agentKey, c.agentKey)
+        XCTAssertFalse(VMConfig.needsMigration(try c.encoded()))
+
+        obj.removeValue(forKey: "agentKey")
+        let old = try JSONSerialization.data(withJSONObject: obj)
+        XCTAssertTrue(VMConfig.needsMigration(old))
+        let migrated = try VMConfig.decode(old)
+        XCTAssertEqual(migrated.agentKey.count, 64)
+        XCTAssertTrue(migrated.agentKey.allSatisfy { "0123456789abcdef".contains($0) }, migrated.agentKey)
+        XCTAssertEqual(migrated.agentToken, c.agentToken)
+    }
+
     func testCloneOfRoundTripsAndIsOmittedWhenNil() throws {
         var c = VMConfig.defaults(name: "C", guestOS: .linux)
         XCTAssertNil(c.cloneOf)
@@ -107,7 +126,8 @@ final class VMConfigTests: XCTestCase {
         let json = #"""
         {"schemaVersion": 1, "name": "Old", "guestOS": "linux", "cpuCount": 2, "memoryMiB": 1024, "display": "ramfb",
          "disks": [{"id": "disk0", "fileName": "disk0.qcow2", "sizeGiB": 8, "bus": "virtio-blk"}],
-         "agentToken": "0f0e0d0c-0000-4000-8000-000000000001", "agentHostPort": 17001, "cloneOf": "Template"}
+         "agentToken": "0f0e0d0c-0000-4000-8000-000000000001", "agentHostPort": 17001, "cloneOf": "Template",
+         "agentKey": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"}
         """#
         let old = Data(json.utf8)
         let c = try VMConfig.decode(old)

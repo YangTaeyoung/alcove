@@ -42,15 +42,15 @@ public struct VMBundle: Sendable, Equatable {
     public func diskURL(_ disk: VMConfig.Disk) -> URL { url.appendingPathComponent(disk.fileName) }
 
     /// Load `config.json`. Fields added after the bundle was written (the guest
-    /// agent token and port) are synthesized by the decoder; they must be
+    /// agent token, port and key) are synthesized by the decoder; they must be
     /// written back at once, because a value regenerated on every load would
     /// differ between the process that started the VM and anyone connecting to
-    /// its guest agent afterwards.
+    /// its guest agent afterwards. A migrated config is returned as `save` wrote it.
     public func loadConfig() throws -> VMConfig {
         let data = try Data(contentsOf: configURL)
         let config = try VMConfig.decode(data)
         if VMConfig.needsMigration(data) {
-            _ = try? save(config)
+            return (try? save(config)) ?? config
         }
         return config
     }
@@ -60,14 +60,16 @@ public struct VMBundle: Sendable, Equatable {
     private static let configLock = NSRecursiveLock()
 
     /// Validates `config` and writes it to `config.json` with the stored config's disk identity
-    /// preserved (`preservingStoredDiskIdentity`). Returns the configuration that was written.
+    /// preserved (`preservingStoredDiskIdentity`) and the stored `agentKey` kept when `config.json` holds one.
+    /// Returns the configuration that was written.
     /// Reading the stored config and writing run under `configLock`.
     @discardableResult
     public func save(_ config: VMConfig) throws -> VMConfig {
         try config.validate()
         VMBundle.configLock.lock()
         defer { VMBundle.configLock.unlock() }
-        let written = preservingStoredDiskIdentity(config)
+        var written = preservingStoredDiskIdentity(config)
+        if let key = storedAgentKey() { written.agentKey = key }
         try written.encoded().write(to: configURL, options: .atomic)
         return written
     }
@@ -76,6 +78,13 @@ public struct VMBundle: Sendable, Equatable {
     /// (`VMConfig.preservingDiskIdentity`); `config` itself when no stored config can be read.
     func preservingStoredDiskIdentity(_ config: VMConfig) -> VMConfig {
         storedConfig().map { config.preservingDiskIdentity(from: $0) } ?? config
+    }
+
+    /// The `agentKey` string stored in `config.json`, or nil when the file or the field is missing.
+    func storedAgentKey() -> String? {
+        guard let data = try? Data(contentsOf: configURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object["agentKey"] as? String
     }
 
     /// Whether a suspended state exists to resume from.
@@ -265,7 +274,7 @@ extension VMBundle {
 
     /// New bundle next to this one, named `newName` without surrounding whitespace, whose disks are
     /// qcow2 overlays backed by this bundle's disks, with a copy of the UEFI variables, a fresh token
-    /// and MAC, an agent port no bundle in the directory uses, no CD-ROMs, USB passthrough or static
+    /// and MAC, this bundle's `agentKey`, an agent port no bundle in the directory uses, no CD-ROMs, USB passthrough or static
     /// forwards, and `cloneOf` set. The clone is added to `clones.json`.
     /// The overlays reference the template's disk files by absolute path.
     /// A template without a `diskEpoch` is saved with `diskEpoch` 0 and, when it has none, a new UUID
@@ -296,7 +305,7 @@ extension VMBundle {
         if case .none = source.network { network = .none }
         let config = VMConfig(name: newName, guestOS: source.guestOS, cpuCount: source.cpuCount, memoryMiB: source.memoryMiB,
                               disks: source.disks, network: network, display: source.display,
-                              sharedFolders: source.sharedFolders, agentToken: token, cloneOf: source.name,
+                              sharedFolders: source.sharedFolders, agentToken: token, agentKey: source.agentKey, cloneOf: source.name,
                               templateEpoch: epoch, templatePath: url.standardizedFileURL.path, templateDiskID: diskID)
         do {
             try config.validate()

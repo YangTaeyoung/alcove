@@ -140,6 +140,48 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertFalse(VMConfig.needsMigration(try Data(contentsOf: b.configURL)))
     }
 
+    func testLoadConfigPersistsAGeneratedAgentKey() throws {
+        let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
+        let b = try VMBundle.create(VMConfig.defaults(name: "Keyless", guestOS: .windows), in: tmp, engine: engine)
+        var raw = try JSONSerialization.jsonObject(with: try Data(contentsOf: b.configURL)) as! [String: Any]
+        raw.removeValue(forKey: "agentKey")
+        try JSONSerialization.data(withJSONObject: raw).write(to: b.configURL)
+        let first = try b.loadConfig()
+        let second = try b.loadConfig()
+        XCTAssertEqual(first.agentKey.count, 64)
+        XCTAssertEqual(first.agentKey, second.agentKey)
+        let stored = try JSONSerialization.jsonObject(with: try Data(contentsOf: b.configURL)) as! [String: Any]
+        XCTAssertEqual(stored["agentKey"] as? String, first.agentKey)
+    }
+
+    func testSaveKeepsTheStoredAgentKey() throws {
+        let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
+        let b = try VMBundle.create(VMConfig.defaults(name: "Keyed", guestOS: .windows), in: tmp, engine: engine)
+        let stored = try b.loadConfig()
+        var other = stored
+        other.agentKey = String(repeating: "ab", count: 32)
+        other.cpuCount = stored.cpuCount + 1
+        let written = try b.save(other)
+        XCTAssertEqual(written.agentKey, stored.agentKey)
+        let reloaded = try b.loadConfig()
+        XCTAssertEqual(reloaded.agentKey, stored.agentKey)
+        XCTAssertEqual(reloaded.cpuCount, stored.cpuCount + 1)
+    }
+
+    /// Two loads of a config without a key that run before either saved: both return the key the first save wrote.
+    func testTwoMigratingLoadsAgreeOnTheAgentKey() throws {
+        let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
+        let b = try VMBundle.create(VMConfig.defaults(name: "Racing", guestOS: .windows), in: tmp, engine: engine)
+        var raw = try JSONSerialization.jsonObject(with: try Data(contentsOf: b.configURL)) as! [String: Any]
+        raw.removeValue(forKey: "agentKey")
+        let old = try JSONSerialization.data(withJSONObject: raw)
+        let early = try VMConfig.decode(old)
+        try old.write(to: b.configURL)
+        let first = try b.loadConfig()
+        XCTAssertNotEqual(early.agentKey, first.agentKey)
+        XCTAssertEqual(try b.save(early).agentKey, first.agentKey)
+    }
+
     func testZeroFilledVarsWithoutTemplateAndCleanupOnFailure() throws {
         let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: false)]).locate()
         XCTAssertNil(engine.firmwareVarsTemplate)
@@ -619,6 +661,7 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(c.name, "Clone")
         XCTAssertEqual(c.cloneOf, "Template")
         XCTAssertNotEqual(c.agentToken, config.agentToken)
+        XCTAssertEqual(c.agentKey, config.agentKey)
         XCTAssertNotEqual(c.agentHostPort, config.agentHostPort)
         XCTAssertEqual(c.agentHostPort, VMConfig.agentPort(for: c.agentToken))
         XCTAssertNotEqual(c.macAddress, config.macAddress)
