@@ -126,7 +126,7 @@ extension ControlHandler {
             var hostPort = 0
             if let value = params["hostPort"], value != .null {
                 guard let port = value.intValue else { throw ControlError.missing("hostPort") }
-                guard (0...65_535).contains(port) else { throw ControlError.failed("hostPort must be between 1 and 65535") }
+                guard (0...65_535).contains(port) else { throw ControlError.failed("hostPort must be between 0 and 65535; 0 lets Alcove choose a free port") }
                 hostPort = port
             }
             await discardStaleForwards(t)

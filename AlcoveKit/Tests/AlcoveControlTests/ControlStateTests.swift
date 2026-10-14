@@ -417,7 +417,7 @@ final class ControlStateTests: XCTestCase {
         let guest = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 70000])
         XCTAssertEqual(guest, "guestPort must be between 1 and 65535")
         let host = await failure(h, "vm.forward.add", ["name": "Win", "guestPort": 80, "hostPort": 70000])
-        XCTAssertEqual(host, "hostPort must be between 1 and 65535")
+        XCTAssertEqual(host, "hostPort must be between 0 and 65535; 0 lets Alcove choose a free port")
         let remove = await failure(h, "vm.forward.remove", ["name": "Win", "hostPort": 0])
         XCTAssertEqual(remove, "hostPort must be between 1 and 65535")
         let lines = await t.monitorLines

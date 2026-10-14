@@ -120,7 +120,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.exec.list` | `name` | `{jobs: [{job, pid, state, code?, cmd, started}]}` |
 | `vm.process.list` | `name`, `filter?` | `{processes: [{pid, ppid, name, path, command, memoryKB}]}` — `filter` is a case-insensitive substring of the process name |
 | `vm.process.kill` | `name`, `pid?` or `processName?`, `tree?` | `{killed}` — `tree` also kills child processes |
-| `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` |
+| `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` — a `text` whose message to the guest tools would reach 1 MiB answers `the clipboard text is too large for one message to the guest tools (<n> bytes of UTF-8; a message holds less than 1 MiB); set a shorter text` |
 | `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` |
 | `vm.pull_file` | `name`, `guestPath`, `path` (host) | `{path, bytes, sha256}` |
 | `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` |
@@ -780,8 +780,10 @@ still shows responding false after 10 s`.
 ## Launching and deploying apps
 
 **`vm.app.launch`** starts the program `path` in the guest (a full path, or a
-name on the search path or registered under `App Paths`, such as
-`msedge.exe`) with `args` (array of strings), `cwd` and `env` (object of
+bare name found in a folder of the machine's `PATH` or registered under the
+HKLM `App Paths` key, such as `msedge.exe`; the user's own `PATH` is not
+searched, and another bare name answers `'<name>' is not in the system
+folders of PATH or under HKLM App Paths; pass the full path of the program`) with `args` (array of strings), `cwd` and `env` (object of
 strings), and waits up to `waitWindow` seconds (0 to 300, default 15; 0 does
 not wait) for the window it opens. It needs guest tools that run commands and
 runs in the concurrent lane. The result is `{pid}` and, when a window was
@@ -1173,7 +1175,8 @@ shows three kinds:
   `config`, `agent` or `runtime` forward of the VM uses, or that the engine
   cannot listen on, answers `host port <n> is taken; pass hostPort: 0 to let
   Alcove choose`. Out-of-range values answer `guestPort must be between 1 and
-  65535` / `hostPort must be between 1 and 65535`. A VM that stops or starts
+  65535` / `hostPort must be between 0 and 65535; 0 lets Alcove choose a free
+  port`. A VM that stops or starts
   again while the forward is being added answers `VM '<vm>' stopped or
   restarted while the forward was added; call vm.forward.add again once it
   runs` and keeps no record of the forward.
@@ -1197,6 +1200,10 @@ adapter down (the guest sees an unplugged cable); `up: true` brings it back.
 `up` must be a boolean; without it, or with another type, the op answers
 `missing or invalid parameter 'up'`. The guest tools connect through the same adapter:
 
+- An answer of the guest tools longer than 8 MiB closes the connection to them,
+  and the op answers `the guest tools sent an answer longer than 8 MiB, so the
+  connection to them was closed; ask for less (a smaller max, depth or range)
+  and retry`.
 - While the link is down, an op that needs the guest tools waits for its
   reply and then answers `guest tools in '<vm>' did not answer <op> in time;
   check vm.status and retry`. `vm.status` keeps reporting `tools: true`,
@@ -2464,14 +2471,20 @@ an agent operation such as `exec.list` (here `vm.exec.list`).
 
 - `command` runs through `shell`: `powershell` (the default on Windows),
   `cmd`, or `sh` (the default elsewhere). `argv` (a non-empty array of
-  strings) starts a program directly. One of the two is required.
-- `timeout` is a whole number of seconds from 1 to 86400; the default is 120.
-  Any other value answers `timeout must be between 1 and 86400 seconds`. When
-  the time is up the guest process tree is killed and the reply has
-  `timedOut: true` and `code: -1`.
-- `cwd` is the working directory, `env` an object of extra environment
-  variables, `stdin` text the command reads from its standard input. Without
-  `stdin` the command reads end-of-file.
+  strings) starts a program directly, with `shell` left out or `none`; another
+  `shell` with `argv` answers `shell '<shell>' does not run argv; pass shell
+  'none' or leave shell out`. One of the two is required.
+- `timeout` (`vm.exec` only) is a whole number of seconds from 1 to 86400; the
+  default is 120. Any other value answers `timeout must be between 1 and 86400
+  seconds`. When the time is up the guest process tree is killed and the reply
+  has `timedOut: true` and `code: -1`. A job of `vm.exec.start` has no time
+  limit.
+- `cwd` is the working directory: without it the command runs in the home
+  folder of the user the guest tools run as, and a relative `cwd` is taken
+  below that folder. `env` is an object of extra environment variables.
+- `stdin` (`vm.exec` only) is text the command reads from its standard input;
+  without it the command reads end-of-file. A job of `vm.exec.start` gets its
+  input through `vm.exec.write`.
 - `stdout` and `stderr` hold the last 200000 bytes of each stream as UTF-8;
   `truncated` says that earlier output was dropped.
 - With guest tools older than the request/response layer, `vm.exec` accepts
