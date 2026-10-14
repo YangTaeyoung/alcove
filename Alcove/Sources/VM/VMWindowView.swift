@@ -29,6 +29,7 @@ private struct VMContentView: View {
     @State private var guestSize: (width: Int, height: Int)?
     @State private var showSnapshots = false
     @State private var showSettings = false
+    @State private var showsToolsRefusal = false
     @State private var confirmReset = false
     @State private var confirmForceStop = false
     @State private var pendingDiscard: VMSession?
@@ -272,7 +273,24 @@ private struct VMContentView: View {
                 .transition(.opacity)
             }
             Spacer()
-            if session.state.isActive {
+            if session.state.isActive, !session.toolsConnected, let refusal = session.toolsRefusal {
+                Button {
+                    showsToolsRefusal.toggle()
+                } label: {
+                    Label("Tools refused", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+                .buttonStyle(.borderless)
+                .help("The guest tools refused the connection: \(refusal)")
+                .popover(isPresented: $showsToolsRefusal, arrowEdge: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("The guest tools refused the connection").font(.headline)
+                        Text(refusal).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(12)
+                    .frame(width: 360, alignment: .leading)
+                }
+            } else if session.state.isActive {
                 Label(session.toolsConnected ? "Tools" : "No tools",
                       systemImage: session.toolsConnected ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver")
                     .labelStyle(.iconOnly)

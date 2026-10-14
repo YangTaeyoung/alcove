@@ -123,6 +123,9 @@ final class AgentAuthTests: XCTestCase {
         XCTAssertFalse(types(agent).contains("welcome"))
         XCTAssertEqual(AgentClient.AgentError.refused(sentence).errorDescription,
                        "the guest tools refused the connection: \(sentence)")
+        XCTAssertEqual(AgentClient.AgentError.refused(sentence).refusal, sentence)
+        XCTAssertNil(AgentClient.AgentError.disconnected.refusal)
+        XCTAssertNil(AgentClient.AgentError.timeout("authed").refusal)
     }
 
     func testTheConnectionIsNotReadyWhileTheAgentHasNotAnsweredTheAuth() async throws {

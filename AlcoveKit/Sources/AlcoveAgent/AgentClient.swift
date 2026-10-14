@@ -420,7 +420,12 @@ public actor AgentClient {
 extension AgentClient.AgentError: LocalizedError {
     /// The agent's sentence for `.refused`; nil for the other cases.
     public var errorDescription: String? {
-        if case .refused(let text) = self { return "the guest tools refused the connection: \(text)" }
+        refusal.map { "the guest tools refused the connection: \($0)" }
+    }
+
+    /// The sentence of the agent's `refused` line for `.refused`; nil for the other cases.
+    public var refusal: String? {
+        if case .refused(let text) = self { return text }
         return nil
     }
 }

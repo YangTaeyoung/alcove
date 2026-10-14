@@ -39,6 +39,9 @@ final class VMSession: Identifiable {
 
     /// True while the guest tools (alcove-agent) answer on the forwarded port.
     private(set) var toolsConnected = false
+    /// The sentence of the guest tools' `refused` line from the latest connection attempt they refused; nil once an
+    /// attempt connects or the tools are disconnected.
+    private(set) var toolsRefusal: String?
 
     /// The last size the window asked the guest to adopt, re-applied when the
     /// guest tools connect: at boot the request goes out before the tools are
@@ -71,6 +74,7 @@ final class VMSession: Identifiable {
         let client = agent
         agent = nil
         toolsConnected = false
+        toolsRefusal = nil
         Task { await client?.disconnect() }
         onStateChange = nil
     }
@@ -93,6 +97,7 @@ final class VMSession: Identifiable {
                     try await client.connect(port: port, expectedToken: token, agentKey: key, timeout: .seconds(5))
                     self.agent = client
                     self.toolsConnected = true
+                    self.toolsRefusal = nil
                     AppControlServer.shared.guestToolsConnected(vm: self.name)
                     if let size = self.lastRequestedResolution {
                         await client.setResolution(width: size.width, height: size.height)
@@ -103,6 +108,7 @@ final class VMSession: Identifiable {
                     self.agent = nil
                     self.toolsConnected = false
                 } catch {
+                    if let refusal = (error as? AgentClient.AgentError)?.refusal { self.toolsRefusal = refusal }
                     try? await Task.sleep(for: .seconds(3))
                 }
             }
@@ -114,6 +120,7 @@ final class VMSession: Identifiable {
         let client = agent
         agent = nil
         toolsConnected = false
+        toolsRefusal = nil
         Task { await client?.disconnect() }
     }
 
