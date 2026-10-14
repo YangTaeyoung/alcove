@@ -123,6 +123,16 @@ test("descriptions name what the control ops need and do", () => {
   assert.match(core.get("alcove_start_vm")!, /session ends/);
 });
 
+test("parameter descriptions carry the path rules the server enforces", () => {
+  const param = (r: ReturnType<typeof rig>, tool: string, name: string) =>
+    ((r.schemas.get(tool) as Record<string, { description?: string }>)[name]).description ?? "";
+  const evidence = rig(registerEvidence);
+  assert.match(param(evidence, "alcove_record_start", "dir"), /missing or empty/);
+  assert.match(param(evidence, "alcove_crash_dumps", "path"), /absolute/);
+  assert.match(param(rig(registerFiles), "alcove_pull_file", "path"), /absolute/i);
+  assert.match(param(rig(registerUi), "alcove_launch_app", "path"), /machine PATH and the HKLM App Paths/);
+});
+
 test("the server instructions name only tools of the enabled toolsets", () => {
   const names = new Map<Toolset, string[]>();
   for (const set of TOOLSETS) names.set(set, registers[set].flatMap((register) => [...rig(register).descriptions.keys()]));

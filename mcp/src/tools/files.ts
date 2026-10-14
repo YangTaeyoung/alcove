@@ -12,7 +12,7 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Copy a file out of the guest",
       description: "Copy a file from the guest to the Mac (needs guest tools with exec allowed). A file already at path is replaced. Returns the Mac path, size and SHA-256.",
-      inputSchema: { name: vmName, guest_path: guestPath("Path of the file"), path: z.string().min(1).describe("Destination path on the Mac") },
+      inputSchema: { name: vmName, guest_path: guestPath("Path of the file"), path: z.string().min(1).describe("Absolute destination path on the Mac") },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ name, guest_path, path: p }) => {

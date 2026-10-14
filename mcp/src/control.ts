@@ -21,6 +21,7 @@ export class ControlClient {
   private nextId = 1;
   private pending = new Map<number, { op: string; resolve: (r: ControlReply) => void; reject: (e: Error) => void }>();
   private headless: ChildProcess | null = null;
+  private closes = 0;
 
   constructor(readonly socketPath = process.env.ALCOVE_CONTROL_SOCKET ?? DEFAULT_SOCKET) {}
 
@@ -39,20 +40,26 @@ export class ControlClient {
   }
 
   private async open(): Promise<void> {
+    const closes = this.closes;
+    const ensureOpen = () => {
+      if (this.closes !== closes) throw new ControlError("the control client was closed");
+    };
     try {
       await this.dial();
       return;
     } catch {
-      /* fall through */
+      ensureOpen();
     }
     await this.startHeadless();
     const deadline = Date.now() + 15000;
     let lastErr: unknown;
     while (Date.now() < deadline) {
+      ensureOpen();
       try {
         await this.dial();
         return;
       } catch (e) {
+        ensureOpen();
         lastErr = e;
         await new Promise((r) => setTimeout(r, 300));
       }
@@ -171,6 +178,7 @@ export class ControlClient {
 
   /** Ends the connection, a connection being made, and the `alcovectl serve` this client started. */
   close() {
+    this.closes++;
     this.dialing?.destroy();
     this.dialing = null;
     if (this.sock) this.onClose();

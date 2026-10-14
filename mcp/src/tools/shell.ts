@@ -4,7 +4,7 @@ import { ControlError, type ControlClient } from "../control.js";
 import { changeResult } from "../observation.js";
 import { clip, commandParams, commandPayload, fail, streamSections, text, vmName, type Registrar } from "../toolkit.js";
 
-/** The most bytes per stream one `alcove_exec_read` asks for: no more characters than the text shows unclipped. */
+/** The most bytes per stream one `alcove_exec_read` asks for. */
 export const EXEC_READ_MAX_BYTES = 60000;
 
 const job = z.string().describe("Job id returned by alcove_exec_start");

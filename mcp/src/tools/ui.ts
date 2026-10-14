@@ -282,7 +282,7 @@ export function register(r: Registrar, client: ControlClient): void {
     description: "Start a program that is already in the guest and wait for its first window. Returns the pid and the window id and title. Needs guest tools with exec allowed. To copy a Mac build into the guest and start it in one step use alcove_deploy.",
     inputSchema: {
       name: vmName,
-      path: z.string().min(1).describe("Executable path inside the guest"),
+      path: z.string().min(1).describe("Executable path inside the guest, or a bare name that is looked up only in the machine PATH and the HKLM App Paths"),
       args: z.array(z.string()).optional().describe("Command-line arguments"),
       cwd: z.string().optional().describe("Working directory inside the guest"),
       env: z.record(z.string()).optional().describe("Extra environment variables"),

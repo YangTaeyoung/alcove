@@ -44,7 +44,7 @@ export function register(r: Registrar, client: ControlClient): void {
       fps: z.number().int().min(1).max(30).optional().describe("Video frames per second (default 5)"),
       video: z.boolean().optional().describe("Also write video.mp4 (default true)"),
       max_seconds: z.number().int().min(1).max(86400).optional().describe("Stop automatically after this long (default 900)"),
-      dir: z.string().optional().describe("Absolute Mac directory to write into (default ~/Library/Application Support/Alcove/Recordings/<vm>-<timestamp>)"),
+      dir: z.string().optional().describe("Absolute Mac directory to write into, missing or empty (default ~/Library/Application Support/Alcove/Recordings/<vm>-<timestamp>)"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, async (a) => {
@@ -145,7 +145,7 @@ export function register(r: Registrar, client: ControlClient): void {
       exe: z.string().optional().describe("Image name such as MyApp.exe (enable, disable)"),
       full: z.boolean().optional().describe("enable: full memory dumps instead of mini dumps (default false)"),
       file: z.string().optional().describe("pull: dump file name as listed by the list action, without a folder"),
-      path: z.string().optional().describe("pull: destination path on the Mac"),
+      path: z.string().optional().describe("pull: absolute destination path on the Mac"),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async (a) => {

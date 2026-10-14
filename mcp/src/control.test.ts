@@ -119,6 +119,26 @@ test("a call without an answer in time fails with a sentence that says the serve
   }
 });
 
+test("close during the first dial starts no server", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alcove-ctl-"));
+  const marker = path.join(dir, "started");
+  const script = path.join(dir, "alcovectl");
+  fs.writeFileSync(script, `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+  const saved = process.env.ALCOVE_CTL;
+  process.env.ALCOVE_CTL = script;
+  try {
+    const client = new ControlClient(path.join(dir, "missing.sock"));
+    const connecting = client.connect();
+    client.close();
+    await assert.rejects(connecting, (e: Error) => e instanceof ControlError && e.message === "the control client was closed");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    if (saved === undefined) delete process.env.ALCOVE_CTL; else process.env.ALCOVE_CTL = saved;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("connected says whether the client holds a connection", async () => {
   const s = await serve(() => ({ ok: true }));
   try {
