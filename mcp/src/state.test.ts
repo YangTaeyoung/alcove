@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { register as registerState } from "./tools/state.js";
+import { register as registerState, restoreWorstMs, RESTORE_MARGIN_MS } from "./tools/state.js";
 import { ControlError } from "./control.js";
 import { LeaseBook, type LeasedControlClient } from "./leases.js";
 import type { Registrar, ToolHandler, ToolResult } from "./toolkit.js";
 
-type Call = { op: string; params: Record<string, unknown> };
+type Call = { op: string; params: Record<string, unknown>; timeoutMs?: number };
 
 /** The state tools over a client that answers every call with `reply`, or throws it when it is an Error. */
 function rig(reply: Record<string, unknown> | Error = {}) {
@@ -15,8 +15,8 @@ function rig(reply: Record<string, unknown> | Error = {}) {
   const registrar: Registrar = { tool: (_set, name, _config, handler) => void handlers.set(name, handler) };
   const client = {
     leases,
-    call: async (op: string, params: Record<string, unknown> = {}) => {
-      calls.push({ op, params });
+    call: async (op: string, params: Record<string, unknown> = {}, timeoutMs?: number) => {
+      calls.push(timeoutMs === undefined ? { op, params } : { op, params, timeoutMs });
       if (reply instanceof Error) throw reply;
       return reply;
     },
@@ -63,6 +63,15 @@ test("alcove_snapshot_restore sends waitTools only when wait_tools_s is given", 
   await run("alcove_snapshot_restore", { name: "Win", snapshot: "s" });
   await run("alcove_snapshot_restore", { name: "Win", snapshot: "s", wait_tools_s: 5 });
   assert.deepEqual(calls.map((c) => c.params), [{ name: "Win", snapshot: "s" }, { name: "Win", snapshot: "s", waitTools: 5 }]);
+});
+
+test("alcove_snapshot_restore waits 15 s longer than the restore may take with its tools wait", async () => {
+  const { run, calls } = rig({ tools: true, clockSynced: true });
+  await run("alcove_snapshot_restore", { name: "Win", snapshot: "s" });
+  await run("alcove_snapshot_restore", { name: "Win", snapshot: "s", wait_tools_s: 600 });
+  assert.deepEqual(calls.map((c) => c.timeoutMs), [987000, 1557000]);
+  assert.equal(restoreWorstMs(30) + RESTORE_MARGIN_MS, 987000);
+  assert.equal(restoreWorstMs(0), 942000);
 });
 
 test("alcove_set_environment is an error result when a row has ok false", async () => {

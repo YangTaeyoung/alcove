@@ -6,6 +6,19 @@ import { fail, text, vmName, type Registrar } from "../toolkit.js";
 
 const snapshotName = z.string().min(1).max(128).describe("Snapshot name (non-empty, at most 128 characters, no newline)");
 const LONG_MS = 660000;
+/** What `vm.snapshot.restore` waits for the guest tools when the call names no wait, in s. */
+const RESTORE_WAIT_TOOLS_S = 30;
+/**
+ * Longest `vm.snapshot.restore` runs before it answers, in ms, when it waits `waitToolsS` seconds for the guest tools:
+ * the engine's load (QMP stop, snapshot-load, its job, query-jobs, job-dismiss and cont: 30 + 30 + 600 + 30 + 30 + 30 s),
+ * the end of a capture's proxy (6 s), the wait for the guest tools and the connection attempt that runs past it (6 s),
+ * and two cleanups after an earlier capture one after the other (90 s each), beside which the clock sync (75 s) runs.
+ */
+export function restoreWorstMs(waitToolsS: number): number {
+  return (750 + 6 + waitToolsS + 6 + 180) * 1000;
+}
+/** What `client.call` waits beyond the longest run of `vm.snapshot.restore`, in ms. */
+export const RESTORE_MARGIN_MS = 15000;
 
 interface SnapshotRow { name: string; date: string; vmStateBytes: number }
 interface ForwardRow { hostPort: number; guestPort: number; kind: string }
@@ -105,7 +118,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
         const res = await client.call(
           "vm.snapshot.restore",
           { name, snapshot, ...(wait_tools_s !== undefined ? { waitTools: wait_tools_s } : {}) },
-          LONG_MS,
+          restoreWorstMs(wait_tools_s ?? RESTORE_WAIT_TOOLS_S) + RESTORE_MARGIN_MS,
         );
         const tools = res.tools === true;
         const clock = res.clockSynced === true;
