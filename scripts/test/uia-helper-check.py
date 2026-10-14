@@ -3,7 +3,7 @@
 events against a running Windows VM.
 
 Talks docs/agent-protocol.md directly on the forwarded agent port, after it
-paired or authenticated with the agentKey of the VM's config.json (--vm), and drives
+authenticated with the agentKey of the VM's config.json (--vm), and drives
 Notepad, File Explorer and the fixture app (build/alcove-fixture-windows-arm64.exe,
 built by scripts/test/all.sh) in the guest. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py) and neither Notepad nor the
@@ -91,13 +91,11 @@ class Agent:
         self.leaks = []
         self.hello = self._next(10)
         expect(self.hello and self.hello.get("t") == "hello", f"expected hello, got {self.hello!r}")
-        first = first_message(self.hello, key)
-        if first:
-            self.send(first)
-            try:
-                check_answer(self._next(10))
-            except AgentKeyError as e:
-                raise Failure(str(e)) from None
+        try:
+            self.send(first_message(self.hello, key))
+            check_answer(self._next(10))
+        except AgentKeyError as e:
+            raise Failure(str(e)) from None
         self.send({"t": "welcome", "v": 1})
 
     def send(self, m):

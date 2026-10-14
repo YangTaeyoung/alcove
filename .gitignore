@@ -13,3 +13,4 @@ DerivedData/
 /AlcoveKit/.build*/
 /mcp/node_modules/
 /mcp/dist/
+__pycache__/

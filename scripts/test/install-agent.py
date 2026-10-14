@@ -14,9 +14,9 @@ install.log during this run. The script then requires, in this order:
    launched and owns the listening agent port in the guest,
 3. hello on the forwarded agent port matches
    guest-tools/internal/server/server.go and asks for the host key,
-4. a second connection pairs the agent with the agentKey of the VM's
-   config.json, or proves that key to an agent paired before, and the agent
-   answers authed.
+4. a second connection sends the signature of the VM's token and the hello's
+   nonce by the agentKey of the VM's config.json, and the agent answers
+   authed.
 
 Usage: install-agent.py [--vm NAME] [--user NAME] [--ssh-port N] [--agent-port N]
 """
@@ -217,8 +217,7 @@ def read_hello(port):
 
 
 def authenticate(port, key):
-    """Pairs with or authenticates to the agent on port with key; returns whether it was paired before, or
-    fails the run with the agent's answer."""
+    """Authenticates to the agent on port with key, or fails the run with the agent's answer."""
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=10)
     except OSError as e:
@@ -227,13 +226,9 @@ def authenticate(port, key):
         s.settimeout(10)
         f = s.makefile("rb")
         hello = json.loads(f.readline() or b"null")
-        first = first_message(hello or {}, key)
-        if not first:
-            fail(f"the agent on port {port} does not ask for the host key: {hello!r}")
-        s.sendall((json.dumps(first) + "\n").encode())
+        s.sendall((json.dumps(first_message(hello or {}, key)) + "\n").encode())
         line = f.readline()
         check_answer(json.loads(line) if line else None)
-        return bool(hello.get("paired"))
     except AgentKeyError as e:
         fail(str(e))
     except (OSError, ValueError) as e:
@@ -289,8 +284,8 @@ def main():
         fail(f"hello.caps lacks {', '.join(missing)}")
     if hello.get("auth") != "key":
         fail(f"hello.auth is {hello.get('auth')!r}, expected 'key'")
-    paired_before = authenticate(args.agent_port, agent_secret)
-    log("authenticated with the agentKey of", repr(args.vm) if paired_before else f"{args.vm!r}; the agent was paired now")
+    authenticate(args.agent_port, agent_secret)
+    log("authenticated with the agentKey of", repr(args.vm))
     print("PASS")
 
 

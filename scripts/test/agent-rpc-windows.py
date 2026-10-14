@@ -2,7 +2,7 @@
 """Checks the agent's request/response operations against a running Windows VM.
 
 Talks docs/agent-protocol.md directly on the forwarded agent port: reads hello,
-pairs or authenticates with the agentKey of the VM's config.json (--vm), sends
+authenticates with the agentKey of the VM's config.json (--vm), sends
 welcome, then req/res with ids. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py). Each check prints
 `PASS <n> <title>`; the first failing check prints `FAIL <n>: <reason>` and the
@@ -52,13 +52,11 @@ class Agent:
         self.other = []
         self.hello = self._next(10)
         expect(self.hello and self.hello.get("t") == "hello", f"expected hello, got {self.hello!r}")
-        first = first_message(self.hello, key)
-        if first:
-            self.send(first)
-            try:
-                check_answer(self._next(10))
-            except AgentKeyError as e:
-                raise Failure(str(e)) from None
+        try:
+            self.send(first_message(self.hello, key))
+            check_answer(self._next(10))
+        except AgentKeyError as e:
+            raise Failure(str(e)) from None
         self.send({"t": "welcome", "v": 1})
 
     def send(self, m):

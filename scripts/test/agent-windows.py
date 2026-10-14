@@ -6,7 +6,7 @@ Requires the "Windows 11" bundle in the app VM directory with port forwards
 ~/Library/Application Support/Alcove/test_id_ed25519, and the agent binary at
 build/alcove-agent-windows-arm64.exe. Boots the VM through alcovectl, installs
 the agent over SSH (scheduled task in the interactive session), then talks the
-agent protocol from the host, after it paired or authenticated with the
+agent protocol from the host, after it authenticated with the
 agentKey of the bundle's config.json: clipboard both ways, file push, exec.
 """
 import base64, hashlib, json, os, socket, subprocess, sys, time
@@ -113,10 +113,8 @@ def main():
         if hello.get("os") != "windows" or "clipboard" not in hello.get("caps", []):
             fail("unexpected hello")
         try:
-            first = first_message(hello, agent_key(VM))
-            if first:
-                agent.send(first)
-                check_answer(agent.next())
+            agent.send(first_message(hello, agent_key(VM)))
+            check_answer(agent.next())
         except AgentKeyError as e:
             fail(str(e))
         agent.send({"t": "welcome", "v": 1})

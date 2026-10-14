@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test of the guest agent inside the Ubuntu 24.04 bundle
 (ssh forward 2223->22 with the test key, agent forward 7647->7645). The host
-side pairs or authenticates with the agentKey of the bundle's config.json."""
+side authenticates with the agentKey of the bundle's config.json."""
 import base64, hashlib, json, os, socket, subprocess, sys, time
 
 sys.dont_write_bytecode = True
@@ -68,10 +68,8 @@ def main():
         log("hello:", {k: hello.get(k) for k in ("os", "agent", "caps", "token")})
         if hello.get("os") != "linux": fail("unexpected hello")
         try:
-            first = first_message(hello, agent_key(VM))
-            if first:
-                agent.send(first)
-                check_answer(agent.next())
+            agent.send(first_message(hello, agent_key(VM)))
+            check_answer(agent.next())
         except AgentKeyError as e:
             fail(str(e))
         agent.send({"t": "welcome", "v": 1})
