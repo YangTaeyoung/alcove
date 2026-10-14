@@ -3,8 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
+	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
 	"go/ast"
@@ -56,8 +55,10 @@ func (m *memoryKeyStore) stored() []byte {
 }
 
 var (
-	testKey  = bytes.Repeat([]byte{0xA5}, KeySize)
-	otherKey = bytes.Repeat([]byte{0x5A}, KeySize)
+	hostPrivate  = ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0xA5}, KeySize))
+	otherPrivate = ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x5A}, KeySize))
+	testKey      = []byte(hostPrivate.Public().(ed25519.PublicKey))
+	otherKey     = []byte(otherPrivate.Public().(ed25519.PublicKey))
 )
 
 // authServer is a listening server with a host key store; dial opens a
@@ -141,15 +142,20 @@ func (c *authConn) expectRefusedAndClosed(t *testing.T, want string) {
 	}
 }
 
-func (c *authConn) mac(t *testing.T, key []byte) string {
+// nonce returns the 32 bytes of the hello's nonce.
+func (c *authConn) nonce(t *testing.T) []byte {
 	t.Helper()
 	nonce, err := hex.DecodeString(c.hello.String("nonce"))
 	if err != nil || len(nonce) != KeySize {
 		t.Fatalf("nonce %q", c.hello.String("nonce"))
 	}
-	m := hmac.New(sha256.New, key)
-	m.Write(nonce)
-	return hex.EncodeToString(m.Sum(nil))
+	return nonce
+}
+
+// sign returns the hex signature by key of the auth context and the hello's nonce.
+func (c *authConn) sign(t *testing.T, key ed25519.PrivateKey) string {
+	t.Helper()
+	return hex.EncodeToString(ed25519.Sign(key, append([]byte(authContext), c.nonce(t)...)))
 }
 
 // ping sends a ping request and requires its ok answer.
@@ -173,7 +179,7 @@ func TestAnUnpairedAgentPairsOnceAndThenServesAHostThatProvesTheKey(t *testing.T
 	if first.hello.String("auth") != "key" || first.hello["paired"] != false || len(first.hello.String("nonce")) != 2*KeySize {
 		t.Fatalf("hello %v", first.hello)
 	}
-	first.send(t, proto.Message{"t": "pair", "key": hex.EncodeToString(testKey)})
+	first.send(t, proto.Message{"t": "pair", "publicKey": hex.EncodeToString(testKey)})
 	if m := first.next(t); m.Type() != "authed" {
 		t.Fatalf("pair answered %v", m)
 	}
@@ -189,7 +195,7 @@ func TestAnUnpairedAgentPairsOnceAndThenServesAHostThatProvesTheKey(t *testing.T
 	if second.hello.String("nonce") == first.hello.String("nonce") {
 		t.Fatal("two connections got the same nonce")
 	}
-	second.send(t, proto.Message{"t": "auth", "mac": second.mac(t, testKey)})
+	second.send(t, proto.Message{"t": "auth", "signature": second.sign(t, hostPrivate)})
 	if m := second.next(t); m.Type() != "authed" {
 		t.Fatalf("auth answered %v", m)
 	}
@@ -199,7 +205,7 @@ func TestAnUnpairedAgentPairsOnceAndThenServesAHostThatProvesTheKey(t *testing.T
 func TestASecondPairWithAnotherKeyIsRefusedAndKeepsTheStoredKey(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
 	c := a.dial()
-	c.send(t, proto.Message{"t": "pair", "key": hex.EncodeToString(otherKey)})
+	c.send(t, proto.Message{"t": "pair", "publicKey": hex.EncodeToString(otherKey)})
 	c.expectRefusedAndClosed(t, errPairedOther)
 	if !bytes.Equal(a.store.stored(), testKey) {
 		t.Fatalf("stored %x", a.store.stored())
@@ -209,57 +215,71 @@ func TestASecondPairWithAnotherKeyIsRefusedAndKeepsTheStoredKey(t *testing.T) {
 func TestAPairWithTheStoredKeyIsServed(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
 	c := a.dial()
-	c.send(t, proto.Message{"t": "pair", "key": hex.EncodeToString(testKey)})
+	c.send(t, proto.Message{"t": "pair", "publicKey": hex.EncodeToString(testKey)})
 	if m := c.next(t); m.Type() != "authed" {
 		t.Fatalf("pair answered %v", m)
 	}
 	c.ping(t)
 }
 
-func TestAMACOfAnotherKeyIsRefused(t *testing.T) {
+func TestASignatureOfAnotherKeyIsRefused(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
 	c := a.dial()
-	c.send(t, proto.Message{"t": "auth", "mac": c.mac(t, otherKey)})
+	c.send(t, proto.Message{"t": "auth", "signature": c.sign(t, otherPrivate)})
 	c.expectRefusedAndClosed(t, errAuthMismatch)
 }
 
-func TestAMalformedMACIsRefused(t *testing.T) {
+func TestASignatureOfTheNonceWithoutTheAuthContextIsRefused(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
-	for _, mac := range []string{"", "zz", strings.Repeat("0", 63)} {
+	c := a.dial()
+	c.send(t, proto.Message{"t": "auth", "signature": hex.EncodeToString(ed25519.Sign(hostPrivate, c.nonce(t)))})
+	c.expectRefusedAndClosed(t, errAuthMismatch)
+}
+
+func TestAMalformedSignatureIsRefused(t *testing.T) {
+	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
+	for _, sig := range []string{"", "zz", strings.Repeat("0", 127), strings.Repeat("0", 128), strings.Repeat("g", 128)} {
 		c := a.dial()
-		c.send(t, proto.Message{"t": "auth", "mac": mac})
+		c.send(t, proto.Message{"t": "auth", "signature": sig})
 		c.expectRefusedAndClosed(t, errAuthMismatch)
 	}
 }
 
-func TestAMACOfAnEarlierConnectionIsRefused(t *testing.T) {
+func TestAnAuthWithAMACFieldInPlaceOfASignatureIsRefused(t *testing.T) {
+	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
+	c := a.dial()
+	c.send(t, proto.Message{"t": "auth", "mac": strings.Repeat("0", 64)})
+	c.expectRefusedAndClosed(t, errAuthMismatch)
+}
+
+func TestASignatureOfAnEarlierConnectionIsRefused(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{})
 	first := a.dial()
-	mac := first.mac(t, testKey)
-	first.send(t, proto.Message{"t": "auth", "mac": mac})
+	sig := first.sign(t, hostPrivate)
+	first.send(t, proto.Message{"t": "auth", "signature": sig})
 	if m := first.next(t); m.Type() != "authed" {
 		t.Fatalf("auth answered %v", m)
 	}
 	replay := a.dial()
-	replay.send(t, proto.Message{"t": "auth", "mac": mac})
+	replay.send(t, proto.Message{"t": "auth", "signature": sig})
 	replay.expectRefusedAndClosed(t, errAuthMismatch)
 }
 
 func TestAuthWhileNoKeyIsStoredIsRefused(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{}, Options{})
 	c := a.dial()
-	c.send(t, proto.Message{"t": "auth", "mac": c.mac(t, testKey)})
+	c.send(t, proto.Message{"t": "auth", "signature": c.sign(t, hostPrivate)})
 	c.expectRefusedAndClosed(t, errNotPaired)
 	if a.store.stored() != nil {
 		t.Fatal("a key was stored")
 	}
 }
 
-func TestAPairKeyThatIsNot64HexDigitsIsRefused(t *testing.T) {
+func TestAPairPublicKeyThatIsNot64HexDigitsIsRefused(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{}, Options{})
 	for _, key := range []string{"", "abc", strings.Repeat("g", 64), strings.Repeat("a", 66)} {
 		c := a.dial()
-		c.send(t, proto.Message{"t": "pair", "key": key})
+		c.send(t, proto.Message{"t": "pair", "publicKey": key})
 		c.expectRefusedAndClosed(t, errBadPairKey)
 	}
 	if a.store.stored() != nil {
@@ -270,7 +290,7 @@ func TestAPairKeyThatIsNot64HexDigitsIsRefused(t *testing.T) {
 func TestAKeyStoreErrorRefusesWithItsReason(t *testing.T) {
 	a := startAuthServer(t, &memoryKeyStore{err: errors.New("the data folder is not locked")}, Options{})
 	c := a.dial()
-	c.send(t, proto.Message{"t": "pair", "key": hex.EncodeToString(testKey)})
+	c.send(t, proto.Message{"t": "pair", "publicKey": hex.EncodeToString(testKey)})
 	c.expectRefusedAndClosed(t, "this alcove-agent cannot use its host key: the data folder is not locked")
 }
 
@@ -388,21 +408,45 @@ func TestSecretsAreComparedInConstantTime(t *testing.T) {
 	if !usesSubtle {
 		t.Fatal("sameSecret does not call subtle.ConstantTimeCompare")
 	}
-	if calls["sameSecret"] < 2 {
-		t.Fatalf("auth.go calls sameSecret %d times; the pair key and the MAC both go through it", calls["sameSecret"])
+	if calls["sameSecret"] < 1 {
+		t.Fatal("auth.go does not compare the pair public key through sameSecret")
 	}
 	for _, f := range []string{"bytes.Equal", "hmac.Equal", "reflect.DeepEqual", "bytes.Compare"} {
 		if calls[f] > 0 {
 			t.Fatalf("auth.go calls %s", f)
 		}
 	}
+	if calls["ed25519.Verify"] != 1 {
+		t.Fatalf("auth.go calls ed25519.Verify %d times", calls["ed25519.Verify"])
+	}
 }
 
-func TestHostMACMatchesTheVectorTheHostAndTheScriptsCompute(t *testing.T) {
-	key := bytes.Repeat([]byte{0xA5}, KeySize)
+// The vector of seed 0xA5 x 32 and nonce 0x0F x 32 that AgentAuthTests.swift checks too.
+const (
+	vectorPublicKey = "29e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d55"
+	// vectorCryptoKitSignature was produced by CryptoKit's Curve25519.Signing for the vector.
+	vectorCryptoKitSignature = "c3bc0953d4da7bb790c3907a80bae91023e0298463dde222ef8e1f1a6b312b4a7c0766deee90601af5cd25772c061db0ac171014a97fcea1fdaa3b64dd8e2d09"
+	// vectorGoSignature is ed25519.Sign's signature for the vector.
+	vectorGoSignature = "34e3a451b7da207d9d86cdc48cc5a9bf8bab364fe35faa83a551117d64e3fe003ab06eef28d3d682b612f24473dd06b74d3fdd5f377a647487ad3e6505015c02"
+)
+
+func TestTheSignaturesOfTheVectorVerify(t *testing.T) {
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0xA5}, KeySize))
+	public := private.Public().(ed25519.PublicKey)
+	if got := hex.EncodeToString(public); got != vectorPublicKey {
+		t.Fatalf("public key %s, expected %s", got, vectorPublicKey)
+	}
 	nonce := bytes.Repeat([]byte{0x0F}, KeySize)
-	const want = "13daefa462caacbb63066b5b01254968e0dbe593431ed427fa29b8c891cadd05"
-	if got := hex.EncodeToString(hostMAC(key, nonce)); got != want {
-		t.Fatalf("hostMAC = %s, expected %s", got, want)
+	if got := hex.EncodeToString(ed25519.Sign(private, append([]byte(authContext), nonce...))); got != vectorGoSignature {
+		t.Fatalf("ed25519.Sign = %s, expected %s", got, vectorGoSignature)
+	}
+	for _, sig := range []string{vectorCryptoKitSignature, vectorGoSignature} {
+		if !hostSigned(public, nonce, sig) {
+			t.Fatalf("%s does not verify", sig)
+		}
+	}
+	other := bytes.Repeat([]byte{0x0E}, KeySize)
+	if hostSigned(public, other, vectorCryptoKitSignature) {
+		t.Fatal("the signature verifies for another nonce")
 	}
 }

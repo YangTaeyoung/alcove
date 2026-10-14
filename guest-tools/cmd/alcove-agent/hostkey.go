@@ -13,8 +13,8 @@ import (
 // keyFileMax bounds what Load reads of a key file.
 const keyFileMax = 256
 
-// fileKeyStore keeps the host key in a file that holds the key as 64
-// hexadecimal digits and a newline.
+// fileKeyStore keeps the host's Ed25519 public key in a file that holds the
+// key as 64 hexadecimal digits and a newline.
 type fileKeyStore struct {
 	path string
 	// unusable, when set, is the error of every Load and Save.

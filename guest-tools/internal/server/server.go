@@ -40,8 +40,8 @@ type Options struct {
 	// AllowPeers holds the address ranges whose connections are served; empty
 	// means DefaultPeers.
 	AllowPeers []netip.Prefix
-	// HostKey keeps the key of the host the agent is paired with; a connection
-	// is served after it paired or proved that key. Nil serves every
+	// HostKey keeps the public key of the host the agent is paired with; a
+	// connection is served after it paired or signed its nonce with that key. Nil serves every
 	// connection from AllowPeers without pairing.
 	HostKey KeyStore
 	// AuthTimeout bounds the time from the hello to the pair or auth message;

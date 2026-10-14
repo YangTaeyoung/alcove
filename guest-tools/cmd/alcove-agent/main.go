@@ -1,6 +1,7 @@
 // alcove-agent runs inside a guest and serves docs/agent-protocol.md on TCP 7645
 // to connections from 10.0.2.2 and from the ranges given with --allow-peer,
-// once the host paired with it or proved the stored host key.
+// once the host paired with it or signed the connection's nonce with the key
+// whose public key is stored.
 //
 //	alcove-agent [--port 7645] [--allow-exec] [--allow-peer CIDR]... [--token T]
 //	alcove-agent --install   (Windows: scheduled task at logon + firewall rule)

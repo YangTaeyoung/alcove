@@ -1,9 +1,8 @@
 package server
 
 import (
-	"crypto/hmac"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -15,16 +14,19 @@ import (
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
 
-// KeyStore keeps the key of the host the agent is paired with.
+// KeyStore keeps the Ed25519 public key of the host the agent is paired with.
 type KeyStore interface {
-	// Load returns the stored key, or nil and no error when none is stored.
+	// Load returns the stored public key, or nil and no error when none is stored.
 	Load() ([]byte, error)
 	// Save stores key; it fails when a key is stored already.
 	Save(key []byte) error
 }
 
-// KeySize is the length in bytes of a host key and of a hello nonce.
+// KeySize is the length in bytes of a host public key and of a hello nonce.
 const KeySize = 32
+
+// authContext comes before the nonce in the message the host signs.
+const authContext = "alcove-agent-auth-v1"
 
 // defaultAuthTimeout is how long a connection may take from the hello to its
 // pair or auth message.
@@ -34,7 +36,7 @@ const (
 	errAuthMismatch    = "the host did not prove the key this alcove-agent is paired with; when the VM's agentKey changed (a re-created VM, or a disk taken from another VM), run alcove-agent --forget-host-key as an administrator in the guest and connect again"
 	errPairedOther     = "this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again"
 	errNotPaired       = "this alcove-agent holds no host key; connect again to pair it"
-	errBadPairKey      = "the key in pair is not 64 hexadecimal digits; send the VM's agentKey"
+	errBadPairKey      = "the publicKey in pair is not 64 hexadecimal digits; send the public key of the VM's agentKey"
 	errUnauthenticated = "this alcove-agent serves only a host that pairs with it or proves its key; update the Alcove app on the host"
 	errAuthTimeout     = "no pair or auth message arrived within 30 s; the host pairs or authenticates right after the hello"
 )
@@ -51,11 +53,18 @@ func sameSecret(a, b []byte) bool {
 	return subtle.ConstantTimeCompare(a, b) == 1
 }
 
-// hostMAC is HMAC-SHA256 of nonce under key.
-func hostMAC(key, nonce []byte) []byte {
-	m := hmac.New(sha256.New, key)
-	m.Write(nonce)
-	return m.Sum(nil)
+// hostSigned reports whether signatureText is the hex Ed25519 signature by
+// the private key of public of authContext followed by nonce.
+func hostSigned(public, nonce []byte, signatureText string) bool {
+	if len(public) != ed25519.PublicKeySize || len(signatureText) != 2*ed25519.SignatureSize {
+		return false
+	}
+	signature, err := hex.DecodeString(signatureText)
+	if err != nil {
+		return false
+	}
+	message := append([]byte(authContext), nonce...)
+	return ed25519.Verify(ed25519.PublicKey(public), message, signature)
 }
 
 // decodeSecret returns the KeySize bytes that 2*KeySize hexadecimal digits
@@ -68,8 +77,9 @@ func decodeSecret(text string) ([]byte, bool) {
 	return b, err == nil
 }
 
-// pair stores key when no key is stored and accepts a key equal to the stored
-// one. It returns the refusal sentence, or "" when the host is served.
+// pair stores the public key keyText encodes when no key is stored and
+// accepts a key equal to the stored one. It returns the refusal sentence, or
+// "" when the host is served.
 func (s *Server) pair(keyText string) string {
 	key, ok := decodeSecret(keyText)
 	if !ok {
@@ -94,9 +104,10 @@ func (s *Server) pair(keyText string) string {
 	return ""
 }
 
-// auth checks that macText is hostMAC of nonce under the stored key. It
-// returns the refusal sentence, or "" when the host is served.
-func (s *Server) auth(macText string, nonce []byte) string {
+// auth checks that signatureText is the host's signature of nonce under the
+// stored public key. It returns the refusal sentence, or "" when the host is
+// served.
+func (s *Server) auth(signatureText string, nonce []byte) string {
 	stored, err := s.opt.HostKey.Load()
 	if err != nil {
 		return keyError(err)
@@ -104,8 +115,7 @@ func (s *Server) auth(macText string, nonce []byte) string {
 	if stored == nil {
 		return errNotPaired
 	}
-	got, err := hex.DecodeString(macText)
-	if err != nil || !sameSecret(hostMAC(stored, nonce), got) {
+	if !hostSigned(stored, nonce, signatureText) {
 		return errAuthMismatch
 	}
 	return ""
@@ -169,9 +179,9 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader) bool {
 		case "welcome", "ping", "pong":
 			continue
 		case "pair":
-			refusal = s.pair(m.String("key"))
+			refusal = s.pair(m.String("publicKey"))
 		case "auth":
-			refusal = s.auth(m.String("mac"), nonce)
+			refusal = s.auth(m.String("signature"), nonce)
 		default:
 			if answer := unauthenticatedAnswer(m); answer != nil {
 				write(answer)
