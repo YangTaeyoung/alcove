@@ -1352,6 +1352,56 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.log.entries, ["proxy.stop"])
     }
 
+    func testAVMTheAppRenamesKeepsItsEntryAndNotesUnderItsNewNameAndPath() async throws {
+        let dir = try tempDir()
+        let path = "/VMs/Win.alcove"
+        let c = try await capture(directory: dir, bundle: path)
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        let other = CaptureJournal.Entry(vm: "Win", port: 49153, thumbprint: otherThumbprint, systemProxy: true, since: "x", path: "/Other/Win.alcove")
+        try c.journal.record(other, now: Date())
+        c.log.clear()
+        await c.h.vmRenamed(from: "Win", oldPath: path, to: "Work", newPath: "/VMs/Work.alcove")
+        XCTAssertEqual(c.log.entries, ["proxy.stop"])
+        let renamed = CaptureJournal.VM(name: "Work", path: "/VMs/Work.alcove")
+        let entry = try XCTUnwrap(c.journal.entry(for: renamed))
+        XCTAssertEqual(entry.vm, "Work")
+        XCTAssertEqual(entry.path, "/VMs/Work.alcove")
+        XCTAssertEqual(entry.port, 49152)
+        XCTAssertEqual(c.journal.snapshotEntry("mid-capture", vm: renamed)?.owner, renamed)
+        XCTAssertNil(c.journal.entry(for: CaptureJournal.VM(name: "Win", path: path)))
+        XCTAssertEqual(c.journal.entry(for: other.owner), other)
+    }
+
+    func testARenameWithoutAHandlerMovesTheEntryOfAnEntryWithoutAPath() throws {
+        let dir = try tempDir()
+        let journal = CaptureJournal(directory: dir)
+        try journal.record(CaptureJournal.Entry(vm: "Win", port: 49152, thumbprint: caThumbprint, systemProxy: true, since: "x"), now: Date())
+        try ControlHandler.vmRenamed(from: "Win", oldPath: "/VMs/Win.alcove", to: "Work", newPath: "/VMs/Work.alcove", captureDirectory: dir)
+        XCTAssertEqual(journal.entry(for: CaptureJournal.VM(name: "Work", path: "/VMs/Work.alcove"))?.port, 49152)
+        XCTAssertNil(journal.entry(for: "Win"))
+    }
+
+    func testCloneOfAVMWhoseGuestHoldsAnEarlierCaptureIsRefused() async throws {
+        let provisioning = LockedBox<FakeProvisioningRegistry?>(nil)
+        let c = try await capture(registry: { target in
+            let registry = FakeProvisioningRegistry(targets: ["Win": target])
+            provisioning.value = registry
+            return registry
+        })
+        try c.journal.record(CaptureJournal.Entry(vm: "Win", port: 49152, thumbprint: caThumbprint, systemProxy: true, since: "x"), now: Date())
+        await c.t.setState(.stopped)
+        let text = await c.failure("vm.clone", ["name": "Win", "newName": "Copy"])
+        XCTAssertEqual(text, "'Win' still holds the proxy settings and the CA certificate of an earlier HTTP capture in its guest; start it, wait "
+                       + "until vm.status shows tools so that Alcove removes them, stop it and call vm.clone again")
+        let calls = await provisioning.value?.calls
+        XCTAssertEqual(calls, [])
+        try c.journal.remove(vm: "Win", now: Date())
+        _ = try await c.h.handle(op: "vm.clone", params: ["name": "Win", "newName": "Copy"])
+        let after = await provisioning.value?.calls
+        XCTAssertEqual(after, ["clone:Win->Copy"])
+    }
+
     func testTheHeadlessLogWritesEachLineToStandardErrorAndTheSystemLog() {
         let written = LockedBox<[String]>([])
         let log = ControlHandler.standardErrorAndSystemLog(write: { written.value = written.value + [$0] })

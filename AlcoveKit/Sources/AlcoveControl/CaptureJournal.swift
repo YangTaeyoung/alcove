@@ -141,6 +141,22 @@ struct CaptureJournal: Sendable {
         }
     }
 
+    /// Gives the entries and the snapshot notes of `old` the name and the path of `new`.
+    func rename(from old: VM, to new: VM, now: Date) throws {
+        guard let contents = read(), contents.captures.contains(where: { $0.belongs(to: old) })
+                || contents.snapshots.contains(where: { $0.entry.belongs(to: old) }) else { return }
+        func moved(_ entry: Entry) -> Entry {
+            var entry = entry
+            entry.vm = new.name
+            entry.path = new.path
+            return entry
+        }
+        try change(now: now) { contents in
+            contents.captures = contents.captures.map { $0.belongs(to: old) ? moved($0) : $0 }
+            contents.snapshots = contents.snapshots.map { $0.entry.belongs(to: old) ? ($0.snapshot, moved($0.entry)) : $0 }
+        }
+    }
+
     // MARK: - the file
 
     /// What the file holds; nil when it is missing or cannot be read as version 1.

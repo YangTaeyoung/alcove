@@ -521,6 +521,25 @@ extension ControlHandler {
         forget(vm: vm)
     }
 
+    /// Called after the app renamed the VM `oldName`, whose bundle had the standardized file path `oldPath`, to
+    /// `newName` at `newPath` without the control protocol: ends a capture under the old name, gives the VM's entry and
+    /// snapshot notes in the capture journal the new name and path, and drops what the handler keeps under the old name.
+    public func vmRenamed(from oldName: String, oldPath: String?, to newName: String, newPath: String?) async {
+        await endCapture(oldName)
+        lostCaptures[oldName] = nil
+        try? ControlHandler.vmRenamed(from: oldName, oldPath: oldPath, to: newName, newPath: newPath, captureDirectory: captureJournal.url
+            .deletingLastPathComponent(), now: wallClock())
+        forget(vm: oldName)
+    }
+
+    /// Gives the entry and the snapshot notes of the VM `oldName` at `oldPath` in the capture journal of
+    /// `captureDirectory` the name `newName` and the path `newPath`; for a host that runs no control handler.
+    public static func vmRenamed(from oldName: String, oldPath: String?, to newName: String, newPath: String?, captureDirectory: URL,
+                                 now: Date = Date()) throws {
+        try CaptureJournal(directory: captureDirectory).rename(from: CaptureJournal.VM(name: oldName, path: oldPath),
+                                                               to: CaptureJournal.VM(name: newName, path: newPath), now: now)
+    }
+
     /// The VM `t` as the capture journal knows it.
     func journalVM(_ t: VMTarget) async -> CaptureJournal.VM {
         CaptureJournal.VM(name: t.name, path: await t.bundlePath())

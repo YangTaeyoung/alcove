@@ -1046,7 +1046,12 @@ cannot clone a VM with a TPM
 a VM named '<newName>' already exists; choose another name
 qemu-img could not create the clone's disk (<message>); check the template's disk images and the free space, then clone again
 every guest-tools port from 17000 to 17999 is used by a VM in <folder>; delete a VM there or move it to another folder, then clone again
+'<vm>' still holds the proxy settings and the CA certificate of an earlier HTTP capture in its guest; start it, wait until vm.status shows tools so that Alcove removes them, stop it and call vm.clone again
 ```
+
+The last one is answered while the capture journal (see [Cleanup after an
+earlier capture](#cleanup-after-an-earlier-capture)) holds an entry for the
+template.
 
 **The template guard.** A clone reads every block it has not written from the
 template's disk, so the template must not change while a clone exists. For as
@@ -1927,9 +1932,11 @@ readable version 1 counts as empty; the next change renames it to
 refuses `vm.http.start` before any guest step. An entry matches a VM by the
 standardized path of its bundle as the host spells it (an entry without
 `path` by name), so the app and `alcovectl serve --dir <other>` keep separate
-entries for equally named VMs; after a rename, a move or with a symbolic link
-in `--dir` the old entry no longer matches, and `vm.http.stop` still restores
-the guest from its state file.
+entries for equally named VMs. A rename in the app gives the VM's entry and
+snapshot notes the new name and path, also while another server owns the
+control socket. After a move by hand or with a symbolic link in `--dir` the
+old entry no longer matches, and `vm.http.stop` still restores the guest from
+its state file.
 
 When the guest tools of a VM with an entry connect and no capture of it runs
 (after a crash of the host, a forced or paused stop, a stop without tools, a

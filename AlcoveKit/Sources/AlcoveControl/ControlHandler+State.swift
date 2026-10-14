@@ -16,6 +16,11 @@ extension ControlHandler {
         do {
             if op == "vm.clone" {
                 let newName = try string(params, "newName").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard captureJournal.entry(for: owner) == nil else {
+                    throw ControlError.failed("'\(name)' still holds the proxy settings and the CA certificate of an earlier HTTP capture in its "
+                                              + "guest; start it, wait until vm.status shows tools so that Alcove removes them, stop it and "
+                                              + "call vm.clone again")
+                }
                 try await provisioning.cloneVM(named: name, as: newName)
                 return ["name": .string(newName)]
             }
