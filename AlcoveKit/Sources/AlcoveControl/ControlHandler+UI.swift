@@ -270,8 +270,16 @@ extension ControlHandler {
     static let maxMarks = 100
     static let maxObservedEvents = 20
     static let observedTreeNodes = 150
-    /// The keys `vm.ui.type` presses for `clear`, in this order; the text typed after them replaces the selection.
-    static let selectAllKeys = ["ctrl+a", "ctrl+home", "ctrl+shift+end"]
+    /// The roles, in lower case, whose `clear` also presses `ctrl+home` and `ctrl+shift+end`.
+    static let textRoles: Set<String> = ["edit", "document"]
+
+    /// The keys `vm.ui.type` presses for `clear` on an element of `role`, in this order; the text typed after them
+    /// replaces the selection. `Edit` and `Document` get `ctrl+a`, `ctrl+home`, `ctrl+shift+end`; any other role,
+    /// or none, gets `ctrl+a`.
+    static func selectAllKeys(role: String?) -> [String] {
+        guard let role, textRoles.contains(role.lowercased()) else { return ["ctrl+a"] }
+        return ["ctrl+a", "ctrl+home", "ctrl+shift+end"]
+    }
     static let defaultLaunchWaitSeconds = 15.0
     static let maxWaitWindowSeconds = 300.0
 
@@ -541,7 +549,7 @@ extension ControlHandler {
             try await self.send("vm.mouse.click", to: t, ["x": .int(Int64(target.x)), "y": .int(Int64(target.y))])
             try await Task.sleep(for: UITiming.focusDelay)
             if clear {
-                for keys in ControlHandler.selectAllKeys { try await self.send("vm.key.press", to: t, ["keys": .string(keys)]) }
+                for keys in ControlHandler.selectAllKeys(role: target.node["role"]?.stringValue) { try await self.send("vm.key.press", to: t, ["keys": .string(keys)]) }
             }
             if !text.isEmpty {
                 try await self.send("vm.type", to: t, ["text": .string(text)])

@@ -485,6 +485,29 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "ui.rect").count, rects)
     }
 
+    func testUITypeClearSelectsWithThreeKeysOnlyForEditAndDocumentTargets() async throws {
+        let target = LockedBox<JSON>(.null)
+        let (h, t, _) = try await rig(["ui.rect": { _, _ in .ok(["node": target.value, "cx": 250, "cy": 72, "clickable": true]) }])
+        let three = try keys(KeyNames.pressSequence("ctrl+a")) + keys(KeyNames.pressSequence("ctrl+home"))
+            + keys(KeyNames.pressSequence("ctrl+shift+end"))
+        let one = try keys(KeyNames.pressSequence("ctrl+a"))
+        let roleless: JSON = ["ref": "e9", "name": "Cell"]
+        let cases: [(JSON, [String])] = [
+            (node("e4", "Edit", "Message"), three),
+            (node("e6", "document", "Body"), three),
+            (node("e7", "DataItem", "B7"), one),
+            (node("e8", "ComboBox", "Size"), one),
+            (roleless, one),
+        ]
+        for (n, selectKeys) in cases {
+            target.value = n
+            let before = await t.sent.count
+            _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "ref": n["ref"] ?? .null, "text": "42", "clear": true])
+            let sent = Array(await t.sent.dropFirst(before + 5))
+            XCTAssertEqual(keys(sent), try selectKeys + keys(KeyNames.typeSequence("42")), "\(n)")
+        }
+    }
+
     /// Makes `agent` answer `clipboard.get` with the text of the latest `clipboard.set`, or with `held` when given,
     /// while `answering` is true; other messages go to the handler the agent had.
     private func giveClipboard(to agent: FakeAgent, holding held: String? = nil, answering: LockedBox<Bool> = LockedBox(true)) {
