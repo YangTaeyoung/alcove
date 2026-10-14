@@ -138,12 +138,14 @@ func (c *capBuf) count() int64 {
 }
 
 // snapshot hands over the kept bytes, whose reservation the store releases
-// when the exchange is added.
+// when the exchange is added; later writes are only counted.
 func (c *capBuf) snapshot() (data []byte, total int64, truncated bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	data, c.buf = c.buf, nil
-	return data, c.n, !c.off && c.n > int64(len(data))
+	truncated = !c.off && c.n > int64(len(data))
+	c.off = true
+	return data, c.n, truncated
 }
 
 // Store keeps the newest exchanges.

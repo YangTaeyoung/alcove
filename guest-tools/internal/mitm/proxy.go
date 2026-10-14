@@ -298,12 +298,22 @@ const tlsHandshakeRecord = 0x16
 var requestLine = regexp.MustCompile(`^[A-Z]+ [^ ]+ HTTP/1\.[01]\r?\n$`)
 
 // startsWithRequestLine reports whether the client's first line, read ahead
-// into br until the connection's read deadline, is an HTTP/1 request line.
+// into br until the connection's read deadline, is an HTTP/1 request line. It
+// reports false at the first method byte outside A-Z.
 func startsWithRequestLine(br *bufio.Reader) bool {
+	inMethod := true
 	for n := 1; n <= br.Size(); n++ {
 		b, err := br.Peek(n)
 		if err != nil {
 			return false
+		}
+		if inMethod {
+			switch c := b[n-1]; {
+			case c == ' ' && n > 1:
+				inMethod = false
+			case c < 'A' || c > 'Z':
+				return false
+			}
 		}
 		if b[n-1] == '\n' {
 			return requestLine.Match(b)

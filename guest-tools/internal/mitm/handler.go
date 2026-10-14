@@ -149,9 +149,8 @@ func drainBody(w http.ResponseWriter, r *http.Request, ex *Exchange) {
 
 // readAhead reads up to maxBodyBytes of an HTTP/1 request body through the
 // capture tee, for at most drainTimeout, and replaces r.Body with one that
-// returns those bytes before the rest. A body read to its end lets the server
-// watch the connection, so a client that hangs up cancels r.Context(). It
-// reports false after answering 408 when the body did not arrive in time.
+// returns those bytes before the rest. It reports false after answering 408
+// when the body did not arrive in time.
 func readAhead(w http.ResponseWriter, r *http.Request, ex *Exchange, resCap *capBuf) bool {
 	if r.ProtoMajor != 1 || r.ContentLength == 0 {
 		return true

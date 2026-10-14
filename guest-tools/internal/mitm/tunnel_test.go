@@ -148,3 +148,19 @@ func TestTunnelEndsAfterTheIdleTimeWhenTheUpstreamHoldsOn(t *testing.T) {
 		t.Fatalf("row %v", x)
 	}
 }
+
+func TestFirstByteOutsideAToZDecidesWithoutWaiting(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+	go client.Write([]byte{0x00})
+	done := make(chan bool, 1)
+	go func() { done <- startsWithRequestLine(bufio.NewReader(server)) }()
+	select {
+	case got := <-done:
+		if got {
+			t.Fatal("a binary first byte was taken for a request line")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("startsWithRequestLine kept waiting for more bytes")
+	}
+}

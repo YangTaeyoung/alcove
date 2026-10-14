@@ -70,3 +70,18 @@ func TestHeadersBeyondTheCapAreLeftOutAndCounted(t *testing.T) {
 		t.Fatalf("used %d, want %d", env.proxy.store.used, want)
 	}
 }
+
+func TestWritesAfterSnapshotReserveNothing(t *testing.T) {
+	s := newStore(10)
+	c := s.newCapBuf(true)
+	c.Write([]byte("abc"))
+	data, total, truncated := c.snapshot()
+	if string(data) != "abc" || total != 3 || truncated {
+		t.Fatalf("snapshot %q of %d, truncated %v", data, total, truncated)
+	}
+	s.add(&Exchange{URL: "http://h/a", ReqBody: data, held: int64(len(data))})
+	c.Write([]byte("defgh"))
+	if s.inflight != 0 || c.count() != 8 {
+		t.Fatalf("in flight %d, count %d", s.inflight, c.count())
+	}
+}
