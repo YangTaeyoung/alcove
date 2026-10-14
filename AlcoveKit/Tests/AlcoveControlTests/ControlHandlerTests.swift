@@ -96,6 +96,10 @@ actor FakeTarget: VMTarget {
     func agent(timeout: Duration) async -> AgentClient? {
         agentTimeouts.append(timeout)
         agentCalls.append((timeout, sent.count))
+        if let hook = agentHook {
+            agentHook = nil
+            await hook(self)
+        }
         if agentWait > .zero {
             agentWaits += 1
             try? await Task.sleep(for: agentWait)
@@ -153,11 +157,22 @@ actor FakeTarget: VMTarget {
     /// What `agentLink()` answers when set, whatever agent is set.
     var linkState: AgentLinkState?
     func setLinkState(_ value: AgentLinkState?) { linkState = value }
+    /// The agent that the connection attempt of the next `agentLink()` without an agent adopts through `connectAgent`.
+    var linkAgent: AgentClient?
+    func setLinkAgent(_ a: AgentClient?) { linkAgent = a }
+    /// Runs once, at the start of the next `agent(timeout:)` call.
+    var agentHook: (@Sendable (FakeTarget) async -> Void)?
+    func setAgentHook(_ hook: (@Sendable (FakeTarget) async -> Void)?) { agentHook = hook }
     /// Counted in `agentCalls` as a call without a timeout.
     func agentLink() async -> AgentLinkState {
         agentCalls.append((.zero, sent.count))
         if let linkState { return linkState }
         if let agentClient { return .connected(agentClient) }
+        if let adopted = linkAgent {
+            linkAgent = nil
+            await connectAgent(adopted)
+            return .connecting
+        }
         return connectingAgent ? .connecting : .notConnected
     }
     func setAgent(_ a: AgentClient?) {

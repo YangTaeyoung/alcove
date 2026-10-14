@@ -114,6 +114,8 @@ public actor ControlHandler {
     let captureJournal: CaptureJournal
     /// Per VM: the running cleanup after an earlier capture.
     var staleCleanups: [String: (id: UUID, task: Task<Bool, Never>)] = [:]
+    /// Per VM: the latest cleanup after an earlier capture that ended, and whether it removed anything from the guest.
+    var endedCleanups: [String: (id: UUID, cleaned: Bool)] = [:]
     /// Per VM: the target object this handler observes the agent connections of.
     var observedTargets: [String: EventMark] = [:]
 

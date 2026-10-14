@@ -961,7 +961,7 @@ final class ControlHTTPTests: XCTestCase {
         let cleaned = await cleanup?.value
         XCTAssertEqual(cleaned, true)
         XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
-        XCTAssertEqual(Array(c.limits.value.suffix(2)), [12_000, 12_000])
+        XCTAssertEqual(Array(c.limits.value.suffix(2)), [25_000, 25_000])
         XCTAssertNil(c.journal.entry(for: "Win"))
         let running = await next.runningCleanup(of: "Win")
         XCTAssertNil(running)
@@ -970,6 +970,77 @@ final class ControlHTTPTests: XCTestCase {
         let second = await next.runningCleanup(of: "Win")
         XCTAssertNil(second)
         XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+    }
+
+    func testToolsTheAppSeesMakeTheControlTargetConnectAndCleanOnce() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        let next = c.makeHandler()
+        await c.t.setAgent(nil)
+        c.log.clear()
+        c.outputs.value["recipe.clearProxy"] = restoredState(caThumbprint)
+        await c.t.setLinkAgent(try await newConnection(c))
+        let calls = await c.t.agentCalls.count
+
+        await next.guestToolsSeen(vm: "Win")
+        let cleaned = await next.runningCleanup(of: "Win")?.value
+        XCTAssertEqual(cleaned, true)
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+        let linked = await c.t.agentCalls.count
+        XCTAssertEqual(linked, calls + 1)
+        let adopted = await c.t.agentClient
+        XCTAssertNotNil(adopted)
+
+        await next.guestToolsSeen(vm: "Win")
+        let again = await next.runningCleanup(of: "Win")
+        XCTAssertNil(again)
+        let after = await c.t.agentCalls.count
+        XCTAssertEqual(after, linked)
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+    }
+
+    func testToolsTheAppSeesCleanOverAConnectionTheControlTargetHolds() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        let next = c.makeHandler()
+        c.log.clear()
+        await next.guestToolsSeen(vm: "Win")
+        let cleaned = await next.runningCleanup(of: "Win")?.value
+        XCTAssertEqual(cleaned, true)
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
+    func testToolsTheAppSeesConnectNothingWithoutAnEntry() async throws {
+        let c = try await capture()
+        await c.t.setAgent(nil)
+        await c.t.setLinkAgent(try await newConnection(c))
+        await c.h.guestToolsSeen(vm: "Win")
+        let calls = await c.t.agentCalls.count
+        XCTAssertEqual(calls, 0)
+        let linkAgent = await c.t.linkAgent
+        XCTAssertNotNil(linkAgent)
+        let cleanup = await c.h.runningCleanup(of: "Win")
+        XCTAssertNil(cleanup)
+        XCTAssertEqual(c.log.entries, [])
+        await c.h.guestToolsSeen(vm: "Nope")
+    }
+
+    func testToolsTheAppSeesLeaveALiveCaptureAlone() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        await c.t.setAgent(nil)
+        await c.t.setLinkAgent(try await newConnection(c))
+        let calls = await c.t.agentCalls.count
+        c.log.clear()
+        await c.h.guestToolsSeen(vm: "Win")
+        let after = await c.t.agentCalls.count
+        XCTAssertEqual(after, calls)
+        let cleanup = await c.h.runningCleanup(of: "Win")
+        XCTAssertNil(cleanup)
+        XCTAssertEqual(c.log.entries, [])
+        XCTAssertNotNil(c.journal.entry(for: "Win"))
     }
 
     func testACleanupThatFailsKeepsTheEntryForTheNextConnection() async throws {
@@ -1142,6 +1213,36 @@ final class ControlHTTPTests: XCTestCase {
         let controller = VMController(bundle: bundle, config: VMConfig.defaults(name: "Win", guestOS: .windows), engine: engine)
         let path = await ControllerTarget(name: "Win", controller: controller).bundlePath()
         XCTAssertEqual(path, "/Users/someone/VMs/Win.alcove")
+    }
+
+    func testARestoreCountsTheCleanupThatEndedBeforeItAsked() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        _ = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        let next = c.makeHandler()
+        await c.t.setSnapshotList([VMController.SnapshotInfo(name: "mid-capture", vmStateSize: 1, date: Date())])
+        _ = try await next.handle(op: "vm.status", params: ["name": "Win"])
+        let connection = try await newConnection(c)
+        await c.t.setAgentHook { t in
+            await t.connectAgent(connection)
+            _ = await next.runningCleanup(of: "Win")?.value
+        }
+        c.log.clear()
+        c.outputs.value["recipe.clearProxy"] = restoredState(caThumbprint)
+        let restored = try await next.handle(op: "vm.snapshot.restore", params: ["name": "Win", "snapshot": "mid-capture", "waitTools": 0])
+        XCTAssertEqual(restored["staleProxyCleared"]?.boolValue, true)
+        XCTAssertEqual(c.log.entries.filter { $0 != "recipe.other" }, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
+    func testASnapshotOfAGuestThatStillHoldsAnEarlierCaptureIsNoted() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        let next = c.makeHandler()
+        _ = try await next.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "after-crash"])
+        XCTAssertEqual(c.journal.snapshotEntry("after-crash", vm: "Win"), c.journal.entry(for: "Win"))
+        XCTAssertEqual(c.journal.snapshotEntry("after-crash", vm: "Win")?.port, 49152)
     }
 
     func testDeleteRemovesTheJournalEntriesOfTheVM() async throws {
@@ -1554,6 +1655,17 @@ final class ControlHTTPTests: XCTestCase {
         let unreachable = try await offline.h.handle(op: "vm.stop", params: ["name": "Win"])
         XCTAssertEqual(unreachable["warning"]?.stringValue, "the guest keeps the proxy settings and the CA certificate of the capture (its guest "
                        + "tools were not connected); Alcove restores them when its guest tools next connect")
+    }
+
+    func testStopOfAPausedCapturingVMSaysTheVMWasPaused() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        await c.t.setState(.paused)
+        c.log.clear()
+        let r = try await c.h.handle(op: "vm.stop", params: ["name": "Win"])
+        XCTAssertEqual(r["warning"]?.stringValue, ControlHandler.unrestoredWarning("the VM was paused"))
+        XCTAssertEqual(c.log.entries, ["proxy.stop"])
+        XCTAssertNotNil(c.journal.entry(for: "Win"))
     }
 
     func testCaptureEndsWhenTheVMIsFoundStopped() async throws {

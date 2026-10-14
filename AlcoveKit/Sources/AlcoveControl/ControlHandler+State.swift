@@ -92,10 +92,13 @@ extension ControlHandler {
                 throw ControlError.failed("a snapshot named '\(snapshot)' already exists in '\(t.name)'; call vm.snapshot.delete first or choose another name")
             }
             do { try await t.createSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot create failed: \(engineReason(error))") }
+            let owner = await journalVM(t)
             if let capture = captures[t.name], capture.guestChanged {
                 try? captureJournal.noteSnapshot(snapshot, during: capture.journalEntry, now: wallClock())
+            } else if let unrestored = captureJournal.entry(for: owner) {
+                try? captureJournal.noteSnapshot(snapshot, during: unrestored, now: wallClock())
             } else {
-                try? captureJournal.forgetSnapshot(snapshot, vm: await journalVM(t), now: wallClock())
+                try? captureJournal.forgetSnapshot(snapshot, vm: owner, now: wallClock())
             }
             return ["snapshot": .string(snapshot)]
         case "vm.snapshot.restore":
@@ -113,17 +116,15 @@ extension ControlHandler {
             await endCapture(t.name)
             let duringCapture = captureJournal.snapshotEntry(snapshot, vm: await journalVM(t))
             if let duringCapture { try? captureJournal.record(duringCapture, now: wallClock()) }
+            let mark = cleanupMark(t.name)
             let agent = await t.agent(timeout: .seconds(max(0, wait)))
+            let cleaning = duringCapture == nil ? nil : agent.map { cleanup(since: mark, t, $0) }
             var clockSynced = false
             if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.snapshot.restore") }
             var out: [String: JSON] = ["snapshot": .string(snapshot), "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced),
                                        "eventSeq": .int(Int64(restored))]
             if capturing { out["captureEnded"] = true }
-            if duringCapture != nil {
-                var cleared = false
-                if let agent { cleared = await staleCleanup(t, agent).value }
-                out["staleProxyCleared"] = .bool(cleared)
-            }
+            if duringCapture != nil { out["staleProxyCleared"] = .bool(await cleaning?.value ?? false) }
             return .object(out)
         case "vm.snapshot.delete":
             let snapshot = try string(params, "snapshot")

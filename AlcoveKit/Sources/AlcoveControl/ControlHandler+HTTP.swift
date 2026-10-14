@@ -30,10 +30,9 @@ public struct HTTPTiming: Sendable {
     public var staleToolsWait = Duration.seconds(5)
     /// Longest each agent request of the CA copy may take; the copy makes four, and a fifth after a failed one.
     public var pushStep = Duration.seconds(6)
-    /// The limit of each recipe of `vm.http.start` and `vm.http.stop`.
+    /// The limit of each recipe of `vm.http.start`, `vm.http.stop` and the cleanup after an earlier capture.
     public var recipe = RecipeLimit(guestMilliseconds: 25_000, marginSeconds: 5)
-    /// The limit of each recipe that undoes a failed start, restores a guest whose VM stops or whose host shuts down,
-    /// or cleans up after an earlier capture.
+    /// The limit of each recipe that undoes a failed start or restores a guest whose VM stops or whose host shuts down.
     public var undo = RecipeLimit(guestMilliseconds: 12_000, marginSeconds: 3)
 
     public init() {}
@@ -451,6 +450,15 @@ extension ControlHandler {
 
     // MARK: - what an earlier capture left
 
+    /// Called when a connection to the guest tools of `vm` that the control target does not hold, such as the app
+    /// window's, is made. When the capture journal holds an entry for the VM and no capture of it is live, the control
+    /// target connects its own tools, and that connection starts the cleanup as every connection it adopts does; a
+    /// connection the target holds already starts it at once. Without an entry nothing is connected.
+    public func guestToolsSeen(vm: String) async {
+        guard captures[vm] == nil, let t = await lookUp(vm), captureJournal.entry(for: await journalVM(t)) != nil, captures[vm] == nil else { return }
+        if case .connected(let agent) = await t.agentLink() { await toolsConnected(t, agent) }
+    }
+
     /// The VM `t` as the capture journal knows it.
     func journalVM(_ t: VMTarget) async -> CaptureJournal.VM {
         CaptureJournal.VM(name: t.name, path: await t.bundlePath())
@@ -465,7 +473,7 @@ extension ControlHandler {
     }
 
     /// The cleanup of `t` that is running, or a new one: under the capture gate of the VM it restores the guest from
-    /// the VM's journal entry and removes the entry when every step worked. Its value tells whether it removed
+    /// the VM's journal entry, with `HTTPTiming.recipe` for each recipe, and removes the entry when every step worked. Its value tells whether it removed
     /// anything of a capture from the guest.
     func staleCleanup(_ t: VMTarget, _ agent: AgentClient) -> Task<Bool, Never> {
         let vm = t.name
@@ -475,7 +483,7 @@ extension ControlHandler {
         let task = Task { [weak self] () -> Bool in
             guard let handler = self else { return false }
             let cleaned = await gate.withLock(vm) { await handler.cleanStale(t, agent) }
-            await handler.cleanupEnded(vm, id)
+            await handler.cleanupEnded(vm, id, cleaned: cleaned)
             return cleaned
         }
         staleCleanups[vm] = (id, task)
@@ -485,7 +493,35 @@ extension ControlHandler {
     /// The cleanup of `vm` that is running; nil when none is.
     func runningCleanup(of vm: String) -> Task<Bool, Never>? { staleCleanups[vm]?.task }
 
-    private func cleanupEnded(_ vm: String, _ id: UUID) {
+    /// The cleanups of a VM at one moment: the one running and the latest that ended.
+    struct CleanupMark: Sendable {
+        var running: UUID?
+        var ended: UUID?
+    }
+
+    /// The cleanups of `vm` as they are now, for `cleanup(since:_:_:)`.
+    func cleanupMark(_ vm: String) -> CleanupMark {
+        CleanupMark(running: staleCleanups[vm]?.id, ended: endedCleanups[vm]?.id)
+    }
+
+    /// Whether a cleanup of `t` begun after `mark` removed anything of a capture from the guest: the one running, the
+    /// one that ended since, or else a new one over `agent`, which waits for a cleanup that was running at `mark`.
+    func cleanup(since mark: CleanupMark, _ t: VMTarget, _ agent: AgentClient) -> Task<Bool, Never> {
+        let vm = t.name
+        if let running = staleCleanups[vm], running.id != mark.running { return running.task }
+        if let ended = endedCleanups[vm], ended.id != mark.ended, ended.id != mark.running {
+            let cleaned = ended.cleaned
+            return Task { cleaned }
+        }
+        guard let earlier = staleCleanups[vm]?.task else { return staleCleanup(t, agent) }
+        return Task {
+            _ = await earlier.value
+            return await self.staleCleanup(t, agent).value
+        }
+    }
+
+    private func cleanupEnded(_ vm: String, _ id: UUID, cleaned: Bool) {
+        endedCleanups[vm] = (id, cleaned)
         if staleCleanups[vm]?.id == id { staleCleanups[vm] = nil }
     }
 
@@ -494,7 +530,7 @@ extension ControlHandler {
         let owner = await journalVM(t)
         guard captures[vm] == nil, let entry = captureJournal.entry(for: owner), await t.state() == .running,
               case .ready(let ready) = await guestAccess(agent, vm: vm) else { return false }
-        let restored = await restoreGuest(t, ready, os: await t.guestOS(), thumbprint: entry.thumbprint, op: "vm.http.stop", limit: httpTiming.undo)
+        let restored = await restoreGuest(t, ready, os: await t.guestOS(), thumbprint: entry.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
         guard restored.failure == nil else { return false }
         try? captureJournal.remove(vm: owner, now: wallClock())
         return restored.cleared
@@ -515,8 +551,9 @@ extension ControlHandler {
     /// otherwise why it still does.
     func restoreCaptureGuest(_ t: VMTarget) async -> String? {
         guard let capture = captures[t.name], capture.guestChanged else { return nil }
-        guard await t.state() == .running, case .ready(let agent) = await guestAccess(t, wait: .zero) else {
-            return "its guest tools were not connected"
+        let state = await t.state()
+        guard state == .running, case .ready(let agent) = await guestAccess(t, wait: .zero) else {
+            return state == .paused ? "the VM was paused" : "its guest tools were not connected"
         }
         let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: "vm.stop", limit: httpTiming.undo)
         if let failure = restored.failure { return failure }
