@@ -235,6 +235,39 @@ final class ScreenTextTests: XCTestCase {
         XCTAssertEqual(r["matches"]?.arrayValue?.count, 1)
     }
 
+    func testTheRetryAfterAFailedRecognitionKeepsTheTurnLimitOfTheCall() async throws {
+        let first = RecognitionGate(), other = RecognitionGate()
+        addTeardownBlock { first.open(); other.open() }
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            first.pass()
+            throw ControlHandler.ControlError.recognitionFailed("transient")
+        }
+        addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
+        let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
+        let limit = Duration.seconds(3)
+        await h.setTextTurnLimit(limit)
+        let began = ContinuousClock.now
+        let find = Task { try await h.handle(op: "vm.find_text", params: ["name": "Win", "languages": ["en-US"]]) }
+        guard await eventually("the first reading runs", { calls.value == 1 }) else { return }
+        let blocking = Task {
+            await RecognitionQueue.shared.recognize(drawText([], width: 30, height: 10).frame, languages: ["en-US"], recognizer: { _, _ in other.pass(); return [] })
+        }
+        guard await eventually("the other reading waits", { RecognitionQueue.shared.load.waiting == 1 }) else { return }
+        try await Task.sleep(until: began + limit, clock: .continuous)
+        let opened = ContinuousClock.now
+        first.open()
+        let answer = await find.result
+        let answeredAfter = opened.duration(to: .now)
+        other.open()
+        _ = await blocking.value
+        guard case .failure(let error) = answer, let e = error as? ControlHandler.ControlError else { return XCTFail("\(answer)") }
+        XCTAssertTrue(e.description.hasPrefix("the text recognition is busy"), e.description)
+        XCTAssertLessThan(answeredAfter, limit)
+        XCTAssertEqual(calls.value, 1)
+    }
+
     func testFindTextReadsBothRecognitionsAgainWhenTheSecondOneOfAReadingWithoutLanguagesFails() async throws {
         let seen = LockedBox<[[String]]>([])
         WaitTiming.recognizer = { _, languages in

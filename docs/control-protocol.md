@@ -402,11 +402,15 @@ batch whose steps all ran leaves them as its steps left them.
   request for the frame and `languages` of a recognition that is running or
   waiting shares it. A request that is cancelled or, in a wait, runs out of
   time before its turn is taken out of the line and never recognized.
-- `vm.find_text` waits for its turn for at most 60 s. Then it leaves the line
-  and answers `the text recognition is busy (another reading has been running
-  for <n> s); retry in a few seconds`, `<n>` being the time the recognition
-  that is running has taken so far. A `vm.find_text` whose own recognition has
-  begun is answered when that recognition ends.
+- `vm.find_text` waits for its turn for at most 60 s from the moment it was
+  asked, one limit for its first recognition and the retry after a failed one.
+  Then it leaves the line and answers `the text recognition is busy (another
+  reading has been running for <n> s); retry in a few seconds`, `<n>` being the
+  time the recognition that is running has taken so far. A `vm.find_text` that
+  shared a recognition that was already running when it was asked gets the
+  same answer when that recognition has not ended within the 60 s. A
+  `vm.find_text` whose own recognition has begun is answered when that
+  recognition ends.
 - When the server starts it reads a small image with both recognizers in the
   background, which loads them; a recognizer that fails to read the image does
   not keep the other from being loaded. Loading takes a fraction of a second,

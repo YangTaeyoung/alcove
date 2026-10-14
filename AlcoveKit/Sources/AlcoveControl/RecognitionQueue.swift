@@ -17,7 +17,8 @@ final class RecognitionQueue: Sendable {
     /// What a caller is told: the outcome of its reading, or nil when it left the queue first.
     private typealias Answer = @Sendable (Outcome?) -> Void
 
-    /// The outcome for a caller whose reading had not begun when its turn limit passed.
+    /// The outcome for a caller whose reading had not begun when its turn limit passed, or that joined the reading
+    /// running when it arrived and that reading had not ended by then.
     struct Busy: Error {
         /// How long the running reading had been running by then.
         let running: Duration
@@ -41,6 +42,8 @@ final class RecognitionQueue: Sendable {
         let answer: Answer
         /// Called once the caller's reading is the running one.
         let began: (@Sendable () -> Void)?
+        /// Whether the caller joined the reading that was running when it arrived.
+        var joinedRunning = false
     }
 
     private struct Request {
@@ -126,7 +129,8 @@ final class RecognitionQueue: Sendable {
     }
 
     /// `ScreenText.read` of `frame` and `languages` with `recognizer`, once the readings asked for earlier have ended.
-    /// Nil when the task was cancelled before the result arrived. `Busy` when the reading had not begun at `limit`;
+    /// Nil when the task was cancelled before the result arrived. `Busy` when the reading had not begun at `limit`, and
+    /// when the caller joined the reading that was running when it arrived and that reading had not ended at `limit`;
     /// the caller has then left the queue. `began` is called once the reading is the running one.
     func recognize(_ frame: Frame, languages: [String]?, recognizer: @escaping Recognizer = WaitTiming.recognizer,
                    turnBy limit: ContinuousClock.Instant? = nil, began: (@Sendable () -> Void)? = nil) async -> Outcome? {
@@ -177,12 +181,14 @@ final class RecognitionQueue: Sendable {
                 return .starts(request)
             }
             if case .reading(let frame, let languages) = work {
-                if running.work.isReading(of: frame, languages: languages) {
-                    state.running?.waiters[caller] = waiter
-                    return .runs
-                }
                 let now = ContinuousClock.now
                 if let limit, now >= limit { return .busy(now - state.runningSince) }
+                if running.work.isReading(of: frame, languages: languages) {
+                    var joiner = waiter
+                    joiner.joinedRunning = true
+                    state.running?.waiters[caller] = joiner
+                    return .runs
+                }
                 if let index = state.waiting.firstIndex(where: { $0.work.isReading(of: frame, languages: languages) }) {
                     state.waiting[index].waiters[caller] = waiter
                     return .waits(raise: state.raises())
@@ -216,9 +222,13 @@ final class RecognitionQueue: Sendable {
         waiter?.answer(nil)
     }
 
-    /// Takes `caller` out of the queue when its reading waits for its turn, and answers it `Busy`.
+    /// Takes `caller` out of the queue when its reading waits for its turn or it joined the reading that was running
+    /// when it arrived, and answers it `Busy`.
     private func giveUpTurn(_ caller: Int) {
         let left: (Waiter, Duration)? = state.withLock { state in
+            if state.running?.waiters[caller]?.joinedRunning == true, let waiter = state.running?.waiters.removeValue(forKey: caller) {
+                return (waiter, ContinuousClock.now - state.runningSince)
+            }
             guard let waiter = state.removeWaiting(caller) else { return nil }
             return (waiter, ContinuousClock.now - state.runningSince)
         }

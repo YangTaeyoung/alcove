@@ -650,14 +650,14 @@ public actor ControlHandler {
         let cropped = area == frame.bounds ? frame : frame.crop(area)
         let chosen = languages
         try ScreenText.validate(languages: chosen ?? ScreenText.defaultLanguages + ScreenText.latinLanguages)
-        let turnLimit = textTurnLimit
+        let turnBy = ContinuousClock.now + textTurnLimit
         let lines: [TextMatch]
         do {
-            lines = try await queuedRecognition(of: cropped, languages: chosen, turnLimit: turnLimit)
+            lines = try await queuedRecognition(of: cropped, languages: chosen, turnBy: turnBy)
         } catch ControlError.recognitionFailed {
             try await Task.sleep(for: .milliseconds(150))
             do {
-                lines = try await queuedRecognition(of: cropped, languages: chosen, turnLimit: turnLimit)
+                lines = try await queuedRecognition(of: cropped, languages: chosen, turnBy: turnBy)
             } catch ControlError.recognitionFailed {
                 throw ControlError.failed("text recognition failed twice; call vm.find_text again or use vm.screenshot")
             }
@@ -673,11 +673,12 @@ public actor ControlHandler {
         return ["matches": .array(rows), "lines": .int(Int64(lines.count))]
     }
 
-    /// The lines the recognition queue reads in `frame`. A reading that has not begun `turnLimit` after this call
-    /// leaves the queue and throws `recognitionBusy`; a cancelled task leaves the queue and throws `CancellationError`.
-    private nonisolated func queuedRecognition(of frame: Frame, languages: [String]?, turnLimit: Duration) async throws -> [TextMatch] {
+    /// The lines the recognition queue reads in `frame`. A reading that has not begun at `turnBy`, or a reading that
+    /// was running when this call joined it and has not ended at `turnBy`, leaves the queue and throws
+    /// `recognitionBusy`; a cancelled task leaves the queue and throws `CancellationError`.
+    private nonisolated func queuedRecognition(of frame: Frame, languages: [String]?, turnBy: ContinuousClock.Instant) async throws -> [TextMatch] {
         let queue = RecognitionQueue.shared
-        guard let outcome = await queue.recognize(frame, languages: languages, turnBy: .now + turnLimit) else { throw CancellationError() }
+        guard let outcome = await queue.recognize(frame, languages: languages, turnBy: turnBy) else { throw CancellationError() }
         do {
             return try outcome.get()
         } catch let busy as RecognitionQueue.Busy {

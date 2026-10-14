@@ -810,6 +810,34 @@ final class WaitTests: XCTestCase {
         XCTAssertFalse(queue.load.running)
     }
 
+    func testACallerThatJoinedTheRunningReadingLeavesItBusyAtItsTurnLimit() async throws {
+        let queue = RecognitionQueue()
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        let started = LockedBox<[Int]>([])
+        let recognizer: RecognitionQueue.Recognizer = { frame, _ in
+            started.value.append(frame.width)
+            gate.pass()
+            return []
+        }
+        let running = Task { await queue.recognize(solid(1, 1, 0), languages: ["en-US"], recognizer: recognizer) }
+        let began = await eventually { started.value == [1] }
+        XCTAssertTrue(began)
+        for limit in [ContinuousClock.now + .milliseconds(50), ContinuousClock.now - .seconds(1)] {
+            let joined = Task { await queue.recognize(solid(1, 1, 0), languages: ["en-US"], recognizer: recognizer, turnBy: limit) }
+            let late = try await finishedValue(of: joined)
+            guard case .failure(let error)?? = late, error is RecognitionQueue.Busy else {
+                XCTFail("\(String(describing: late))")
+                continue
+            }
+            XCTAssertEqual(queue.load.callers, 1)
+        }
+        gate.open()
+        let answered = await running.value
+        XCTAssertEqual(try answered?.get(), [])
+        XCTAssertEqual(started.value, [1])
+    }
+
     func testACallerIsToldOnceWhenItsReadingBegins() async throws {
         let queue = RecognitionQueue()
         let gate = RecognitionGate()
