@@ -453,6 +453,8 @@ enum GuestRecipes {
     static let windowsProxyStatePath = "C:\\ProgramData\\Alcove\\proxy-previous.json"
     /// Where the proxy's CA certificate is kept in a Linux guest.
     static let linuxProxyCAPath = "/usr/local/share/ca-certificates/alcove-proxy.crt"
+    /// Where a Linux guest keeps the proxy's CA certificate while its removal waits for the CA bundle to be rebuilt.
+    static let linuxProxyCAAsidePath = "/usr/local/share/alcove-proxy.crt.removing"
 
     /// The guest path the proxy's CA certificate is pushed to; nil for a guest OS without a CA recipe.
     static func proxyCAPath(os: VMConfig.GuestOS) -> String? {
@@ -616,9 +618,9 @@ enum GuestRecipes {
     }
 
     /// Windows: removes the certificate with `thumbprint` from the machine's trusted roots, or without a thumbprint the
-    /// certificate of the CA file, and deletes the CA file. Linux: renames the CA file to `<CA file>.removing`, runs
-    /// `update-ca-certificates --fresh` when the guest has it, and deletes `<CA file>.removing` once that worked; a
-    /// `<CA file>.removing` that is there is refreshed and deleted the same way.
+    /// certificate of the CA file, and deletes the CA file. Linux: moves the CA file to `linuxProxyCAAsidePath`, outside
+    /// the folder `update-ca-certificates` reads, runs `update-ca-certificates --fresh` when the guest has it, and
+    /// deletes the aside file once that worked; an aside file that is there is refreshed and deleted the same way.
     /// Prints `{"removed":<bool>,"fileRemoved":<bool>}`: whether a certificate left the trusted roots and whether the
     /// file was there. A failure prints one sentence on stderr and exits with 2.
     static func removeProxyCA(thumbprint: String?, os: VMConfig.GuestOS) -> String? {
@@ -646,7 +648,7 @@ enum GuestRecipes {
         case .linux:
             return #"""
             ca=\#(linuxProxyCAPath)
-            gone="$ca.removing"
+            gone=\#(linuxProxyCAAsidePath)
             if [ -e "$ca" ]; then mv -f "$ca" "$gone" || { echo "could not move $ca aside; check that alcove-agent runs as root, then call vm.http.stop again" >&2; exit 2; }; fi
             [ -e "$gone" ] || { printf '{"removed":false,"fileRemoved":false}\n'; exit 0; }
             if command -v update-ca-certificates >/dev/null 2>&1; then
@@ -863,8 +865,8 @@ enum GuestRecipes {
     /// and `systemProxy` of a readable one, whether the CA file is there, whether the certificate of the CA file or
     /// of the state file's thumbprint is among the machine's trusted roots, the per-user WinINET proxy, and the port
     /// of a `10.0.2.2` address that is the whole WinHTTP proxy (0 without one).
-    /// Linux prints `{"caFile":<bool>,"caRemoving":<bool>}`: whether the CA file or `<CA file>.removing` is there, and
-    /// whether `<CA file>.removing` is.
+    /// Linux prints `{"caFile":<bool>,"caRemoving":<bool>}`: whether the CA file or the aside file of its removal
+    /// (`linuxProxyCAAsidePath`) is there, and whether the aside file is.
     /// A failure prints one sentence on stderr and exits with 2.
     static func readSystemProxy(os: VMConfig.GuestOS) -> String? {
         switch os {
@@ -920,9 +922,10 @@ enum GuestRecipes {
         case .linux:
             return #"""
             ca=\#(linuxProxyCAPath)
+            gone=\#(linuxProxyCAAsidePath)
             file=false
             removing=false
-            if [ -e "$ca.removing" ]; then file=true; removing=true; fi
+            if [ -e "$gone" ]; then file=true; removing=true; fi
             if [ -e "$ca" ]; then file=true; fi
             printf '{"caFile":%s,"caRemoving":%s}\n' "$file" "$removing"
             """#

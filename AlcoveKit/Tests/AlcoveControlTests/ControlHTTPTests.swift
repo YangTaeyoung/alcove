@@ -2298,6 +2298,11 @@ final class ControlHTTPTests: XCTestCase {
         let scripts = [try XCTUnwrap(GuestRecipes.installProxyCA(thumbprint: caThumbprint, os: .linux)),
                        try XCTUnwrap(GuestRecipes.removeProxyCA(thumbprint: nil, os: .linux)),
                        try XCTUnwrap(GuestRecipes.readSystemProxy(os: .linux))]
+        XCTAssertEqual(GuestRecipes.linuxProxyCAAsidePath, "/usr/local/share/alcove-proxy.crt.removing")
+        for script in scripts.dropFirst() {
+            XCTAssertTrue(script.contains("=/usr/local/share/alcove-proxy.crt.removing\n"), script)
+            XCTAssertFalse(script.contains("$ca.removing"), script)
+        }
         for script in scripts {
             XCTAssertTrue(script.contains("/usr/local/share/ca-certificates/alcove-proxy.crt"), script)
             let check = Process()
@@ -2311,11 +2316,13 @@ final class ControlHTTPTests: XCTestCase {
         }
     }
 
-    /// Runs `script` with `/bin/sh`, with `caPath` in place of the Linux CA path and `bin` first on the PATH.
-    private func runShell(_ script: String, caPath: String, bin: URL) throws -> (status: Int32, stdout: String, stderr: String) {
+    /// Runs `script` with `/bin/sh`, with `caPath` and `asidePath` in place of the Linux CA path and its aside path, and
+    /// `bin` first on the PATH.
+    private func runShell(_ script: String, caPath: String, asidePath: String, bin: URL) throws -> (status: Int32, stdout: String, stderr: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", script.replacingOccurrences(of: GuestRecipes.linuxProxyCAPath, with: caPath)]
+        process.arguments = ["-c", script.replacingOccurrences(of: GuestRecipes.linuxProxyCAAsidePath, with: asidePath)
+                                .replacingOccurrences(of: GuestRecipes.linuxProxyCAPath, with: caPath)]
         process.environment = ["PATH": bin.path + ":/usr/bin:/bin"]
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
@@ -2337,8 +2344,10 @@ final class ControlHTTPTests: XCTestCase {
         try "#!/bin/sh\necho \"$*\" >> '\(calls)'\nif [ -e '\(fail)' ]; then rm -f '\(fail)'; exit 1; fi\nexit 0\n"
             .write(toFile: stub, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
-        let ca = dir.appendingPathComponent("alcove-proxy.crt").path
-        let aside = ca + ".removing"
+        let store = dir.appendingPathComponent("ca-certificates")
+        try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+        let ca = store.appendingPathComponent("alcove-proxy.crt").path
+        let aside = dir.appendingPathComponent("alcove-proxy.crt.removing").path
         let remove = try XCTUnwrap(GuestRecipes.removeProxyCA(thumbprint: nil, os: .linux))
         let read = try XCTUnwrap(GuestRecipes.readSystemProxy(os: .linux))
         let files = FileManager.default
@@ -2346,30 +2355,31 @@ final class ControlHTTPTests: XCTestCase {
 
         try "pem".write(toFile: ca, atomically: true, encoding: .utf8)
         try "".write(toFile: fail, atomically: true, encoding: .utf8)
-        let failed = try runShell(remove, caPath: ca, bin: bin)
+        let failed = try runShell(remove, caPath: ca, asidePath: aside, bin: bin)
         XCTAssertEqual(failed.status, 2)
         XCTAssertEqual(failed.stdout, "")
         XCTAssertEqual(failed.stderr, "update-ca-certificates --fresh failed in the guest, so the guest still trusts the proxy CA; "
                        + "run it with vm.exec to see why, then call vm.http.stop again\n")
         XCTAssertFalse(files.fileExists(atPath: ca))
         XCTAssertTrue(files.fileExists(atPath: aside))
-        XCTAssertEqual(try runShell(read, caPath: ca, bin: bin).stdout, "{\"caFile\":true,\"caRemoving\":true}\n")
+        XCTAssertEqual(try files.contentsOfDirectory(atPath: store.path), [])
+        XCTAssertEqual(try runShell(read, caPath: ca, asidePath: aside, bin: bin).stdout, "{\"caFile\":true,\"caRemoving\":true}\n")
 
-        let retried = try runShell(remove, caPath: ca, bin: bin)
+        let retried = try runShell(remove, caPath: ca, asidePath: aside, bin: bin)
         XCTAssertEqual(retried.status, 0)
         XCTAssertEqual(retried.stdout, "{\"removed\":true,\"fileRemoved\":true}\n")
         XCTAssertEqual(refreshes(), ["--fresh", "--fresh"])
         XCTAssertFalse(files.fileExists(atPath: aside))
-        XCTAssertEqual(try runShell(read, caPath: ca, bin: bin).stdout, "{\"caFile\":false,\"caRemoving\":false}\n")
+        XCTAssertEqual(try runShell(read, caPath: ca, asidePath: aside, bin: bin).stdout, "{\"caFile\":false,\"caRemoving\":false}\n")
 
-        let idle = try runShell(remove, caPath: ca, bin: bin)
+        let idle = try runShell(remove, caPath: ca, asidePath: aside, bin: bin)
         XCTAssertEqual(idle.stdout, "{\"removed\":false,\"fileRemoved\":false}\n")
         XCTAssertEqual(refreshes().count, 2)
 
         try "pem".write(toFile: ca, atomically: true, encoding: .utf8)
         try "old".write(toFile: aside, atomically: true, encoding: .utf8)
-        XCTAssertEqual(try runShell(read, caPath: ca, bin: bin).stdout, "{\"caFile\":true,\"caRemoving\":true}\n")
-        let both = try runShell(remove, caPath: ca, bin: bin)
+        XCTAssertEqual(try runShell(read, caPath: ca, asidePath: aside, bin: bin).stdout, "{\"caFile\":true,\"caRemoving\":true}\n")
+        let both = try runShell(remove, caPath: ca, asidePath: aside, bin: bin)
         XCTAssertEqual(both.stdout, "{\"removed\":true,\"fileRemoved\":true}\n")
         XCTAssertEqual(refreshes().count, 3)
         XCTAssertFalse(files.fileExists(atPath: ca))
