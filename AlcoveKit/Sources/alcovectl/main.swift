@@ -4,8 +4,9 @@
 //   alcovectl list [--dir DIR]
 //   alcovectl args NAME [--dir DIR]          print the QEMU command line
 //   alcovectl agent NAME [--dir DIR] [--command CMD]   probe the guest agent of a running VM
-//   alcovectl agent-sign --vm NAME [--nonce HEX] [--public-key] [--dir DIR]   print the signature of an agent nonce
-//                 and/or the public key of the VM's agentKey (docs/agent-protocol.md, Host key)
+//   alcovectl agent-sign --vm NAME [--nonce HEX] [--public-key] [--token] [--dir DIR]   print the signature of the
+//                 VM's agentToken and an agent nonce, the public key of the VM's agentKey and the agentToken
+//                 (docs/agent-protocol.md, Host key)
 //   alcovectl serve [--dir DIR] [--socket PATH]   headless control server (docs/control-protocol.md) until SIGTERM
 //   alcovectl run-script [--vm NAME] [--var KEY[=VALUE]]... [--snapshot NAME] [--socket PATH] [--in-process] [--] FILE   replay a script (--help lists the exit statuses)
 //   alcovectl run NAME [--dir DIR] [--seconds N] [--screenshot PATH --after N] [--resize WxH --resize-after N]
@@ -49,8 +50,8 @@ if CommandLine.arguments.dropFirst().first == "run-script" { runScriptCommand(Ar
 /// `alcovectl agent-sign`: prints the lines `AgentKey.signLines` gives for the agentKey of the VM whose config is named
 /// `--vm`, one per line, or a sentence on stderr with exit status 1.
 func agentSignCommand(_ a: Args) -> Never {
-    let nonce = a.value("nonce"), publicKey = a.options["public-key"] != nil
-    guard let name = a.value("vm"), !name.isEmpty, nonce != nil || publicKey else { fail(AgentKey.signUsage) }
+    let nonce = a.value("nonce"), publicKey = a.options["public-key"] != nil, token = a.options["token"] != nil
+    guard let name = a.value("vm"), !name.isEmpty, nonce != nil || publicKey || token else { fail(AgentKey.signUsage) }
     let dir = resolvedVMDirectory(a.value("dir"))
     guard let b = VMBundle.named(name, in: dir) else {
         fail("no VM named '\(name)' in \(dir.path); pass the VM's name with --vm and its folder with --dir or ALCOVE_VM_DIR")
@@ -58,7 +59,8 @@ func agentSignCommand(_ a: Args) -> Never {
     let config: VMConfig
     do { config = try b.loadConfig() } catch { fail("cannot read \(b.configURL.path) (\(error.localizedDescription)); restore config.json from a backup") }
     do {
-        print(try AgentKey.signLines(agentKey: config.agentKey, nonce: nonce, publicKey: publicKey).joined(separator: "\n"))
+        print(try AgentKey.signLines(agentKey: config.agentKey, agentToken: config.agentToken, nonce: nonce, publicKey: publicKey,
+                                     token: token).joined(separator: "\n"))
     } catch {
         fail("\(error)")
     }

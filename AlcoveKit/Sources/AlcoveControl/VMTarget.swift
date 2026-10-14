@@ -141,7 +141,7 @@ actor AgentLink {
     var isConnecting: Bool { attempts > 0 && !lastAttemptFailed }
 
     /// `isRunning` says whether the VM runs; `endpoint` gives the forwarded agent port and the token the agent must
-    /// present; `agentKey` gives the key the client pairs or authenticates with.
+    /// present; `agentKey` gives the key the client authenticates with.
     init(events: EventBuffer, retryDelay: Duration = .seconds(1), isRunning: @escaping @Sendable () async -> Bool,
          endpoint: @escaping @Sendable () async -> (port: Int, token: String?),
          agentKey: @escaping @Sendable () async -> String? = { nil }) {

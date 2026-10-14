@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import AlcoveControl
 import AlcoveAgent
 import AlcoveQMP
@@ -7,28 +8,43 @@ import AlcoveTestSupport
 final class AgentKeyLinkTests: XCTestCase {
     private let key = String(repeating: "5a", count: 32)
     private let nonce = String(repeating: "c3", count: 32)
-    private let sentence = "this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again"
+    private let sentence = "this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later"
 
-    func testTheLinkPairsTheAgentWithThePublicKeyOfTheVMsKey() async throws {
+    func testTheLinkSignsTheTokenAndTheNonceWithTheVMsKey() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
-        agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": false]
-        agent.handler = { m, _ in m["t"]?.stringValue == "pair" ? [["t": "authed"]] : [] }
+        agent.helloExtra = ["auth": "key", "nonce": .string(nonce)]
+        agent.handler = { m, _ in m["t"]?.stringValue == "auth" ? [["t": "authed"]] : [] }
         let key = self.key
         let link = AgentLink(events: EventBuffer(), isRunning: { true }, endpoint: { (agent.port, "tok") }, agentKey: { key })
         let client = await link.agent(timeout: .seconds(30))
         XCTAssertNotNil(client)
-        XCTAssertEqual(agent.received.first?["t"]?.stringValue, "pair")
-        XCTAssertEqual(agent.received.first?["publicKey"]?.stringValue, AgentKey.publicKey(key))
+        XCTAssertEqual(agent.received.first?["t"]?.stringValue, "auth")
+        let nonce = try XCTUnwrap(linkTestHex(self.nonce))
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: XCTUnwrap(linkTestHex(XCTUnwrap(AgentKey.publicKey(key)))))
+        let signature = try XCTUnwrap(linkTestHex(XCTUnwrap(agent.received.first?["signature"]?.stringValue)))
+        XCTAssertTrue(publicKey.isValidSignature(signature, for: Data("alcove-agent-auth-v2tok".utf8) + nonce))
         let refusal = await link.lastRefusal()
         XCTAssertNil(refusal)
     }
 
+    func testTheLinkKeepsTheSentenceForGuestToolsWithoutAuth() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let key = self.key
+        let link = AgentLink(events: EventBuffer(), retryDelay: .milliseconds(10), isRunning: { true },
+                             endpoint: { (agent.port, "tok") }, agentKey: { key })
+        let client = await link.agent(timeout: .seconds(1))
+        XCTAssertNil(client)
+        let refusal = await link.lastRefusal()
+        XCTAssertEqual(refusal, AgentClient.agentWithoutAuth)
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "welcome" })
+    }
+
     func testTheLinkKeepsTheSentenceOfAnAgentThatRefusedIt() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
-        agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": false]
+        agent.helloExtra = ["auth": "key", "nonce": .string(nonce)]
         let sentence = self.sentence
         agent.handler = { m, a in
-            guard m["t"]?.stringValue == "pair" else { return [] }
+            guard m["t"]?.stringValue == "auth" else { return [] }
             a.sendLine(["t": "refused", "error": .string(sentence)])
             a.drop()
             return []
@@ -83,7 +99,7 @@ final class AgentKeyLinkTests: XCTestCase {
         XCTAssertEqual(rows.last?["ok"]?.boolValue, false)
         XCTAssertEqual(rows.last?["detail"]?.stringValue, "the guest tools refused the connection: \(sentence)")
         XCTAssertEqual(rows.last?["hint"]?.stringValue,
-                       "run alcove-agent --forget-host-key as an administrator in the guest and connect again")
+                       "start the VM with Alcove 0.2 or later")
     }
 
     func testTheFixOfARefusalIsTheTextAfterItsFirstSemicolon() {
@@ -91,4 +107,18 @@ final class AgentKeyLinkTests: XCTestCase {
         XCTAssertEqual(ControlHandler.refusalFix("no next step"), ControlHandler.refusalFallbackFix)
         XCTAssertEqual(ControlHandler.refusalFix("trailing; "), ControlHandler.refusalFallbackFix)
     }
+}
+
+/// The bytes an even number of hexadecimal digits encode, or nil.
+private func linkTestHex(_ text: String) -> Data? {
+    guard text.count % 2 == 0 else { return nil }
+    var out = Data()
+    var index = text.startIndex
+    while index < text.endIndex {
+        let next = text.index(index, offsetBy: 2)
+        guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+        out.append(byte)
+        index = next
+    }
+    return out
 }

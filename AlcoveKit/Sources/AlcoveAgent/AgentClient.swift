@@ -2,8 +2,8 @@ import Foundation
 import AlcoveQMP
 
 /// Host side of the guest agent protocol (docs/agent-protocol.md): connects
-/// to the forwarded agent port, validates the token, pairs with or authenticates
-/// to an agent that asks for the VM's agent key, and exchanges messages.
+/// to the forwarded agent port, validates the token, authenticates to the agent
+/// with the VM's agent key, and exchanges messages.
 public actor AgentClient {
     public enum AgentError: Error, Equatable, Sendable {
         case connect(String)
@@ -14,7 +14,7 @@ public actor AgentClient {
         case timeout(String)
         case remote(String)
         case unsupported(String)
-        /// The agent's `refused` line: a sentence that names the next step.
+        /// The agent's `refused` line, or `agentWithoutAuth`: a sentence that names the next step.
         case refused(String)
     }
 
@@ -24,12 +24,16 @@ public actor AgentClient {
         public let agentVersion: String
         public let capabilities: [String]
         public let rpcVersion: Int
-        /// Whether the connection paired with or authenticated to the agent with the VM's agent key.
+        /// Whether the connection authenticated to the agent with the VM's agent key.
         public let authenticated: Bool
     }
 
     /// The handshake reason when the agent asks for the VM's agent key and `connect` was given none.
     public static let noAgentKey = "the guest tools ask for the VM's agent key and none was given"
+    /// The handshake reason when the agent asks for the VM's agent key and `connect` was given no token to sign.
+    public static let noAgentToken = "the VM's config.json has no agentToken to sign; restore config.json from a backup"
+    /// The refusal of a hello without `auth` by a `connect` that was given the VM's agent key.
+    public static let agentWithoutAuth = "the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)"
     /// The handshake reason when the given agent key is not 64 hexadecimal digits.
     public static let badAgentKey = "the agentKey in the VM's config.json is not 64 hexadecimal digits; restore config.json from a backup"
     /// The handshake reason when the agent asks for a signature without a nonce of 64 hexadecimal digits.
@@ -83,9 +87,10 @@ public actor AgentClient {
     }
 
     /// Connect to `127.0.0.1:port`, wait for `hello`, check the token (when
-    /// `expectedToken` is non-nil), pair with or authenticate to an agent whose hello carries `auth: "key"` with
-    /// `agentKey` and wait for its `authed`, then answer `welcome` and mark the connection ready. The whole
-    /// handshake runs within `timeout`. An agent's `refused` line throws `.refused` with its sentence.
+    /// `expectedToken` is non-nil), send an agent whose hello carries `auth: "key"` the signature by `agentKey` of
+    /// `expectedToken` and the hello's nonce and wait for its `authed`, then answer `welcome` and mark the connection
+    /// ready. With an `agentKey`, a hello without `auth: "key"` throws `.refused(agentWithoutAuth)` and nothing is
+    /// sent. The whole handshake runs within `timeout`. An agent's `refused` line throws `.refused` with its sentence.
     public func connect(port: Int, expectedToken: String?, agentKey: String? = nil, timeout: Duration = .seconds(10)) async throws {
         guard transport == nil else { return }
         handshakeExpired = false
@@ -128,9 +133,14 @@ public actor AgentClient {
             throw AgentError.tokenMismatch
         }
         let authenticates = h["auth"]?.stringValue == "key"
+        if !authenticates, agentKey != nil {
+            timeoutTask.cancel()
+            disconnect()
+            throw AgentError.refused(AgentClient.agentWithoutAuth)
+        }
         if authenticates {
             do {
-                try await authenticate(hello: h, agentKey: agentKey)
+                try await authenticate(hello: h, token: expectedToken, agentKey: agentKey)
             } catch {
                 timeoutTask.cancel()
                 disconnect()
@@ -145,21 +155,19 @@ public actor AgentClient {
         isConnected = true
     }
 
-    /// Sends `pair` with the public key of `agentKey` to an agent whose hello says `paired: false`, otherwise `auth`
-    /// with the signature by `agentKey` of the hello's nonce (`AgentKey`), and waits for `authed`.
-    private func authenticate(hello h: JSON, agentKey: String?) async throws {
+    /// Sends `auth` with the signature by `agentKey` of `token` and the hello's nonce (`AgentKey`), and waits for
+    /// `authed`.
+    private func authenticate(hello h: JSON, token: String?, agentKey: String?) async throws {
         guard let agentKey else { throw AgentError.handshake(AgentClient.noAgentKey) }
-        guard let publicKey = AgentKey.publicKey(agentKey) else { throw AgentError.handshake(AgentClient.badAgentKey) }
-        let message: JSON
-        if h["paired"]?.boolValue == true {
-            guard let nonce = h["nonce"]?.stringValue.flatMap(AgentClient.hexBytes), nonce.count == 32 else {
-                throw AgentError.handshake(AgentClient.badNonce)
-            }
-            guard let signature = AgentKey.signature(agentKey, nonce: nonce) else { throw AgentError.handshake(AgentClient.badAgentKey) }
-            message = ["t": "auth", "signature": .string(signature)]
-        } else {
-            message = ["t": "pair", "publicKey": .string(publicKey)]
+        guard AgentKey.publicKey(agentKey) != nil else { throw AgentError.handshake(AgentClient.badAgentKey) }
+        guard let token, !token.isEmpty else { throw AgentError.handshake(AgentClient.noAgentToken) }
+        guard let nonce = h["nonce"]?.stringValue.flatMap(AgentClient.hexBytes), nonce.count == 32 else {
+            throw AgentError.handshake(AgentClient.badNonce)
         }
+        guard let signature = AgentKey.signature(agentKey, token: token, nonce: nonce) else {
+            throw AgentError.handshake(AgentClient.badAgentKey)
+        }
+        let message: JSON = ["t": "auth", "signature": .string(signature)]
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             if let refusal {
                 cont.resume(throwing: AgentError.refused(refusal))
