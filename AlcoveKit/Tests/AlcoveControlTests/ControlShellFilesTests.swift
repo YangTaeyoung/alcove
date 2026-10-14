@@ -204,6 +204,17 @@ final class ControlShellFilesTests: XCTestCase {
         }
     }
 
+    func testExecStartRefusesStdinAndTimeoutWithoutStartingAJob() async throws {
+        let (h, agent) = try await setup { m, _ in m["op"]?.stringValue == "exec.start" ? [agentReply(m, ["job": "j1", "pid": 42])] : [] }
+        let stdin = await failure(h, "vm.exec.start", ["name": "Win", "command": "sort", "stdin": "b\na\n"])
+        XCTAssertEqual(stdin, "vm.exec.start takes no stdin; start the job, then send the text with vm.exec.write (eof: true closes the job's stdin)")
+        let timeout = await failure(h, "vm.exec.start", ["name": "Win", "command": "sort", "timeout": 5])
+        XCTAssertEqual(timeout, "vm.exec.start takes no timeout; a job runs until it exits or vm.exec.kill ends it")
+        XCTAssertEqual(agentRequests(agent, "exec.start").count, 0)
+        let started = try await h.handle(op: "vm.exec.start", params: ["name": "Win", "command": "sort", "stdin": .null, "timeout": .null])
+        XCTAssertEqual(started["job"]?.stringValue, "j1")
+    }
+
     // MARK: - processes
 
     func testProcessListMapsNames() async throws {

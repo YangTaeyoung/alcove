@@ -12,6 +12,12 @@ extension ControlHandler {
             case "vm.exec":
                 return try await exec(t, params)
             case "vm.exec.start":
+                if let value = params["stdin"], value != .null {
+                    throw ControlError.failed("vm.exec.start takes no stdin; start the job, then send the text with vm.exec.write (eof: true closes the job's stdin)")
+                }
+                if let value = params["timeout"], value != .null {
+                    throw ControlError.failed("vm.exec.start takes no timeout; a job runs until it exits or vm.exec.kill ends it")
+                }
                 let request = try commandParams(params, stdin: false)
                 let r = try await tools(t).call("exec.start", request)
                 return pick(r, ["job", "pid"])

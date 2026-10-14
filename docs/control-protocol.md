@@ -108,7 +108,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.find_text` | `name`, `query?`, `regex?`, `region?`, `languages?` | `{matches, lines}` — see [Finding text](#finding-text) |
 | `vm.wait_for` | `name`, `conditions`, `timeout?`, observe params | `{matched, waited, type?, detail?, problems?, observation?}` — see [Waiting for conditions](#waiting-for-conditions) |
 | `vm.exec` | `name`, `command` or `argv`, `timeout?` s, `cwd?`, `env?`, `stdin?`, `shell?` | `{code, output, stdout, stderr, timedOut, truncated}` — runs a command through the guest agent and waits for it; `output` is `stdout` followed by `stderr` |
-| `vm.exec.start` | `name`, `command` or `argv`, `cwd?`, `env?`, `shell?` | `{job, pid}` — starts a background job and returns at once |
+| `vm.exec.start` | `name`, `command` or `argv`, `cwd?`, `env?`, `shell?` | `{job, pid}` — starts a background job and returns at once. `stdin` is refused (`vm.exec.start takes no stdin; start the job, then send the text with vm.exec.write (eof: true closes the job's stdin)`), and so is `timeout` (`vm.exec.start takes no timeout; a job runs until it exits or vm.exec.kill ends it`) |
 | `vm.exec.read` | `name`, `job`, `outOffset?`, `errOffset?`, `max?` | `{state, code?, pid, out, err, outNext, errNext, dropped}` — output from the given byte offsets |
 | `vm.exec.write` | `name`, `job`, `data`, `eof?` | `{}` — writes to the job's stdin; `eof` closes it |
 | `vm.exec.kill` | `name`, `job` | `{state}` — kills the job's process tree |
