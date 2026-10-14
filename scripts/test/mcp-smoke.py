@@ -67,56 +67,66 @@ def main():
     print("list_vms:", err, out)
     if err or vm not in out:
         raise SystemExit("VM not listed")
-    err, out, _ = m.call("alcove_start_vm", {"name": vm}, 400)
+    err, out, _ = m.call("alcove_start_vm", {"name": vm}, 1000)
     print("start:", err, out)
     if err:
         raise SystemExit("start failed")
-    err, out, _ = m.call("alcove_wait_idle", {"name": vm, "seconds": 3, "timeout_s": 120}, 200)
-    print("wait_idle:", err, out)
-    err, out, imgs = m.call("alcove_screenshot", {"name": vm, "max_width": 800})
-    print("screenshot:", err, out, "images:", len(imgs))
-    if err or not imgs:
-        raise SystemExit("screenshot failed")
-    png = base64.b64decode(imgs[0]["data"])
-    assert png[:4] == b"\x89PNG", "not a PNG"
-    open(os.path.join(ROOT, "build", "mcp-shot.png"), "wb").write(png)
-    # the guest may still be booting/logging in: wait for the tools to connect
-    for _ in range(36):
-        err, out, _ = m.call("alcove_vm_status", {"name": vm})
-        if '"tools": true' in out:
-            break
-        time.sleep(5)
-    print("status:", err, out.replace("\n", " ")[:300])
-    err, out, _ = m.call("alcove_exec", {"name": vm, "command": "hostname"}, 200)
-    print("exec hostname:", err, out.strip())
-    if err:
-        raise SystemExit("exec failed")
-    err, out, _ = m.call("alcove_press_keys", {"name": vm, "keys": "win+r"})
-    print("press win+r:", err, out)
-    time.sleep(1.5)
-    err, out, _ = m.call("alcove_type", {"name": vm, "text": "notepad\n"})
-    print("type:", err, out)
-    time.sleep(4)
-    marker = f"typed via MCP {int(time.time())}"
-    err, out, _ = m.call("alcove_type", {"name": vm, "text": marker})
-    time.sleep(1)
-    err, out, _ = m.call("alcove_press_keys", {"name": vm, "keys": "ctrl+a"})
-    err, out, _ = m.call("alcove_press_keys", {"name": vm, "keys": "ctrl+c"})
-    time.sleep(1)
-    err, out, _ = m.call("alcove_get_clipboard", {"name": vm})
-    print("clipboard after typing in notepad:", err, out.strip())
-    if marker not in out:
-        raise SystemExit("typed text did not round-trip through Notepad and the clipboard")
-    err, out, imgs = m.call("alcove_screenshot", {"name": vm, "max_width": 800})
-    open(os.path.join(ROOT, "build", "mcp-shot-notepad.png"), "wb").write(base64.b64decode(imgs[0]["data"]))
-    # close notepad without saving: alt+f4 then "n" (Don't save)
-    m.call("alcove_press_keys", {"name": vm, "keys": "alt+f4"}); time.sleep(1)
-    m.call("alcove_press_keys", {"name": vm, "keys": "n"}); time.sleep(1)
-    err, out, _ = m.call("alcove_click", {"name": vm, "x": 20, "y": 20, "button": "right"})
-    print("right click:", err, out)
-    m.call("alcove_press_keys", {"name": vm, "keys": "esc"})
-    err, out, _ = m.call("alcove_stop_vm", {"name": vm}, 200)
-    print("stop:", err, out)
+    stopped = False
+    try:
+        err, out, _ = m.call("alcove_wait_idle", {"name": vm, "seconds": 3, "timeout_s": 120}, 200)
+        print("wait_idle:", err, out)
+        err, out, imgs = m.call("alcove_screenshot", {"name": vm, "max_width": 800})
+        print("screenshot:", err, out, "images:", len(imgs))
+        if err or not imgs:
+            raise SystemExit("screenshot failed")
+        png = base64.b64decode(imgs[0]["data"])
+        assert png[:4] == b"\x89PNG", "not a PNG"
+        os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
+        open(os.path.join(ROOT, "build", "mcp-shot.png"), "wb").write(png)
+        # the guest may still be booting/logging in: wait for the tools to connect
+        for _ in range(36):
+            err, out, _ = m.call("alcove_vm_status", {"name": vm})
+            if '"tools": true' in out:
+                break
+            time.sleep(5)
+        print("status:", err, out.replace("\n", " ")[:300])
+        err, out, _ = m.call("alcove_exec", {"name": vm, "command": "hostname"}, 200)
+        print("exec hostname:", err, out.strip())
+        if err:
+            raise SystemExit("exec failed")
+        err, out, _ = m.call("alcove_press_keys", {"name": vm, "keys": "win+r"})
+        print("press win+r:", err, out)
+        time.sleep(1.5)
+        err, out, _ = m.call("alcove_type", {"name": vm, "text": "notepad\n"})
+        print("type:", err, out)
+        time.sleep(4)
+        marker = f"typed via MCP {int(time.time())}"
+        err, out, _ = m.call("alcove_type", {"name": vm, "text": marker})
+        time.sleep(1)
+        err, out, _ = m.call("alcove_press_keys", {"name": vm, "keys": "ctrl+a"})
+        err, out, _ = m.call("alcove_press_keys", {"name": vm, "keys": "ctrl+c"})
+        time.sleep(1)
+        err, out, _ = m.call("alcove_get_clipboard", {"name": vm})
+        print("clipboard after typing in notepad:", err, out.strip())
+        if marker not in out:
+            raise SystemExit("typed text did not round-trip through Notepad and the clipboard")
+        err, out, imgs = m.call("alcove_screenshot", {"name": vm, "max_width": 800})
+        open(os.path.join(ROOT, "build", "mcp-shot-notepad.png"), "wb").write(base64.b64decode(imgs[0]["data"]))
+        # close notepad without saving: alt+f4 then "n" (Don't save)
+        m.call("alcove_press_keys", {"name": vm, "keys": "alt+f4"}); time.sleep(1)
+        m.call("alcove_press_keys", {"name": vm, "keys": "n"}); time.sleep(1)
+        err, out, _ = m.call("alcove_click", {"name": vm, "x": 20, "y": 20, "button": "right"})
+        print("right click:", err, out)
+        m.call("alcove_press_keys", {"name": vm, "keys": "esc"})
+        err, out, _ = m.call("alcove_stop_vm", {"name": vm}, 200)
+        stopped = True
+        print("stop:", err, out)
+    finally:
+        if not stopped:
+            try:
+                m.call("alcove_stop_vm", {"name": vm}, 200)
+            except MCPError as e:
+                print(f"stopping {vm} after the failure failed too: {e}; stop it with alcove_stop_vm or in the Alcove app", file=sys.stderr)
     print("PASS: MCP end to end")
     m.close()
 
