@@ -386,7 +386,7 @@ final class GuestRecipeTests: XCTestCase {
         }
         let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(checks(r).compactMap { $0["id"]?.stringValue },
-                       ["engine", "host", "state", "display", "tools", "rpc", "exec", "session", "disk", "clock", "network", "scale"])
+                       ["engine", "host", "state", "display", "tools", "rpc", "exec", "session", "disk", "clock", "network", "scale", "proxy"])
         XCTAssertEqual(check(r, "state")?["ok"]?.boolValue, true)
         XCTAssertEqual(check(r, "display")?["detail"]?.stringValue, "800x600")
         XCTAssertEqual(check(r, "tools")?["ok"]?.boolValue, true)
@@ -400,8 +400,8 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(check(r, "clock")?["hint"]?.stringValue, "vm.set_environment clock=host")
         XCTAssertEqual(check(r, "network")?["ok"]?.boolValue, true)
         XCTAssertEqual(check(r, "scale")?["detail"]?.stringValue, "125 %")
-        XCTAssertEqual(commands(agent).count, 1)
-        XCTAssertEqual(commands(agent).first, GuestRecipes.doctorProbe(os: .windows))
+        XCTAssertEqual(check(r, "proxy")?["detail"]?.stringValue, "no system proxy")
+        XCTAssertEqual(commands(agent), [GuestRecipes.doctorProbe(os: .windows), GuestRecipes.readSystemProxy(os: .windows)])
     }
 
     func testDoctorFlagsLockedSessionLowDiskAndNoDNS() async throws {
@@ -529,7 +529,8 @@ final class GuestRecipeTests: XCTestCase {
         }
         let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(check(r, "clock")?["ok"]?.boolValue, true)
-        XCTAssertEqual(commands(agent), [GuestRecipes.doctorProbe(os: .linux)])
+        XCTAssertEqual(commands(agent), [GuestRecipes.doctorProbe(os: .linux), GuestRecipes.readSystemProxy(os: .linux)])
+        XCTAssertEqual(check(r, "proxy")?["ok"]?.boolValue, true)
     }
 
     // MARK: - start of a suspended session

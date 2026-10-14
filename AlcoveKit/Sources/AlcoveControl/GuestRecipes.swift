@@ -442,4 +442,381 @@ enum GuestRecipes {
         ConvertTo-Json -InputObject @($items) -Compress -Depth 4
         """
     }
+
+    // MARK: - HTTP capture: proxy CA and system proxy
+
+    /// The address a guest on the user-mode network reaches the host at.
+    static let proxyHost = "10.0.2.2"
+    /// Where the proxy's CA certificate is kept in a Windows guest.
+    static let windowsProxyCAPath = "C:\\ProgramData\\Alcove\\proxy-ca.pem"
+    /// Where a Windows guest keeps the proxy settings from before a capture, the capture's port and its CA thumbprint.
+    static let windowsProxyStatePath = "C:\\ProgramData\\Alcove\\proxy-previous.json"
+    /// Where the proxy's CA certificate is kept in a Linux guest.
+    static let linuxProxyCAPath = "/usr/local/share/ca-certificates/alcove-proxy.crt"
+
+    /// The guest path the proxy's CA certificate is pushed to; nil for a guest OS without a CA recipe.
+    static func proxyCAPath(os: VMConfig.GuestOS) -> String? {
+        switch os {
+        case .windows: return windowsProxyCAPath
+        case .linux: return linuxProxyCAPath
+        case .other: return nil
+        }
+    }
+
+    private static let proxyPaths = #"""
+        $caPath = 'C:\ProgramData\Alcove\proxy-ca.pem'
+        $statePath = 'C:\ProgramData\Alcove\proxy-previous.json'
+        $inet = 'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        $conn = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections'
+        function AlcoveBool($value) { if ($value) { return 'true' }; return 'false' }
+
+        """#
+
+    /// `AlcoveCA`: the certificate of the PEM file at `$caPath`; nothing when the file holds no certificate block.
+    private static let proxyCAReader = #"""
+        function AlcoveCA {
+          $m = [regex]::Match([System.IO.File]::ReadAllText($caPath), '-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----')
+          if (-not $m.Success) { return $null }
+          [byte[]]$der = [Convert]::FromBase64String(($m.Groups[1].Value -replace '\s', ''))
+          return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($der)
+        }
+
+        """#
+
+    /// `AlcoveRoot <flags>`: the machine's trusted root store, opened with the `OpenFlags` value named `flags`.
+    /// `$byThumbprint`: the find type that selects a certificate by its thumbprint.
+    private static let proxyRootStore = #"""
+        function AlcoveRoot($flags) {
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+          $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]$flags)
+          return $store
+        }
+        $byThumbprint = [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint
+
+        """#
+
+    /// `AlcoveState`: the object stored in `$statePath`; nothing when the file is missing or holds no version 1 state.
+    /// `AlcoveSafe`: a string of base64 characters as it is, nothing for any other value.
+    private static let proxyStateReader = #"""
+        function AlcoveState {
+          if (-not [System.IO.File]::Exists($statePath)) { return $null }
+          try { $s = ConvertFrom-Json ([System.IO.File]::ReadAllText($statePath)) } catch { return $null }
+          if ($null -eq $s -or $s.version -ne 1) { return $null }
+          return $s
+        }
+        function AlcoveSafe($value) { if ($value -is [string] -and $value -match '^[A-Za-z0-9+/=]*$') { return $value }; return $null }
+
+        """#
+
+    /// `AlcoveBlobText`: the bytes of a registry value as Latin-1 text without NUL characters.
+    /// `AlcovePort`: the port of the first `10.0.2.2:<port>` in a text, 0 when it holds none.
+    private static let proxyAddressReader = #"""
+        function AlcoveBlobText($raw) {
+          if ($raw -isnot [byte[]]) { return '' }
+          return [System.Text.Encoding]::GetEncoding(28591).GetString($raw).Replace([string][char]0, '')
+        }
+        function AlcovePort($text) {
+          $m = [regex]::Match([string]$text, '10\.0\.2\.2:([0-9]{1,5})')
+          if ($m.Success) { return [int]$m.Groups[1].Value }
+          return 0
+        }
+
+        """#
+
+    /// `AlcoveRefresh`: tells WinINET that the proxy settings changed; true when both calls succeeded.
+    private static let proxyRefresh = #"""
+        function AlcoveRefresh {
+          try {
+            Add-Type -Namespace Alcove -Name Inet -MemberDefinition '[DllImport("wininet.dll", SetLastError = true)] public static extern bool InternetSetOption(IntPtr handle, int option, IntPtr buffer, int length);'
+            $changed = [Alcove.Inet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)
+            $reread = [Alcove.Inet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
+            return ($changed -and $reread)
+          } catch { return $false }
+        }
+
+        """#
+
+    /// Opens the current user's and the machine's registry hive in the 64-bit view as `$hkcu` and `$hklm`.
+    private static let openRegistryHives = """
+          $hkcu = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+          $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        """
+
+    /// The WinINET values a capture changes: the registry value name and its field in the state file.
+    private static let wininetTextValues = [("ProxyServer", "proxyServer"), ("ProxyOverride", "proxyOverride"), ("AutoConfigURL", "autoConfigURL")]
+
+    /// Windows: gives the pushed CA file the access list "Administrators and SYSTEM: full control, Users: read" without
+    /// inheritance, checks that its certificate has `thumbprint` (the SHA-1 of the certificate as 40 hexadecimal
+    /// digits) and adds it to the machine's trusted roots unless it is there. Prints `{"installed":true,"added":<bool>}`.
+    /// Linux: makes the pushed CA file world-readable and runs `update-ca-certificates`. Prints
+    /// `{"installed":<bool>,"bundle":"<path>"}`: `installed` is false when the guest has no `update-ca-certificates`;
+    /// `bundle` is the system bundle that holds the CA, or the CA file when there is none.
+    /// A failure prints one sentence on stderr and exits with 2.
+    static func installProxyCA(thumbprint: String, os: VMConfig.GuestOS) -> String? {
+        switch os {
+        case .windows:
+            return windowsPrelude + proxyPaths + proxyCAReader + proxyRootStore + "$thumb = \(quote(thumbprint, os: os))\n" + #"""
+            $added = $false
+            try {
+              if (-not [System.IO.File]::Exists($caPath)) { [Console]::Error.WriteLine('the proxy CA file C:\ProgramData\Alcove\proxy-ca.pem is missing in the guest; call vm.http.start again'); exit 2 }
+              $allow = [System.Security.AccessControl.AccessControlType]::Allow
+              $acl = New-Object System.Security.AccessControl.FileSecurity
+              $acl.SetAccessRuleProtection($true, $false)
+              $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'), [System.Security.AccessControl.FileSystemRights]::FullControl, $allow))
+              $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [System.Security.AccessControl.FileSystemRights]::FullControl, $allow))
+              $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), [System.Security.AccessControl.FileSystemRights]::Read, $allow))
+              [System.IO.File]::SetAccessControl($caPath, $acl)
+              $cert = AlcoveCA
+              if ($null -eq $cert -or $cert.Thumbprint -ne $thumb) { [Console]::Error.WriteLine('the proxy CA file in the guest is not the certificate the host sent; call vm.http.start again'); exit 2 }
+              $store = AlcoveRoot 'ReadWrite'
+              if ($store.Certificates.Find($byThumbprint, $thumb, $false).Count -eq 0) { $store.Add($cert); $added = $true }
+              $store.Close()
+            } catch {
+              [Console]::Error.WriteLine('could not install the proxy CA in the guest: ' + ($_.Exception.GetBaseException().Message -replace '\s+', ' ') + '; check that alcove-agent runs elevated')
+              exit 2
+            }
+            '{"installed":true,"added":' + (AlcoveBool $added) + '}'
+            """#
+        case .linux:
+            return #"""
+            ca=\#(linuxProxyCAPath)
+            [ -f "$ca" ] || { echo "the proxy CA file $ca is missing in the guest; call vm.http.start again" >&2; exit 2; }
+            chmod 644 "$ca" || { echo "could not make $ca readable; check that alcove-agent runs as root" >&2; exit 2; }
+            if ! command -v update-ca-certificates >/dev/null 2>&1; then printf '{"installed":false,"bundle":"%s"}\n' "$ca"; exit 0; fi
+            update-ca-certificates >/dev/null 2>&1 || { echo "update-ca-certificates failed in the guest; run it with vm.exec to see why" >&2; exit 2; }
+            bundle=/etc/ssl/certs/ca-certificates.crt
+            [ -f "$bundle" ] || bundle=$ca
+            printf '{"installed":true,"bundle":"%s"}\n' "$bundle"
+            """#
+        case .other:
+            return nil
+        }
+    }
+
+    /// Windows: removes the certificate with `thumbprint` from the machine's trusted roots, or without a thumbprint the
+    /// certificate of the CA file, and deletes the CA file. Linux: deletes the CA file and runs
+    /// `update-ca-certificates --fresh` when the guest has it.
+    /// Prints `{"removed":<bool>,"fileRemoved":<bool>}`: whether a certificate left the trusted roots and whether the
+    /// file was there. A failure prints one sentence on stderr and exits with 2.
+    static func removeProxyCA(thumbprint: String?, os: VMConfig.GuestOS) -> String? {
+        switch os {
+        case .windows:
+            return windowsPrelude + proxyPaths + proxyCAReader + proxyRootStore + "$thumb = \(quote(thumbprint ?? "", os: os))\n" + #"""
+            $removed = $false
+            $fileRemoved = $false
+            try {
+              if (-not $thumb -and [System.IO.File]::Exists($caPath)) {
+                try { $cert = AlcoveCA; if ($cert) { $thumb = $cert.Thumbprint } } catch { }
+              }
+              if ($thumb) {
+                $store = AlcoveRoot 'ReadWrite'
+                foreach ($found in @($store.Certificates.Find($byThumbprint, $thumb, $false))) { $store.Remove($found); $removed = $true }
+                $store.Close()
+              }
+              if ([System.IO.File]::Exists($caPath)) { [System.IO.File]::Delete($caPath); $fileRemoved = $true }
+            } catch {
+              [Console]::Error.WriteLine('could not remove the proxy CA from the guest: ' + ($_.Exception.GetBaseException().Message -replace '\s+', ' ') + '; check that alcove-agent runs elevated, then call vm.http.stop again')
+              exit 2
+            }
+            '{"removed":' + (AlcoveBool $removed) + ',"fileRemoved":' + (AlcoveBool $fileRemoved) + '}'
+            """#
+        case .linux:
+            return #"""
+            ca=\#(linuxProxyCAPath)
+            [ -e "$ca" ] || { printf '{"removed":false,"fileRemoved":false}\n'; exit 0; }
+            rm -f "$ca" || { echo "could not delete $ca; check that alcove-agent runs as root, then call vm.http.stop again" >&2; exit 2; }
+            if command -v update-ca-certificates >/dev/null 2>&1; then
+              update-ca-certificates --fresh >/dev/null 2>&1 || { echo "update-ca-certificates failed in the guest; run it with vm.exec to see why" >&2; exit 2; }
+            fi
+            printf '{"removed":true,"fileRemoved":true}\n'
+            """#
+        case .other:
+            return nil
+        }
+    }
+
+    /// Windows only: points the per-user WinINET proxy (`ProxyEnable` 1, `ProxyServer`, `ProxyOverride` `<local>`, no
+    /// `AutoConfigURL`) and, through `netsh winhttp set proxy`, the WinHTTP proxy at `10.0.2.2:<port>`. Before that it
+    /// writes the state file: the four WinINET values and the raw `WinHttpSettings` registry value as they were (each
+    /// absent or present), `port` and `thumbprint`. A state file that is already there keeps its remembered values and
+    /// gets the new port and thumbprint, and the certificate of its old thumbprint leaves the trusted roots when the
+    /// thumbprint differs. Settings that already point at `10.0.2.2` are remembered as "no proxy".
+    /// Prints `{"set":true,"keptPrevious":<bool>,"winhttp":<bool>,"refreshed":<bool>}`: `winhttp` is false when netsh
+    /// failed, `refreshed` is false when WinINET could not be told about the change.
+    /// A failure prints one sentence on stderr and exits with 2.
+    static func setSystemProxy(port: Int, thumbprint: String, os: VMConfig.GuestOS) -> String? {
+        guard os == .windows else { return nil }
+        let remembered = wininetTextValues.map { "    $\($0.1) = AlcoveSafe $state.\($0.1)\n" }.joined()
+        let current = wininetTextValues.map { "    $\($0.1) = $key.GetValue('\($0.0)', $null, $asStored)\n" }.joined()
+        let encoded = wininetTextValues.map { "    $\($0.1) = AlcoveText $\($0.1)\n" }.joined()
+        let fields = wininetTextValues.map { " + ',\"\($0.1)\":' + (AlcoveField $\($0.1))" }.joined()
+        return windowsPrelude + proxyPaths + proxyRootStore + proxyStateReader + proxyAddressReader + proxyRefresh
+            + "$server = '\(proxyHost):\(port)'\n$thumb = \(quote(thumbprint, os: os))\n" + #"""
+            function AlcoveText($value) { if ($null -eq $value) { return $null }; return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$value)) }
+            function AlcoveField($value) { if ($null -eq $value) { return 'null' }; return '"' + $value + '"' }
+            $kept = $false
+            $winhttp = $false
+            $refreshed = $false
+            try {
+            \#(openRegistryHives)
+              $key = $hkcu.CreateSubKey($inet)
+              $state = AlcoveState
+              if ($state) {
+                $kept = $true
+                $old = [string]$state.thumbprint
+                if ($old -match '^[0-9A-Fa-f]{40}$' -and $old -ne $thumb) {
+                  $store = AlcoveRoot 'ReadWrite'
+                  foreach ($found in @($store.Certificates.Find($byThumbprint, $old, $false))) { $store.Remove($found) }
+                  $store.Close()
+                }
+                $enable = $state.proxyEnable
+            \#(remembered)    $blob = AlcoveSafe $state.winhttp
+              } else {
+                $asStored = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+                $enable = $key.GetValue('ProxyEnable')
+            \#(current)    $raw = $null
+                $ck = $hklm.OpenSubKey($conn)
+                if ($ck) { $raw = $ck.GetValue('WinHttpSettings'); $ck.Close() }
+                $blob = $null
+                if ($raw -is [byte[]]) { $blob = [Convert]::ToBase64String($raw) }
+                if ((AlcovePort $proxyServer) -gt 0) { $enable = 0; $proxyServer = $null; $proxyOverride = $null }
+                if ((AlcovePort (AlcoveBlobText $raw)) -gt 0) { $blob = $null }
+            \#(encoded)  }
+              $enableText = 'null'
+              if ($null -ne $enable) { try { $enableText = [string][int]$enable } catch { $enableText = '0' } }
+              $json = '{"version":1,"thumbprint":"' + $thumb + '","port":\#(port),"proxyEnable":' + $enableText\#(fields) + ',"winhttp":' + (AlcoveField $blob) + '}'
+              [System.IO.File]::WriteAllText($statePath, $json)
+              $key.SetValue('ProxyServer', $server, [Microsoft.Win32.RegistryValueKind]::String)
+              $key.SetValue('ProxyOverride', '<local>', [Microsoft.Win32.RegistryValueKind]::String)
+              $key.DeleteValue('AutoConfigURL', $false)
+              $key.SetValue('ProxyEnable', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+              $key.Close()
+              $netsh = $env:SystemRoot + '\System32\netsh.exe'
+              $ErrorActionPreference = 'Continue'
+              $null = & $netsh winhttp set proxy ('proxy-server=' + $server) 'bypass-list=<local>' 2>&1
+              $ErrorActionPreference = 'Stop'
+              $winhttp = $LASTEXITCODE -eq 0
+              $refreshed = AlcoveRefresh
+            } catch {
+              [Console]::Error.WriteLine('could not set the system proxy of the guest: ' + ($_.Exception.GetBaseException().Message -replace '\s+', ' ') + '; check that alcove-agent runs elevated, or call vm.http.start with systemProxy false')
+              exit 2
+            }
+            '{"set":true,"keptPrevious":' + (AlcoveBool $kept) + ',"winhttp":' + (AlcoveBool $winhttp) + ',"refreshed":' + (AlcoveBool $refreshed) + '}'
+            """#
+    }
+
+    /// Windows only: with a state file, puts back the WinINET values and the raw `WinHttpSettings` value it remembers,
+    /// removes the ones it remembers as absent and deletes the file. Without one, it clears only settings that point
+    /// at `10.0.2.2`: `ProxyEnable` 0 without `ProxyServer` and `ProxyOverride`, and no `WinHttpSettings` value.
+    /// Prints `{"restored":<bool>,"cleared":<bool>,"thumbprint":"<of the state file, or empty>","refreshed":<bool>}`.
+    /// A failure prints one sentence on stderr and exits with 2.
+    static func clearSystemProxy(os: VMConfig.GuestOS) -> String? {
+        guard os == .windows else { return nil }
+        let restore = wininetTextValues.map { name, field in
+            "    $stored = AlcoveSafe $state.\(field)\n"
+                + "    if ($null -eq $stored) { $key.DeleteValue('\(name)', $false) } else { $key.SetValue('\(name)', "
+                + "[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($stored)), [Microsoft.Win32.RegistryValueKind]::String) }\n"
+        }.joined()
+        return windowsPrelude + proxyPaths + proxyStateReader + proxyAddressReader + proxyRefresh + #"""
+            $restored = $false
+            $cleared = $false
+            $refreshed = $false
+            $thumb = ''
+            try {
+            \#(openRegistryHives)
+              $key = $hkcu.CreateSubKey($inet)
+              $state = AlcoveState
+              if ($state) {
+            \#(restore)    if ($null -eq $state.proxyEnable) { $key.DeleteValue('ProxyEnable', $false) } else { $key.SetValue('ProxyEnable', [int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::DWord) }
+                $blob = AlcoveSafe $state.winhttp
+                $ck = $hklm.CreateSubKey($conn)
+                if ($null -eq $blob) { $ck.DeleteValue('WinHttpSettings', $false) } else { [byte[]]$raw = [Convert]::FromBase64String($blob); $ck.SetValue('WinHttpSettings', $raw, [Microsoft.Win32.RegistryValueKind]::Binary) }
+                $ck.Close()
+                if ([string]$state.thumbprint -match '^[0-9A-Fa-f]{40}$') { $thumb = ([string]$state.thumbprint).ToUpper() }
+                $restored = $true
+              } else {
+                $serverNow = $key.GetValue('ProxyServer', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ((AlcovePort $serverNow) -gt 0) {
+                  $key.SetValue('ProxyEnable', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+                  $key.DeleteValue('ProxyServer', $false)
+                  $key.DeleteValue('ProxyOverride', $false)
+                  $cleared = $true
+                }
+                $ck = $hklm.OpenSubKey($conn, $true)
+                if ($ck) {
+                  if ((AlcovePort (AlcoveBlobText ($ck.GetValue('WinHttpSettings')))) -gt 0) { $ck.DeleteValue('WinHttpSettings', $false); $cleared = $true }
+                  $ck.Close()
+                }
+              }
+              $key.Close()
+              if ([System.IO.File]::Exists($statePath)) { [System.IO.File]::Delete($statePath) }
+              if ($restored -or $cleared) { $refreshed = AlcoveRefresh }
+            } catch {
+              [Console]::Error.WriteLine('could not restore the proxy settings of the guest: ' + ($_.Exception.GetBaseException().Message -replace '\s+', ' ') + '; check that alcove-agent runs elevated, then call vm.http.stop again')
+              exit 2
+            }
+            '{"restored":' + (AlcoveBool $restored) + ',"cleared":' + (AlcoveBool $cleared) + ',"thumbprint":"' + $thumb + '","refreshed":' + (AlcoveBool $refreshed) + '}'
+            """#
+    }
+
+    /// Reads what a capture leaves in the guest without changing it.
+    /// Windows prints `{"previous":<bool>,"previousPort":<n>,"caFile":<bool>,"caInStore":<bool>,"wininetEnabled":<bool>,
+    /// "wininetServer":"<base64 of the UTF-8 text>","winhttpPort":<n>}`: whether the state file is there and the port
+    /// it holds, whether the CA file is there, whether the certificate of the CA file (or of the state file's
+    /// thumbprint) is among the machine's trusted roots, the per-user WinINET proxy, and the port of a `10.0.2.2`
+    /// address in the WinHTTP proxy (0 without one).
+    /// Linux prints `{"caFile":<bool>}`.
+    /// A failure prints one sentence on stderr and exits with 2.
+    static func readSystemProxy(os: VMConfig.GuestOS) -> String? {
+        switch os {
+        case .windows:
+            return windowsPrelude + proxyPaths + proxyCAReader + proxyRootStore + proxyStateReader + proxyAddressReader + #"""
+            $previous = $false
+            $previousPort = 0
+            $caFile = $false
+            $caInStore = $false
+            $enabled = $false
+            $server = ''
+            $winhttpPort = 0
+            try {
+              $thumb = ''
+              $state = AlcoveState
+              if ($state) {
+                $previous = $true
+                try { $previousPort = [int]$state.port } catch { }
+                if ([string]$state.thumbprint -match '^[0-9A-Fa-f]{40}$') { $thumb = [string]$state.thumbprint }
+              }
+              if ([System.IO.File]::Exists($caPath)) {
+                $caFile = $true
+                try { $cert = AlcoveCA; if ($cert) { $thumb = $cert.Thumbprint } } catch { }
+              }
+              if ($thumb) {
+                $store = AlcoveRoot 'ReadOnly'
+                $caInStore = $store.Certificates.Find($byThumbprint, $thumb, $false).Count -gt 0
+                $store.Close()
+              }
+            \#(openRegistryHives)
+              $key = $hkcu.OpenSubKey($inet)
+              if ($key) {
+                $server = [string]$key.GetValue('ProxyServer', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                try { $enabled = ([int]$key.GetValue('ProxyEnable', 0) -ne 0) -and ($server.Length -gt 0) } catch { }
+                $key.Close()
+              }
+              $ck = $hklm.OpenSubKey($conn)
+              if ($ck) {
+                $winhttpPort = AlcovePort (AlcoveBlobText ($ck.GetValue('WinHttpSettings')))
+                $ck.Close()
+              }
+            } catch {
+              [Console]::Error.WriteLine('could not read the proxy settings of the guest: ' + ($_.Exception.GetBaseException().Message -replace '\s+', ' ') + '; check that alcove-agent runs elevated')
+              exit 2
+            }
+            '{"previous":' + (AlcoveBool $previous) + ',"previousPort":' + $previousPort + ',"caFile":' + (AlcoveBool $caFile) + ',"caInStore":' + (AlcoveBool $caInStore) + ',"wininetEnabled":' + (AlcoveBool $enabled) + ',"wininetServer":"' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($server)) + '","winhttpPort":' + $winhttpPort + '}'
+            """#
+        case .linux:
+            return "ca=\(linuxProxyCAPath)\nif [ -e \"$ca\" ]; then printf '{\"caFile\":true}\\n'; else printf '{\"caFile\":false}\\n'; fi"
+        case .other:
+            return nil
+        }
+    }
 }

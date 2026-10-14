@@ -19,6 +19,7 @@ extension ControlHandler {
                 try await provisioning.cloneVM(named: name, as: newName)
                 return ["name": .string(newName)]
             }
+            await endCapture(name)
             try await provisioning.deleteVM(named: name)
         } catch let error as ControlError {
             throw error
@@ -90,6 +91,11 @@ extension ControlHandler {
                 throw ControlError.failed("a snapshot named '\(snapshot)' already exists in '\(t.name)'; call vm.snapshot.delete first or choose another name")
             }
             do { try await t.createSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot create failed: \(engineReason(error))") }
+            if captures[t.name] != nil {
+                captureSnapshots[t.name, default: []].insert(snapshot)
+            } else {
+                captureSnapshots[t.name]?.remove(snapshot)
+            }
             return ["snapshot": .string(snapshot)]
         case "vm.snapshot.restore":
             let snapshot = try string(params, "snapshot")
@@ -102,15 +108,23 @@ extension ControlHandler {
                 throw ControlError.failed("snapshot restore failed: \(engineReason(error))")
             }
             let restored = await passEvents(of: t)
+            let capturing = captures[t.name] != nil
+            await endCapture(t.name)
             let agent = await t.agent(timeout: .seconds(max(0, wait)))
             var clockSynced = false
             if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.snapshot.restore") }
-            return ["snapshot": .string(snapshot), "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced),
-                    "eventSeq": .int(Int64(restored))]
+            var out: [String: JSON] = ["snapshot": .string(snapshot), "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced),
+                                       "eventSeq": .int(Int64(restored))]
+            if capturing { out["captureEnded"] = true }
+            if captureSnapshots[t.name]?.contains(snapshot) == true {
+                out["staleProxyCleared"] = .bool(await clearStaleAfterRestore(t, agent))
+            }
+            return .object(out)
         case "vm.snapshot.delete":
             let snapshot = try string(params, "snapshot")
             try await requireSnapshot(snapshot, in: t)
             do { try await t.deleteSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot delete failed: \(engineReason(error))") }
+            captureSnapshots[t.name]?.remove(snapshot)
             return [:]
         case "vm.forward.add":
             let guestPort = try portParameter(params, "guestPort")

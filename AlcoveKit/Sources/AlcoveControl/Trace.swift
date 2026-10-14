@@ -29,7 +29,7 @@ struct TraceEntry {
         switch outcome {
         case .success(let result):
             obj["ok"] = true
-            obj["result"] = TraceSanitizer.sanitize(TraceSanitizer.maskValues(result, secrets: secrets))
+            obj["result"] = TraceSanitizer.sanitize(result: TraceSanitizer.maskValues(result, secrets: secrets), op: op)
         case .failure(let error):
             obj["ok"] = false
             obj["error"] = TraceSanitizer.sanitize(TraceSanitizer.maskValues(.string(ControlHandler.failureReason(error, fallback: "the op failed")), secrets: secrets))
@@ -62,6 +62,33 @@ enum TraceSanitizer {
     /// Removes `lease`, image payloads and long strings; masks secret-looking env values.
     static func sanitize(_ value: JSON) -> JSON {
         sanitize(value, inEnv: false)
+    }
+
+    /// The sanitized result of `op`. In a `vm.http.request` result the values of the `ControlHandler.secretHeaders`
+    /// become `<masked>` unless the proxy stored them redacted, and a body longer than `maxStringLength` is cut and
+    /// marked with `bodyCut`.
+    static func sanitize(result: JSON, op: String) -> JSON {
+        guard op == "vm.http.request", case .object(var fields) = result else { return sanitize(result) }
+        for key in ["headers", "trailers"] {
+            guard let pairs = fields[key]?.arrayValue else { continue }
+            fields[key] = .array(pairs.map(maskedHeader))
+        }
+        let body = fields.removeValue(forKey: "body")
+        guard case .object(var out) = sanitize(.object(fields)) else { return sanitize(result) }
+        if case .string(let text)? = body {
+            out["body"] = .string(cut(text))
+            if text.count > maxStringLength { out["bodyCut"] = true }
+        } else if let body {
+            out["body"] = sanitize(body)
+        }
+        return .object(out)
+    }
+
+    /// A `[name, value]` header pair with the value masked when the name is one of `ControlHandler.secretHeaders`.
+    private static func maskedHeader(_ pair: JSON) -> JSON {
+        guard let items = pair.arrayValue, items.count == 2, let name = items[0].stringValue, let value = items[1].stringValue,
+              ControlHandler.secretHeaders.contains(name.lowercased()), !value.hasPrefix("<redacted ") else { return pair }
+        return [.string(name), "<masked>"]
     }
 
     private static func sanitize(_ value: JSON, inEnv: Bool) -> JSON {

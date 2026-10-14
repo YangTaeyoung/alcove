@@ -156,15 +156,18 @@ extension ControlHandler {
     }
 
     /// Runs `script` in the guest. `ok` means exit code 0 without a timeout; `detail` is trimmed stderr on failure, trimmed stdout otherwise.
-    func runRecipe(_ agent: AgentClient, _ script: String, vm: String, op: String) async -> (ok: Bool, detail: String, stdout: String) {
-        let r = await runRecipeOutput(agent, script, vm: vm, op: op)
+    /// The guest gets `timeoutMilliseconds` for the script, 60 s when nil.
+    func runRecipe(_ agent: AgentClient, _ script: String, vm: String, op: String,
+                   timeoutMilliseconds: Int? = nil) async -> (ok: Bool, detail: String, stdout: String) {
+        let r = await runRecipeOutput(agent, script, vm: vm, op: op, timeoutMilliseconds: timeoutMilliseconds)
         return (r.ok, r.detail, r.stdout)
     }
 
-    func runRecipeOutput(_ agent: AgentClient, _ script: String, vm: String, op: String) async -> RecipeOutput {
+    func runRecipeOutput(_ agent: AgentClient, _ script: String, vm: String, op: String, timeoutMilliseconds: Int? = nil) async -> RecipeOutput {
+        let limit = timeoutMilliseconds ?? ControlHandler.recipeTimeoutMilliseconds
         do {
-            let r = try await agent.call("exec.run", ["cmd": .string(script), "timeout_ms": .int(Int64(ControlHandler.recipeTimeoutMilliseconds))],
-                                         timeout: .seconds(ControlHandler.recipeTimeoutMilliseconds / 1000 + 15))
+            let r = try await agent.call("exec.run", ["cmd": .string(script), "timeout_ms": .int(Int64(limit))],
+                                         timeout: .seconds(limit / 1000 + 15))
             let code = r["code"]?.intValue ?? -1
             let timedOut = r["timed_out"]?.boolValue ?? false
             let truncated = r["truncated"]?.boolValue ?? false
@@ -172,7 +175,7 @@ extension ControlHandler {
             let err = (r["stderr"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let ok = code == 0 && !timedOut
             if ok { return RecipeOutput(ok: true, detail: out, stdout: out, truncated: truncated) }
-            let detail = !err.isEmpty ? err : timedOut ? "timed out after \(ControlHandler.recipeTimeoutMilliseconds / 1000) s" : out.isEmpty ? "exit code \(code)" : out
+            let detail = !err.isEmpty ? err : timedOut ? "timed out after \(limit / 1000) s" : out.isEmpty ? "exit code \(code)" : out
             return RecipeOutput(ok: false, detail: detail, stdout: out, timedOut: timedOut, truncated: truncated)
         } catch {
             return RecipeOutput(ok: false, detail: agentFailure(error, vm: vm, op: op).description, stdout: "")
@@ -188,7 +191,7 @@ extension ControlHandler {
 
     // MARK: - vm.doctor
 
-    private func check(_ id: String, _ ok: Bool, _ detail: String, hint: String? = nil) -> JSON {
+    func check(_ id: String, _ ok: Bool, _ detail: String, hint: String? = nil) -> JSON {
         var row: [String: JSON] = ["id": .string(id), "ok": .bool(ok), "detail": .string(detail)]
         if let hint, !ok { row["hint"] = .string(hint) }
         return .object(row)
@@ -236,6 +239,7 @@ extension ControlHandler {
             return ["checks": .array(rows)]
         }
         rows += probeRows(probe, received: received)
+        rows.append(await proxyCheck(t, agent: agent, os: os))
         return ["checks": .array(rows)]
     }
 
@@ -490,7 +494,8 @@ extension ControlHandler {
     private static let reservedDeviceNames: Set<String> =
         Set(["CON", "PRN", "AUX", "NUL"] + ["COM", "LPT"].flatMap { port in (0...9).map { "\(port)\($0)" } + ["\u{B9}", "\u{B2}", "\u{B3}"].map { port + $0 } })
 
-    private static func lastJSONObject(_ output: String) -> JSON? {
+    /// The last line of `output` that is a JSON object.
+    static func lastJSONObject(_ output: String) -> JSON? {
         for line in output.split(whereSeparator: \.isNewline).reversed() where line.hasPrefix("{") {
             if let json = try? JSON.parse(Data(line.utf8)), json.objectValue != nil { return json }
         }

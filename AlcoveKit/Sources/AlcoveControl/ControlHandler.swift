@@ -101,12 +101,22 @@ public actor ControlHandler {
     @TaskLocal static var scriptCall: ScriptCall?
     /// The values of the secret variables of the script run this task belongs to; trace lines of its calls hold `TraceSanitizer.mask` in their place.
     @TaskLocal static var scriptSecrets: [String] = []
+    /// Builds the proxy of a new HTTP capture.
+    let makeProxy: @Sendable () -> ProxyControlling
+    /// The HTTP captures by VM name.
+    var captures: [String: HTTPCapture] = [:]
+    /// One `vm.http.start` or `vm.http.stop` per VM at a time.
+    let captureGate = InputGate()
+    /// Per VM: the snapshots created while it was capturing.
+    var captureSnapshots: [String: Set<String>] = [:]
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
     public init(registry: VMRegistry, hostKind: String, clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
                 engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() },
-                recordingsDirectory: URL? = nil, diagnosticsDirectory: URL? = nil) {
+                recordingsDirectory: URL? = nil, diagnosticsDirectory: URL? = nil,
+                makeProxy: @escaping @Sendable () -> ProxyControlling = { ProxyProcess(executable: ToolLocator.proxy()) }) {
+        self.makeProxy = makeProxy
         self.registry = registry
         self.hostKind = hostKind
         self.clock = clock
@@ -135,6 +145,8 @@ public actor ControlHandler {
         "script.run", "script.save",
         "vm.window.list", "vm.window.action", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.ui.click", "vm.ui.type", "vm.ui.action",
         "vm.app.launch", "vm.deploy", "vm.events", "vm.collect_diagnostics",
+        "vm.http.start", "vm.http.stop", "vm.http.requests", "vm.http.request", "vm.http.clear",
+        "vm.http.rule.add", "vm.http.rule.list", "vm.http.rule.remove", "vm.http.rule.clear",
     ]
 
     /// Whether `op` is exempt from the lease guard.
@@ -148,6 +160,7 @@ public actor ControlHandler {
         "vm.forward.list", "vm.lease.acquire", "vm.lease.release", "vm.doctor", "vm.find_text",
         "vm.wait_for", "vm.record.status", "vm.window.list", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.events",
         "vm.event_log", "vm.crash_dumps.list", "vm.crash_dumps.pull", "vm.collect_diagnostics",
+        "vm.http.requests", "vm.http.request", "vm.http.rule.list",
         "script.save",
     ]
 
@@ -226,6 +239,7 @@ public actor ControlHandler {
                 }
             } else {
                 runtimeForwards[t.name] = nil
+                await endCapture(t.name)
                 let resuming = await t.isSuspended()
                 do {
                     try await t.start(discardChanges: discard)
@@ -249,16 +263,23 @@ public actor ControlHandler {
             return try await provision(op: op, params: params)
         case "vm.stop":
             let t = try await target(params)
+            let force = params["force"]?.boolValue ?? false
+            let capturing = captures[t.name] != nil
             if await t.state().isActive {
+                if capturing, !force { await restoreCaptureGuest(t) }
+                await endCapture(t.name)
                 do {
-                    try await t.stop(force: params["force"]?.boolValue ?? false)
+                    try await t.stop(force: force)
                 } catch {
                     throw ControlError.failed("stop failed: \(ControlHandler.failureReason(error, fallback: "the VM did not stop; check vm.status, or call vm.stop with force"))")
                 }
             }
+            await endCapture(t.name)
             lastSize[t.name] = nil
             runtimeForwards[t.name] = nil
-            return ["state": .string(describe(await t.state())), "eventSeq": .int(Int64(await passEvents(of: t)))]
+            var stopped: [String: JSON] = ["state": .string(describe(await t.state())), "eventSeq": .int(Int64(await passEvents(of: t)))]
+            if capturing { stopped["captureEnded"] = true }
+            return .object(stopped)
         case "vm.pause":
             let t = try await running(params)
             if await t.state() == .running { try await t.pause() }
@@ -316,6 +337,9 @@ public actor ControlHandler {
             return try await ui(op: op, params: params)
         case "vm.deploy":
             return try await deploy(params)
+        case "vm.http.start", "vm.http.stop", "vm.http.requests", "vm.http.request", "vm.http.clear",
+             "vm.http.rule.add", "vm.http.rule.list", "vm.http.rule.remove", "vm.http.rule.clear":
+            return try await http(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
             // than 0.5% of the frame's tiles changing between samples 250 ms apart
@@ -350,8 +374,9 @@ public actor ControlHandler {
         return t
     }
 
-    /// Drops the lease, the runtime forwards, the cached frame size, the event positions and the agent mark of `vm`.
+    /// Drops the lease, the runtime forwards, the cached frame size, the event positions, the agent mark and the capture snapshots of `vm`.
     func forget(vm: String) {
+        captureSnapshots[vm] = nil
         leases.forget(vm: vm)
         runtimeForwards[vm] = nil
         forwardInstances[vm] = nil
@@ -415,6 +440,7 @@ public actor ControlHandler {
         guard st == .running || st == .paused else {
             runtimeForwards[t.name] = nil
             noteVMGone(t.name)
+            await endCapture(t.name)
             throw ControlError.notRunning(t.name, st)
         }
         return t

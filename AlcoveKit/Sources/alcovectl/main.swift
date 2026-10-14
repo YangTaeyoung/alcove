@@ -181,7 +181,8 @@ case "serve":
         fail("a control server is already running at \(socketPath) (the Alcove app, or another alcovectl serve)")
     }
     let registry = HeadlessRegistry(directory: vmDir, engine: engine)
-    let server = ControlServer(handler: ControlHandler(registry: registry, hostKind: "headless", engineDescription: engine.qemuSystem), socketPath: socketPath)
+    let handler = ControlHandler(registry: registry, hostKind: "headless", engineDescription: engine.qemuSystem)
+    let server = ControlServer(handler: handler, socketPath: socketPath)
     do { try server.start(loadingRecognizers: true) } catch { fail("cannot start control server: \(error)") }
     print("alcove control server (headless) listening at \(socketPath); VMs in \(vmDir.path)")
     let stop = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -189,6 +190,7 @@ case "serve":
     let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     let shutdown: @Sendable () -> Void = {
         Task.detached {
+            await handler.shutdown()
             await registry.stopAll()
             server.stop()
             exit(0)

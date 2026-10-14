@@ -629,6 +629,7 @@ extension ControlHandler {
         let waitMs = try waitWindowMilliseconds(params, default: ControlHandler.defaultLaunchWaitSeconds)
         let t = try await running(params)
         let agent = try await tools(t)
+        addProxyEnvironment(to: &request, vm: t.name)
         do { return try await launch(agent, request, waitMs: waitMs) } catch { throw agentFailure(error, vm: t.name, op: op) }
     }
 
