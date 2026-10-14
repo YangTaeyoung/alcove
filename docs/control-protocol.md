@@ -70,8 +70,14 @@ lease is checked again when its turn comes. A click, drag, key press or typing
 that is cancelled or fails while it holds a button or keys releases them
 before it ends.
 
-Closing a connection discards the replies to its unfinished requests. A
-command that `vm.exec` already started in the guest keeps running until it
+Closing a connection cancels every unfinished request of it in both lanes
+and discards their replies: a serial request still queued behind another never
+runs, and a running one stops at its next cancellation point (a `vm.wait_for`
+at its next tick, a `vm.type` at its next key). Replies wait in a
+per-connection outbox and are written as the client reads them, so a client
+that stops reading holds back nobody else; a connection with more than 64 MiB
+of unread replies, or one that reads none of its pending replies for 30 s, is
+closed. A command that `vm.exec` already started in the guest keeps running until it
 ends or reaches its `timeout`; jobs started with `vm.exec.start` are not
 affected. The control socket pushes nothing to a client: a job's exit is seen
 through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of

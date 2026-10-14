@@ -6,7 +6,10 @@ import AlcoveQMP
 /// Multiple clients. Each connection has two lanes: operations for which
 /// `ControlHandler.isConcurrent` is true start at once in their own task and
 /// answer when they finish; all other operations run one after another in the
-/// order they arrived. Closing a connection cancels its tasks.
+/// order they arrived. Closing a connection cancels every unfinished task of both
+/// lanes. Replies wait in a per-connection outbox that is written as the client
+/// reads; a connection whose outbox passes `maxOutboxBytes`, or that takes no
+/// bytes of it for `writeStallLimit`, is closed.
 public final class ControlServer: @unchecked Sendable {
     public enum ServerError: Error, Equatable { case socket(errno: Int32), bind(path: String, errno: Int32), listen(errno: Int32), pathTooLong(String) }
 
@@ -23,6 +26,10 @@ public final class ControlServer: @unchecked Sendable {
     private var nextConnectionID = 0
     private var nextTaskID = 0
     private var discardedReplies = 0
+    /// Longest a connection with unwritten replies may go without taking any of their bytes.
+    private let writeStallLimit: Duration
+    /// Most bytes of replies a connection may leave unread.
+    private let maxOutboxBytes: Int
 
     private final class Client {
         /// Server-wide number of this connection; a later connection on the same descriptor has a different one.
@@ -31,21 +38,49 @@ public final class ControlServer: @unchecked Sendable {
         var source: DispatchSourceRead?
         var pending = Data()
         /// The newest task of the serial lane.
-        var task: Task<Void, Never>?
+        var newestSerial: Task<Void, Never>?
+        /// The unfinished tasks of the serial lane by server-wide task id.
+        var serial: [Int: Task<Void, Never>] = [:]
         /// The running tasks of the concurrent lane by server-wide task id.
         var concurrent: [Int: Task<Void, Never>] = [:]
+        /// Replies not yet written, oldest first; `written` bytes of the first one are written.
+        var outbox: [Data] = []
+        var written = 0
+        var outboxBytes = 0
+        /// Writes the outbox while the socket takes no more bytes at once.
+        var writeSource: DispatchSourceWrite?
+        /// Checks that the outbox keeps moving while `writeSource` waits.
+        var stallTimer: DispatchSourceTimer?
+        /// When the outbox last moved: a reply was queued into an empty outbox or bytes were written.
+        var lastProgress = ContinuousClock.now
         init(id: Int, fd: Int32) { self.id = id; self.fd = fd }
 
         func cancelTasks() {
-            task?.cancel()
+            for (_, t) in serial { t.cancel() }
+            serial.removeAll()
+            newestSerial = nil
             for (_, t) in concurrent { t.cancel() }
             concurrent.removeAll()
         }
+
+        /// Stops writing and drops the replies not yet written.
+        func dropOutbox() {
+            writeSource?.cancel(); writeSource = nil
+            stallTimer?.cancel(); stallTimer = nil
+            outbox.removeAll()
+            written = 0
+            outboxBytes = 0
+        }
     }
 
-    public init(handler: ControlHandler, socketPath: String = ControlServer.defaultSocketPath) {
+    /// A connection that takes none of its unwritten replies for `writeStallLimit`, or whose unwritten replies pass
+    /// `maxOutboxBytes`, is closed.
+    public init(handler: ControlHandler, socketPath: String = ControlServer.defaultSocketPath,
+                writeStallLimit: Duration = .seconds(30), maxOutboxBytes: Int = 64 << 20) {
         self.handler = handler
         self.socketPath = socketPath
+        self.writeStallLimit = writeStallLimit
+        self.maxOutboxBytes = maxOutboxBytes
     }
 
     /// Whether another server already answers on `path`.
@@ -95,7 +130,7 @@ public final class ControlServer: @unchecked Sendable {
     private func shutDown() {
         listenSource?.cancel(); listenSource = nil
         if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1 }
-        for (_, c) in clients { c.source?.cancel(); c.cancelTasks(); Darwin.close(c.fd) }
+        for (_, c) in clients { c.source?.cancel(); c.dropOutbox(); c.cancelTasks(); Darwin.close(c.fd) }
         clients.removeAll()
         unlink(socketPath)
     }
@@ -137,36 +172,57 @@ public final class ControlServer: @unchecked Sendable {
         }
     }
 
-    /// Starts a concurrent operation in its own tracked task; chains any other request behind the connection's previous serial task.
+    /// Starts a concurrent operation in its own tracked task; chains any other request behind the connection's previous
+    /// serial task, in a tracked task that answers nothing once it is cancelled.
     private func enqueue(_ line: Data, for client: Client) {
         let fd = client.fd
         let connection = client.id
         let handler = self.handler
-        if let op = (try? JSON.parse(line))?["op"]?.stringValue, ControlHandler.isConcurrent(op: op) {
-            let id = nextTaskID
-            nextTaskID += 1
+        let parsed = Result { try JSON.parse(line) }
+        let id = nextTaskID
+        nextTaskID += 1
+        if let op = (try? parsed.get())?["op"]?.stringValue, ControlHandler.isConcurrent(op: op) {
             client.concurrent[id] = Task { [weak self] in
-                let reply = await ControlServer.process(line, handler: handler)
+                let reply = await ControlServer.process(line, parsed: parsed, handler: handler)
                 self?.write(reply, to: fd, connection: connection)
-                self?.forgetConcurrentTask(id, of: fd)
+                self?.forgetTask(id, of: fd, connection: connection)
             }
             return
         }
-        let previous = client.task
-        client.task = Task { [weak self] in
+        let previous = client.newestSerial
+        let task = Task { [weak self] in
             await previous?.value
-            let reply = await ControlServer.process(line, handler: handler)
-            self?.write(reply, to: fd, connection: connection)
+            if !Task.isCancelled {
+                let reply = await ControlServer.process(line, parsed: parsed, handler: handler)
+                self?.write(reply, to: fd, connection: connection)
+            }
+            self?.forgetTask(id, of: fd, connection: connection)
         }
+        client.serial[id] = task
+        client.newestSerial = task
     }
 
-    private func forgetConcurrentTask(_ id: Int, of fd: Int32) {
-        queue.async { [self] in clients[fd]?.concurrent[id] = nil }
+    private func forgetTask(_ id: Int, of fd: Int32, connection: Int) {
+        queue.async { [self] in
+            guard let client = clients[fd], client.id == connection else { return }
+            client.concurrent[id] = nil
+            client.serial[id] = nil
+        }
     }
 
     /// The number of concurrent-lane tasks that are still tracked, over all connections.
     func concurrentTaskCount() -> Int {
         queue.sync { clients.values.reduce(0) { $0 + $1.concurrent.count } }
+    }
+
+    /// The number of serial-lane tasks that are still tracked, over all connections.
+    func serialTaskCount() -> Int {
+        queue.sync { clients.values.reduce(0) { $0 + $1.serial.count } }
+    }
+
+    /// The bytes of replies not yet written, over all connections.
+    func outboxByteCount() -> Int {
+        queue.sync { clients.values.reduce(0) { $0 + $1.outboxBytes } }
     }
 
     /// The number of open connections.
@@ -184,12 +240,17 @@ public final class ControlServer: @unchecked Sendable {
     /// The reply line to the request line `line`. A line that cannot be parsed is answered with `unreadableRequest`
     /// and the `id` that `requestID` reads from it.
     static func process(_ line: Data, handler: ControlHandler) async -> Data {
+        await process(line, parsed: Result { try JSON.parse(line) }, handler: handler)
+    }
+
+    /// The reply line to the request line `line`, which `parsed` holds parsed.
+    static func process(_ line: Data, parsed: Result<JSON, Error>, handler: ControlHandler) async -> Data {
         var id: JSON = .null
         var result: [String: JSON]
         do {
             let req: JSON
             do {
-                req = try JSON.parse(line)
+                req = try parsed.get()
             } catch {
                 id = requestID(in: line) ?? .null
                 throw ControlHandler.ControlError.failed(unreadableRequest)
@@ -215,7 +276,7 @@ public final class ControlServer: @unchecked Sendable {
     /// with valid escapes (a `\u` escape needs four hex digits; whether it is half a surrogate pair is not checked),
     /// numbers, `true`, `false`, `null`, and objects and arrays of these nested at most 512 deep. Nil when the line does
     /// not begin as an object, when anything before the key is not JSON syntax, when the key is spelled other than
-    /// `"id"`, and when the value of the key is not a number or a string that parses.
+    /// `"id"`, when the value of the key is not a number or a string that parses, and when no `,` or `}` follows it.
     static func requestID(in line: Data) -> JSON? {
         let bytes = [UInt8](line)
         var at = 0
@@ -333,6 +394,8 @@ public final class ControlServer: @unchecked Sendable {
             if Array(key) == Array("\"id\"".utf8) {
                 let start = at
                 guard skipValue(), let value = try? JSON.parse(Data(bytes[start..<at])) else { return nil }
+                skipSpace()
+                guard next(is: ",") || next(is: "}") else { return nil }
                 return value.stringValue != nil || value.doubleValue != nil ? value : nil
             }
             guard skipValue() else { return nil }
@@ -342,28 +405,84 @@ public final class ControlServer: @unchecked Sendable {
         }
     }
 
-    /// Writes `data` to `fd` while connection `connection` still owns it; drops the reply otherwise.
+    /// Queues `data` in the outbox of connection `connection` while it still owns `fd` and writes what the socket takes;
+    /// drops the reply when the connection is gone, and closes a connection whose outbox would pass `maxOutboxBytes`.
     private func write(_ data: Data, to fd: Int32, connection: Int) {
         queue.async { [self] in
             guard let client = clients[fd], client.id == connection else { discardedReplies += 1; return }
-            var offset = 0
-            while offset < data.count {
-                let n = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress! + offset, data.count - offset) }
-                if n > 0 { offset += n; continue }
-                if n < 0, errno == EAGAIN || errno == EWOULDBLOCK {
-                    var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-                    _ = poll(&pfd, 1, 5000)
-                    continue
-                }
-                if n < 0, errno == EINTR { continue }
+            guard client.outboxBytes + data.count <= maxOutboxBytes else {
+                discardedReplies += 1
                 closeClient(client)
                 return
             }
+            if client.outbox.isEmpty { client.lastProgress = .now }
+            client.outbox.append(data)
+            client.outboxBytes += data.count
+            flush(client)
         }
+    }
+
+    /// Writes the outbox of `client` until it is empty or the socket takes no more; then a write source goes on when
+    /// the socket has room and a timer closes the connection once it took nothing for `writeStallLimit`.
+    private func flush(_ client: Client) {
+        while let first = client.outbox.first {
+            let offset = client.written
+            let n = first.withUnsafeBytes { Darwin.write(client.fd, $0.baseAddress! + offset, first.count - offset) }
+            if n > 0 {
+                client.lastProgress = .now
+                client.written += n
+                client.outboxBytes -= n
+                if client.written == first.count {
+                    client.outbox.removeFirst()
+                    client.written = 0
+                }
+                continue
+            }
+            if n < 0, errno == EINTR { continue }
+            if n < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                waitForRoom(client)
+                return
+            }
+            closeClient(client)
+            return
+        }
+        client.writeSource?.cancel(); client.writeSource = nil
+        client.stallTimer?.cancel(); client.stallTimer = nil
+    }
+
+    /// Starts the write source and the stall timer of `client` unless they run.
+    private func waitForRoom(_ client: Client) {
+        if client.writeSource == nil {
+            let source = DispatchSource.makeWriteSource(fileDescriptor: client.fd, queue: queue)
+            source.setEventHandler { [weak self, weak client] in
+                guard let self, let client, self.clients[client.fd] === client else { return }
+                self.flush(client)
+            }
+            source.resume()
+            client.writeSource = source
+        }
+        if client.stallTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            let period = ControlServer.dispatchInterval(writeStallLimit / 4)
+            timer.schedule(deadline: .now() + period, repeating: period)
+            timer.setEventHandler { [weak self, weak client] in
+                guard let self, let client, self.clients[client.fd] === client else { return }
+                if !client.outbox.isEmpty, client.lastProgress.duration(to: .now) >= self.writeStallLimit { self.closeClient(client) }
+            }
+            timer.resume()
+            client.stallTimer = timer
+        }
+    }
+
+    /// `duration` in whole nanoseconds, at least one millisecond.
+    private static func dispatchInterval(_ duration: Duration) -> DispatchTimeInterval {
+        let nanoseconds = duration.components.seconds * 1_000_000_000 + duration.components.attoseconds / 1_000_000_000
+        return .nanoseconds(Int(max(1_000_000, nanoseconds)))
     }
 
     private func closeClient(_ client: Client) {
         client.source?.cancel(); client.source = nil
+        client.dropOutbox()
         client.cancelTasks()
         Darwin.close(client.fd)
         clients[client.fd] = nil

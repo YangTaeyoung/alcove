@@ -80,6 +80,11 @@ final class ControlServerTests: XCTestCase {
             (#"{"a": "\u12", "id": 5, "x": }"#, .null),
             (#"{"\u0069d": 5, "x": }"#, .null),
             (#"{"a": [true, false, null, -1.5e3, 0, {"b": "\u00e9\n"}, []], "c": {}, "id": 6, "x": }"#, 6),
+            (#"{"id": 8 }"#.replacingOccurrences(of: "}", with: "} \u{1}"), 8),
+            (#"{"id": 5 6, "x": "\ud83d"}"#, .null),
+            (#"{"id": "a" "b", "x": "\ud83d"}"#, .null),
+            (#"{"id": 5"#, .null),
+            (#"{"id": 5 x"#, .null),
         ]
         for (line, id) in cases {
             let r = try await reply(line)
@@ -91,9 +96,10 @@ final class ControlServerTests: XCTestCase {
         XCTAssertEqual(noObject, ["ok": false, "id": .null, "error": "missing or invalid parameter 'op'"])
     }
 
-    private func startServer(_ handler: ControlHandler, loadingRecognizers: Bool = false) throws -> (ControlServer, String) {
+    private func startServer(_ handler: ControlHandler, loadingRecognizers: Bool = false,
+                             writeStallLimit: Duration = .seconds(30), maxOutboxBytes: Int = 64 << 20) throws -> (ControlServer, String) {
         let path = "/tmp/alcove-ctl-\(UUID().uuidString.prefix(8)).sock"
-        let server = ControlServer(handler: handler, socketPath: path)
+        let server = ControlServer(handler: handler, socketPath: path, writeStallLimit: writeStallLimit, maxOutboxBytes: maxOutboxBytes)
         try server.start(loadingRecognizers: loadingRecognizers)
         addTeardownBlock { server.stop() }
         return (server, path)
@@ -323,6 +329,90 @@ final class ControlServerTests: XCTestCase {
             request: "{\"id\":1,\"op\":\"vm.clipboard.get\",\"name\":\"Win\"}\n",
             holding: { $0["t"]?.stringValue == "clipboard.get" },
             answer: { _ in ["t": "clipboard.text", "text": "stale clipboard of the first connection"] })
+    }
+
+    func testClosingTheConnectionCancelsEveryQueuedSerialOp() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
+        await t.setAgentWait(.seconds(20))
+        let (server, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory))
+        let fd = connectClient(path)
+
+        send("{\"id\":1,\"op\":\"vm.clipboard.get\",\"name\":\"Win\"}\n{\"id\":2,\"op\":\"vm.clipboard.get\",\"name\":\"Win\"}\n{\"id\":3,\"op\":\"vm.status\",\"name\":\"Win\"}\n", on: fd)
+        guard await eventually("the first request waits for the agent", { await t.agentWaits == 1 }) else { return }
+        XCTAssertEqual(server.serialTaskCount(), 3)
+        close(fd)
+        guard await eventually("the first request is cancelled", { await t.cancelledAgentWaits == 1 }) else { return }
+        guard await eventually("the serial tasks are forgotten", { server.serialTaskCount() == 0 }) else { return }
+        let waits = await t.agentWaits
+        XCTAssertEqual(waits, 1)
+        let statusCalls = await t.agentTimeouts.count
+        XCTAssertEqual(statusCalls, 1)
+    }
+
+    func testFinishedSerialOpsAreForgotten() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
+        let (server, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory))
+        let fd = connectClient(path)
+        defer { close(fd) }
+        send("{\"id\":1,\"op\":\"hello\"}\n{\"id\":2,\"op\":\"hello\"}\n", on: fd)
+        XCTAssertEqual(readReply(fd)["id"]?.intValue, 1)
+        XCTAssertEqual(readReply(fd)["id"]?.intValue, 2)
+        _ = await eventually("the serial tasks are forgotten") { server.serialTaskCount() == 0 }
+    }
+
+    /// A handler over a running VM "Win" whose screenshots are a 1000x1000 frame of noise, several MB of PNG.
+    private func noisyHandler() async -> ControlHandler {
+        var pixels = Data(count: 1000 * 1000 * 4)
+        pixels.withUnsafeMutableBytes { arc4random_buf($0.baseAddress, $0.count) }
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
+        await t.setFrames([Frame(width: 1000, height: 1000, pixels: pixels)])
+        return ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+    }
+
+    func testAClientThatDoesNotReadDoesNotHoldBackOtherClients() async throws {
+        let (server, path) = try startServer(await noisyHandler())
+        let stalled = connectClient(path)
+        defer { close(stalled) }
+        send("{\"id\":1,\"op\":\"vm.screenshot\",\"name\":\"Win\"}\n", on: stalled)
+        guard await eventually("the screenshot reply waits to be read", { server.outboxByteCount() > 0 }) else { return }
+
+        let other = connectClient(path)
+        defer { close(other) }
+        send("{\"id\":7,\"op\":\"hello\"}\n", on: other)
+        let reply = readReply(other)
+        XCTAssertEqual(reply["id"]?.intValue, 7)
+        XCTAssertEqual(reply["host"]?.stringValue, "test")
+        XCTAssertEqual(server.connectionCount(), 2)
+
+        var total = 0
+        var b = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = read(stalled, &b, b.count)
+            if n <= 0 { break }
+            total += n
+            if b[n - 1] == 10 { break }
+        }
+        XCTAssertGreaterThan(total, 1_000_000)
+        XCTAssertEqual(server.outboxByteCount(), 0)
+    }
+
+    func testAClientWithoutWriteProgressIsClosed() async throws {
+        let (server, path) = try startServer(await noisyHandler(), writeStallLimit: .milliseconds(300))
+        let stalled = connectClient(path)
+        defer { close(stalled) }
+        send("{\"id\":1,\"op\":\"vm.screenshot\",\"name\":\"Win\"}\n", on: stalled)
+        guard await eventually("the screenshot reply waits to be read", { server.outboxByteCount() > 0 }) else { return }
+        _ = await eventually("the client is closed") { server.connectionCount() == 0 }
+        XCTAssertEqual(server.outboxByteCount(), 0)
+    }
+
+    func testAClientWhoseUnreadRepliesPassTheOutboxLimitIsClosed() async throws {
+        let (server, path) = try startServer(await noisyHandler(), maxOutboxBytes: 1 << 20)
+        let stalled = connectClient(path)
+        defer { close(stalled) }
+        send("{\"id\":1,\"op\":\"vm.screenshot\",\"name\":\"Win\"}\n", on: stalled)
+        _ = await eventually("the client is closed") { server.connectionCount() == 0 }
+        XCTAssertEqual(server.outboxByteCount(), 0)
     }
 
     func testFinishedConcurrentOpsAreForgotten() async throws {
