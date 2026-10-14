@@ -912,6 +912,25 @@ final class ScriptBuilderTests: XCTestCase {
                                         "seq 5 (vm.process.kill): \(pid)", "seq 7 (vm.wait_for): \(pid)"])
     }
 
+    func testHTTPCaptureOpsAreLeftOutWithAWarning() {
+        let draft = ScriptBuilder.draft(trace: [
+            entry(1, "vm.http.start", ["hosts": ["api.example.com"]], result: ["proxy": "10.0.2.2:5000"]),
+            entry(2, "vm.http.rule.add", ["match": ["path": "/v1/*"], "action": ["status": 500]], result: ["rule": 1]),
+            entry(3, "vm.mouse.click", ["x": 5, "y": 6]),
+            entry(4, "vm.http.requests", result: ["exchanges": []]),
+            entry(5, "vm.http.rule.remove", ["rule": 1]),
+            entry(6, "vm.http.rule.clear"),
+            entry(7, "vm.http.clear"),
+            entry(8, "vm.http.stop", result: ["exchanges": 3]),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(ops(draft.script), ["vm.mouse.click"])
+        let reason = "an HTTP capture and its rules belong to the setup of a run, not to its steps; start the capture and add its rules with the vm.http ops before running the script"
+        XCTAssertEqual(draft.warnings, [1, 2, 5, 6, 7, 8].map { seq in
+            let op = ["vm.http.start", "vm.http.rule.add", "", "", "vm.http.rule.remove", "vm.http.rule.clear", "vm.http.clear", "vm.http.stop"][seq - 1]
+            return "seq \(seq) (\(op)) is left out: \(reason)"
+        })
+    }
+
     func testLabelsNeverCarryTheMaskMarker() {
         let masked = target("Sign in", "Button", "<masked>", byName: (1, 0))
         let draft = ScriptBuilder.draft(trace: [

@@ -24,7 +24,7 @@ struct TraceEntry {
     var json: JSON {
         var obj: [String: JSON] = [
             "seq": .int(Int64(seq)), "time": .string(TraceEntry.format(time)), "ms": .int(Int64(ms)), "op": .string(op),
-            "params": TraceSanitizer.sanitize(TraceSanitizer.maskValues(params, secrets: secrets)), "durationMs": .int(Int64(durationMs)),
+            "params": TraceSanitizer.sanitize(params: TraceSanitizer.maskValues(params, secrets: secrets), op: op), "durationMs": .int(Int64(durationMs)),
         ]
         switch outcome {
         case .success(let result):
@@ -64,10 +64,36 @@ enum TraceSanitizer {
         sanitize(value, inEnv: false)
     }
 
+    /// The sanitized params of `op`. In the `action.headers` object of `vm.http.rule.add` the values of the
+    /// `ControlHandler.secretHeaders` become `<masked>`.
+    static func sanitize(params: JSON, op: String) -> JSON {
+        guard op == "vm.http.rule.add", case .object(var fields) = params else { return sanitize(params) }
+        fields["action"] = fields["action"].map(maskingRuleHeaders)
+        return sanitize(.object(fields))
+    }
+
+    /// `action` with `<masked>` in place of the value of each of the `ControlHandler.secretHeaders` in its `headers` object.
+    private static func maskingRuleHeaders(_ action: JSON) -> JSON {
+        guard case .object(var fields) = action, case .object(let headers)? = fields["headers"] else { return action }
+        fields["headers"] = .object(Dictionary(uniqueKeysWithValues: headers.map { name, value in
+            (name, ControlHandler.secretHeaders.contains(name.lowercased()) ? JSON.string(mask) : value)
+        }))
+        return .object(fields)
+    }
+
     /// The sanitized result of `op`. In a `vm.http.request` result the values of the `ControlHandler.secretHeaders`
     /// become `<masked>` unless the proxy stored them as `<redacted n chars>`, and a body longer than `maxStringLength`
-    /// is cut and marked with `bodyCut`.
+    /// is cut and marked with `bodyCut`. In a `vm.http.rule.list` result the secret headers of each rule's
+    /// `action.headers` become `<masked>`.
     static func sanitize(result: JSON, op: String) -> JSON {
+        if op == "vm.http.rule.list", case .object(var fields) = result, let rules = fields["rules"]?.arrayValue {
+            fields["rules"] = .array(rules.map { rule in
+                guard case .object(var ruleFields) = rule else { return rule }
+                ruleFields["action"] = ruleFields["action"].map(maskingRuleHeaders)
+                return .object(ruleFields)
+            })
+            return sanitize(.object(fields))
+        }
         guard op == "vm.http.request", case .object(var fields) = result else { return sanitize(result) }
         for key in ["headers", "trailers"] {
             guard let pairs = fields[key]?.arrayValue else { continue }

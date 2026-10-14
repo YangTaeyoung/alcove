@@ -96,6 +96,18 @@ final class TraceTests: XCTestCase {
 
     // MARK: trace content
 
+    func testSecretHeadersOfHTTPRulesAreMaskedInTheTrace() throws {
+        let headers: JSON = ["Authorization": "Bearer abc", "set-cookie": "sid=1", "X-Request-Id": "r1"]
+        let add = TraceEntry(seq: 1, time: Date(), ms: 0, op: "vm.http.rule.add",
+                             params: ["name": "Win", "match": ["path": "/v1/*"], "action": ["status": 200, "headers": headers]],
+                             outcome: .success(["rule": 1]), durationMs: 1, before: nil, after: nil).json
+        XCTAssertEqual(add["params"]?["action"]?["headers"], ["Authorization": "<masked>", "set-cookie": "<masked>", "X-Request-Id": "r1"])
+        let list = TraceEntry(seq: 2, time: Date(), ms: 0, op: "vm.http.rule.list", params: ["name": "Win"],
+                              outcome: .success(["rules": [["id": 1, "match": [:], "action": ["headers": headers], "hits": 0]]]),
+                              durationMs: 1, before: nil, after: nil).json
+        XCTAssertEqual(list["result"]?["rules"]?[0]?["action"]?["headers"], ["Authorization": "<masked>", "set-cookie": "<masked>", "X-Request-Id": "r1"])
+    }
+
     func testTraceMasksSecrets() async throws {
         let (h, _, _) = setup()
         let dir = try await start(h)

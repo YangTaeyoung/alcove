@@ -14,6 +14,8 @@ enum ScriptBuilder {
         var required: [String] = []
     }
 
+    /// Why an entry of a `vm.http.*` op that changes a capture is left out.
+    static let captureReason = "an HTTP capture and its rules belong to the setup of a run, not to its steps; start the capture and add its rules with the vm.http ops before running the script"
     /// The read-only ops that become steps.
     static let keptReadOnlyOps: Set<String> = ["vm.wait_for", "vm.wait_idle"]
     /// The most characters of typed text, a command or a path a label shows.
@@ -48,7 +50,8 @@ enum ScriptBuilder {
     /// - The `text` of a `vm.ui.type` and the `value` of a `vm.ui.action` whose `target` or result node is a password
     ///   element, and the `text` of a `vm.type` when the latest entry that says what it was aimed at was aimed at a
     ///   password element, become a variable each: `password`, `password2`, and so on. Such a `vm.type` step is not merged.
-    /// A `vm.key.press`, `vm.key.down` or `vm.key.up` whose keys the trace masks is left out.
+    /// A `vm.key.press`, `vm.key.down` or `vm.key.up` whose keys the trace masks is left out, and so is every
+    /// `vm.http.*` entry, with a warning.
     /// No variable has a default. The warnings hold a sentence for every entry left out, every selector that lost its
     /// window, every variable, every step that names a job id or a pid, every step whose selector carries an `index`, and
     /// every window part that stands for a longer title.
@@ -253,6 +256,10 @@ enum ScriptBuilder {
             if let role = entry["script"], role != .null, role.stringValue != ScriptCall.step.rawValue { return }
             guard Script.allows(op: op), ControlHandler.knownOps.contains(op),
                   !ControlHandler.isReadOnly(op: op) || keptReadOnlyOps.contains(op) else { return }
+            if op.hasPrefix("vm.http.") {
+                leaveOut("seq \(seq) (\(op))", ScriptBuilder.captureReason)
+                return
+            }
             var params = entry["params"]?.objectValue ?? [:]
             params["name"] = nil
             params["lease"] = nil
