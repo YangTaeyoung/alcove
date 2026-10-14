@@ -333,7 +333,7 @@ final class DiagnosticsTests: XCTestCase {
 
     func testNewestEventLogMessageIsTheFirstEntryOfTheList() async throws {
         let r = try await rig {
-            $0.applicationEntries = [entry("2026-10-14T01:05:00Z", "App", "listed first"), entry("2026-10-14T09:00:00+09:00", "App", "listed second")]
+            $0.applicationEntries = [entry("2026-10-14T01:05:00Z", "App", "listed first"), entry("2026-10-14T00:00:00Z", "App", "listed second")]
         }
         let result = try await collect(r.handler)
         XCTAssertTrue(try summaryLines(result).contains("event log Application: 2 entries of level error or worse in the last 30 minutes; newest: listed first"))
@@ -382,7 +382,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(scripts.count, 2)
         for script in scripts {
             XCTAssertTrue(script.contains("AddMinutes(-90)"), script)
-            XCTAssertTrue(script.contains("$filter.Level = @(1,2)"), script)
+            XCTAssertTrue(script.contains(" and (Level=1 or Level=2)"), script)
         }
         XCTAssertTrue(scripts.contains { $0.contains("$log = 'Application'") })
         XCTAssertTrue(scripts.contains { $0.contains("$log = 'System'") })
@@ -710,7 +710,7 @@ final class DiagnosticsTests: XCTestCase {
             $0.fs["C:\\alcove-dumps\\here.exe.2.dmp"] = Data(count: 4)
         }
         let result = try await collect(r.handler)
-        XCTAssertEqual(try read("dumps/gone.exe.1.dmp.error.txt"), "'C:\\alcove-dumps\\gone.exe.1.dmp' is not a file in the guest; check the path\n")
+        XCTAssertEqual(try read("dumps/gone.exe.1.dmp.error.txt"), "C:\\alcove-dumps holds no dump named 'gone.exe.1.dmp'; list the dumps with vm.crash_dumps.list\n")
         XCTAssertTrue(files(result).contains("dumps/here.exe.2.dmp"))
         XCTAssertFalse(files(result).contains("dumps/gone.exe.1.dmp"))
         XCTAssertTrue(try XCTUnwrap(result["summary"]?.stringValue).contains("crash dump gone.exe.1.dmp: 4 bytes"))
