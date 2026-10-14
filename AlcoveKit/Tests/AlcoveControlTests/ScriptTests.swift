@@ -486,7 +486,8 @@ final class ScriptTests: XCTestCase {
         let parsed = try script(steps([wait]))
         let handler = rig.handler
         let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
-        while try await leasedBy(rig) == nil { try await Task.sleep(for: .milliseconds(20)) }
+        let leased = await eventually("the run holds its lease") { (try? await handler.handle(op: "vm.status", params: ["name": "Win"]))?["leasedBy"] != nil }
+        XCTAssertTrue(leased)
         rig.clock.advance(.seconds(500))
         var remaining = ""
         let deadline = ContinuousClock.now + .seconds(30)
@@ -669,9 +670,9 @@ final class ScriptTests: XCTestCase {
         let parsed = try script(steps([gate, exec("after")]))
         let handler = rig.handler
         let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
-        while try await leasedBy(rig) == nil { try await Task.sleep(for: .milliseconds(10)) }
-        await handler.forget(vm: "Win")
-        _ = try await handler.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "agent-b", "ttl": 60])
+        let leased = await eventually("the run holds its lease") { (try? await handler.handle(op: "vm.status", params: ["name": "Win"]))?["leasedBy"] != nil }
+        XCTAssertTrue(leased)
+        await handler.replaceLease(vm: "Win", owner: "agent-b")
         rig.fs["C:\\gate"] = Data("x".utf8)
         let result = await task.value
         XCTAssertFalse(result.passed)
@@ -690,9 +691,9 @@ final class ScriptTests: XCTestCase {
         let parsed = try script(steps([gate]))
         let handler = rig.handler
         let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
-        while try await leasedBy(rig) == nil { try await Task.sleep(for: .milliseconds(10)) }
-        await handler.forget(vm: "Win")
-        _ = try await handler.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "agent-b", "ttl": 60])
+        let leased = await eventually("the run holds its lease") { (try? await handler.handle(op: "vm.status", params: ["name": "Win"]))?["leasedBy"] != nil }
+        XCTAssertTrue(leased)
+        await handler.replaceLease(vm: "Win", owner: "agent-b")
         rig.fs["C:\\gate"] = Data("x".utf8)
         let result = await task.value
         XCTAssertTrue(result.passed, result.error ?? "")
@@ -954,11 +955,12 @@ final class ScriptTests: XCTestCase {
         let parsed = try script(steps([stall, exec("after")]))
         let handler = rig.handler
         let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
-        var request: JSON?
-        while request == nil {
-            request = agentRequests(rig.agent, "exec.run").first { $0["cmd"]?.stringValue == "stall" }
-            if request == nil { try await Task.sleep(for: .milliseconds(10)) }
+        let agent = rig.agent
+        let sent = await eventually("the stalling step sent its request") {
+            agentRequests(agent, "exec.run").contains { $0["cmd"]?.stringValue == "stall" }
         }
+        XCTAssertTrue(sent)
+        let request = agentRequests(agent, "exec.run").first { $0["cmd"]?.stringValue == "stall" }
         task.cancel()
         rig.agent.sendLine(["t": "res", "id": request?["id"] ?? .null, "ok": false, "error": "exec stopped"])
         let result = await task.value
@@ -1038,5 +1040,13 @@ final class ScriptTests: XCTestCase {
         XCTAssertTrue(ControlHandler.knownOps.contains("script.run"))
         XCTAssertTrue(ControlHandler.isConcurrent(op: "script.run"))
         XCTAssertFalse(ControlHandler.isReadOnly(op: "script.run"))
+    }
+}
+
+extension ControlHandler {
+    /// Drops the lease of `vm` and grants a new one to `owner` in one step of the actor.
+    func replaceLease(vm: String, owner: String) {
+        leases.forget(vm: vm)
+        _ = try? leases.acquire(vm: vm, owner: owner, ttl: .seconds(60), token: nil, now: clock())
     }
 }
