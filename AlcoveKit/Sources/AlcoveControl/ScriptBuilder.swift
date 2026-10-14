@@ -357,13 +357,18 @@ enum ScriptBuilder {
             if let id = sessionID(op: op, params: params) {
                 warnings.append("\(line): its \(id) belongs to the recorded session and a replay gets another one; change the step by hand")
             }
+            let aimedAtPassword = op == "vm.type" ? passwordAimed
+                : entry["target"]?["password"]?.boolValue == true || ControlHandler.isPasswordNode(entry["result"]?["node"])
             if let param = ControlHandler.writtenTextParam(op: op), item.step.params[param]?.stringValue != nil,
-               item.step.params[param]?.stringValue == TraceSanitizer.mask
-                || (op == "vm.type" ? passwordAimed : entry["target"]?["password"]?.boolValue == true || ControlHandler.isPasswordNode(entry["result"]?["node"])) {
+               item.step.params[param]?.stringValue == TraceSanitizer.mask || aimedAtPassword {
                 let variable = newVariable("password")
                 item.secret = (param, variable)
                 item.text = nil
-                warnings.append("\(line): its \(param) goes into a password field and is not written to the script; the step reads it from the variable '\(variable)', pass it in variables when running the script")
+                if aimedAtPassword {
+                    warnings.append("\(line): its \(param) goes into a password field and is not written to the script; the step reads it from the variable '\(variable)', pass it in variables when running the script")
+                } else {
+                    warnings.append("step \(pending.count + 1) (\(op)) typed text that the recording masked; it is the variable ${\(variable)} and must be passed")
+                }
             }
             item.subject = subject(of: item.step, element: item.element)
             if let secret = item.secret { item.step.params[secret.param] = nil }
@@ -625,6 +630,7 @@ enum ScriptBuilder {
             subject = item.secret != nil ? "into a password field" : item.text.map { UITreeText.quoted(short($0)) }
         }
         let full = [item.step.op, subject ?? ""].filter { !$0.isEmpty }.joined(separator: " ")
+            .replacingOccurrences(of: TraceSanitizer.mask, with: "hidden text")
         return full.count > labelLimit ? String(full.prefix(labelLimit)) + "…" : full
     }
 

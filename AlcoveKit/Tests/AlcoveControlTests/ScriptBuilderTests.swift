@@ -548,7 +548,7 @@ final class ScriptBuilderTests: XCTestCase {
             reads("seq 2 (vm.type)", "text", "password"), reads("seq 3 (vm.type)", "text", "password2"),
             reads("seq 4 (vm.ui.type)", "text", "password3"), reads("seq 5 (vm.ui.action)", "value", "password4"),
             reads("seq 6 (vm.ui.type)", "text", "password5"), reads("seq 7 (vm.ui.action)", "value", "password6"),
-            reads("seq 8 (vm.type)", "text", "password7"),
+            "step 8 (vm.type) typed text that the recording masked; it is the variable ${password7} and must be passed",
             reads("seq 11 (vm.type)", "text", "password8"), reads("seq 12 (vm.type)", "text", "password9"),
             "seq 15 (vm.exec): the trace masks the env value 'DB_PASSWORD'; the step reads it from the variable 'DB_PASSWORD', pass it in variables when running the script",
             "seq 15 (vm.exec): the trace masks the env value 'password'; the step reads it from the variable 'password10', pass it in variables when running the script",
@@ -912,6 +912,16 @@ final class ScriptBuilderTests: XCTestCase {
                                         "seq 5 (vm.process.kill): \(pid)", "seq 7 (vm.wait_for): \(pid)"])
     }
 
+    func testLabelsNeverCarryTheMaskMarker() {
+        let masked = target("Sign in", "Button", "<masked>", byName: (1, 0))
+        let draft = ScriptBuilder.draft(trace: [
+            entry(2, "vm.mouse.click", ["x": 190, "y": 112], ["target": masked]),
+            entry(3, "vm.ui.click", ["selector": ["role": "Button", "name": "<masked>"]], result: ["x": 190, "y": 112]),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(draft.script.steps.map(\.label), ["vm.ui.click Button \"hidden text\"", "vm.ui.click Button \"hidden text\""])
+        XCTAssertFalse(String(decoding: try! draft.script.encoded(), as: UTF8.self).contains("<masked>"))
+    }
+
     func testMaskMarkerNeverReachesAScript() {
         let user = target("Sign in", "Edit", "User", byName: (1, 0))
         let entries: [JSON] = [
@@ -977,14 +987,14 @@ final class ScriptBuilderTests: XCTestCase {
     func testSaveRefusesAScriptThatStillHoldsTheMaskMarker() async throws {
         let h = handler()
         let dir = try recordingDir([
-            entry(1, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("Alcove Fixture", "Button", "<masked>", byName: (1, 0))]),
+            entry(1, "vm.mouse.click", ["x": 190, "y": 112], ["target": target("<masked>", "Button", "Send", byName: (1, 0))]),
         ])
         let out = try tempDir().appendingPathComponent("flow.json")
         do {
             _ = try await h.handle(op: "script.save", params: ["dir": .string(dir.path), "path": .string(out.path)])
             XCTFail("saved a script with the marker")
         } catch {
-            XCTAssertTrue("\(error)".hasPrefix("step 1 (vm.ui.click Button \"<masked>\") still holds the mask marker '<masked>' of the trace; "), "\(error)")
+            XCTAssertTrue("\(error)".hasPrefix("step 1 (vm.ui.click Button \"Send\") still holds the mask marker '<masked>' of the trace; "), "\(error)")
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: out.path))
     }
