@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -103,17 +104,62 @@ func TestLeafMatchesHostAndChainsToCA(t *testing.T) {
 	}
 }
 
+// ageLeaf replaces the cached leaf of host with a copy that expires at
+// notAfter and returns the copy.
+func ageLeaf(ca *CA, host string, notAfter time.Time) *tls.Certificate {
+	entry := ca.leaves[host].Value.(*leafEntry)
+	stale := *entry.cert
+	leaf := *entry.cert.Leaf
+	leaf.NotAfter = notAfter
+	stale.Leaf = &leaf
+	entry.cert = &stale
+	return &stale
+}
+
 func TestLeafIsReplacedNearExpiry(t *testing.T) {
 	ca, _ := LoadOrCreateCA(t.TempDir())
-	first, _ := ca.Leaf("a.example")
-	stale := *first
-	staleLeaf := *first.Leaf
-	staleLeaf.NotAfter = time.Now().Add(12 * time.Hour)
-	stale.Leaf = &staleLeaf
-	ca.leaves["a.example"] = &stale
+	ca.Leaf("a.example")
+	stale := ageLeaf(ca, "a.example", time.Now().Add(12*time.Hour))
 	next, _ := ca.Leaf("a.example")
-	if next == &stale {
+	if next == stale {
 		t.Fatal("near-expiry leaf was served from the cache")
+	}
+}
+
+func TestLeafCacheKeepsTheMostRecentlyUsedHosts(t *testing.T) {
+	old := maxLeaves
+	maxLeaves = 3
+	t.Cleanup(func() { maxLeaves = old })
+	ca, err := LoadOrCreateCA(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := ca.Leaf("a.example")
+	b, _ := ca.Leaf("b.example")
+	ca.Leaf("c.example")
+	ca.Leaf("a.example")
+	ca.Leaf("d.example")
+	if n := len(ca.leaves); n != 3 {
+		t.Fatalf("%d cached leaves, want 3", n)
+	}
+	if again, _ := ca.Leaf("a.example"); again != a {
+		t.Fatal("the most recently used host lost its leaf")
+	}
+	if again, _ := ca.Leaf("b.example"); again == b {
+		t.Fatal("the least recently used host kept its leaf")
+	}
+}
+
+func TestLeavesNearExpiryLeaveTheCacheOnInsert(t *testing.T) {
+	ca, err := LoadOrCreateCA(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca.Leaf("old.example")
+	ageLeaf(ca, "old.example", time.Now().Add(time.Hour))
+	ca.Leaf("new.example")
+	if n := len(ca.leaves); n != 1 {
+		t.Fatalf("%d cached leaves, want 1", n)
 	}
 }
 

@@ -3,6 +3,7 @@
 package mitm
 
 import (
+	"container/list"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -28,13 +29,29 @@ const (
 	leafRenewal  = 24 * time.Hour
 )
 
+// maxLeaves bounds the number of cached leaf certificates.
+var maxLeaves = 1000
+
 // CA signs per-host leaf certificates.
 type CA struct {
-	dir    string
-	cert   *x509.Certificate
-	key    *ecdsa.PrivateKey
+	dir  string
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
+
 	mu     sync.Mutex
-	leaves map[string]*tls.Certificate
+	leaves map[string]*list.Element
+	// recent orders the cached leaves, most recently used first; its values
+	// are *leafEntry.
+	recent *list.List
+}
+
+type leafEntry struct {
+	host string
+	cert *tls.Certificate
+}
+
+func newCA(dir string, cert *x509.Certificate, key *ecdsa.PrivateKey) *CA {
+	return &CA{dir: dir, cert: cert, key: key, leaves: map[string]*list.Element{}, recent: list.New()}
 }
 
 // caSettleTime bounds how long a load waits for ca.pem when ca.key exists
@@ -134,7 +151,7 @@ func parseCA(dir string, certPEM, keyPEM []byte, now time.Time) (*CA, error) {
 	if now.Before(cert.NotBefore) {
 		return nil, fmt.Errorf("ca.pem is not valid before %s%s", cert.NotBefore.UTC().Format(time.RFC3339), fix)
 	}
-	return &CA{dir: dir, cert: cert, key: key, leaves: map[string]*tls.Certificate{}}, nil
+	return newCA(dir, cert, key), nil
 }
 
 func createCA(dir, certPath, keyPath string) (*CA, error) {
@@ -191,7 +208,7 @@ func createCA(dir, certPath, keyPath string) (*CA, error) {
 	if err := os.Link(certTmp, certPath); err != nil {
 		return nil, fmt.Errorf("cannot write %s (%v); delete ca.pem and ca.key in %s to create a new CA", certPath, err, dir)
 	}
-	return &CA{dir: dir, cert: cert, key: key, leaves: map[string]*tls.Certificate{}}, nil
+	return newCA(dir, cert, key), nil
 }
 
 // writeTemp writes data to a new file of mode 0600 in dir and returns its
@@ -227,16 +244,22 @@ func (c *CA) PEMPath() string { return filepath.Join(c.dir, "ca.pem") }
 func (c *CA) Certificate() *x509.Certificate { return c.cert }
 
 // Leaf returns a certificate for host signed by the CA. Results are cached per
-// host and replaced when they are within a day of expiry.
+// host and replaced when they are within a day of expiry. The cache holds at
+// most maxLeaves hosts and drops the least recently used one beyond that;
+// adding a host also drops every leaf within a day of expiry.
 func (c *CA) Leaf(host string) (*tls.Certificate, error) {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	if host == "" {
-		return nil, errors.New("cannot issue a certificate for an empty host name")
+		return nil, errors.New("cannot issue a certificate for an empty host name; connect to the server by its name or address")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cached, ok := c.leaves[host]; ok && time.Until(cached.Leaf.NotAfter) > leafRenewal {
-		return cached, nil
+	if el, ok := c.leaves[host]; ok {
+		cached := el.Value.(*leafEntry).cert
+		if time.Until(cached.Leaf.NotAfter) > leafRenewal {
+			c.recent.MoveToFront(el)
+			return cached, nil
+		}
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -270,6 +293,25 @@ func (c *CA) Leaf(host string) (*tls.Certificate, error) {
 		return nil, err
 	}
 	out := &tls.Certificate{Certificate: [][]byte{der, c.cert.Raw}, PrivateKey: key, Leaf: leaf}
-	c.leaves[host] = out
+	c.cacheLeaf(host, out)
 	return out, nil
+}
+
+// cacheLeaf stores cert for host as the most recently used leaf. Called with
+// c.mu held.
+func (c *CA) cacheLeaf(host string, cert *tls.Certificate) {
+	for el := c.recent.Front(); el != nil; {
+		next := el.Next()
+		if e := el.Value.(*leafEntry); e.host == host || time.Until(e.cert.Leaf.NotAfter) <= leafRenewal {
+			c.recent.Remove(el)
+			delete(c.leaves, e.host)
+		}
+		el = next
+	}
+	c.leaves[host] = c.recent.PushFront(&leafEntry{host: host, cert: cert})
+	for c.recent.Len() > maxLeaves {
+		oldest := c.recent.Back()
+		c.recent.Remove(oldest)
+		delete(c.leaves, oldest.Value.(*leafEntry).host)
+	}
 }
