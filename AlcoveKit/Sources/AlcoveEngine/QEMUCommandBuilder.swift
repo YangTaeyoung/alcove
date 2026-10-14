@@ -115,8 +115,11 @@ public struct QEMUCommandBuilder: Sendable {
 
         a += ["-device", "virtio-rng-pci"]
         a += ["-device", "virtio-serial-pci,id=vser0"]
-        // the guest agent reads its token from the SMBIOS OEM strings (type 11)
-        a += ["-smbios", "type=11,value=alcove-token=\(config.agentToken)"]
+        // the guest agent reads its token and the host's public key from the SMBIOS OEM strings (type 11)
+        a += ["-smbios", "type=11,value=alcove-token=\(Self.escape(config.agentToken))"]
+        if let hostKey = config.agentPublicKey {
+            a += ["-smbios", "type=11,value=alcove-hostkey=\(hostKey)"]
+        }
 
         // Emitted whenever the config asks for it: a missing swtpm must fail
         // loudly (VMController refuses to start), never silently drop the TPM.

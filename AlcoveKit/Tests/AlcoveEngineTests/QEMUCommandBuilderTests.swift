@@ -13,6 +13,7 @@ final class QEMUCommandBuilderTests: XCTestCase {
         var c = VMConfig.defaults(name: "Win", guestOS: .windows, installISO: "/isos/win.iso")
         c.macAddress = "52:54:00:aa:bb:cc"
         c.network = .user(portForwards: [.init(hostPort: 2222, guestPort: 22)])
+        c.agentKey = String(repeating: "a5", count: 32)
         let a = args(c)
         let expected: [String] = [
             "-name", "guest=Win,debug-threads=on",
@@ -37,6 +38,7 @@ final class QEMUCommandBuilderTests: XCTestCase {
             "-device", "virtio-rng-pci",
             "-device", "virtio-serial-pci,id=vser0",
             "-smbios", "type=11,value=alcove-token=\(c.agentToken)",
+            "-smbios", "type=11,value=alcove-hostkey=29e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d55",
             "-qmp", "unix:\(bundle.qmpSocketPath),server=on,wait=off",
             "-serial", "file:/vms/Test.alcovevm/run/serial.log", "-monitor", "none",
             "-pidfile", "/vms/Test.alcovevm/run/qemu.pid",

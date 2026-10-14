@@ -90,6 +90,18 @@ final class VMConfigTests: XCTestCase {
         XCTAssertEqual(migrated.agentToken, c.agentToken)
     }
 
+    func testTheAgentPublicKeyIsTheEd25519PublicKeyOfTheAgentKey() {
+        var c = VMConfig.defaults(name: "K", guestOS: .windows)
+        c.agentKey = String(repeating: "a5", count: 32)
+        XCTAssertEqual(c.agentPublicKey, "29e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d55")
+        c.agentKey = String(repeating: "A5", count: 32)
+        XCTAssertEqual(c.agentPublicKey, "29e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d55")
+        for bad in ["", "a5", String(repeating: "a5", count: 31), String(repeating: "zz", count: 32), String(repeating: "a5", count: 33)] {
+            c.agentKey = bad
+            XCTAssertNil(c.agentPublicKey, bad)
+        }
+    }
+
     func testCloneOfRoundTripsAndIsOmittedWhenNil() throws {
         var c = VMConfig.defaults(name: "C", guestOS: .linux)
         XCTAssertNil(c.cloneOf)

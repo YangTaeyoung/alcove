@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Persistent description of a virtual machine (`config.json` in the bundle).
 public struct VMConfig: Codable, Sendable, Equatable {
@@ -107,8 +108,9 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public var agentToken: String
     /// Host loopback port forwarded to the guest agent (guest port 7645).
     public var agentHostPort: Int
-    /// The seed of the Ed25519 private key the guest agent is paired with: 32 random bytes as 64 lower-case
-    /// hexadecimal digits (docs/agent-protocol.md, Host key). It never reaches the guest; the agent gets its public key.
+    /// The seed of the Ed25519 private key the host proves to the guest agent: 32 random bytes as 64 lower-case
+    /// hexadecimal digits (docs/agent-protocol.md, Host key). It never reaches the guest; the guest gets
+    /// `agentPublicKey` as an SMBIOS string.
     public var agentKey: String
     /// Name of the template this VM was cloned from; nil for a VM that is not a clone.
     public var cloneOf: String?
@@ -204,6 +206,31 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public static func randomAgentKey() -> String {
         var generator = SystemRandomNumberGenerator()
         return (0..<32).map { _ in String(format: "%02x", UInt8.random(in: 0...255, using: &generator)) }.joined()
+    }
+
+    /// The Ed25519 public key of `agentKey` as 64 lower-case hexadecimal digits; nil when `agentKey` is not 64
+    /// hexadecimal digits.
+    public var agentPublicKey: String? {
+        let digits = Array(agentKey.utf8)
+        guard digits.count == 64 else { return nil }
+        var seed = Data(capacity: 32)
+        var index = 0
+        while index < digits.count {
+            guard let high = VMConfig.hexValue(digits[index]), let low = VMConfig.hexValue(digits[index + 1]) else { return nil }
+            seed.append(high << 4 | low)
+            index += 2
+        }
+        guard let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: seed) else { return nil }
+        return key.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func hexValue(_ c: UInt8) -> UInt8? {
+        switch c {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return c - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return c - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return c - UInt8(ascii: "A") + 10
+        default: return nil
+        }
     }
 
     /// A random locally administered unicast MAC (`52:54:00:xx:xx:xx`, the QEMU OUI).

@@ -42,10 +42,8 @@ public struct VMBundle: Sendable, Equatable {
     public func diskURL(_ disk: VMConfig.Disk) -> URL { url.appendingPathComponent(disk.fileName) }
 
     /// Load `config.json`. Fields added after the bundle was written (the guest
-    /// agent token, port and key) are synthesized by the decoder; they must be
-    /// written back at once, because a value regenerated on every load would
-    /// differ between the process that started the VM and anyone connecting to
-    /// its guest agent afterwards. A migrated config is returned as `save` wrote it.
+    /// agent token, port and key) are synthesized by the decoder and written
+    /// back at once; a migrated config is returned as `save` wrote it.
     public func loadConfig() throws -> VMConfig {
         let data = try Data(contentsOf: configURL)
         let config = try VMConfig.decode(data)
@@ -273,8 +271,8 @@ extension VMBundle {
     }
 
     /// New bundle next to this one, named `newName` without surrounding whitespace, whose disks are
-    /// qcow2 overlays backed by this bundle's disks, with a copy of the UEFI variables, a fresh token
-    /// and MAC, this bundle's `agentKey`, an agent port no bundle in the directory uses, no CD-ROMs, USB passthrough or static
+    /// qcow2 overlays backed by this bundle's disks, with a copy of the UEFI variables, a fresh token,
+    /// `agentKey` and MAC, an agent port no bundle in the directory uses, no CD-ROMs, USB passthrough or static
     /// forwards, and `cloneOf` set. The clone is added to `clones.json`.
     /// The overlays reference the template's disk files by absolute path.
     /// A template without a `diskEpoch` is saved with `diskEpoch` 0 and, when it has none, a new UUID
@@ -305,7 +303,7 @@ extension VMBundle {
         if case .none = source.network { network = .none }
         let config = VMConfig(name: newName, guestOS: source.guestOS, cpuCount: source.cpuCount, memoryMiB: source.memoryMiB,
                               disks: source.disks, network: network, display: source.display,
-                              sharedFolders: source.sharedFolders, agentToken: token, agentKey: source.agentKey, cloneOf: source.name,
+                              sharedFolders: source.sharedFolders, agentToken: token, agentKey: VMConfig.randomAgentKey(), cloneOf: source.name,
                               templateEpoch: epoch, templatePath: url.standardizedFileURL.path, templateDiskID: diskID)
         do {
             try config.validate()
