@@ -474,10 +474,13 @@ public actor ControlHandler {
     }
 
     /// Width and height of the current guest frame of `t`, which `vm.list` reports for the VM from then on.
-    func frameSize(of t: VMTarget) async throws -> (Int, Int) {
+    /// Cancellation is thrown as `CancellationError`.
+    func frameSize(of t: VMTarget) async throws -> (width: Int, height: Int) {
         let size: (width: Int, height: Int)
         do {
             size = try await t.frameSize()
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw ControlError.failed("the size of the guest screen could not be read: \(ControlHandler.failureReason(error, fallback: "the display gave no image; check vm.status"))")
         }

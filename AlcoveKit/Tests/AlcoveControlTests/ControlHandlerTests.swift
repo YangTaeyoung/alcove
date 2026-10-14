@@ -77,8 +77,15 @@ actor FakeTarget: VMTarget {
         guard let f = Frame(png: png) else { throw NSError(domain: "FakeTarget", code: 1) }
         return f
     }
+    /// The `frameSize()` calls.
+    var frameSizeCalls = 0
+    /// What `frameSize()` throws when set.
+    var frameSizeError: Error?
+    func setFrameSizeError(_ e: Error?) { frameSizeError = e }
     /// The size of the frame the next `frame()` call serves; the call is not counted in `frameCalls`.
     func frameSize() async throws -> (width: Int, height: Int) {
+        frameSizeCalls += 1
+        if let frameSizeError { throw frameSizeError }
         if let next = frames.first { return (next.width, next.height) }
         guard let f = Frame(png: png) else { throw NSError(domain: "FakeTarget", code: 1) }
         return (f.width, f.height)
@@ -280,6 +287,36 @@ final class ControlHandlerTests: XCTestCase {
         XCTAssertEqual(sent.first, .abs(con: 0, x: ToQEMU.absoluteMax, y: ToQEMU.absoluteMax))
         let frames = await t.frameCalls
         XCTAssertEqual(frames, 0)
+    }
+
+    func testEachPointerOpReadsTheFrameSizeOnce() async throws {
+        let (h, t) = setup()
+        let ops: [(String, JSON)] = [
+            ("vm.mouse.drag", ["name": "Win", "fromX": 0, "fromY": 0, "toX": 100, "toY": 100]),
+            ("vm.mouse.click", ["name": "Win", "x": 5, "y": 5, "count": 3]),
+            ("vm.mouse.scroll", ["name": "Win", "x": 5, "y": 5, "dy": 2]),
+            ("vm.mouse.move", ["name": "Win", "x": 5, "y": 5]),
+            ("vm.mouse.down", ["name": "Win", "x": 5, "y": 5]),
+            ("vm.mouse.up", ["name": "Win"]),
+        ]
+        var expected = 0
+        for (op, params) in ops {
+            _ = try await h.handle(op: op, params: params)
+            if params["x"] != nil || params["fromX"] != nil { expected += 1 }
+            let calls = await t.frameSizeCalls
+            XCTAssertEqual(calls, expected, op)
+        }
+    }
+
+    func testABatchCancelledWhileTheFrameSizeIsReadEndsAsCancelled() async throws {
+        let (h, t) = setup()
+        await t.setFrameSizeError(CancellationError())
+        do {
+            let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.mouse.move", "x": 5, "y": 5]]])
+            XCTFail("the batch returned \(r)")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
     }
 
     func testScrollDragAndMove() async throws {

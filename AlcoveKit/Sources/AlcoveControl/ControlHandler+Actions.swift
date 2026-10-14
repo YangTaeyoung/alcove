@@ -180,13 +180,13 @@ extension ControlHandler {
     func send(_ op: String, to t: VMTarget, _ params: JSON, caller: String? = nil) async throws {
         switch op {
         case "vm.mouse.move":
-            try await move(t, x: try int(params, "x"), y: try int(params, "y"))
+            try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t))
             await t.sendDisplay(.sync)
         case "vm.mouse.click":
             let button = try button(params["button"]?.stringValue)
             let count = max(1, min(3, params["count"]?.intValue ?? 1))
             let hold = params["hold"]?.intValue ?? 60
-            try await move(t, x: try int(params, "x"), y: try int(params, "y"))
+            try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t))
             for i in 0..<count {
                 await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
                 try await Task.sleep(for: .milliseconds(hold))
@@ -198,23 +198,24 @@ extension ControlHandler {
             guard (params["x"] == nil) == (params["y"] == nil) else {
                 throw ControlError.failed("\(op) takes 'x' and 'y' together; pass both or neither")
             }
-            if params["x"] != nil { try await move(t, x: try int(params, "x"), y: try int(params, "y")) }
+            if params["x"] != nil { try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t)) }
             guard await t.sendDisplay(.btn(con: 0, button: button, down: op == "vm.mouse.down")) else { throw ControlError.noDisplay(t.name) }
             await t.sendDisplay(.sync)
         case "vm.mouse.drag":
             let button = try button(params["button"]?.stringValue)
             let (fx, fy, tx, ty) = (try int(params, "fromX"), try int(params, "fromY"), try int(params, "toX"), try int(params, "toY"))
-            try await move(t, x: fx, y: fy); await t.sendDisplay(.sync)
+            let size = try await frameSize(of: t)
+            try await move(t, x: fx, y: fy, in: size); await t.sendDisplay(.sync)
             await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
             try await Task.sleep(for: .milliseconds(80))
             for step in 1...10 {
-                try await move(t, x: fx + (tx - fx) * step / 10, y: fy + (ty - fy) * step / 10)
+                try await move(t, x: fx + (tx - fx) * step / 10, y: fy + (ty - fy) * step / 10, in: size)
                 await t.sendDisplay(.sync)
                 try await Task.sleep(for: .milliseconds(25))
             }
             await t.sendDisplay(.btn(con: 0, button: button, down: false)); await t.sendDisplay(.sync)
         case "vm.mouse.scroll":
-            try await move(t, x: try int(params, "x"), y: try int(params, "y")); await t.sendDisplay(.sync)
+            try await move(t, x: try int(params, "x"), y: try int(params, "y"), in: try await frameSize(of: t)); await t.sendDisplay(.sync)
             let dy = params["dy"]?.intValue ?? 0, dx = params["dx"]?.intValue ?? 0
             for _ in 0..<abs(dy) { await wheel(t, dy > 0 ? .wheelDown : .wheelUp) }
             for _ in 0..<abs(dx) { await wheel(t, dx > 0 ? .wheelRight : .wheelLeft) }
@@ -288,9 +289,9 @@ extension ControlHandler {
         }
     }
 
-    /// Moves the pointer to guest pixel (x, y), clamped to the frame as it is at this moment.
-    private func move(_ t: VMTarget, x: Int, y: Int) async throws {
-        let (w, h) = try await frameSize(of: t)
+    /// Moves the pointer to guest pixel (x, y) of a frame of `size`, clamped to that frame.
+    private func move(_ t: VMTarget, x: Int, y: Int, in size: (width: Int, height: Int)) async throws {
+        let (w, h) = size
         guard w > 1, h > 1 else { throw ControlError.noDisplay(t.name) }
         let ax = Int((Double(max(0, min(x, w - 1))) / Double(w - 1) * Double(ToQEMU.absoluteMax)).rounded())
         let ay = Int((Double(max(0, min(y, h - 1))) / Double(h - 1) * Double(ToQEMU.absoluteMax)).rounded())
