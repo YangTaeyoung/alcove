@@ -213,6 +213,11 @@ extension VMBundle {
     func storedConfig() -> VMConfig? { try? VMConfig.decode(Data(contentsOf: configURL)) }
     /// Whether an engine process holds this bundle's pidfile lock.
     public var isRunning: Bool { VMController.pidfileLockHolder(pidFileURL.path) != nil }
+    /// The host of the engine that holds this bundle's pidfile lock when `VMController.otherHost(ofEngine:)`
+    /// names one; nil otherwise.
+    public var otherEngineHost: (name: String, pid: pid_t)? {
+        VMController.pidfileLockHolder(pidFileURL.path).flatMap(VMController.otherHost(ofEngine:))
+    }
     /// The disk image a session that discards changes writes to in place of `diskURL(disk)`.
     public func ephemeralDiskURL(_ disk: VMConfig.Disk) -> URL { runURL.appendingPathComponent("ephemeral-\(disk.id).qcow2") }
     /// The UEFI variable store a session that discards changes writes to in place of `efiVarsURL`.

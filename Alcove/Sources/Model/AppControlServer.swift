@@ -7,10 +7,6 @@ import AlcoveEngine
 /// (docs/control-protocol.md) so `alcove-mcp` and scripts can drive VMs the
 /// user is watching. Started at launch (`AppDelegate`) when no other server
 /// owns the socket; stopped on quit so the socket file is removed.
-///
-/// Hosting the server while the app runs is what keeps automation from
-/// spawning a headless `alcovectl serve` for the same bundles — a second
-/// owner of a running VM's bundle would stop the app's engine as an orphan.
 @MainActor @Observable
 final class AppControlServer {
     static let shared = AppControlServer()

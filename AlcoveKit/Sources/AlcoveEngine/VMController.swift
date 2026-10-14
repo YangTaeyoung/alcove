@@ -694,12 +694,18 @@ public actor VMController {
         Self.pidfileLockHolder(bundle.pidFileURL.path).flatMap(anotherHostRefusal(holder:))
     }
 
-    /// The refusal for the pidfile lock holder `pid` when its parent is alive and is neither launchd (pid 1)
-    /// nor this process; nil otherwise.
+    /// The refusal for the pidfile lock holder `pid` when `otherHost(ofEngine:)` names its host; nil otherwise.
     private func anotherHostRefusal(holder pid: pid_t) -> String? {
-        guard let parent = Self.parentPID(of: pid), parent != 1, parent != getpid() else { return nil }
-        return "'\(config.name)' is running in another Alcove host (\(Self.processName(parent)) pid \(parent)); "
+        guard let host = Self.otherHost(ofEngine: pid) else { return nil }
+        return "'\(config.name)' is running in another Alcove host (\(host.name) pid \(host.pid)); "
             + "stop the VM there or quit that host, then start it here"
+    }
+
+    /// The name and pid of the parent of the engine process `pid` when that parent is alive and is neither
+    /// launchd (pid 1) nor this process; nil otherwise.
+    public nonisolated static func otherHost(ofEngine pid: pid_t) -> (name: String, pid: pid_t)? {
+        guard let parent = parentPID(of: pid), parent != 1, parent != getpid() else { return nil }
+        return (processName(parent), parent)
     }
 
     /// An engine from a previous app instance (crash, force-quit) may still own

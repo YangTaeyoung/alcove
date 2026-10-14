@@ -12,6 +12,7 @@ final class AppModel {
     enum AppError: Error {
         case engineUnavailable(String)
         case vmIsActive(String)
+        case vmRunsInAnotherHost(String, host: String)
         case nameAlreadyUsed(String)
         case templateHasClones(String, clones: [String])
     }
@@ -132,10 +133,10 @@ final class AppModel {
         return session
     }
 
-    /// Remove the bundle (to the Trash when possible) and its session. The VM must be stopped
+    /// Remove the bundle (to the Trash when possible) and its session. The VM must be stopped (`refuseRunning`)
     /// and must not be the template of a clone; a clone leaves its template's clone list.
     func deleteVM(_ session: VMSession) throws {
-        guard !session.state.isActive else { throw AppError.vmIsActive(session.name) }
+        try refuseRunning(session)
         try refuseTemplate(session)
         let fm = FileManager.default
         do {
@@ -152,11 +153,11 @@ final class AppModel {
     }
 
     /// Move the bundle to `<newConfig.name>.alcovevm`, save `newConfig` into it
-    /// and replace the session. The VM must be stopped and must not be the template
+    /// and replace the session. The VM must be stopped (`refuseRunning`) and must not be the template
     /// of a clone; a renamed clone is re-listed by its template. Returns the new session.
     func rename(_ session: VMSession, to newConfig: VMConfig) throws -> VMSession {
         guard let engine else { throw AppError.engineUnavailable(engineIssue ?? "") }
-        guard !session.state.isActive else { throw AppError.vmIsActive(session.name) }
+        try refuseRunning(session)
         try refuseTemplate(session)
         var config = newConfig
         config.name = newConfig.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -222,6 +223,17 @@ final class AppModel {
     }
 
     // MARK: - internals
+
+    /// Throws when the session is active or an engine holds its bundle's pidfile lock; names the other host
+    /// when that engine runs under one (`VMBundle.otherEngineHost`).
+    private func refuseRunning(_ session: VMSession) throws {
+        guard !session.state.isActive else { throw AppError.vmIsActive(session.name) }
+        guard session.bundle.isRunning else { return }
+        if let host = session.bundle.otherEngineHost {
+            throw AppError.vmRunsInAnotherHost(session.name, host: "\(host.name) pid \(host.pid)")
+        }
+        throw AppError.vmIsActive(session.name)
+    }
 
     /// Throws when clones are backed by this session's disks.
     private func refuseTemplate(_ session: VMSession) throws {

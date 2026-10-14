@@ -24,6 +24,21 @@ targets:
       # XcodeGen infers the resources build phase from the file type, so the
       # asset catalogue belongs in `sources` (there is no `resources` key).
       - path: Alcove/Resources/Assets.xcassets
+    # Contents/MacOS/alcove-proxy, from build/alcove-proxy (scripts/test/all.sh builds it).
+    postBuildScripts:
+      - name: Copy alcove-proxy
+        basedOnDependencyAnalysis: true
+        inputFiles:
+          - $(SRCROOT)/build/alcove-proxy
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/alcove-proxy
+        script: |
+          proxy="$SRCROOT/build/alcove-proxy"
+          if [ ! -x "$proxy" ]; then
+            echo "error: $proxy is missing; build it with scripts/test/all.sh or with (cd guest-tools && GOOS=darwin GOARCH=arm64 go build -o ../build/alcove-proxy ./cmd/alcove-proxy), then build the app again"
+            exit 1
+          fi
+          cp -f "$proxy" "$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/alcove-proxy"
     dependencies:
       - package: AlcoveKit
         product: AlcoveDisplayProtocol

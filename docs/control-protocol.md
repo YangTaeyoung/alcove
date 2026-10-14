@@ -1564,7 +1564,8 @@ the Alcove CA; the guest trusts that CA while the capture runs.
 
 The server looks for `alcove-proxy` in this order: the file `$ALCOVE_PROXY`
 names (and only that file when the variable is set), `alcove-proxy` next to
-the running executable, `<repo>/build/alcove-proxy` (built by
+the running executable (the app bundle carries it in `Contents/MacOS`, next
+to the app's executable), `<repo>/build/alcove-proxy` (built by
 `scripts/test/all.sh`). Without it `vm.http.start` answers `alcove-proxy was
 not found; build it with scripts/test/all.sh or set ALCOVE_PROXY`.
 

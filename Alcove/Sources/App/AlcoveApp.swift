@@ -148,9 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let model = AppModel.shared
         model.refreshDockBadge()
-        // The app must own the control socket while it runs: a headless
-        // `alcovectl serve` started in its place would treat the app's engines
-        // as orphans of a crashed instance and stop them.
+        // Starts the control server unless another server owns the socket.
         let control = AppControlServer.shared
         control.start()
         if let failure = control.startFailure {

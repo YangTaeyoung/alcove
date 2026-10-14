@@ -341,6 +341,8 @@ final class VMControllerFakeEngineTests: XCTestCase {
         }
         let refused = await vm.state
         XCTAssertEqual(refused, .stopped)
+        XCTAssertEqual(vm.bundle.otherEngineHost?.pid, shell.processIdentifier)
+        XCTAssertEqual(vm.bundle.otherEngineHost?.name, name)
         XCTAssertEqual(kill(holder, 0), 0, "the other host's engine keeps running")
         XCTAssertEqual(VMController.pidfileLockHolder(vm.bundle.pidFileURL.path), holder)
         XCTAssertFalse(launched(vm))
@@ -348,8 +350,11 @@ final class VMControllerFakeEngineTests: XCTestCase {
         kill(shell.processIdentifier, SIGKILL)
         let orphaned = await waitUntil { VMController.parentPID(of: holder) == 1 }
         XCTAssertTrue(orphaned, "the lock holder was not re-parented to launchd")
+        XCTAssertNil(vm.bundle.otherEngineHost, "an orphan has no other host")
+        XCTAssertTrue(vm.bundle.isRunning)
         try await vm.start()
         let s = await vm.state; XCTAssertEqual(s, .running)
+        XCTAssertNil(vm.bundle.otherEngineHost, "this process's own engine has no other host")
         let stopped = await waitUntil { kill(holder, 0) != 0 }
         XCTAssertTrue(stopped, "the orphaned lock holder pid \(holder) is gone")
         XCTAssertNotEqual(VMController.pidfileLockHolder(vm.bundle.pidFileURL.path), holder)
