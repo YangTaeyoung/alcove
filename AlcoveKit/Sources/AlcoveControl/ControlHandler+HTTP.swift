@@ -274,7 +274,7 @@ extension ControlHandler {
         do {
             _ = try await agent.pushFile(URL(fileURLWithPath: hostCAPath), toGuestPath: guestPath, overwrite: true, timeout: httpTiming.pushStep)
         } catch {
-            throw ControlError.failed("could not copy the proxy CA into the guest: \(agentFailure(error, vm: t.name, op: op)); call vm.http.start again")
+            throw ControlError.failed("could not copy the proxy CA into the guest: \(agentFailure(error, vm: t.name, op: op))")
         }
         capture.guestCAPath = guestPath
         guard let install = GuestRecipes.installProxyCA(thumbprint: capture.thumbprint, os: os) else { return nil }

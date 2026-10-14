@@ -503,6 +503,22 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.factory.latest.stopCount, 1)
     }
 
+    func testACopyThatFailsIsUndoneAndNamed() async throws {
+        let c = try await capture()
+        let files = c.agentHandler
+        c.agent.handler = { m, a in
+            guard m["op"]?.stringValue == "fs.write" else { return files(m, a) }
+            var refusal: [String: JSON] = ["t": "res", "ok": false, "error": "cannot write 'C:\\ProgramData\\Alcove\\proxy-ca.pem.alcove-part': Access is denied.; check the folder"]
+            refusal["id"] = m["id"] ?? .null
+            return [.object(refusal)]
+        }
+        let text = await c.failure("vm.http.start")
+        XCTAssertEqual(text, "could not copy the proxy CA into the guest: cannot write 'C:\\ProgramData\\Alcove\\proxy-ca.pem.alcove-part': Access is denied.; check the folder")
+        XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertEqual(c.limits.value, [12_000, 12_000])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
     func testARecipeThatGivesNoReasonBecomesASentence() async throws {
         let c = try await capture()
         c.answers.value["recipe.installCA"] = ["code": 1, "stdout": "", "stderr": "", "timed_out": false]
