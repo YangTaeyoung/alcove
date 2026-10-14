@@ -834,7 +834,12 @@ extension ControlHandler {
         case .ended(let last):
             directory = last.directory
             video = last.video
-            log.update { $0.recording = "\(last.directory.path) (ended \(ISO8601DateFormatter().string(from: last.ended)))" }
+            let ended = ISO8601DateFormatter().string(from: last.ended)
+            guard FileManager.default.fileExists(atPath: directory.path) else {
+                log.update { $0.recording = "\(directory.path) (ended \(ended); its folder no longer exists)" }
+                return
+            }
+            log.update { $0.recording = "\(directory.path) (ended \(ended))" }
         case .ending(let r):
             directory = r.directory
             video = r.video

@@ -1083,6 +1083,23 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(lines.last, "steps that failed: none")
     }
 
+    func testEndedRecordingWhoseFolderWasRemovedIsNamedWithoutFailedSteps() async throws {
+        let r = try await rig()
+        await r.target.setFrames((0..<300).map { blockFrame(step: $0) })
+        let recording = try await startRecording(r.handler, ["video": true, "fps": 10])
+        _ = try await r.handler.handle(op: "vm.mouse.move", params: ["name": "Win", "x": 5, "y": 5])
+        let written = await eventually { FileManager.default.fileExists(atPath: recording.appendingPathComponent("video.mp4").path) }
+        XCTAssertTrue(written)
+        _ = try await r.handler.handle(op: "vm.record.stop", params: ["name": "Win"])
+        try FileManager.default.removeItem(at: recording)
+
+        let result = try await collect(r.handler)
+        XCTAssertFalse(files(result).contains { $0.hasPrefix("trace") || $0.hasPrefix("video") || $0.hasPrefix("frames") }, "\(files(result))")
+        let lines = try summaryLines(result)
+        XCTAssertTrue(lines.contains { $0.hasPrefix("recording: \(recording.path) (ended 20") && $0.hasSuffix("Z; its folder no longer exists)") }, "\(lines)")
+        XCTAssertEqual(lines.last, "steps that failed: none")
+    }
+
     func testRecordingEndedByTheVMStoppingIsCopied() async throws {
         let r = try await rig()
         let recording = try await startRecording(r.handler)
