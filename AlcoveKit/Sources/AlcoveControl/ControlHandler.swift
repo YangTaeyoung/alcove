@@ -237,7 +237,8 @@ public actor ControlHandler {
         params["maxWidth"]?.intValue.flatMap { $0 > 0 ? $0 : nil }
     }
 
-    /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
+    /// Runs one operation. Input operations for the same VM run one at a time in arrival order; once one has the VM's
+    /// input gate, a cancelled task throws `CancellationError` and a lease that refuses it throws, before it sends anything.
     public func handle(op: String, params: JSON) async throws -> JSON {
         if !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
            let refusal = leases.refusal(vm: vm, token: params["lease"]?.stringValue, now: clock()) {
@@ -249,9 +250,18 @@ public actor ControlHandler {
             return try await self.recorded(op: op, params: params) { try await self.performNotingEvents(op: op, params: params) }
         }
         if ControlHandler.isInput(op: op), let vm = params["name"]?.stringValue {
-            return try await inputGate.withLock(vm, run)
+            return try await inputGate.withLock(vm) {
+                try Task.checkCancellation()
+                if let refusal = await self.leaseRefusal(vm: vm, token: params["lease"]?.stringValue) { throw ControlError.failed(refusal) }
+                return try await run()
+            }
         }
         return try await run()
+    }
+
+    /// Why the lease of `vm` refuses a mutating op that passes `token`; nil when the op may run.
+    private func leaseRefusal(vm: String, token: String?) -> String? {
+        leases.refusal(vm: vm, token: token, now: clock())
     }
 
     /// Runs one operation without the lease guard and without taking the input gate.

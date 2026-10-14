@@ -63,7 +63,12 @@ Each connection has two lanes.
 The lanes do not wait for each other: a screenshot or a click is answered
 while a `vm.exec` of the same connection is still running. Mouse and keyboard
 ops, `vm.batch`, `vm.window.action`, `vm.ui.click`, `vm.ui.type` and
-`vm.ui.action` for one VM run one at a time across all connections.
+`vm.ui.action` for one VM run one at a time across all connections. Such an op
+that is cancelled while it waits for its turn (its connection closed, or the
+`script.run` or batch it belongs to was cancelled) sends nothing, and the VM's
+lease is checked again when its turn comes. A click, drag, key press or typing
+that is cancelled or fails while it holds a button or keys releases them
+before it ends.
 
 Closing a connection discards the replies to its unfinished requests. A
 command that `vm.exec` already started in the guest keeps running until it
@@ -336,7 +341,10 @@ and `results[i]` is the result of step `i` (`{}` for input and `sleep`,
 `{idle}` for `vm.wait_idle`, the `vm.wait_for` result for `vm.wait_for`).
 The first step that fails ends the batch; the reply is still a success and adds
 `failedStep` (its index) and `error` (its message). Steps after it do not
-run; steps before it keep their effect.
+run; steps before it keep their effect, except that a batch that stops at a
+failed step or is cancelled releases the buttons and keys that its
+`vm.mouse.down` and `vm.key.down` steps pressed and no later step released. A
+batch whose steps all ran leaves them as its steps left them.
 
 ## Finding text
 

@@ -520,6 +520,132 @@ final class ControlHandlerTests: XCTestCase {
         XCTAssertEqual(r["sentWidth"]?.intValue, 400)
     }
 
+    /// The keys and buttons `sent` leaves pressed: each down without a later up of the same key or button.
+    private func pressed(_ sent: [ToQEMU]) -> [String] {
+        var down: [String] = []
+        for message in sent {
+            switch message {
+            case .btn(_, let button, let isDown):
+                if isDown { down.append("\(button)") } else { down.removeAll { $0 == "\(button)" } }
+            case .key(let code, _, let isDown):
+                if isDown { down.append("key \(code ?? -1)") } else { down.removeAll { $0 == "key \(code ?? -1)" } }
+            default: break
+            }
+        }
+        return down
+    }
+
+    /// Starts `op` in a task, waits until `t` has received a message that `started` accepts, cancels the task and returns
+    /// what the task threw.
+    private func cancelled(_ h: ControlHandler, _ t: FakeTarget, _ op: String, _ params: JSON,
+                           once started: @escaping @Sendable ([ToQEMU]) -> Bool) async -> Error? {
+        let task = Task { try await h.handle(op: op, params: params) }
+        guard await eventually("\(op) has begun", { started(await t.sent) }) else { task.cancel(); return nil }
+        task.cancel()
+        do { _ = try await task.value; return nil } catch { return error }
+    }
+
+    func testACancelledClickReleasesItsButton() async throws {
+        let (h, t) = setup()
+        let error = await cancelled(h, t, "vm.mouse.click", ["name": "Win", "x": 5, "y": 5, "hold": 10_000, "button": "right"]) {
+            $0.contains(.btn(con: 0, button: .right, down: true))
+        }
+        XCTAssertTrue(error is CancellationError, "\(String(describing: error))")
+        let sent = await t.sent
+        XCTAssertEqual(pressed(sent), [])
+        XCTAssertEqual(Array(sent.suffix(2)), [.btn(con: 0, button: .right, down: false), .sync])
+    }
+
+    func testACancelledDragReleasesItsButton() async throws {
+        let (h, t) = setup()
+        let error = await cancelled(h, t, "vm.mouse.drag", ["name": "Win", "fromX": 0, "fromY": 0, "toX": 100, "toY": 100]) {
+            $0.contains(.btn(con: 0, button: .left, down: true))
+        }
+        XCTAssertTrue(error is CancellationError, "\(String(describing: error))")
+        let sent = await t.sent
+        XCTAssertEqual(pressed(sent), [])
+    }
+
+    func testACancelledKeyPressReleasesItsKeysInReverseOrder() async throws {
+        let (h, t) = setup()
+        let error = await cancelled(h, t, "vm.key.press", ["name": "Win", "keys": "ctrl+shift+a", "hold": 10_000]) {
+            $0.contains(.key(mac: 0, q: nil, down: true))
+        }
+        XCTAssertTrue(error is CancellationError, "\(String(describing: error))")
+        let sent = await t.sent
+        XCTAssertEqual(pressed(sent), [])
+        XCTAssertEqual(Array(sent.suffix(3)), [.key(mac: 0, q: nil, down: false), .key(mac: 56, q: nil, down: false), .key(mac: 59, q: nil, down: false)])
+    }
+
+    func testACancelledTypeReleasesTheKeyItPressed() async throws {
+        let (h, t) = setup()
+        let error = await cancelled(h, t, "vm.type", ["name": "Win", "text": "Hello", "delay": 1000]) { !$0.isEmpty }
+        XCTAssertTrue(error is CancellationError, "\(String(describing: error))")
+        let sent = await t.sent
+        XCTAssertEqual(pressed(sent), [])
+        XCTAssertEqual(sent.first, .key(mac: 56, q: nil, down: true))
+    }
+
+    func testACancelledBatchReleasesWhatItsDownStepsPressed() async throws {
+        let (h, t) = setup()
+        let steps: JSON = [["op": "vm.key.down", "key": "shift"], ["op": "vm.mouse.down", "button": "middle"],
+                           ["op": "vm.key.down", "key": "a"], ["op": "vm.key.up", "key": "a"], ["op": "sleep", "ms": 10_000]]
+        let error = await cancelled(h, t, "vm.batch", ["name": "Win", "steps": steps]) { $0.contains(.key(mac: 0, q: nil, down: false)) }
+        XCTAssertTrue(error is CancellationError, "\(String(describing: error))")
+        let sent = await t.sent
+        XCTAssertEqual(pressed(sent), [])
+        XCTAssertEqual(Array(sent.suffix(3)), [.btn(con: 0, button: .middle, down: false), .sync, .key(mac: 56, q: nil, down: false)])
+    }
+
+    func testAFailedBatchReleasesWhatItsDownStepsPressed() async throws {
+        let (h, t) = setup()
+        let steps: JSON = [["op": "vm.key.down", "key": "ctrl"], ["op": "vm.mouse.down"], ["op": "vm.mouse.click", "x": 5]]
+        let r = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": steps])
+        XCTAssertEqual(r["failedStep"]?.intValue, 2)
+        let sent = await t.sent
+        XCTAssertEqual(pressed(sent), [])
+        XCTAssertEqual(Array(sent.suffix(3)), [.btn(con: 0, button: .left, down: false), .sync, .key(mac: 59, q: nil, down: false)])
+    }
+
+    func testABatchThatEndsWithAKeyDownLeavesItDown() async throws {
+        let (h, t) = setup()
+        _ = try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.down", "key": "shift"]]])
+        let sent = await t.sent
+        XCTAssertEqual(pressed(sent), ["key 56"])
+    }
+
+    func testAnInputOpCancelledWhileItWaitsForTheGateSendsNothing() async throws {
+        let (h, t) = setup()
+        let first = Task { try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "hold": 300]) }
+        guard await eventually("the first click holds its button", { await t.sent.contains(.btn(con: 0, button: .left, down: true)) }) else { return }
+        let second = Task { try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 50, "y": 50, "button": "right"]) }
+        guard await eventually("the second click waits for the gate", { await h.inputGate.waiterCount(for: "Win") == 1 }) else { return }
+        second.cancel()
+        _ = try await first.value
+        do { _ = try await second.value; XCTFail("the second click ran") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        let sent = await t.sent
+        XCTAssertFalse(sent.contains { if case .btn(_, .right, _) = $0 { return true }; return false })
+        XCTAssertEqual(sent.filter { if case .abs = $0 { return true }; return false }.count, 1)
+    }
+
+    func testAnInputOpQueuedBeforeALeaseIsRefusedByThatLease() async throws {
+        let (h, t) = setup()
+        let first = Task { try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "hold": 300]) }
+        guard await eventually("the first click holds its button", { await t.sent.contains(.btn(con: 0, button: .left, down: true)) }) else { return }
+        let second = Task { try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 50, "y": 50, "button": "right"]) }
+        guard await eventually("the second click waits for the gate", { await h.inputGate.waiterCount(for: "Win") == 1 }) else { return }
+        _ = try await h.handle(op: "vm.lease.acquire", params: ["name": "Win", "owner": "agent-b", "seconds": 60])
+        _ = try await first.value
+        do {
+            _ = try await second.value
+            XCTFail("the second click ran")
+        } catch let e as ControlHandler.ControlError {
+            XCTAssertTrue(e.description.hasPrefix("VM 'Win' is leased by agent-b for another "), e.description)
+        }
+        let sent = await t.sent
+        XCTAssertFalse(sent.contains { if case .btn(_, .right, _) = $0 { return true }; return false })
+    }
+
     func testWaitIdle() async throws {
         let (h, t) = setup()
         let r = try await h.handle(op: "vm.wait_idle", params: ["name": "Win", "seconds": 1, "timeout": 5])

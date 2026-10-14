@@ -71,7 +71,9 @@ extension ControlHandler {
         return .object(out)
     }
 
-    /// Runs the steps of a batch in order and stops at the first one that throws.
+    /// Runs the steps of a batch in order and stops at the first one that throws. A batch that stops at a failed step or
+    /// is cancelled releases the buttons and keys that its `vm.mouse.down` and `vm.key.down` steps pressed and no later
+    /// step released.
     func batch(_ params: JSON) async throws -> JSON {
         let options = try observeOptions(params)
         let steps = try batchSteps(params, vm: try string(params, "name"))
@@ -80,14 +82,18 @@ extension ControlHandler {
         let before = options.level == .none ? nil : try await frame(of: t, before: "vm.batch")
         var results: [JSON] = []
         var failure: (step: Int, message: String)?
+        var held = HeldInput()
         for (index, step) in steps.enumerated() {
-            try Task.checkCancellation()
             do {
+                try Task.checkCancellation()
                 results.append(try await run(step, on: t))
+                held.note(step.op, step.params)
             } catch is CancellationError {
+                await release(held, on: t)
                 throw CancellationError()
             } catch {
                 failure = (index, ControlHandler.failureReason(error, fallback: "the step failed; check vm.status"))
+                await release(held, on: t)
                 break
             }
         }
@@ -103,6 +109,39 @@ extension ControlHandler {
     private struct BatchStep {
         let op: String
         let params: [String: JSON]
+    }
+
+    /// The mouse buttons and keys pressed in a guest and not released yet, in the order they were pressed.
+    struct HeldInput {
+        private(set) var buttons: [InputButton] = []
+        private(set) var keys: [Int] = []
+
+        mutating func press(_ button: InputButton) { buttons.removeAll { $0 == button }; buttons.append(button) }
+        mutating func lift(_ button: InputButton) { buttons.removeAll { $0 == button } }
+        mutating func press(key code: Int) { keys.removeAll { $0 == code }; keys.append(code) }
+        mutating func lift(key code: Int) { keys.removeAll { $0 == code } }
+
+        /// Takes in a step `op` with `params` that ran: a button or key it pressed or released.
+        mutating func note(_ op: String, _ params: [String: JSON]) {
+            switch op {
+            case "vm.mouse.down", "vm.mouse.up":
+                guard let button = try? ControlHandler.inputButton(params["button"]?.stringValue) else { return }
+                if op == "vm.mouse.down" { press(button) } else { lift(button) }
+            case "vm.key.down", "vm.key.up":
+                guard let name = params["key"]?.stringValue, let key = try? KeyNames.key(named: name) else { return }
+                if op == "vm.key.down" { press(key: key.code) } else { lift(key: key.code) }
+            default:
+                return
+            }
+        }
+    }
+
+    /// Sends `t` the release of every button and key in `held`, the latest pressed first, without a pause.
+    func release(_ held: HeldInput, on t: VMTarget) async {
+        for button in held.buttons.reversed() {
+            await t.sendDisplay(.btn(con: 0, button: button, down: false)); await t.sendDisplay(.sync)
+        }
+        for code in held.keys.reversed() { await t.sendDisplay(.key(mac: code, q: nil, down: false)) }
     }
 
     /// The validated `steps` parameter of a batch for `vm`; step numbers in errors count from 0.
@@ -197,7 +236,9 @@ extension ControlHandler {
             try await move(t, x: x, y: y, in: try await frameSize(of: t))
             for i in 0..<count {
                 await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
-                try await Task.sleep(for: .milliseconds(hold))
+                var held = HeldInput()
+                held.press(button)
+                do { try await Task.sleep(for: .milliseconds(hold)) } catch { await release(held, on: t); throw error }
                 await t.sendDisplay(.btn(con: 0, button: button, down: false)); await t.sendDisplay(.sync)
                 if i < count - 1 { try await Task.sleep(for: .milliseconds(90)) }
             }
@@ -219,11 +260,18 @@ extension ControlHandler {
             let size = try await frameSize(of: t)
             try await move(t, x: fx, y: fy, in: size); await t.sendDisplay(.sync)
             await t.sendDisplay(.btn(con: 0, button: button, down: true)); await t.sendDisplay(.sync)
-            try await Task.sleep(for: .milliseconds(80))
-            for step in 1...10 {
-                try await move(t, x: fx + (tx - fx) * step / 10, y: fy + (ty - fy) * step / 10, in: size)
-                await t.sendDisplay(.sync)
-                try await Task.sleep(for: .milliseconds(25))
+            var held = HeldInput()
+            held.press(button)
+            do {
+                try await Task.sleep(for: .milliseconds(80))
+                for step in 1...10 {
+                    try await move(t, x: fx + (tx - fx) * step / 10, y: fy + (ty - fy) * step / 10, in: size)
+                    await t.sendDisplay(.sync)
+                    try await Task.sleep(for: .milliseconds(25))
+                }
+            } catch {
+                await release(held, on: t)
+                throw error
             }
             await t.sendDisplay(.btn(con: 0, button: button, down: false)); await t.sendDisplay(.sync)
         case "vm.mouse.scroll":
@@ -295,6 +343,11 @@ extension ControlHandler {
     }
 
     func button(_ name: String?) throws -> InputButton {
+        try ControlHandler.inputButton(name)
+    }
+
+    /// The mouse button `name` names; left when nil.
+    static func inputButton(_ name: String?) throws -> InputButton {
         switch (name ?? "left").lowercased() {
         case "left": return .left
         case "right": return .right
@@ -317,13 +370,22 @@ extension ControlHandler {
         await t.sendDisplay(.btn(con: 0, button: b, down: false)); await t.sendDisplay(.sync)
     }
 
+    /// Sends the key events of `seq` with `gap` ms after each; a key whose release follows its press waits
+    /// `holdBeforeRelease` ms before it. When it throws, the keys it pressed and did not release are released.
     private func sendKeys(_ t: VMTarget, _ seq: [(code: Int, down: Bool)], gap: Int, holdBeforeRelease: Int) async throws {
-        for (i, ev) in seq.enumerated() {
-            if !ev.down, holdBeforeRelease > 0, i > 0, seq[i - 1].down, seq[i - 1].code == ev.code {
-                try await Task.sleep(for: .milliseconds(holdBeforeRelease))
+        var held = HeldInput()
+        do {
+            for (i, ev) in seq.enumerated() {
+                if !ev.down, holdBeforeRelease > 0, i > 0, seq[i - 1].down, seq[i - 1].code == ev.code {
+                    try await Task.sleep(for: .milliseconds(holdBeforeRelease))
+                }
+                guard await t.sendDisplay(.key(mac: ev.code, q: nil, down: ev.down)) else { throw ControlError.noDisplay(t.name) }
+                if ev.down { held.press(key: ev.code) } else { held.lift(key: ev.code) }
+                if gap > 0 { try await Task.sleep(for: .milliseconds(gap)) }
             }
-            guard await t.sendDisplay(.key(mac: ev.code, q: nil, down: ev.down)) else { throw ControlError.noDisplay(t.name) }
-            if gap > 0 { try await Task.sleep(for: .milliseconds(gap)) }
+        } catch {
+            await release(held, on: t)
+            throw error
         }
     }
 }
