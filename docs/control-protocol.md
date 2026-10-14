@@ -996,8 +996,9 @@ removed) next to the stopped VM `name`, its template:
   writes.
 - The clone has a copy of the template's UEFI variables, the template's CPU,
   memory, display and shared folders, a new guest-tools token, a new MAC
-  address and a guest-tools port that no VM in the directory uses. It has no
-  CD-ROMs, USB passthrough or configured port forwards.
+  address and a guest-tools port (17000–17999) that no VM in the directory
+  uses as its guest-tools port or as the host port of a TCP port forward. It
+  has no CD-ROMs, USB passthrough or configured port forwards.
 - Its row carries `cloneOf`.
 
 Refusals of `vm.clone`:
@@ -1010,6 +1011,7 @@ cannot clone a VM with a TPM
 '<newName>' cannot be used as a VM name; choose a non-empty name without '/', ':' or ','
 a VM named '<newName>' already exists; choose another name
 qemu-img could not create the clone's disk (<message>); check the template's disk images and the free space, then clone again
+every guest-tools port from 17000 to 17999 is used by a VM in <folder>; delete a VM there or move it to another folder, then clone again
 ```
 
 **The template guard.** A clone reads every block it has not written from the
@@ -1018,7 +1020,8 @@ long as a VM has a clone, `vm.start` of that VM is refused with the `is a
 template with clones` sentence, whether the clone is stopped or running, and
 also with `discardChanges`. The clones of a VM are the bundles in its
 directory, or listed in its `clones.json`, whose configuration names it as
-`cloneOf`.
+`cloneOf`, and the bundles listed in its `clones.json` whose `config.json`
+exists but cannot be read.
 
 **Stale clones.** When a VM is cloned for the first time, its `config.json`
 receives a `diskID` and a `diskEpoch`, and every later cold start of that VM

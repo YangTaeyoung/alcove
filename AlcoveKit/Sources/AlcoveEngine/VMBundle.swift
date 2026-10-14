@@ -184,9 +184,13 @@ extension VMBundle {
         case notAClone(String)
         case cloneRunning(String)
         case overlayFailed(String)
+        case noFreeAgentPort(String)
 
         public var description: String {
             switch self {
+            case .noFreeAgentPort(let directory):
+                return "every guest-tools port from 17000 to 17999 is used by a VM in \(directory); "
+                    + "delete a VM there or move it to another folder, then clone again"
             case .overlayFailed(let m):
                 return "qemu-img could not create the clone's disk (\(m)); check the template's disk images and the free space, then clone again"
             case .sourceRunning(let n): return "'\(n)' is running; stop it before cloning it"
@@ -216,15 +220,22 @@ extension VMBundle {
 
     /// The bundles whose config names this bundle's config name as `cloneOf`: those listed in
     /// clones.json plus those in this bundle's parent directory, once each by standardized path.
+    /// A bundle listed in clones.json whose config.json exists but cannot be decoded also counts.
     /// clones.json is rewritten to that set; an undecodable file counts as an empty list.
     public func liveClones(fileManager fm: FileManager = .default) -> [URL] {
         let name = configName, own = url.standardizedFileURL.path
         let listed = (try? JSONDecoder().decode([String].self, from: Data(contentsOf: clonesURL))) ?? []
         let siblings = VMBundle.list(in: url.deletingLastPathComponent(), fileManager: fm).map(\.url)
         var live: [String] = []
-        for candidate in listed.map({ URL(fileURLWithPath: $0) }) + siblings {
+        for (index, candidate) in (listed.map({ URL(fileURLWithPath: $0) }) + siblings).enumerated() {
             let path = candidate.standardizedFileURL.path
-            guard path != own, !live.contains(path), VMBundle(url: candidate).storedConfig()?.cloneOf == name else { continue }
+            guard path != own, !live.contains(path) else { continue }
+            let bundle = VMBundle(url: candidate)
+            if let config = bundle.storedConfig() {
+                guard config.cloneOf == name else { continue }
+            } else {
+                guard index < listed.count, fm.fileExists(atPath: bundle.configURL.path) else { continue }
+            }
             live.append(path)
         }
         if live != listed || (live.isEmpty && fm.fileExists(atPath: clonesURL.path)) { try? writeClones(live, fileManager: fm) }
@@ -267,12 +278,15 @@ extension VMBundle {
         let epoch = source.diskEpoch ?? 0
         let diskID = source.diskEpoch == nil ? (source.diskID ?? UUID().uuidString.lowercased()) : source.diskID
 
-        let takenPorts = Set(VMBundle.list(in: directory, fileManager: fm).compactMap { $0.storedConfig()?.agentHostPort } + [source.agentHostPort])
+        let takenPorts = Set(VMBundle.list(in: directory, fileManager: fm).compactMap { $0.storedConfig() }.flatMap(\.hostTCPPorts)
+                             + source.hostTCPPorts)
+        guard !VMConfig.agentPorts.allSatisfy(takenPorts.contains) else { throw CloneError.noFreeAgentPort(directory.path) }
         var token = UUID().uuidString.lowercased(), attempts = 0
         while takenPorts.contains(VMConfig.agentPort(for: token)), attempts < VMBundle.tokenAttempts {
             token = UUID().uuidString.lowercased()
             attempts += 1
         }
+        guard !takenPorts.contains(VMConfig.agentPort(for: token)) else { throw CloneError.noFreeAgentPort(directory.path) }
         var network = VMConfig.Network.user(portForwards: [])
         if case .none = source.network { network = .none }
         let config = VMConfig(name: newName, guestOS: source.guestOS, cpuCount: source.cpuCount, memoryMiB: source.memoryMiB,
@@ -315,13 +329,18 @@ extension VMBundle {
     private static let tokenAttempts = 100_000
 
     /// Removes this clone's bundle directory, its socket directory and its entry in the template's `clones.json`.
+    /// The template is the bundle at the clone's `templatePath` when its config is named `cloneOf`, otherwise
+    /// the bundle named `cloneOf` in this bundle's directory.
     public func deleteClone(fileManager fm: FileManager = .default) throws {
         let config = try loadConfig()
         guard let template = config.cloneOf else { throw CloneError.notAClone(config.name) }
         guard !isRunning else { throw CloneError.cloneRunning(config.name) }
         try fm.removeItem(at: url)
         try? fm.removeItem(atPath: socketDirectory)
-        _ = VMBundle.named(template, in: url.deletingLastPathComponent(), fileManager: fm)?.liveClones(fileManager: fm)
+        let recorded = config.templatePath.map { VMBundle(url: URL(fileURLWithPath: $0)) }
+        let templateBundle = recorded.flatMap { $0.storedConfig()?.name == template ? $0 : nil }
+            ?? VMBundle.named(template, in: url.deletingLastPathComponent(), fileManager: fm)
+        _ = templateBundle?.liveClones(fileManager: fm)
     }
 
     /// The sentence that refuses to start a VM configured as `config`; nil when `config` has no

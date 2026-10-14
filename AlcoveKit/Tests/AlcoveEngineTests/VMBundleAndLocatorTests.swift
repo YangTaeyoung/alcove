@@ -244,6 +244,71 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertFalse(ports.dropFirst().contains(ports[0]))
     }
 
+    /// Sibling bundles named `Crowd<i>` whose guest-tools ports cover 17000...17999 except `free`.
+    private func crowdAgentPorts(except free: Set<Int>) throws {
+        var crowd = VMConfig.defaults(name: "Crowd", guestOS: .linux)
+        for (i, port) in (17000...17999).filter({ !free.contains($0) }).enumerated() {
+            crowd.name = "Crowd\(i)"
+            crowd.agentHostPort = port
+            let sibling = VMBundle(url: tmp.appendingPathComponent(crowd.name).appendingPathExtension(VMBundle.pathExtension))
+            try FileManager.default.createDirectory(at: sibling.url, withIntermediateDirectories: true)
+            try sibling.save(crowd)
+        }
+    }
+
+    func testClonePortsAvoidSiblingsTCPForwards() throws {
+        let (template, engine) = try stubTemplate()
+        let own = try template.loadConfig().agentHostPort
+        let free = Set([17011, 17503, 17998, 17100].filter { $0 != own }.prefix(3))
+        try crowdAgentPorts(except: free.union([own]))
+        let forwarded = try XCTUnwrap(free.sorted().first)
+        var forwarding = VMConfig.defaults(name: "Forwarding", guestOS: .linux)
+        forwarding.agentHostPort = own
+        forwarding.network = .user(portForwards: [.init(proto: .tcp, hostPort: forwarded, guestPort: 22)])
+        _ = try VMBundle.create(forwarding, in: tmp, engine: engine)
+        var ports: [Int] = []
+        for name in ["One", "Two"] {
+            ports.append(try template.cloneLinked(named: name, engine: engine).loadConfig().agentHostPort)
+        }
+        XCTAssertEqual(Set(ports), free.subtracting([forwarded]))
+    }
+
+    func testCloneIsRefusedWhenEveryAgentPortIsTaken() throws {
+        let (template, engine) = try stubTemplate()
+        try crowdAgentPorts(except: [try template.loadConfig().agentHostPort])
+        XCTAssertThrowsError(try template.cloneLinked(named: "Copy", engine: engine)) {
+            XCTAssertEqual($0 as? VMBundle.CloneError, .noFreeAgentPort(self.tmp.path))
+            XCTAssertEqual("\($0)", "every guest-tools port from 17000 to 17999 is used by a VM in \(self.tmp.path); "
+                + "delete a VM there or move it to another folder, then clone again")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent("Copy.alcovevm").path))
+    }
+
+    func testAListedCloneWhoseConfigCannotBeReadStillGuardsTheTemplate() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "Copy", engine: engine)
+        try Data("not json".utf8).write(to: clone.configURL)
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(clone.url)])
+        XCTAssertEqual(try listedClones(template), [standardPath(clone.url)])
+        XCTAssertEqual(template.liveClones().map { VMBundle(url: $0).configName }, ["Copy"])
+        try FileManager.default.removeItem(at: clone.url)
+        XCTAssertEqual(template.liveClones(), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
+    }
+
+    func testDeletingACloneUpdatesTheListOfTheTemplateAtItsRecordedPath() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "Copy", engine: engine)
+        let elsewhere = tmp.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        let moved = VMBundle(url: elsewhere.appendingPathComponent(clone.url.lastPathComponent))
+        try FileManager.default.moveItem(at: clone.url, to: moved.url)
+        XCTAssertEqual(try listedClones(template), [standardPath(clone.url)])
+        try moved.deleteClone()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: moved.url.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
+    }
+
     func testCloneNameIsTrimmed() throws {
         let (template, engine) = try stubTemplate()
         let clone = try template.cloneLinked(named: "  Copy \n", engine: engine)

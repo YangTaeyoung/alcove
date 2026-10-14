@@ -159,11 +159,21 @@ public struct VMConfig: Codable, Sendable, Equatable {
     /// Guest port the agent listens on.
     public static let agentGuestPort = 7645
 
-    /// A host port in 17000...17999 derived from the token (stable per VM).
+    /// The host ports `agentPort(for:)` chooses from.
+    public static let agentPorts = 17000...17999
+
+    /// A host port in `agentPorts` derived from the token (stable per VM).
     public static func agentPort(for token: String) -> Int {
         var h: UInt32 = 2166136261
         for b in token.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
-        return 17000 + Int(h % 1000)
+        return agentPorts.lowerBound + Int(h % UInt32(agentPorts.count))
+    }
+
+    /// The host TCP ports this VM forwards: its guest-tools port and the host ports of its TCP port forwards.
+    public var hostTCPPorts: [Int] {
+        var ports = [agentHostPort]
+        if case .user(let forwards) = network { ports += forwards.filter { $0.proto == .tcp }.map(\.hostPort) }
+        return ports
     }
 
     /// Sensible defaults per guest OS.
