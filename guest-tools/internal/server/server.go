@@ -40,6 +40,13 @@ type Options struct {
 	// AllowPeers holds the address ranges whose connections are served; empty
 	// means DefaultPeers.
 	AllowPeers []netip.Prefix
+	// HostKey keeps the key of the host the agent is paired with; a connection
+	// is served after it paired or proved that key. Nil serves every
+	// connection from AllowPeers without pairing.
+	HostKey KeyStore
+	// AuthTimeout bounds the time from the hello to the pair or auth message;
+	// 0 means 30 s.
+	AuthTimeout time.Duration
 }
 
 // DefaultPeers is the address from which QEMU's user-mode network delivers the
@@ -58,6 +65,9 @@ type Server struct {
 	connMu sync.Mutex
 	conns  map[*conn]struct{}
 	jobs   *jobTable
+
+	// pairMu orders the pair messages of all connections.
+	pairMu sync.Mutex
 
 	launchMu sync.Mutex
 	// claimed holds the ids of windows an app.launch has taken; a concurrent
@@ -180,6 +190,10 @@ func (s *Server) handle(c net.Conn) {
 		return
 	}
 	lg.Printf("connection from %s", c.RemoteAddr())
+	r := proto.NewReader(c)
+	if !s.handshake(c, r) {
+		return
+	}
 	cn := newConn(c, lg)
 	go cn.writeLoop()
 	defer cn.stopWriter()
@@ -187,8 +201,6 @@ func (s *Server) handle(c net.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	send(proto.Message{"t": "hello", "v": proto.Version, "proto": proto.RPCVersion, "os": runtime.GOOS, "agent": AgentVersion,
-		"token": s.opt.Token, "caps": s.caps()})
 	s.addConn(cn)
 	defer s.removeConn(cn)
 
@@ -212,7 +224,6 @@ func (s *Server) handle(c net.Conn) {
 
 	inFlight := make(chan struct{}, maxInFlight)
 	xfers := map[string]*fileXfer{}
-	r := proto.NewReader(c)
 	for {
 		m, err := r.Next()
 		if err != nil {
