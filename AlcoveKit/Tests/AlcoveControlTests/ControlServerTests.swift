@@ -196,6 +196,8 @@ final class ControlServerTests: XCTestCase {
         XCTAssertEqual(rc, 0)
         var limit = timeval(tv_sec: 10, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
+        var noSignal: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
         return fd
     }
 
@@ -408,12 +410,28 @@ final class ControlServerTests: XCTestCase {
     }
 
     func testAClientWhoseUnreadRepliesPassTheOutboxLimitIsClosed() async throws {
-        let (server, path) = try startServer(await noisyHandler(), maxOutboxBytes: 1 << 20)
+        let (server, path) = try startServer(await noisyHandler(), maxOutboxBytes: 8 << 20)
         let stalled = connectClient(path)
         defer { close(stalled) }
-        send("{\"id\":1,\"op\":\"vm.screenshot\",\"name\":\"Win\"}\n", on: stalled)
+        for id in 1...3 { send("{\"id\":\(id),\"op\":\"vm.screenshot\",\"name\":\"Win\"}\n", on: stalled) }
         _ = await eventually("the client is closed") { server.connectionCount() == 0 }
         XCTAssertEqual(server.outboxByteCount(), 0)
+    }
+
+    func testAReplyLargerThanTheOutboxLimitIsAnsweredWithASentence() async throws {
+        let (server, path) = try startServer(await noisyHandler(), maxOutboxBytes: 1 << 20)
+        let fd = connectClient(path)
+        defer { close(fd) }
+        send("{\"id\":1,\"op\":\"vm.screenshot\",\"name\":\"Win\"}\n", on: fd)
+        let reply = readReply(fd)
+        XCTAssertEqual(reply["id"]?.intValue, 1)
+        XCTAssertEqual(reply["ok"]?.boolValue, false)
+        let error = reply["error"]?.stringValue ?? ""
+        XCTAssertTrue(error.hasPrefix("the reply to vm.screenshot holds "), error)
+        XCTAssertTrue(error.hasSuffix(" bytes, more than the 1048576 bytes one reply may hold; ask for less, such as a vm.screenshot with maxWidth, scale or region"), error)
+        send("{\"id\":2,\"op\":\"hello\"}\n", on: fd)
+        XCTAssertEqual(readReply(fd)["id"]?.intValue, 2)
+        XCTAssertEqual(server.connectionCount(), 1)
     }
 
     func testFinishedConcurrentOpsAreForgotten() async throws {

@@ -9,7 +9,8 @@ import AlcoveQMP
 /// order they arrived. Closing a connection cancels every unfinished task of both
 /// lanes. Replies wait in a per-connection outbox that is written as the client
 /// reads; a connection whose outbox passes `maxOutboxBytes`, or that takes no
-/// bytes of it for `writeStallLimit`, is closed.
+/// bytes of it for `writeStallLimit`, is closed. A request whose reply alone is
+/// longer than `maxOutboxBytes` is answered with a failure that says so.
 public final class ControlServer: @unchecked Sendable {
     public enum ServerError: Error, Equatable { case socket(errno: Int32), bind(path: String, errno: Int32), listen(errno: Int32), pathTooLong(String) }
 
@@ -178,12 +179,13 @@ public final class ControlServer: @unchecked Sendable {
         let fd = client.fd
         let connection = client.id
         let handler = self.handler
+        let maxReply = maxOutboxBytes
         let parsed = Result { try JSON.parse(line) }
         let id = nextTaskID
         nextTaskID += 1
         if let op = (try? parsed.get())?["op"]?.stringValue, ControlHandler.isConcurrent(op: op) {
             client.concurrent[id] = Task { [weak self] in
-                let reply = await ControlServer.process(line, parsed: parsed, handler: handler)
+                let reply = await ControlServer.process(line, parsed: parsed, handler: handler, maxReplyBytes: maxReply)
                 self?.write(reply, to: fd, connection: connection)
                 self?.forgetTask(id, of: fd, connection: connection)
             }
@@ -193,7 +195,7 @@ public final class ControlServer: @unchecked Sendable {
         let task = Task { [weak self] in
             await previous?.value
             if !Task.isCancelled {
-                let reply = await ControlServer.process(line, parsed: parsed, handler: handler)
+                let reply = await ControlServer.process(line, parsed: parsed, handler: handler, maxReplyBytes: maxReply)
                 self?.write(reply, to: fd, connection: connection)
             }
             self?.forgetTask(id, of: fd, connection: connection)
@@ -243,9 +245,11 @@ public final class ControlServer: @unchecked Sendable {
         await process(line, parsed: Result { try JSON.parse(line) }, handler: handler)
     }
 
-    /// The reply line to the request line `line`, which `parsed` holds parsed.
-    static func process(_ line: Data, parsed: Result<JSON, Error>, handler: ControlHandler) async -> Data {
+    /// The reply line to the request line `line`, which `parsed` holds parsed. A reply line longer than `maxReplyBytes`
+    /// is replaced by a failure that says so.
+    static func process(_ line: Data, parsed: Result<JSON, Error>, handler: ControlHandler, maxReplyBytes: Int = .max) async -> Data {
         var id: JSON = .null
+        var op = "the request"
         var result: [String: JSON]
         do {
             let req: JSON
@@ -256,8 +260,9 @@ public final class ControlServer: @unchecked Sendable {
                 throw ControlHandler.ControlError.failed(unreadableRequest)
             }
             id = req["id"] ?? .null
-            guard let op = req["op"]?.stringValue else { throw ControlHandler.ControlError.missing("op") }
-            let r = try await handler.handle(op: op, params: req)
+            guard let name = req["op"]?.stringValue else { throw ControlHandler.ControlError.missing("op") }
+            op = name
+            let r = try await handler.handle(op: name, params: req)
             result = r.objectValue ?? [:]
             result["ok"] = true
         } catch let e as ControlHandler.ControlError {
@@ -268,7 +273,17 @@ public final class ControlServer: @unchecked Sendable {
         result["id"] = id
         var data = (try? JSON.object(result).serialized()) ?? Data("{\"ok\":false,\"error\":\"encode failed\"}".utf8)
         data.append(10)
+        if data.count > maxReplyBytes {
+            let sentence = ControlServer.replyTooLarge(op: op, bytes: data.count, limit: maxReplyBytes)
+            data = (try? JSON.object(["id": id, "ok": false, "error": .string(sentence)]).serialized()) ?? Data()
+            data.append(10)
+        }
         return data
+    }
+
+    /// The failure of a request whose reply line of `bytes` bytes is longer than `limit`.
+    static func replyTooLarge(op: String, bytes: Int, limit: Int) -> String {
+        "the reply to \(op) holds \(bytes) bytes, more than the \(limit) bytes one reply may hold; ask for less, such as a vm.screenshot with maxWidth, scale or region"
     }
 
     /// The value of the top-level `id` key of a request line that cannot be parsed as a whole: a number or a string.

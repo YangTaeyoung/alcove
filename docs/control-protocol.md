@@ -79,7 +79,10 @@ at its next tick, a `vm.type` at its next key). Replies wait in a
 per-connection outbox and are written as the client reads them, so a client
 that stops reading holds back nobody else; a connection with more than 64 MiB
 of unread replies, or one that reads none of its pending replies for 30 s, is
-closed. A command that `vm.exec` already started in the guest keeps running until it
+closed. A reply that alone would hold more than 64 MiB (67108864 bytes) is not
+sent; the request answers `the reply to <op> holds <n> bytes, more than the
+67108864 bytes one reply may hold; ask for less, such as a vm.screenshot with
+maxWidth, scale or region` instead. A command that `vm.exec` already started in the guest keeps running until it
 ends or reaches its `timeout`; jobs started with `vm.exec.start` are not
 affected. The control socket pushes nothing to a client: a job's exit is seen
 through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
