@@ -4,6 +4,7 @@ package proto
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -131,14 +132,25 @@ type Writer struct {
 func NewWriter(w io.Writer) *Writer { return &Writer{w: w} }
 
 func (w *Writer) Send(m Message) error {
-	if m.Type() == "" {
-		return errors.New("message without type")
-	}
-	b, err := json.Marshal(m)
+	b, err := Encode(m)
 	if err != nil {
 		return err
 	}
-	b = append(b, '\n')
 	_, err = w.w.Write(b)
 	return err
+}
+
+// Encode returns the line Send writes for m, newline included. '<', '>' and
+// '&' are written as they are.
+func Encode(m Message) ([]byte, error) {
+	if m.Type() == "" {
+		return nil, errors.New("message without type")
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

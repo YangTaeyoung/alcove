@@ -8,6 +8,16 @@ import (
 	"testing"
 )
 
+func TestWriterKeepsAngleBracketsAndAmpersandsAsTheyAre(t *testing.T) {
+	var buf bytes.Buffer
+	if err := NewWriter(&buf).Send(Message{"t": "res", "name": "<a href=\"x\">&amp;</a>"}); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"name":"<a href=\"x\">&amp;</a>","t":"res"}` + "\n"; buf.String() != want {
+		t.Fatalf("line %q, expected %q", buf.String(), want)
+	}
+}
+
 func TestRoundTripAndTolerance(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
