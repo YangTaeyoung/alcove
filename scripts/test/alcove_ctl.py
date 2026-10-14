@@ -87,12 +87,13 @@ class Client:
             self._cond.notify_all()
 
     def send(self, op, **params):
-        """Sends one request without waiting and returns its id. Every keyword goes to the server as a parameter."""
+        """Sends one request without waiting and returns its id. Every keyword goes to the server as a parameter,
+        except `id`, which is the number of the request itself."""
         with self._write_lock:
             self._next_id += 1
             rid = self._next_id
             try:
-                self._sock.sendall((json.dumps({"id": rid, "op": op, **params}) + "\n").encode())
+                self._sock.sendall((json.dumps({**params, "id": rid, "op": op}) + "\n").encode())
             except OSError as e:
                 raise ControlError(f"cannot send {op}: {e}") from None
         return rid
