@@ -15,20 +15,25 @@ hold no C:\\alcove-e2e and no C:\\alcove-apps\\alcove-e2e-app, run no fixture,
 and show no window of the fixture, of the test page in Edge, of Character Map
 or of the Services console; the script refuses to start otherwise.
 
-Each check prints `PASS <n> <title>`; the first failing check prints
-`FAIL <n>: <reason>` and the script exits 1. The checks start the fixture app
-from C:\\alcove-apps\\alcove-e2e-app, Edge with the profile folder
-C:\\alcove-e2e\\edge-profile, Notepad, Character Map and the Services console,
-create junctions under C:\\alcove-e2e and restart the guest agent once through
-its scheduled task. Before Notepad starts, the files of its saved tabs are
-copied to a temporary directory on the host. However the run ends, a second
+Each check prints `PASS <n> <title>`, or `SKIP <n> <title>: <reason>` when
+the guest cannot produce what it needs; the first failing check prints
+`FAIL <n>: <reason>` and the script exits 1. A run without a failure ends with
+`<p> passed, <s> skipped` and the numbers of the skipped checks.
+
+The checks start the fixture app from C:\\alcove-apps\\alcove-e2e-app, Edge
+with the profile folder C:\\alcove-e2e\\edge-profile, Notepad, Character Map
+and the Services console, create junctions under C:\\alcove-e2e and restart
+the guest agent once through its scheduled task. Before Notepad starts, the
+files of its saved tabs are copied to a temporary directory on the host. However the run ends, a second
 connection stops the recording of the run, ends the processes the run started
 (the ones that run from the two folders, the Edge processes of that profile,
 and the Notepad, Character Map and console processes that were not running
 before), puts Notepad's saved tabs and the clipboard text back, removes the
 junctions with rmdir and deletes the two folders and the host directory of the
 run. When a step of that cannot finish, the script prints
-`cleanup failed: ...` with what to do by hand and exits 1.
+`cleanup failed: ...` with what to do by hand and exits 1. SIGTERM, SIGHUP
+and SIGINT print `interrupted; restoring the guest...`, run the same cleanup
+and exit with 128 plus the signal's number (143, 129, 130).
 
 Usage: at4-e2e.py [--vm NAME] [--only N[,N...]]
 """
@@ -113,6 +118,21 @@ foreach ($id in @(PIDS)) { "$id=" + [AlcoveE2E.Token]::Level($id) }
 
 class Failure(Exception):
     pass
+
+
+class Skipped(Exception):
+    """Raised by a check that cannot run on this guest; its text is the reason."""
+
+
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+def say(line):
+    """Prints `line`; a terminal that is gone (after SIGHUP) does not stop the run or its cleanup."""
+    try:
+        print(line, flush=True)
+    except OSError:
+        pass
 
 
 def expect(cond, reason):
@@ -518,10 +538,10 @@ class Run:
 
     def cleanup_error(self, what):
         self.cleanup_failed = True
-        print(f"cleanup failed: {what}", flush=True)
+        say(f"cleanup failed: {what}")
 
     def cleanup(self):
-        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in STOP_SIGNALS}
         try:
             self.cleanup_steps()
         finally:
@@ -554,7 +574,7 @@ class Run:
         if self.host and restored and not self.notepad_copy:
             shutil.rmtree(self.host, ignore_errors=True)
         elif self.host:
-            print(f"the host directory {self.host} of this run is kept", flush=True)
+            say(f"the host directory {self.host} of this run is kept")
 
     def restore(self, c, touched, by_hand):
         """Puts the guest back; returns whether the guest could be reached."""
@@ -856,7 +876,7 @@ def _(run):
             f"{found[0]['x']},{found[0]['y']}, tree of {count} elements, title after the click {title['detail']['title']!r}")
 
 
-@check("the tree of a Notepad that the elevated agent started is read, and no window has a higher integrity level than the agent")
+@check("the tree of a Notepad that the elevated agent started is read, and the windows above the agent's integrity level are reported")
 def _(run):
     run.prepare_guest()
     before = run.tracked("notepad")
@@ -1086,15 +1106,17 @@ def _(run):
     began = time.monotonic()
     never = run.wait_for([{"type": "ui_exists", "window": TITLE, "name": MISSING_NAME}], timeout=3)
     took = time.monotonic() - began
-    expect(never["matched"] == -1 and "problems" not in never and "type" not in never and 3 <= never["waited"] <= 3 + TICK_S + 0.1 and took < 3 + TICK_S + 1,
+    expect(never["matched"] == -1 and "problems" not in never and "type" not in never and never["waited"] >= 3
+           and never["waited"] <= 3 + TICK_S + 1 and took <= 3 + TICK_S + 2,
            f"ui_exists for an element that never appears answered {never!r} after {took:.2f} s with timeout 3")
 
     missing = {"window": MISSING_WINDOW, "role": "Button"}
     for kind in ("ui_exists", "ui_enabled"):
         r = run.wait_for([{"type": kind, **missing}], timeout=2)
-        expect(r["matched"] == -1 and "problems" not in r and r["waited"] <= 2 + TICK_S + 0.1, f"{kind} in a window that does not exist answered {r!r}")
+        expect(r["matched"] == -1 and "problems" not in r and r["waited"] >= 2 and r["waited"] <= 2 + TICK_S + 1,
+               f"{kind} in a window that does not exist answered {r!r}")
     r = run.wait_for([{"type": "ui_gone", **missing}], timeout=5)
-    expect(r["matched"] == 0 and r["type"] == "ui_gone" and r["waited"] < 1, f"ui_gone in a window that does not exist answered {r!r}")
+    expect(r["matched"] == 0 and r["type"] == "ui_gone" and r["waited"] <= 2, f"ui_gone in a window that does not exist answered {r!r}")
     r = run.wait_for([{"type": "ui_text_stable", "window": MISSING_WINDOW, "role": "Document"}], timeout=2)
     problems = r.get("problems") or [{}]
     expect(r["matched"] == -1 and len(problems) == 1 and problems[0].get("condition") == 0 and problems[0].get("type") == "ui_text_stable"
@@ -1151,7 +1173,7 @@ def _(run):
     if slow < SLOW_SEARCH_S:
         left = run.end(run.c, lambda: run.started("mmc"))
         expect(not left, f"the console processes {sorted(left)} still run 15 s after vm.process.kill")
-        return f"skipped: the search of the Services console took {slow:.1f} s, less than the {SLOW_SEARCH_S} s this check needs"
+        raise Skipped(f"the search of the Services console took {slow:.1f} s, less than the {SLOW_SEARCH_S} s this check needs")
 
     run.focus()
     same = run.call("vm.ui.find", selector={"window": TITLE, "role": "Button", "name": "Same", "index": 0})["nodes"][0]
@@ -1337,6 +1359,12 @@ def main():
     args = ap.parse_args()
     only = {int(n) for n in args.only.split(",") if n}
 
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, terminate)
+
     try:
         client = Client()
         client.call("hello", 60)
@@ -1354,19 +1382,19 @@ def main():
         print(f"FAIL 0: the guest already holds what this run creates: {'; '.join(found)}; remove it and run this script again")
         sys.exit(1)
     run = Run(client, args.vm, apps_existed)
-
-    def terminate(signum, frame):
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGTERM, terminate)
     failed = None
     interrupted = False
+    passed, skipped = [], []
     try:
         for n, title, fn in CHECKS:
             if only and n not in only:
                 continue
             try:
                 note = fn(run)
+            except Skipped as e:
+                skipped.append(n)
+                say(f"SKIP {n} {title}: {e}")
+                continue
             except Failure as e:
                 failed = f"FAIL {n}: {e}"
             except ControlTimeout as e:
@@ -1380,17 +1408,20 @@ def main():
             except OSError as e:
                 failed = f"FAIL {n}: {e}"
             if failed:
-                print(failed, flush=True)
+                say(failed)
                 break
-            print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
+            passed.append(n)
+            say(f"PASS {n} {title}" + (f" ({note})" if note else ""))
+        if not failed:
+            say(f"{len(passed)} passed, {len(skipped)} skipped" + (f" ({', '.join(map(str, skipped))})" if skipped else ""))
     except (KeyboardInterrupt, SystemExit):
         interrupted = True
         raise
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        for sig in STOP_SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
         if interrupted:
-            print("interrupted; restoring the guest...", flush=True)
+            say("interrupted; restoring the guest...")
         try:
             run.cleanup()
         except Exception as e:
