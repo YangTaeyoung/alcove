@@ -9,7 +9,7 @@ final class AgentKeyLinkTests: XCTestCase {
     private let nonce = String(repeating: "c3", count: 32)
     private let sentence = "this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again"
 
-    func testTheLinkPairsTheAgentWithTheKeyOfTheVM() async throws {
+    func testTheLinkPairsTheAgentWithThePublicKeyOfTheVMsKey() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": false]
         agent.handler = { m, _ in m["t"]?.stringValue == "pair" ? [["t": "authed"]] : [] }
@@ -18,7 +18,7 @@ final class AgentKeyLinkTests: XCTestCase {
         let client = await link.agent(timeout: .seconds(30))
         XCTAssertNotNil(client)
         XCTAssertEqual(agent.received.first?["t"]?.stringValue, "pair")
-        XCTAssertEqual(agent.received.first?["key"]?.stringValue, key)
+        XCTAssertEqual(agent.received.first?["publicKey"]?.stringValue, AgentKey.publicKey(key))
         let refusal = await link.lastRefusal()
         XCTAssertNil(refusal)
     }

@@ -107,8 +107,8 @@ public struct VMConfig: Codable, Sendable, Equatable {
     public var agentToken: String
     /// Host loopback port forwarded to the guest agent (guest port 7645).
     public var agentHostPort: Int
-    /// The key the guest agent is paired with: 32 random bytes as 64 lower-case hexadecimal digits
-    /// (docs/agent-protocol.md, Host key). It never reaches the guest except in the agent's `pair` message.
+    /// The seed of the Ed25519 private key the guest agent is paired with: 32 random bytes as 64 lower-case
+    /// hexadecimal digits (docs/agent-protocol.md, Host key). It never reaches the guest; the agent gets its public key.
     public var agentKey: String
     /// Name of the template this VM was cloned from; nil for a VM that is not a clone.
     public var cloneOf: String?

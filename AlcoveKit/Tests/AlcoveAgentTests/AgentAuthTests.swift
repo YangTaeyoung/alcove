@@ -8,27 +8,38 @@ final class AgentAuthTests: XCTestCase {
     private let key = String(repeating: "a5", count: 32)
     private let nonce = String(repeating: "0f", count: 32)
 
-    private func bytes(_ hex: String) -> Data {
-        var out = Data()
-        var index = hex.startIndex
-        while index < hex.endIndex {
-            let next = hex.index(index, offsetBy: 2)
-            out.append(UInt8(hex[index..<next], radix: 16)!)
-            index = next
-        }
-        return out
+    private func bytes(_ hex: String) -> Data { hexData(hex) }
+
+    /// The vector of seed 0xA5 x 32 and nonce 0x0F x 32 that auth_test.go checks too.
+    private let vectorPublicKey = "29e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d55"
+    /// A signature CryptoKit produced for the vector; auth_test.go verifies it with crypto/ed25519.
+    private let vectorCryptoKitSignature = "c3bc0953d4da7bb790c3907a80bae91023e0298463dde222ef8e1f1a6b312b4a7c0766deee90601af5cd25772c061db0ac171014a97fcea1fdaa3b64dd8e2d09"
+    /// The signature Go's ed25519.Sign produces for the vector.
+    private let vectorGoSignature = "34e3a451b7da207d9d86cdc48cc5a9bf8bab364fe35faa83a551117d64e3fe003ab06eef28d3d682b612f24473dd06b74d3fdd5f377a647487ad3e6505015c02"
+
+    private func verifies(_ signature: String, publicKey: String, nonce: String) -> Bool {
+        signatureVerifies(signature, publicKey: publicKey, nonce: nonce)
     }
 
-    private func mac(key: String, nonce: String) -> String {
-        HMAC<SHA256>.authenticationCode(for: bytes(nonce), using: SymmetricKey(data: bytes(key)))
-            .map { String(format: "%02x", $0) }.joined()
+    /// Whether a line the agent received holds the agentKey.
+    private func carriesTheKey(_ agent: FakeAgent) -> Bool {
+        agent.received.contains { line in (try? line.serialized()).map { String(decoding: $0, as: UTF8.self).contains(key) } ?? true }
     }
 
     private func types(_ agent: FakeAgent) -> [String] { agent.received.compactMap { $0["t"]?.stringValue } }
 
-    func testTheMACMatchesTheVectorTheAgentAndTheScriptsCompute() {
-        let mac = AgentClient.mac(key: Data(repeating: 0xA5, count: 32), nonce: Data(repeating: 0x0F, count: 32))
-        XCTAssertEqual(mac, "13daefa462caacbb63066b5b01254968e0dbe593431ed427fa29b8c891cadd05")
+    func testTheKeyOfTheVectorSignsWhatTheAgentVerifies() throws {
+        XCTAssertEqual(AgentKey.authContext, "alcove-agent-auth-v1")
+        XCTAssertEqual(AgentKey.publicKey(key), vectorPublicKey)
+        let signature = try XCTUnwrap(AgentKey.signature(key, nonce: bytes(nonce)))
+        XCTAssertEqual(signature.count, 128)
+        XCTAssertTrue(verifies(signature, publicKey: vectorPublicKey, nonce: nonce))
+        XCTAssertTrue(verifies(vectorCryptoKitSignature, publicKey: vectorPublicKey, nonce: nonce))
+        XCTAssertTrue(verifies(vectorGoSignature, publicKey: vectorPublicKey, nonce: nonce))
+        XCTAssertFalse(verifies(signature, publicKey: vectorPublicKey, nonce: String(repeating: "0e", count: 32)))
+        XCTAssertNil(AgentKey.publicKey("abc"))
+        XCTAssertNil(AgentKey.publicKey(String(repeating: "g", count: 64)))
+        XCTAssertNil(AgentKey.signature(String(repeating: "a5", count: 31), nonce: bytes(nonce)))
         XCTAssertEqual(AgentClient.hexBytes("0aFf"), Data([0x0A, 0xFF]))
         XCTAssertNil(AgentClient.hexBytes("0g"))
         XCTAssertNil(AgentClient.hexBytes("abc"))
@@ -46,22 +57,24 @@ final class AgentAuthTests: XCTestCase {
         XCTAssertEqual(authenticated, true)
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(Array(types(agent).prefix(2)), ["pair", "welcome"])
-        XCTAssertEqual(agent.received.first?["key"]?.stringValue, key)
+        XCTAssertEqual(agent.received.first?["publicKey"]?.stringValue, vectorPublicKey)
+        XCTAssertFalse(carriesTheKey(agent), "a line carried the agentKey")
     }
 
-    func testAPairedAgentGetsTheMACOfItsNonce() async throws {
+    func testAPairedAgentGetsTheSignatureOfItsNonce() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": true]
-        let expected = mac(key: key, nonce: nonce)
+        let publicKey = vectorPublicKey, nonce = self.nonce
+        let valid: @Sendable (String) -> Bool = { signatureVerifies($0, publicKey: publicKey, nonce: nonce) }
         agent.handler = { m, _ in
             guard m["t"]?.stringValue == "auth" else { return [] }
-            return m["mac"]?.stringValue == expected ? [["t": "authed"]] : [["t": "refused", "error": "wrong mac"]]
+            return valid(m["signature"]?.stringValue ?? "") ? [["t": "authed"]] : [["t": "refused", "error": "wrong signature"]]
         }
         let client = AgentClient()
         try await client.connect(port: agent.port, expectedToken: "tok", agentKey: key)
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(Array(types(agent).prefix(2)), ["auth", "welcome"])
-        XCTAssertNil(agent.received.first?["key"], "the key itself was sent to a paired agent")
+        XCTAssertFalse(carriesTheKey(agent), "a line carried the agentKey")
     }
 
     func testTheRefusedSentenceIsTheErrorOfConnect() async throws {
@@ -160,4 +173,22 @@ final class AgentAuthTests: XCTestCase {
             XCTAssertEqual(text, "this alcove-agent serves only a host that pairs with it")
         }
     }
+}
+
+/// The bytes that `hex`, an even number of hexadecimal digits, encodes.
+private func hexData(_ hex: String) -> Data {
+    var out = Data()
+    var index = hex.startIndex
+    while index < hex.endIndex {
+        let next = hex.index(index, offsetBy: 2)
+        out.append(UInt8(hex[index..<next], radix: 16)!)
+        index = next
+    }
+    return out
+}
+
+/// Whether `signature` is the signature by the private key of `publicKey` of the auth context and `nonce`.
+private func signatureVerifies(_ signature: String, publicKey: String, nonce: String) -> Bool {
+    guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: hexData(publicKey)) else { return false }
+    return key.isValidSignature(hexData(signature), for: Data("alcove-agent-auth-v1".utf8) + hexData(nonce))
 }

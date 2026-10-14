@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import AlcoveQMP
 
 /// Host side of the guest agent protocol (docs/agent-protocol.md): connects
@@ -33,7 +32,7 @@ public actor AgentClient {
     public static let noAgentKey = "the guest tools ask for the VM's agent key and none was given"
     /// The handshake reason when the given agent key is not 64 hexadecimal digits.
     public static let badAgentKey = "the agentKey in the VM's config.json is not 64 hexadecimal digits; restore config.json from a backup"
-    /// The handshake reason when the agent asks for a MAC without a nonce of 64 hexadecimal digits.
+    /// The handshake reason when the agent asks for a signature without a nonce of 64 hexadecimal digits.
     public static let badNonce = "the guest tools sent no usable nonce; reinstall alcove-agent in the guest"
 
     public enum Event: Sendable, Equatable {
@@ -146,19 +145,20 @@ public actor AgentClient {
         isConnected = true
     }
 
-    /// Sends `pair` with `agentKey` to an agent whose hello says `paired: false`, otherwise `auth` with the
-    /// HMAC-SHA256 of the hello's nonce under the key, and waits for `authed`.
+    /// Sends `pair` with the public key of `agentKey` to an agent whose hello says `paired: false`, otherwise `auth`
+    /// with the signature by `agentKey` of the hello's nonce (`AgentKey`), and waits for `authed`.
     private func authenticate(hello h: JSON, agentKey: String?) async throws {
         guard let agentKey else { throw AgentError.handshake(AgentClient.noAgentKey) }
-        guard let key = AgentClient.hexBytes(agentKey), key.count == 32 else { throw AgentError.handshake(AgentClient.badAgentKey) }
+        guard let publicKey = AgentKey.publicKey(agentKey) else { throw AgentError.handshake(AgentClient.badAgentKey) }
         let message: JSON
         if h["paired"]?.boolValue == true {
             guard let nonce = h["nonce"]?.stringValue.flatMap(AgentClient.hexBytes), nonce.count == 32 else {
                 throw AgentError.handshake(AgentClient.badNonce)
             }
-            message = ["t": "auth", "mac": .string(AgentClient.mac(key: key, nonce: nonce))]
+            guard let signature = AgentKey.signature(agentKey, nonce: nonce) else { throw AgentError.handshake(AgentClient.badAgentKey) }
+            message = ["t": "auth", "signature": .string(signature)]
         } else {
-            message = ["t": "pair", "key": .string(agentKey)]
+            message = ["t": "pair", "publicKey": .string(publicKey)]
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             if let refusal {
@@ -172,11 +172,6 @@ public actor AgentClient {
                 send(message)
             }
         }
-    }
-
-    /// The lower-case hexadecimal HMAC-SHA256 of `nonce` under `key`.
-    nonisolated static func mac(key: Data, nonce: Data) -> String {
-        HMAC<SHA256>.authenticationCode(for: nonce, using: SymmetricKey(data: key)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// The bytes an even number of hexadecimal digits encode, or nil.
