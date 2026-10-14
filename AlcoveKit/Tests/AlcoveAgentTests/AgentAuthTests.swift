@@ -26,6 +26,14 @@ final class AgentAuthTests: XCTestCase {
 
     private func types(_ agent: FakeAgent) -> [String] { agent.received.compactMap { $0["t"]?.stringValue } }
 
+    func testTheMACMatchesTheVectorTheAgentAndTheScriptsCompute() {
+        let mac = AgentClient.mac(key: Data(repeating: 0xA5, count: 32), nonce: Data(repeating: 0x0F, count: 32))
+        XCTAssertEqual(mac, "13daefa462caacbb63066b5b01254968e0dbe593431ed427fa29b8c891cadd05")
+        XCTAssertEqual(AgentClient.hexBytes("0aFf"), Data([0x0A, 0xFF]))
+        XCTAssertNil(AgentClient.hexBytes("0g"))
+        XCTAssertNil(AgentClient.hexBytes("abc"))
+    }
+
     func testAnUnpairedAgentIsPairedWithTheKeyBeforeTheConnectionIsReady() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": false]

@@ -397,3 +397,12 @@ func TestSecretsAreComparedInConstantTime(t *testing.T) {
 		}
 	}
 }
+
+func TestHostMACMatchesTheVectorTheHostAndTheScriptsCompute(t *testing.T) {
+	key := bytes.Repeat([]byte{0xA5}, KeySize)
+	nonce := bytes.Repeat([]byte{0x0F}, KeySize)
+	const want = "13daefa462caacbb63066b5b01254968e0dbe593431ed427fa29b8c891cadd05"
+	if got := hex.EncodeToString(hostMAC(key, nonce)); got != want {
+		t.Fatalf("hostMAC = %s, expected %s", got, want)
+	}
+}
