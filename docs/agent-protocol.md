@@ -15,7 +15,8 @@ An agent serves a connection only when both of these hold:
    `--allow-peer <address or CIDR range>` (repeatable; `--install` passes them
    on to the scheduled task or the systemd unit) adds a range, for tests and
    for guests on another network.
-2. The host proved that it holds the VM's agent key ([Host key](#host-key)).
+2. The host proved that it holds the VM's agent key by signing the
+   connection's nonce ([Host key](#host-key)).
    Agents without key support skip this step.
 
 A peer outside the ranges gets one line and the connection closes; it gets no
@@ -83,16 +84,18 @@ Capabilities:
 
 ## Host key
 
-The host keeps one key per VM: `agentKey` in the VM's `config.json`, 32
-random bytes written as 64 lower-case hexadecimal digits. The app creates it
-with the VM, and adds it to the `config.json` of a VM created before the
-field existed when it first loads that file; a stored key is never replaced
-by a save. A linked clone takes its template's key, because its disk starts
-from the template's disk and with it the key the template's agent stored.
-The key reaches the guest only in the `pair` message below; it is not in the
-SMBIOS strings or in anything else the guest can read.
+The host keeps one Ed25519 private key per VM: `agentKey` in the VM's
+`config.json`, the 32-byte seed of the key (RFC 8032) written as 64
+lower-case hexadecimal digits of random bytes. Every 32 bytes are a seed, so
+every stored `agentKey` of 64 hexadecimal digits is used as it is. The app
+creates it with the VM, and adds it to the `config.json` of a VM created
+before the field existed when it first loads that file; a stored key is
+never replaced by a save. A linked clone takes its template's key, because
+its disk starts from the template's disk and with it the public key the
+template's agent stored. The private key never leaves the host: the `pair`
+message below carries the public key, and `auth` a signature.
 
-The agent stores the key of the host it is paired with:
+The agent stores the public key of the host it is paired with:
 
 - Windows: `%ProgramData%\Alcove\host.key`, in the data folder that is locked
   to Administrators and SYSTEM at every start
@@ -107,7 +110,8 @@ The agent stores the key of the host it is paired with:
   `O_NOFOLLOW` and used only when it is a regular file of that user that no
   other user can read or write.
 
-The file holds the 64 hexadecimal digits and a newline. The agent reads it
+The file holds the 32 bytes of the public key as 64 hexadecimal digits and
+a newline. The agent reads it
 for every connection, so `--forget-host-key` takes effect on the next
 connection without a restart.
 
@@ -123,20 +127,31 @@ connection without a restart.
 
 | `t` | Fields | Sent when |
 |---|---|---|
-| `pair` | `key` (the VM's `agentKey`) | `paired` is false |
-| `auth` | `mac` (64 lower-case hexadecimal digits) | `paired` is true |
+| `pair` | `publicKey`: the Ed25519 public key of the VM's `agentKey`, 64 lower-case hexadecimal digits | `paired` is false |
+| `auth` | `signature`: 128 lower-case hexadecimal digits | `paired` is true |
 
-`mac` is HMAC-SHA256 whose key is the 32 bytes of `agentKey` and whose
-message is the 32 bytes of the hello's `nonce` (both hex-decoded). The agent
-compares the MAC it computes with the one it received, and a `pair` key with
-its stored key, in constant time (`crypto/subtle`). A MAC answers one nonce
-only; a MAC sent on another connection is refused.
+`signature` is the Ed25519 signature (RFC 8032, pure Ed25519) by the VM's
+`agentKey` of the 20 ASCII bytes `alcove-agent-auth-v1` followed by the 32
+bytes of the hello's `nonce` (hex-decoded). The agent verifies it with the
+stored public key (`crypto/ed25519`), and compares a `pair` public key with
+the stored one in constant time (`crypto/subtle`). A signature answers one
+nonce only; a signature sent on another connection is refused. The host may
+sign with random per-signature data (CryptoKit does); every valid signature
+is accepted.
+
+Scripts that speak the protocol sign through the host's `alcovectl`:
+`alcovectl agent-sign --vm <name> --nonce <hex>` prints the signature of
+that nonce, and with `--public-key` also the public key (one per line,
+signature first); `--public-key` alone prints the public key. It reads the
+`agentKey` of the VM whose `config.json` has that `name` in the VM folder
+(`--dir`, `ALCOVE_VM_DIR`, or `~/Library/Application Support/Alcove/VMs`).
 
 **Agent → host.** The agent answers with one line:
 
 - `{"t":"authed"}`: the connection is served from now on. A `pair` stores the
-  key before this line. A `pair` whose key equals the stored key also answers
-  `authed`, so two connections that pair at the same time both succeed.
+  public key before this line. A `pair` whose public key equals the stored
+  one also answers `authed`, so two connections that pair at the same time
+  both succeed.
 - `{"t":"refused","error":"<sentence>"}`, and the connection closes.
 
 Until `authed` the agent sends nothing else: no keepalive, no events, no
@@ -154,10 +169,10 @@ The refusals of `pair` and `auth`:
 
 | Case | `error` |
 |---|---|
-| `auth` with a wrong or malformed `mac` | `the host did not prove the key this alcove-agent is paired with; when the VM's agentKey changed (a re-created VM, or a disk taken from another VM), run alcove-agent --forget-host-key as an administrator in the guest and connect again` |
-| `pair` with a key other than the stored one | `this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again` |
+| `auth` with a wrong or malformed `signature` | `the host did not prove the key this alcove-agent is paired with; when the VM's agentKey changed (a re-created VM, or a disk taken from another VM), run alcove-agent --forget-host-key as an administrator in the guest and connect again` |
+| `pair` with a public key other than the stored one | `this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again` |
 | `auth` while no key is stored | `this alcove-agent holds no host key; connect again to pair it` |
-| `pair` whose `key` is not 64 hexadecimal digits | `the key in pair is not 64 hexadecimal digits; send the VM's agentKey` |
+| `pair` whose `publicKey` is not 64 hexadecimal digits | `the publicKey in pair is not 64 hexadecimal digits; send the public key of the VM's agentKey` |
 | the stored key cannot be read, or the key cannot be stored | `this alcove-agent cannot use its host key: <reason>` |
 
 The reasons of the last row:
@@ -186,16 +201,26 @@ the agent; the app does that within seconds while the VM runs.
 **What it does not prevent.** Pairing trusts the first `pair`, like the first
 use of an ssh host key. A guest program that pairs the agent before the host
 first connects is not prevented: the host then gets the mismatch refusal and
-shows it, and an administrator resets the pairing. The `pair` message carries
-the key in clear text once, over the forwarded connection.
+shows it, and an administrator resets the pairing. The `pair` message and
+the signatures carry nothing that proves the key on another connection: a
+guest program that receives them (for example one that listens on port 7645
+while the agent is not running) cannot authenticate to the agent with them.
+
+**Agent log.** The agent writes a served connection to its log as
+`connection from <address>` once it is served (after `authed`), and a
+refused one (the address check, `pair`, `auth` or the 30 s deadline) as
+`refused the connection from <address>: <sentence>`. The same sentence is
+written at most once per minute; the next line written for it ends with
+`(<n> more refused for this reason since the last line)` when connections
+were refused in between.
 
 ## Messages
 
 | Direction | `t` | Fields | Meaning |
 |---|---|---|---|
 | agent → host | `refused` | `error` | the last line to a peer that is not served ([Who is served](#who-is-served), [Host key](#host-key)); the connection closes |
-| host → agent | `pair` | `key` | pair an agent whose hello says `paired: false` ([Host key](#host-key)) |
-| host → agent | `auth` | `mac` | prove the key to an agent whose hello says `paired: true` ([Host key](#host-key)) |
+| host → agent | `pair` | `publicKey` | pair an agent whose hello says `paired: false` ([Host key](#host-key)) |
+| host → agent | `auth` | `signature` | prove the key to an agent whose hello says `paired: true` ([Host key](#host-key)) |
 | agent → host | `authed` | — | the `pair` or `auth` succeeded; the connection is served |
 | both | `ping` / `pong` | — | keepalive every 10 s |
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
