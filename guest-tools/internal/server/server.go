@@ -92,6 +92,9 @@ type Server struct {
 	ownMu   sync.Mutex
 	ownSeq  uint64
 	ownTime time.Time
+
+	// refusals writes the refused connections to the log.
+	refusals refusalLog
 }
 
 func New(opt Options) *Server {
@@ -198,16 +201,17 @@ func (s *Server) handle(c net.Conn) {
 	lg := s.opt.Logger
 	addr, ok := s.peerAllowed(c.RemoteAddr())
 	if !ok {
-		lg.Printf("refused the connection from %s", c.RemoteAddr())
+		sentence := refusal(s.allowPeers(), addr)
+		s.refusals.write(lg, c.RemoteAddr(), sentence)
 		_ = c.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
-		_ = proto.NewWriter(c).Send(proto.Message{"t": "refused", "error": refusal(s.allowPeers(), addr)})
+		_ = proto.NewWriter(c).Send(proto.Message{"t": "refused", "error": sentence})
 		return
 	}
-	lg.Printf("connection from %s", c.RemoteAddr())
 	r := proto.NewReader(c)
 	if !s.handshake(c, r) {
 		return
 	}
+	lg.Printf("connection from %s", c.RemoteAddr())
 	cn := newConn(c, lg)
 	go cn.writeLoop()
 	defer cn.stopWriter()

@@ -157,7 +157,7 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader) bool {
 		return false
 	}
 	refuse := func(text string) bool {
-		s.opt.Logger.Printf("refused the connection from %s: %s", c.RemoteAddr(), text)
+		s.refusals.write(s.opt.Logger, c.RemoteAddr(), text)
 		write(proto.Message{"t": "refused", "error": text})
 		return false
 	}
