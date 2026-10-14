@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
 	"net"
 	"strings"
 	"testing"
@@ -134,7 +136,7 @@ func TestAReplyOverTheHostLineLimitBecomesAnError(t *testing.T) {
 		return proto.Message{"text": strings.Repeat("<", size)}, nil
 	})
 	var got proto.Message
-	capture := func(m proto.Message) { got = m }
+	capture := func(m proto.Message, _ []byte) { got = m }
 
 	size = 4 << 20
 	s.dispatch(context.Background(), proto.Message{"t": "req", "id": 1, "op": "t.big"}, capture)
@@ -294,5 +296,30 @@ func TestV1MessagesStillWork(t *testing.T) {
 	send(t, w, proto.Message{"t": "clipboard.get"})
 	if got := expect(t, r, "clipboard.text"); got.String("text") != "v1 text" {
 		t.Fatalf("clipboard.text %v", got)
+	}
+}
+
+func TestDispatchHandsOverTheLineItEncodedForTheSizeCheck(t *testing.T) {
+	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
+	var got proto.Message
+	var line []byte
+	s.dispatch(context.Background(), proto.Message{"t": "req", "id": 3, "op": "ping"}, func(m proto.Message, l []byte) { got, line = m, l })
+	want, err := proto.Encode(got)
+	if err != nil || line == nil || string(line) != string(want) {
+		t.Fatalf("line %q for %v, expected %q", line, got, want)
+	}
+}
+
+func TestTheConnWritesAHandedOverLineAsItIs(t *testing.T) {
+	cli, srv := net.Pipe()
+	defer cli.Close()
+	c := newConn(srv, log.New(io.Discard, "", 0))
+	go c.writeLoop()
+	defer c.stopWriter()
+	c.sendReply(proto.Message{"t": "res", "id": 1, "ok": true}, []byte("{\"t\":\"res\",\"id\":1,\"ok\":true,\"as\":\"encoded\"}\n"))
+	cli.SetDeadline(time.Now().Add(10 * time.Second))
+	m, err := proto.NewReader(cli).Next()
+	if err != nil || m.String("as") != "encoded" {
+		t.Fatalf("read %v, %v", m, err)
 	}
 }

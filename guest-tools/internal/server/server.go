@@ -255,7 +255,7 @@ func (s *Server) handle(c net.Conn) {
 			case inFlight <- struct{}{}:
 				go func(m proto.Message) {
 					defer func() { <-inFlight }()
-					s.dispatch(ctx, m, send)
+					s.dispatch(ctx, m, cn.sendReply)
 				}(m)
 			default:
 				send(proto.Message{"t": "res", "id": m["id"], "ok": false, "error": tooManyRequests()})

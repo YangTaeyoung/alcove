@@ -46,7 +46,7 @@ type conn struct {
 	nc  net.Conn
 	w   *proto.Writer
 	lg  *log.Logger
-	out chan proto.Message
+	out chan outgoing
 
 	// mu orders the events put into out and guards dropped.
 	mu      sync.Mutex
@@ -56,16 +56,27 @@ type conn struct {
 	stop chan struct{} // closed to ask the writer to stop
 }
 
+// outgoing is a queued message; line, when set, is its encoded line, which is
+// written as it is.
+type outgoing struct {
+	m    proto.Message
+	line []byte
+}
+
 func newConn(nc net.Conn, lg *log.Logger) *conn {
-	return &conn{nc: nc, w: proto.NewWriter(nc), lg: lg, out: make(chan proto.Message, eventQueueSize),
+	return &conn{nc: nc, w: proto.NewWriter(nc), lg: lg, out: make(chan outgoing, eventQueueSize),
 		done: make(chan struct{}), stop: make(chan struct{})}
 }
 
 // send queues a reply or other message; it waits for room or for the
 // connection to close.
-func (c *conn) send(m proto.Message) {
+func (c *conn) send(m proto.Message) { c.sendReply(m, nil) }
+
+// sendReply queues m like send; a non-nil line is m's encoded line and is
+// written instead of encoding m again.
+func (c *conn) sendReply(m proto.Message, line []byte) {
 	select {
-	case c.out <- m:
+	case c.out <- outgoing{m: m, line: line}:
 	case <-c.done:
 	}
 }
@@ -82,7 +93,7 @@ func (c *conn) enqueueEvent(ev proto.Message) {
 			return
 		}
 		select {
-		case c.out <- droppedEvent(c.dropped):
+		case c.out <- outgoing{m: droppedEvent(c.dropped)}:
 			c.dropped = 0
 		case <-c.done:
 			return
@@ -92,7 +103,7 @@ func (c *conn) enqueueEvent(ev proto.Message) {
 		}
 	}
 	select {
-	case c.out <- ev:
+	case c.out <- outgoing{m: ev}:
 	case <-c.done:
 	default:
 		c.dropped++
@@ -123,12 +134,12 @@ func (c *conn) writeLoop() {
 		select {
 		case <-c.stop:
 			return
-		case m := <-c.out:
-			if !c.write(m) {
+		case o := <-c.out:
+			if !c.write(o) {
 				return
 			}
 			if n := c.takeDroppedWhenIdle(); n > 0 {
-				if !c.write(droppedEvent(n)) {
+				if !c.write(outgoing{m: droppedEvent(n)}) {
 					return
 				}
 			}
@@ -136,9 +147,15 @@ func (c *conn) writeLoop() {
 	}
 }
 
-func (c *conn) write(m proto.Message) bool {
+func (c *conn) write(o outgoing) bool {
 	_ = c.nc.SetWriteDeadline(time.Now().Add(connWriteTimeout))
-	if err := c.w.Send(m); err != nil {
+	var err error
+	if o.line != nil {
+		_, err = c.nc.Write(o.line)
+	} else {
+		err = c.w.Send(o.m)
+	}
+	if err != nil {
 		c.lg.Printf("send: %v", err)
 		_ = c.nc.Close()
 		return false
@@ -187,12 +204,13 @@ func (s *Server) removeConn(c *conn) {
 	s.connMu.Unlock()
 }
 
-// dispatch runs one "req" message and sends the matching "res". A request
-// without an id is not run. A reply whose line would reach maxReplyLine is
-// replaced by an error that asks for less.
-func (s *Server) dispatch(ctx context.Context, req proto.Message, send func(proto.Message)) {
+// dispatch runs one "req" message and sends the matching "res" with its
+// encoded line, or with a nil line when it was not encoded. A request without
+// an id is not run. A reply whose line would reach maxReplyLine is replaced by
+// an error that asks for less.
+func (s *Server) dispatch(ctx context.Context, req proto.Message, send func(m proto.Message, line []byte)) {
 	if req["id"] == nil {
-		send(proto.Message{"t": "res", "id": nil, "ok": false, "error": errNoID})
+		send(proto.Message{"t": "res", "id": nil, "ok": false, "error": errNoID}, nil)
 		return
 	}
 	fail := func(text string) proto.Message {
@@ -200,7 +218,7 @@ func (s *Server) dispatch(ctx context.Context, req proto.Message, send func(prot
 	}
 	fields, err := s.invoke(ctx, req)
 	if err != nil {
-		send(fail(err.Error()))
+		send(fail(err.Error()), nil)
 		return
 	}
 	res := proto.Message{}
@@ -214,11 +232,12 @@ func (s *Server) dispatch(ctx context.Context, req proto.Message, send func(prot
 	switch {
 	case err != nil:
 		s.opt.Logger.Printf("op %s: the answer could not be encoded: %v", req.String("op"), err)
-		res = fail(fmt.Sprintf("the answer to '%s' could not be encoded; see the agent log", req.String("op")))
+		send(fail(fmt.Sprintf("the answer to '%s' could not be encoded; see the agent log", req.String("op"))), nil)
 	case len(line) >= maxReplyLine:
-		res = fail(fmt.Sprintf("the answer to '%s' is larger than the 8 MiB line the host reads; ask for less (a lower max, depth or limit, a narrower path or a name filter)", req.String("op")))
+		send(fail(fmt.Sprintf("the answer to '%s' is larger than the 8 MiB line the host reads; ask for less (a lower max, depth or limit, a narrower path or a name filter)", req.String("op"))), nil)
+	default:
+		send(res, line)
 	}
-	send(res)
 }
 
 // tooManyRequests is the error of a request that arrives while maxInFlight
