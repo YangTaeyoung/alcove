@@ -70,6 +70,16 @@ final class ControlServerTests: XCTestCase {
             (#"{"id": "\ud83d"}"#, .null),
             ("not json at all", .null),
             (#"[{"id": 5}"#, .null),
+            (#"{"op": "x", "a": nope, "id": 5, "#, .null),
+            (#"{"a": tru, "id": 5, "x": }"#, .null),
+            (#"{"a": 01, "id": 5, "x": }"#, .null),
+            (#"{"a": 1 2, "id": 5, "x": }"#, .null),
+            (#"{"a": [1, 2,], "id": 5, "x": }"#, .null),
+            (#"{"a": {"b" 1}, "id": 5, "x": }"#, .null),
+            (#"{"a": "\q", "id": 5, "x": }"#, .null),
+            (#"{"a": "\u12", "id": 5, "x": }"#, .null),
+            (#"{"\u0069d": 5, "x": }"#, .null),
+            (#"{"a": [true, false, null, -1.5e3, 0, {"b": "\u00e9\n"}, []], "c": {}, "id": 6, "x": }"#, 6),
         ]
         for (line, id) in cases {
             let r = try await reply(line)

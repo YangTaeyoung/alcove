@@ -211,67 +211,133 @@ public final class ControlServer: @unchecked Sendable {
     }
 
     /// The value of the top-level `id` key of a request line that cannot be parsed as a whole: a number or a string.
-    /// The line is scanned from its start; nil when it does not begin as an object, when the scan meets broken syntax
-    /// before it reaches the key, and when the value of the key is anything else.
+    /// The line is scanned from its start, and every key and value before the key must be JSON syntax: UTF-8 strings
+    /// with valid escapes (a `\u` escape needs four hex digits; whether it is half a surrogate pair is not checked),
+    /// numbers, `true`, `false`, `null`, and objects and arrays of these nested at most 512 deep. Nil when the line does
+    /// not begin as an object, when anything before the key is not JSON syntax, when the key is spelled other than
+    /// `"id"`, and when the value of the key is not a number or a string that parses.
     static func requestID(in line: Data) -> JSON? {
         let bytes = [UInt8](line)
         var at = 0
+        let quote = UInt8(ascii: "\""), backslash = UInt8(ascii: "\\")
         func skipSpace() { while at < bytes.count, [0x20, 0x09, 0x0D, 0x0A].contains(bytes[at]) { at += 1 } }
-        /// The bytes of the string that starts at `at`, quotes included; nil when it does not end.
+        func next(is byte: Character) -> Bool { at < bytes.count && bytes[at] == UInt8(ascii: byte.unicodeScalars.first!) }
+        func isDigit(_ b: UInt8) -> Bool { b >= 0x30 && b <= 0x39 }
+        func isHex(_ b: UInt8) -> Bool { isDigit(b) || ((b | 0x20) >= 0x61 && (b | 0x20) <= 0x66) }
+        /// The bytes of the string that starts at `at`, quotes included; nil when it does not end or is not a JSON string.
         func string() -> ArraySlice<UInt8>? {
-            guard at < bytes.count, bytes[at] == UInt8(ascii: "\"") else { return nil }
+            guard next(is: "\"") else { return nil }
             let start = at
             at += 1
             while at < bytes.count {
-                if bytes[at] == UInt8(ascii: "\\") { at += 2; continue }
-                if bytes[at] == UInt8(ascii: "\"") { at += 1; return bytes[start..<at] }
+                let b = bytes[at]
+                if b == quote {
+                    at += 1
+                    return String(bytes: bytes[start..<at], encoding: .utf8) == nil ? nil : bytes[start..<at]
+                }
+                if b < 0x20 { return nil }
+                if b == backslash {
+                    guard at + 1 < bytes.count else { return nil }
+                    if bytes[at + 1] == UInt8(ascii: "u") {
+                        guard at + 5 < bytes.count, bytes[(at + 2)...(at + 5)].allSatisfy(isHex) else { return nil }
+                        at += 6
+                    } else {
+                        guard Array("\"\\/bfnrt".utf8).contains(bytes[at + 1]) else { return nil }
+                        at += 2
+                    }
+                    continue
+                }
                 at += 1
             }
             return nil
         }
-        /// Moves past the value that starts at `at`; false when it does not end.
-        func skipValue() -> Bool {
-            guard at < bytes.count else { return false }
-            if bytes[at] == UInt8(ascii: "\"") { return string() != nil }
-            guard bytes[at] == UInt8(ascii: "{") || bytes[at] == UInt8(ascii: "[") else {
-                let start = at
-                while at < bytes.count, ![UInt8(ascii: ","), UInt8(ascii: "}"), UInt8(ascii: "]")].contains(bytes[at]) { at += 1 }
-                return at > start
-            }
-            var depth = 0
-            while at < bytes.count {
-                switch bytes[at] {
-                case UInt8(ascii: "\""):
-                    guard string() != nil else { return false }
-                    continue
-                case UInt8(ascii: "{"), UInt8(ascii: "["): depth += 1
-                case UInt8(ascii: "}"), UInt8(ascii: "]"):
-                    depth -= 1
-                    if depth == 0 { at += 1; return true }
-                default: break
-                }
+        func digits() -> Bool {
+            let start = at
+            while at < bytes.count, isDigit(bytes[at]) { at += 1 }
+            return at > start
+        }
+        func number() -> Bool {
+            if next(is: "-") { at += 1 }
+            if next(is: "0") { at += 1 } else { guard digits() else { return false } }
+            if next(is: ".") { at += 1; guard digits() else { return false } }
+            if next(is: "e") || next(is: "E") {
                 at += 1
+                if next(is: "+") || next(is: "-") { at += 1 }
+                guard digits() else { return false }
             }
-            return false
+            return true
+        }
+        func literal(_ word: String) -> Bool {
+            let w = Array(word.utf8)
+            guard at + w.count <= bytes.count, Array(bytes[at..<(at + w.count)]) == w else { return false }
+            at += w.count
+            return true
+        }
+        /// Moves past `"key":` at `at`, spaces included; false when it is not there.
+        func memberKey() -> Bool {
+            skipSpace()
+            guard string() != nil else { return false }
+            skipSpace()
+            guard next(is: ":") else { return false }
+            at += 1
+            return true
+        }
+        /// Moves past the JSON value that starts at `at`; false when it is not JSON syntax or does not end.
+        func skipValue() -> Bool {
+            var open: [UInt8] = []
+            while true {
+                skipSpace()
+                guard at < bytes.count else { return false }
+                switch bytes[at] {
+                case quote:
+                    guard string() != nil else { return false }
+                case UInt8(ascii: "{"), UInt8(ascii: "["):
+                    let opening = bytes[at]
+                    at += 1
+                    skipSpace()
+                    if next(is: opening == UInt8(ascii: "{") ? "}" : "]") { at += 1; break }
+                    guard open.count < 512 else { return false }
+                    open.append(opening)
+                    if opening == UInt8(ascii: "{") { guard memberKey() else { return false } }
+                    continue
+                case UInt8(ascii: "t"): guard literal("true") else { return false }
+                case UInt8(ascii: "f"): guard literal("false") else { return false }
+                case UInt8(ascii: "n"): guard literal("null") else { return false }
+                default:
+                    guard number() else { return false }
+                }
+                closing: while let top = open.last {
+                    skipSpace()
+                    if next(is: ",") {
+                        at += 1
+                        if top == UInt8(ascii: "{") { guard memberKey() else { return false } }
+                        break closing
+                    }
+                    guard next(is: top == UInt8(ascii: "{") ? "}" : "]") else { return false }
+                    at += 1
+                    open.removeLast()
+                }
+                if open.isEmpty { return true }
+            }
         }
         skipSpace()
-        guard at < bytes.count, bytes[at] == UInt8(ascii: "{") else { return nil }
+        guard next(is: "{") else { return nil }
         at += 1
         while true {
             skipSpace()
             guard let key = string() else { return nil }
             skipSpace()
-            guard at < bytes.count, bytes[at] == UInt8(ascii: ":") else { return nil }
+            guard next(is: ":") else { return nil }
             at += 1
             skipSpace()
             if Array(key) == Array("\"id\"".utf8) {
                 let start = at
-                guard at < bytes.count, skipValue(), let value = try? JSON.parse(Data(bytes[start..<at])) else { return nil }
+                guard skipValue(), let value = try? JSON.parse(Data(bytes[start..<at])) else { return nil }
                 return value.stringValue != nil || value.doubleValue != nil ? value : nil
             }
             guard skipValue() else { return nil }
             skipSpace()
-            guard at < bytes.count, bytes[at] == UInt8(ascii: ",") else { return nil }
+            guard next(is: ",") else { return nil }
             at += 1
         }
     }
