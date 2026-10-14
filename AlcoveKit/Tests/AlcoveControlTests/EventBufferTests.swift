@@ -437,6 +437,33 @@ final class EventBufferTests: XCTestCase {
         XCTAssertFalse(settled)
     }
 
+    /// A loopback TCP listener that accepts connections in the kernel and never says hello; closed at teardown.
+    private func silentListener() -> Int {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        _ = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        Darwin.listen(fd, 8)
+        var bound = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &bound) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) } }
+        addTeardownBlock { Darwin.close(fd) }
+        return Int(UInt16(bigEndian: bound.sin_port))
+    }
+
+    func testLinkGivesUpAtTheCallersDeadlineWhenTheAgentNeverSaysHello() async throws {
+        let port = silentListener()
+        let link = AgentLink(events: EventBuffer(), retryDelay: .seconds(600), isRunning: { true }, endpoint: { (port, nil) })
+        let ended = await finishes("the caller gets nil", within: .seconds(4)) {
+            let client = await link.agent(timeout: .milliseconds(300))
+            XCTAssertNil(client)
+        }
+        XCTAssertTrue(ended)
+        let connecting = await link.isConnecting
+        XCTAssertFalse(connecting)
+    }
+
     func testLinkStopsConnectingWhenItsCallerIsCancelled() async throws {
         let unreachable = FakeAgent()
         unreachable.stop()

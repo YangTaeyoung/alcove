@@ -167,8 +167,10 @@ actor AgentLink {
     }
 
     /// Makes connection attempts until one is adopted, another caller's client is connected, or an attempt ended
-    /// with no room for a further one before `deadline`. A failed attempt is followed by a pause of `retryDelay`;
-    /// a caller cancelled before or during that pause gets nil at once.
+    /// with no room for a further one before `deadline`. An attempt waits for the agent's hello for at most 5 s, and
+    /// no longer than until `deadline` when that is in the future. A failed attempt with room for a further one is
+    /// followed by a pause of `retryDelay`; one without that room returns nil at once, and a caller cancelled before
+    /// or during the pause gets nil at once.
     /// The caller has counted the first attempt in `attempts`; the count is kept while a further attempt follows
     /// and is given back when none does, in the same step that adopts a client.
     private func connect(until deadline: ContinuousClock.Instant) async -> AgentClient? {
@@ -176,20 +178,23 @@ actor AgentLink {
             let begun = generation
             let target = await endpoint()
             let candidate = AgentClient()
+            let left = ContinuousClock.now.duration(to: deadline)
             do {
-                try await candidate.connect(port: target.port, expectedToken: target.token, timeout: .seconds(5))
+                try await candidate.connect(port: target.port, expectedToken: target.token,
+                                            timeout: left > .zero ? min(.seconds(5), left) : .seconds(5))
             } catch {
                 if begun == generation { lastAttemptFailed = true }
-                let again = ContinuousClock.now + retryDelay < deadline
-                if !again { attempts -= 1 }
+                guard ContinuousClock.now + retryDelay < deadline else {
+                    attempts -= 1
+                    return nil
+                }
                 do {
                     try await Task.sleep(for: retryDelay)
                 } catch {
-                    if again { attempts -= 1 }
+                    attempts -= 1
                     return nil
                 }
-                if again { continue }
-                return nil
+                continue
             }
             if begun == generation { lastAttemptFailed = false }
             let hasUI = await candidate.hello?.capabilities.contains("ui") ?? false
@@ -268,7 +273,8 @@ actor AgentLink {
         }
     }
 
-    /// One connection attempt, already counted in `attempts`, when the VM runs and no client is connected.
+    /// One connection attempt, already counted in `attempts`, when the VM runs and no client is connected. An attempt
+    /// that adopted no client is followed by a pause of `retryDelay`, during which no further warm-up starts.
     private func warm() async {
         guard await isRunning() else {
             attempts -= 1
@@ -279,7 +285,7 @@ actor AgentLink {
             attempts -= 1
             return
         }
-        _ = await connect(until: .now)
+        if await connect(until: .now) == nil { try? await Task.sleep(for: retryDelay) }
     }
 }
 
