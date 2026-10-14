@@ -6,6 +6,9 @@ import { clip, fail, text, vmName, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
+/** The line after the entries of a list the guest cut to its output budget. */
+export const EVENT_LOG_CUT = "older matching entries were left out to keep the output within its budget; narrow with level, provider, contains or since_minutes";
+
 /** One block per entry: `time level provider (id)` followed by the indented message. */
 export function eventLogText(entries: Obj[]): string {
   if (entries.length === 0) return "no matching entries";
@@ -90,8 +93,8 @@ export function register(r: Registrar, client: ControlClient): void {
       name: vmName,
       log: z.string().optional().describe("Log name (default Application; also System, Security or any channel)"),
       level: z.enum(["critical", "error", "warning", "info"]).optional().describe("This level and everything more severe (default: all levels)"),
-      provider: z.string().optional().describe("Only entries from this provider/source"),
-      since_minutes: z.number().int().min(1).max(100000).optional().describe("Only entries of the last N minutes (default 60)"),
+      provider: z.string().optional().describe("Only entries of this provider/source: its exact name in any case, no wildcards"),
+      since_minutes: z.number().int().min(1).max(5256000).optional().describe("Only entries of the last N minutes (default 60)"),
       contains: z.string().optional().describe("Only entries whose message contains this text"),
       max: z.number().int().min(1).max(500).optional().describe("Most entries to return (default 50)"),
     },
@@ -108,7 +111,9 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(a.max !== undefined ? { max: a.max } : {}),
       }, 180000);
       const entries = (reply.entries as Obj[]) ?? [];
-      return text(clip(eventLogText(entries), 60000, "lower max or narrow with level, provider or contains"), { entries });
+      const truncated = reply.truncated === true;
+      const body = eventLogText(entries) + (truncated ? `\n${EVENT_LOG_CUT}` : "");
+      return text(clip(body, 60000, "lower max or narrow with level, provider or contains"), { entries, ...(truncated ? { truncated } : {}) });
     } catch (e) {
       return fail(e);
     }
@@ -116,13 +121,13 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("evidence", "alcove_crash_dumps", {
     title: "Collect crash dumps",
-    description: "Manage crash dumps of a Windows guest. enable (needs exe) makes Windows write a dump when that program crashes, into C:\\alcove-dumps (newest 5 kept); disable (needs exe) turns it off; list shows the dumps taken; pull (needs file and path) copies one dump to the Mac. Enable before the run that may crash.",
+    description: "Manage crash dumps of a Windows guest. enable (needs exe) makes Windows write a dump when that program crashes, into C:\\alcove-dumps (Windows keeps the newest 5 dumps of that folder, counted over all enabled programs); disable (needs exe) turns it off; list shows the dumps taken; pull (needs file and path) copies one dump to the Mac. Enable before the run that may crash.",
     inputSchema: {
       name: vmName,
       action: z.enum(["enable", "disable", "list", "pull"]),
       exe: z.string().optional().describe("Image name such as MyApp.exe (enable, disable)"),
       full: z.boolean().optional().describe("enable: full memory dumps instead of mini dumps (default false)"),
-      file: z.string().optional().describe("pull: dump file name or path as listed by the list action"),
+      file: z.string().optional().describe("pull: dump file name as listed by the list action, without a folder"),
       path: z.string().optional().describe("pull: destination path on the Mac"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -145,7 +150,7 @@ export function register(r: Registrar, client: ControlClient): void {
         case "list": {
           const reply = await client.call("vm.crash_dumps.list", { name: a.name }, 120000);
           const dumps = (reply.dumps as Obj[]) ?? [];
-          const body = dumps.length === 0 ? "no crash dumps" : dumps.map((d) => `${d.file} ${d.exe} ${d.bytes} bytes ${d.time}`).join("\n");
+          const body = dumps.length === 0 ? "no crash dumps" : dumps.map((d) => `${d.file}${d.exe ? ` ${d.exe}` : ""} ${d.bytes} bytes ${d.time}`).join("\n");
           return text(body, { dumps });
         }
         default: {
@@ -162,11 +167,11 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("evidence", "alcove_collect_diagnostics", {
     title: "Collect a diagnostics bundle",
-    description: "Write everything useful about the VM's current state into one directory on the Mac: screenshot, windows, UI tree, processes, event logs, guest events, job output, requested log file tails, recent crash dumps, doctor report and, while recording, the trace and video. Returns the summary (windows not responding, dumps, error counts per log, failed jobs, foreground window), then the directory and the file list. Call it when a test fails, before changing anything.",
+    description: "Write everything useful about the VM's current state into one directory on the Mac: screenshot, windows, UI tree, processes, event logs, guest events, job output, requested log file tails, recent crash dumps, doctor report, and the trace, frames and video of the running recording or of one that ended within since_minutes. Returns the summary (windows not responding, dumps, error counts per log, failed jobs, foreground window), then the directory and the file list. Call it when a test fails, before changing anything.",
     inputSchema: {
       name: vmName,
-      dir: z.string().optional().describe("Absolute Mac directory to write into (default ~/Library/Application Support/Alcove/Diagnostics/<vm>-<timestamp>)"),
-      since_minutes: z.number().int().min(1).max(100000).optional().describe("How far back event logs and dumps reach (default 30)"),
+      dir: z.string().optional().describe("Absolute Mac directory to write into, missing or empty (default ~/Library/Application Support/Alcove/Diagnostics/<vm>-<timestamp>)"),
+      since_minutes: z.number().int().min(1).max(5256000).optional().describe("How far back event logs, dumps and an ended recording reach (default 30)"),
       log_files: z.array(z.string()).optional().describe("Guest log file paths; the last 2000 lines of each are copied"),
       process_name: z.string().optional().describe("Narrow the process list to this program and mark it"),
     },

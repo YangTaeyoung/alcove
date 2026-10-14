@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { register, eventLogText } from "./tools/evidence.js";
+import { register, eventLogText, EVENT_LOG_CUT } from "./tools/evidence.js";
 import { rig, textOf } from "./test-rig.js";
 
 test("eventLogText prints a header line and the indented message per entry", () => {
@@ -31,6 +31,19 @@ test("alcove_event_log maps since_minutes", async () => {
   const t = rig(register, { entries: [] });
   await t.run("alcove_event_log", { name: "vm", since_minutes: 5, level: "error" });
   assert.deepEqual(t.calls[0], { op: "vm.event_log", params: { name: "vm", level: "error", sinceMinutes: 5 } });
+});
+
+test("alcove_event_log says that older entries were left out when the guest cut the list", async () => {
+  const entry = { time: "t", level: "error", provider: "p", id: 1, message: "m" };
+  const cut = rig(register, { entries: [entry], truncated: true });
+  assert.equal(textOf(await cut.run("alcove_event_log", { name: "vm" })), `t error p (1)\n  m\n${EVENT_LOG_CUT}`);
+  const whole = rig(register, { entries: [entry] });
+  assert.equal(textOf(await whole.run("alcove_event_log", { name: "vm" })), "t error p (1)\n  m");
+});
+
+test("alcove_crash_dumps list leaves out the image name of a dump that has none", async () => {
+  const t = rig(register, { dumps: [{ file: "noexe.dmp", exe: "", bytes: 5, time: "t" }] });
+  assert.equal(textOf(await t.run("alcove_crash_dumps", { name: "vm", action: "list" })), "noexe.dmp 5 bytes t");
 });
 
 test("alcove_record_start maps max_seconds to maxSeconds", async () => {
