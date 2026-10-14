@@ -13,7 +13,6 @@ import (
 )
 
 const (
-	websocketRefusal = "websocket interception is not supported; exclude this host with the hosts filter"
 	badTargetRefusal = "request target must start with '/'"
 	clientClosed     = "the client closed the connection"
 	incompleteBody   = "the request body was not received completely"
@@ -93,10 +92,35 @@ func (p *Proxy) record(ex *Exchange) {
 // handler serves requests for one client connection. With a scheme and
 // authority the request path is resolved against them (intercepted TLS);
 // with neither the request must carry an absolute URL (plain proxying).
-func (p *Proxy) handler(scheme, authority string) http.Handler {
+// release ends the serving of the connection after a handler took it over.
+func (p *Proxy) handler(scheme, authority string, release func()) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p.serveRequest(w, r, scheme, authority)
+		p.serveRequest(w, r, scheme, authority, release)
 	})
+}
+
+// isWebSocketUpgrade reports whether h asks to upgrade to a WebSocket.
+func isWebSocketUpgrade(h http.Header) bool {
+	if !strings.EqualFold(h.Get("Upgrade"), "websocket") {
+		return false
+	}
+	for _, v := range h.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// switchScope carries what a switch to the WebSocket protocol changes.
+type switchScope struct {
+	reqCap  *capBuf
+	pe      *pendingEntry
+	release func()
+	// taken is set once the client connection was hijacked.
+	taken bool
 }
 
 // drainBody reads the rest of the request body through the capture tee, for at
@@ -163,7 +187,7 @@ func (p *Proxy) waitDelay(r *http.Request, delayMs int, ex *Exchange) bool {
 	return false
 }
 
-func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, authority string) {
+func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, authority string, release func()) {
 	start := time.Now()
 	u := &url.URL{Scheme: scheme, Host: authority, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery}
 	if authority == "" {
@@ -196,6 +220,7 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 	}
 	pe := &pendingEntry{time: start, kind: ex.Kind, method: r.Method, url: target, req: reqCap.count, res: resCap.count}
 	endPending := p.beginPending(pe)
+	sw := &switchScope{reqCap: reqCap, pe: pe, release: release}
 	defer func() {
 		defer endPending()
 		ex.Ms = time.Since(start).Milliseconds()
@@ -205,6 +230,9 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 			ex.ReqTrailers = headerPairs(r.Trailer)
 		}
 		p.record(ex)
+		if sw.taken {
+			sw.release()
+		}
 	}()
 
 	reqBody := r.Body
@@ -214,7 +242,7 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 	}{io.TeeReader(reqBody, reqCap), reqBody}
 
 	if untouched {
-		p.forward(w, r, u, ex, resCap)
+		p.forward(w, r, u, ex, resCap, sw)
 		ex.ResHeaders, ex.ResTrailers = nil, nil
 		return
 	}
@@ -247,12 +275,7 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		}
 	}
 
-	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		drainBody(w, r, ex)
-		respondText(w, ex, resCap, http.StatusNotImplemented, websocketRefusal)
-		return
-	}
-	p.forward(w, r, u, ex, resCap)
+	p.forward(w, r, u, ex, resCap, sw)
 }
 
 func respondText(w http.ResponseWriter, ex *Exchange, resCap *capBuf, status int, text string) {
@@ -282,7 +305,11 @@ func (p *Proxy) synthesize(w http.ResponseWriter, ex *Exchange, resCap *capBuf, 
 	_, _ = io.WriteString(io.MultiWriter(w, resCap), act.Body)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *Exchange, resCap *capBuf) {
+// forward sends the request upstream and relays the answer. A WebSocket
+// upgrade request keeps its Upgrade and Connection headers; when the upstream
+// switches protocols, the connections are joined by switchProtocols.
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *Exchange, resCap *capBuf, sw *switchScope) {
+	upgrade := r.ProtoMajor == 1 && isWebSocketUpgrade(r.Header)
 	var body io.Reader = r.Body
 	if r.ContentLength == 0 {
 		body = nil
@@ -297,6 +324,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *
 	out.ContentLength = r.ContentLength
 	out.Header = r.Header.Clone()
 	removeHopByHop(out.Header)
+	if upgrade {
+		out.Header.Set("Connection", "Upgrade")
+		out.Header["Upgrade"] = r.Header.Values("Upgrade")
+	}
 	if wantsTrailers(r.Header) {
 		out.Header.Set("Te", "trailers")
 	}
@@ -318,6 +349,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *
 		return
 	}
 	defer resp.Body.Close()
+	if upgrade && resp.StatusCode == http.StatusSwitchingProtocols {
+		p.switchProtocols(w, resp, ex, resCap, sw)
+		return
+	}
 	removeHopByHop(resp.Header)
 	h := w.Header()
 	for k, vs := range resp.Header {

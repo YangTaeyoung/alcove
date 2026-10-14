@@ -371,25 +371,6 @@ func TestUpstreamFailureAnswersBadGateway(t *testing.T) {
 	}
 }
 
-func TestWebSocketUpgradeIsRefused(t *testing.T) {
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("upstream reached") }))
-	defer up.Close()
-	env := newEnv(t)
-	req, _ := http.NewRequest("GET", up.URL, nil)
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	resp, err := env.client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 501 || string(body) != "websocket interception is not supported; exclude this host with the hosts filter" {
-		t.Fatalf("got %d %q", resp.StatusCode, body)
-	}
-	env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" && x["status"] == float64(501) })
-}
-
 func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Hop") != "" || r.Header.Get("Proxy-Authorization") != "" || r.Header.Get("X-Keep") != "k" {

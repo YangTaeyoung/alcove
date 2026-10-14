@@ -69,6 +69,14 @@ func (c *capBuf) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// stopKeeping drops the kept bytes; later writes are only counted.
+func (c *capBuf) stopKeeping() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.off = true
+	c.buf = nil
+}
+
 func (c *capBuf) count() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()

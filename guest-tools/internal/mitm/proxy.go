@@ -227,7 +227,7 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	bc := &bufConn{Conn: conn, r: br}
 	if string(head) != "CONNECT " {
 		_ = conn.SetReadDeadline(time.Time{})
-		p.serveHTTP(bc, p.handler("", ""))
+		p.serveHTTP(bc, "", "")
 		return
 	}
 	req, err := http.ReadRequest(br)
@@ -294,7 +294,7 @@ func (p *Proxy) interceptTLS(conn *bufConn, host, port string) {
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
-	p.serveHTTP(tc, p.handler("https", hostPort(host, port, "443")))
+	p.serveHTTP(tc, "https", hostPort(host, port, "443"))
 }
 
 func hostPort(host, port, defaultPort string) string {
@@ -336,11 +336,13 @@ func (l *oneConnListener) Close() error {
 func (l *oneConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
 
 // serveHTTP serves HTTP/1.1 (and HTTP/2 on a negotiated TLS connection) on
-// conn and returns when the connection is finished.
-func (p *Proxy) serveHTTP(conn net.Conn, h http.Handler) {
+// conn with p.handler(scheme, authority) and returns when the connection is
+// finished or, after a handler took the connection over, when that handler
+// has released it.
+func (p *Proxy) serveHTTP(conn net.Conn, scheme, authority string) {
 	ln := &oneConnListener{conn: conn, done: make(chan struct{})}
 	srv := &http.Server{
-		Handler:           h,
+		Handler:           p.handler(scheme, authority, func() { ln.Close() }),
 		ErrorLog:          log.New(io.Discard, "", 0),
 		IdleTimeout:       2 * time.Minute,
 		ReadHeaderTimeout: firstBytesTimeout,

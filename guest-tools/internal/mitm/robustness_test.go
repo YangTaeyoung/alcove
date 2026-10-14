@@ -174,7 +174,7 @@ func TestTrailersAreForwardedAndCaptured(t *testing.T) {
 	}
 }
 
-func TestMockedAndRefusedRequestsKeepTheirRequestBody(t *testing.T) {
+func TestMockedAndDroppedRequestsKeepTheirRequestBody(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer up.Close()
 	env := newEnv(t)
@@ -190,15 +190,7 @@ func TestMockedAndRefusedRequestsKeepTheirRequestBody(t *testing.T) {
 		resp.Body.Close()
 		t.Fatal("expected the dropped request to fail")
 	}
-	req, _ := http.NewRequest("POST", up.URL+"/ws", strings.NewReader(payload))
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	if resp, err := env.client.Do(req); err != nil {
-		t.Fatal(err)
-	} else {
-		resp.Body.Close()
-	}
-	for _, path := range []string{"/mock", "/drop", "/ws"} {
+	for _, path := range []string{"/mock", "/drop"} {
 		x := env.waitExchange(func(x map[string]any) bool { return strings.HasSuffix(x["url"].(string), path) })
 		if int(x["reqBytes"].(float64)) != len(payload) {
 			t.Errorf("%s: reqBytes %v", path, x["reqBytes"])

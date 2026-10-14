@@ -17,6 +17,9 @@ type pendingEntry struct {
 	rule   atomic.Int64
 	req    func() int64
 	res    func() int64
+	// switched is set when the request became a WebSocket; the entry then
+	// reads as a tunnel.
+	switched atomic.Bool
 }
 
 // beginPending lists e until the returned function is called.
@@ -45,8 +48,12 @@ func (p *Proxy) pendingRows() []map[string]any {
 	}
 	rows := make([]map[string]any, 0, len(entries))
 	for _, e := range entries {
+		kind := e.kind
+		if e.switched.Load() {
+			kind = "tunnel"
+		}
 		row := map[string]any{
-			"time": e.time.UTC().Format(time.RFC3339Nano), "kind": e.kind, "method": e.method, "url": e.url,
+			"time": e.time.UTC().Format(time.RFC3339Nano), "kind": kind, "method": e.method, "url": e.url,
 			"ms": time.Since(e.time).Milliseconds(), "reqBytes": e.req(), "resBytes": e.res(),
 		}
 		if r := e.rule.Load(); r != 0 {
