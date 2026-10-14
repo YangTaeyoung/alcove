@@ -175,8 +175,9 @@ extension ControlHandler {
         }
     }
 
-    /// Sends the display messages of one action op to `t`.
-    func send(_ op: String, to t: VMTarget, _ params: JSON) async throws {
+    /// Sends the display messages of one action op to `t`. `caller`, the op the client called, is named in the
+    /// sentences that ask for a retry; it is `op` when nil.
+    func send(_ op: String, to t: VMTarget, _ params: JSON, caller: String? = nil) async throws {
         switch op {
         case "vm.mouse.move":
             try await move(t, x: try int(params, "x"), y: try int(params, "y"))
@@ -234,23 +235,48 @@ extension ControlHandler {
             if let seq = try? KeyNames.typeSequence(text) {
                 try await sendKeys(t, seq, gap: delay, holdBeforeRelease: 0)
             } else {
-                // Text outside the US layout goes into the guest clipboard and is pasted once the guest reports it there.
-                guard let agent = await t.agent(timeout: .seconds(2)) else { throw ControlError.untypable("this text") }
-                let held: String
-                do {
-                    try await agent.setClipboard(text: text)
-                    held = try await agent.getClipboard()
-                } catch {
-                    throw agentFailure(error, vm: t.name, op: op)
-                }
-                guard held == text else {
-                    throw ControlError.failed("the guest clipboard did not take the text, so nothing was typed; call \(op) again")
-                }
-                try await sendKeys(t, try KeyNames.pressSequence("ctrl+v"), gap: 20, holdBeforeRelease: 0)
+                try await paste(text, into: t, caller: caller ?? op)
             }
         default:
             throw ControlError.unknownOp(op)
         }
+    }
+
+    /// The most bytes of UTF-8 clipboard text the guest tools report (`clipboardMaxBytes` in guest-tools/internal/server/bounds.go).
+    static let guestClipboardReportBytes = 700_000
+
+    /// `text` cut to its first `maxBytes` bytes of UTF-8 without splitting a character, as the guest tools cut it.
+    nonisolated static func cutUTF8(_ text: String, maxBytes: Int) -> String {
+        let bytes = Array(text.utf8)
+        guard bytes.count > maxBytes else { return text }
+        var end = maxBytes
+        while end > 0, bytes[end] & 0xC0 == 0x80 { end -= 1 }
+        return String(decoding: bytes[..<end], as: UTF8.self)
+    }
+
+    /// Puts `text` into the guest clipboard of `t` and presses `ctrl+v` once the guest reports it there; the guest reports
+    /// the first `guestClipboardReportBytes` bytes of a longer text, which are compared with the same part of `text`.
+    private func paste(_ text: String, into t: VMTarget, caller: String) async throws {
+        guard let agent = await t.agent(timeout: .seconds(2)) else { throw ControlError.untypable("this text") }
+        guard let hello = await agent.hello, hello.capabilities.contains("clipboard") else {
+            throw ControlError.failed("the guest tools in '\(t.name)' have no clipboard (a Linux guest needs wl-copy or xclip in its session), "
+                + "so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only")
+        }
+        guard AgentClient.clipboardMessageFits(text) else {
+            throw ControlError.failed("the text is too large for the guest clipboard (\(text.utf8.count) bytes of UTF-8; one message to the "
+                + "guest tools holds less than 1 MiB); split it over several \(caller) calls")
+        }
+        let held: String
+        do {
+            try await agent.setClipboard(text: text)
+            held = try await agent.getClipboard()
+        } catch {
+            throw agentFailure(error, vm: t.name, op: caller)
+        }
+        guard held == ControlHandler.cutUTF8(text, maxBytes: ControlHandler.guestClipboardReportBytes) else {
+            throw ControlError.failed("the guest clipboard did not take the text, so nothing was typed; call \(caller) again")
+        }
+        try await sendKeys(t, try KeyNames.pressSequence("ctrl+v"), gap: 20, holdBeforeRelease: 0)
     }
 
     func button(_ name: String?) throws -> InputButton {

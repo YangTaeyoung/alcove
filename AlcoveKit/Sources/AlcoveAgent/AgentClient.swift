@@ -119,11 +119,16 @@ public actor AgentClient {
 
     /// Set the guest clipboard text. Throws `.remote` without sending when the message would be longer than the agent reads.
     public func setClipboard(text: String) throws {
-        let message: JSON = ["t": "clipboard.set", "text": .string(text)]
-        guard fitsAgentLine(message) else {
+        guard AgentClient.clipboardMessageFits(text) else {
             throw AgentError.remote("clipboard text is too large for the guest agent (limit about 700 KB of UTF-8)")
         }
-        send(message)
+        send(["t": "clipboard.set", "text": .string(text)])
+    }
+
+    /// Whether the `clipboard.set` message for `text` stays below `maxRequestBytes`, the longest line the agent reads.
+    public nonisolated static func clipboardMessageFits(_ text: String) -> Bool {
+        guard let line = try? JSON.object(["t": "clipboard.set", "text": .string(text)]).serialized() else { return false }
+        return line.count < maxRequestBytes
     }
 
     /// Read the guest clipboard text.

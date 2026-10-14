@@ -552,7 +552,7 @@ extension ControlHandler {
                 for keys in ControlHandler.selectAllKeys(role: target.node["role"]?.stringValue) { try await self.send("vm.key.press", to: t, ["keys": .string(keys)]) }
             }
             if !text.isEmpty {
-                try await self.send("vm.type", to: t, ["text": .string(text)])
+                try await self.send("vm.type", to: t, ["text": .string(text)], caller: op)
             } else if clear {
                 try await self.send("vm.key.press", to: t, ["keys": "backspace"])
             }

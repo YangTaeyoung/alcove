@@ -563,6 +563,48 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(keys(sent), [])
     }
 
+    func testTextOutsideTheUSLayoutIsRefusedWhenTheGuestToolsHaveNoClipboard() async throws {
+        let (h, t, agent) = try await rig(caps: ["files", "exec", "ui"])
+        giveClipboard(to: agent)
+        let message = await failure(h, "vm.type", ["name": "Win", "text": "한글"])
+        XCTAssertEqual(message, "the guest tools in 'Win' have no clipboard (a Linux guest needs wl-copy or xclip in its session), "
+            + "so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only")
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue?.hasPrefix("clipboard.") == true })
+        let sent = await t.sent
+        XCTAssertEqual(keys(sent), [])
+    }
+
+    func testTextAboveTheGuestClipboardReportIsPastedWhole() async throws {
+        let (h, t, agent) = try await rig()
+        let text = String(repeating: "한", count: 250_000)
+        let reported = String(repeating: "한", count: 233_333)
+        XCTAssertEqual(reported.utf8.count, 699_999)
+        giveClipboard(to: agent, holding: reported)
+        _ = try await h.handle(op: "vm.type", params: ["name": "Win", "text": .string(text)])
+        let set = agent.received.last { $0["t"]?.stringValue == "clipboard.set" }
+        XCTAssertEqual(set?["text"]?.stringValue, text)
+        let sent = await t.sent
+        XCTAssertEqual(keys(sent), try keys(KeyNames.pressSequence("ctrl+v")))
+    }
+
+    func testTextTooLargeForTheGuestToolsIsRefusedWithItsOwnSentence() async throws {
+        let (h, t, agent) = try await rig()
+        giveClipboard(to: agent)
+        let message = await failure(h, "vm.type", ["name": "Win", "text": .string(String(repeating: "한", count: 400_000))])
+        XCTAssertEqual(message, "the text is too large for the guest clipboard (1200000 bytes of UTF-8; one message to the guest tools "
+            + "holds less than 1 MiB); split it over several vm.type calls")
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue?.hasPrefix("clipboard.") == true })
+        let sent = await t.sent
+        XCTAssertEqual(keys(sent), [])
+    }
+
+    func testUITypeWhoseTextTheGuestClipboardDidNotTakeNamesUIType() async throws {
+        let (h, _, agent) = try await rig(["ui.rect": { _, _ in .ok(["node": messageEdit, "cx": 250, "cy": 72, "clickable": true]) }])
+        giveClipboard(to: agent, holding: "what was there before")
+        let message = await failure(h, "vm.ui.type", ["name": "Win", "ref": "e4", "text": "한글"])
+        XCTAssertEqual(message, "the guest clipboard did not take the text, so nothing was typed; call vm.ui.type again")
+    }
+
     func testUIActionPassesValue() async throws {
         let after = node("e4", "Edit", "Message", depth: 1, x: 150, y: 60, w: 200, h: 24, value: "새 값 \"x\"")
         let (h, t, agent) = try await rig(["ui.act": { _, _ in .ok(["node": after]) }])
