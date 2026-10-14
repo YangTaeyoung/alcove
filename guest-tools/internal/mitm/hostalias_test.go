@@ -41,9 +41,12 @@ func TestDialAddressMapsTheGuestNameOfTheHostToLoopback(t *testing.T) {
 }
 
 func TestPlainHTTPToTheGuestNameOfTheHostReachesLoopback(t *testing.T) {
-	var seenHost string
+	seenHosts := make(chan string, 1)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenHost = r.Host
+		select {
+		case seenHosts <- r.Host:
+		default:
+		}
 		io.WriteString(w, "from the host")
 	}))
 	defer up.Close()
@@ -58,7 +61,7 @@ func TestPlainHTTPToTheGuestNameOfTheHostReachesLoopback(t *testing.T) {
 	if resp.StatusCode != 200 || string(body) != "from the host" {
 		t.Fatalf("got %d %q", resp.StatusCode, body)
 	}
-	if seenHost != "10.0.2.2:"+portOf(t, up.URL) {
+	if seenHost := <-seenHosts; seenHost != "10.0.2.2:"+portOf(t, up.URL) {
 		t.Fatalf("the upstream saw Host %q", seenHost)
 	}
 	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
