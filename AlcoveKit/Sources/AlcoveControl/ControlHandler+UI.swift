@@ -270,6 +270,8 @@ extension ControlHandler {
     static let maxMarks = 100
     static let maxObservedEvents = 20
     static let observedTreeNodes = 150
+    /// The keys `vm.ui.type` presses for `clear`, in this order; the text typed after them replaces the selection.
+    static let selectAllKeys = ["ctrl+a", "ctrl+home", "ctrl+shift+end"]
     static let defaultLaunchWaitSeconds = 15.0
     static let maxWaitWindowSeconds = 300.0
 
@@ -538,7 +540,9 @@ extension ControlHandler {
             let target = try await self.clickPoint(agent, element, vm: t.name, op: op)
             try await self.send("vm.mouse.click", to: t, ["x": .int(Int64(target.x)), "y": .int(Int64(target.y))])
             try await Task.sleep(for: UITiming.focusDelay)
-            if clear { try await self.send("vm.key.press", to: t, ["keys": "ctrl+a"]) }
+            if clear {
+                for keys in ControlHandler.selectAllKeys { try await self.send("vm.key.press", to: t, ["keys": .string(keys)]) }
+            }
             if !text.isEmpty {
                 try await self.send("vm.type", to: t, ["text": .string(text)])
             } else if clear {
@@ -581,12 +585,22 @@ extension ControlHandler {
         return Int((seconds * 1000).rounded())
     }
 
+    /// The end of the agent's sentence for a program that could not be started, and the end a control caller gets.
+    static let agentLaunchHint = "; check the path with fs.stat"
+    static let launchHint = "; check the path with vm.fs.list"
+
     /// `app.launch` with `request` and a window wait of `waitMs`; the agent call outlasts the wait by 30 s.
     /// The result holds `pid`, the `window` that appeared, or `windowTimedOut` when one was waited for and none appeared.
+    /// An agent sentence that ends with `agentLaunchHint` is thrown with `launchHint` in its place.
     func launch(_ agent: AgentClient, _ request: [String: JSON], waitMs: Int) async throws -> JSON {
         var fields = request
         fields["wait_window_ms"] = .int(Int64(waitMs))
-        let r = try await agent.call("app.launch", fields, timeout: .milliseconds(waitMs + 30_000))
+        let r: JSON
+        do {
+            r = try await agent.call("app.launch", fields, timeout: .milliseconds(waitMs + 30_000))
+        } catch AgentClient.AgentError.remote(let message) where message.hasSuffix(ControlHandler.agentLaunchHint) {
+            throw AgentClient.AgentError.remote(String(message.dropLast(ControlHandler.agentLaunchHint.count)) + ControlHandler.launchHint)
+        }
         var out: [String: JSON] = [:]
         if let pid = r["pid"] { out["pid"] = pid }
         if let window = r["window"], window != .null {
@@ -710,7 +724,8 @@ extension ControlHandler {
     static let agentNotConnected = "the guest tools are not connected; UI facts need alcove-agent running in the guest"
 
     /// Adds the foreground window title, the focused element, the events since the VM's previous observation and,
-    /// at level `ui`, the tree of the foreground window. Needs a connected agent with the `ui` capability; without one
+    /// at level `ui`, the tree of the foreground window. The title is that of the focused element's window when that
+    /// window is in the foreground; otherwise the window list is read for the window in front. Needs a connected agent with the `ui` capability; without one
     /// only level `ui` says so in `uiError`: the agent is being connected, is not connected, or has no UI Automation.
     /// The agent and that sentence come from one reading of the VM's agent connection.
     /// The helper calls share one budget counted from the start: `UITiming.factBudget`, or `UITiming.treeFactBudget`
@@ -735,8 +750,21 @@ extension ControlHandler {
         }
         switch helperTaken ? Fact.late : await fact(agent, "ui.focused", [:], vm: t.name, by: end) {
         case .answer(let r):
-            observation.foreground = r["window"]?["title"]?.stringValue
             observation.focused = r["node"].map(UITreeText.label)
+            if r["window"]?["foreground"]?.boolValue == true {
+                observation.foreground = r["window"]?["title"]?.stringValue
+            } else {
+                switch await fact(agent, "win.list", [:], vm: t.name, by: end) {
+                case .answer(let list):
+                    let front = (list["windows"]?.arrayValue ?? []).first { $0["foreground"]?.boolValue == true }
+                    observation.foreground = front?["title"]?.stringValue
+                case .late:
+                    observation.uiError = ControlHandler.busyHelperFacts
+                case .failed(let error):
+                    let reason = agentFailure(error, vm: t.name, op: "the observation").description
+                    observation.uiError = "the foreground window could not be read: \(reason)"
+                }
+            }
         case .late:
             observation.uiError = ControlHandler.busyHelperFacts
         case .failed(let error):

@@ -463,7 +463,9 @@ final class ControlUITests: XCTestCase {
         var sent = await t.sent
         XCTAssertEqual(Array(sent.prefix(5)), [absolute(250, 72), .btn(con: 0, button: .left, down: true), .sync,
                                                .btn(con: 0, button: .left, down: false), .sync])
-        let expected = try keys(KeyNames.pressSequence("ctrl+a")) + keys(KeyNames.typeSequence("Hi 1")) + keys(KeyNames.pressSequence("enter"))
+        let selectAll = try keys(KeyNames.pressSequence("ctrl+a")) + keys(KeyNames.pressSequence("ctrl+home"))
+            + keys(KeyNames.pressSequence("ctrl+shift+end"))
+        let expected = try selectAll + keys(KeyNames.typeSequence("Hi 1")) + keys(KeyNames.pressSequence("enter"))
         XCTAssertEqual(keys(Array(sent.dropFirst(5))), expected)
         XCTAssertEqual(sent.count, 5 + expected.count)
 
@@ -475,7 +477,7 @@ final class ControlUITests: XCTestCase {
         let emptied = await t.sent.count
         _ = try await h.handle(op: "vm.ui.type", params: ["name": "Win", "ref": "e4", "text": "", "clear": true])
         sent = Array(await t.sent.dropFirst(emptied))
-        XCTAssertEqual(keys(sent), try keys(KeyNames.pressSequence("ctrl+a")) + keys(KeyNames.pressSequence("backspace")))
+        XCTAssertEqual(keys(sent), try selectAll + keys(KeyNames.pressSequence("backspace")))
 
         let rects = agentRequests(agent, "ui.rect").count
         let missing = await failure(h, "vm.ui.type", ["name": "Win", "ref": "e4"])
@@ -1454,6 +1456,7 @@ final class ControlUITests: XCTestCase {
                 switch m["args"]?[0]?.stringValue {
                 case "window": return .ok(["pid": 7, "window": fixtureWindow])
                 case "broken": return .fail("'C:\\alcove-apps\\launching\\app.exe' is not a valid application; check the file")
+                case "gone": return .fail("cannot start '\(m["path"]?.stringValue ?? "")': The system cannot find the file specified.; check the path with fs.stat")
                 default: return .ok(["pid": 7, "window": .null])
                 }
             },
@@ -1478,7 +1481,13 @@ final class ControlUITests: XCTestCase {
         let broken = await failure(h, "vm.deploy", ["name": "Win", "path": .string(dir.path), "launch": ["exe": "app.exe", "args": ["broken"]]])
         XCTAssertEqual(broken, "the files were copied to C:\\alcove-apps\\launching, but starting C:\\alcove-apps\\launching\\app.exe failed: "
                        + "'C:\\alcove-apps\\launching\\app.exe' is not a valid application; check the file")
-        XCTAssertEqual(agentRequests(agent, "app.launch").count, 7)
+
+        let gone = await failure(h, "vm.app.launch", ["name": "Win", "path": "C:\\apps\\gone.exe", "args": ["gone"]])
+        XCTAssertEqual(gone, "cannot start 'C:\\apps\\gone.exe': The system cannot find the file specified.; check the path with vm.fs.list")
+        let goneAfterCopy = await failure(h, "vm.deploy", ["name": "Win", "path": .string(dir.path), "launch": ["exe": "app.exe", "args": ["gone"]]])
+        XCTAssertEqual(goneAfterCopy, "the files were copied to C:\\alcove-apps\\launching, but starting C:\\alcove-apps\\launching\\app.exe failed: "
+                       + "cannot start 'C:\\alcove-apps\\launching\\app.exe': The system cannot find the file specified.; check the path with vm.fs.list")
+        XCTAssertEqual(agentRequests(agent, "app.launch").count, 9)
     }
 
     // MARK: - events
@@ -1620,6 +1629,48 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(withTree["observation"]?["foreground"], "Alcove Fixture")
         XCTAssertNil(withTree["observation"]?["png"])
         XCTAssertEqual(fields(agentRequests(agent, "ui.tree").last), ["window": "foreground", "max": 150])
+    }
+
+    func testObservationNamesTheWindowInFrontWhenTheFocusedElementIsOutsideIt() async throws {
+        let desktop = window("0x1000c", "", x: 0, y: 0, w: 800, h: 600)
+        let nowhere = node("e9", "Pane", "", w: 800, h: 600)
+        let lists = LockedBox<[JSON]>([fixtureWindow, notesWindow])
+        let (h, _, agent) = try await rig([
+            "ui.focused": { _, n in n == 1 ? .ok(["node": messageEdit, "window": fixtureWindow]) : .ok(["node": nowhere, "window": desktop]) },
+            "win.list": { _, _ in .ok(["windows": .array(lists.value)]) },
+            "ui.tree": { _, _ in .ok(["window": notesWindow, "nodes": [], "truncated": false]) },
+        ])
+        let click: JSON = ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20]
+        let unfocused = try await h.handle(op: "vm.mouse.click", params: click)
+        XCTAssertEqual(unfocused["observation"]?["foreground"], "Alcove Fixture")
+        XCTAssertEqual(unfocused["observation"]?["focused"], "Pane \"\"")
+        XCTAssertNil(unfocused["observation"]?["uiError"])
+        XCTAssertEqual(requestOps(agent), ["ui.focused", "win.list"])
+
+        let focused = try await h.handle(op: "vm.mouse.click", params: click)
+        XCTAssertEqual(focused["observation"]?["foreground"], "Alcove Fixture")
+        XCTAssertEqual(requestOps(agent), ["ui.focused", "win.list", "ui.focused"])
+
+        lists.value = [notesWindow]
+        let noneInFront = try await h.handle(op: "vm.mouse.click", params: click)
+        XCTAssertNil(noneInFront["observation"]?["foreground"])
+        XCTAssertEqual(noneInFront["observation"]?["focused"], "Pane \"\"")
+        XCTAssertNil(noneInFront["observation"]?["uiError"])
+        let withTree = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "ui", "settleMs": 20])
+        XCTAssertEqual(withTree["observation"]?["foreground"], .string("메모 \"초안\" - Notepad"))
+    }
+
+    func testObservationWhoseWindowListFailsKeepsTheFocusedElement() async throws {
+        let desktop = window("0x1000c", "", x: 0, y: 0, w: 800, h: 600)
+        let (h, _, agent) = try await rig([
+            "ui.focused": { _, _ in .ok(["node": node("e9", "Pane", "", w: 800, h: 600), "window": desktop]) },
+            "win.list": { _, _ in .fail("UI helper exited; retry") },
+        ])
+        let r = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "ui", "settleMs": 20])
+        XCTAssertNil(r["observation"]?["foreground"])
+        XCTAssertEqual(r["observation"]?["focused"], "Pane \"\"")
+        XCTAssertEqual(r["observation"]?["uiError"], "the foreground window could not be read: UI helper exited; retry")
+        XCTAssertEqual(requestOps(agent), ["ui.focused", "win.list"])
     }
 
     func testObservationReportsOnlyTheNewestEvents() async throws {
