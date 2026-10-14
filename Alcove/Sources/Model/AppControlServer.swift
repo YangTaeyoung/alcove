@@ -54,7 +54,8 @@ final class AppControlServer {
         handler = nil
     }
 
-    /// Restores the guests of the running HTTP captures and ends the captures; returns after 20 s at the latest.
+    /// Ends the active recordings, restores the guests of the running HTTP captures and ends the captures; returns
+    /// after 20 s at the latest.
     func endCaptures() async {
         await handler?.shutdown(within: .seconds(20))
     }

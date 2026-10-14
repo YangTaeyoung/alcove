@@ -140,9 +140,10 @@ struct AlcoveCommands: Commands {
 }
 
 /// Launch and quit handling: hosts the automation control socket while the
-/// app runs, and with active VMs offers to suspend or shut them all down;
-/// before either, the guests of running HTTP captures are restored, for 20 s
-/// at most.
+/// app runs, and with active VMs offers to suspend or shut them all down.
+/// Before the app quits, also without an active VM, the control handler ends
+/// the active recordings and restores the guests of running HTTP captures,
+/// for 20 s at most.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -167,7 +168,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let model = AppModel.shared
         let active = model.activeSessions
-        guard !active.isEmpty else { return .terminateNow }
+        guard !active.isEmpty else {
+            guard AppControlServer.shared.isRunning else { return .terminateNow }
+            Task {
+                await AppControlServer.shared.endCaptures()
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+        }
 
         let alert = NSAlert()
         alert.alertStyle = .warning

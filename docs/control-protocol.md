@@ -1365,7 +1365,7 @@ call vm.record.stop first`.
   succeeded, when an op finds its VM not running, and after 20 trace lines in
   a row could not be written. Its summary then waits for the next
   `vm.record.stop`, which returns it once.
-- When the control server shuts down (the app quits with VMs running, or
+- When the control server shuts down (the app quits, also with no VM running, or
   `alcovectl serve` and `alcovectl run-script --in-process` end), every
   recording is ended and its files completed before the HTTP captures end.
   When its VM is deleted (`vm.delete` or in the app), the recording is ended
