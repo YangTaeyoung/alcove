@@ -213,8 +213,10 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   is then not sent.
 - With `wait_window_ms` above 0 on an agent with the `ui` capability, the
   agent lists the windows before the start and then every 150 ms:
-  - candidates are the titled windows that were not listed before the start
-    and not already claimed by another in-flight or finished `app.launch` (a
+  - candidates are the titled windows that were not listed before the start,
+    have a rectangle that is not empty or are minimized (a window of 0×0 such
+    as `OLEChannelWnd` of `mmc.exe` is none), and are
+    not already claimed by another in-flight or finished `app.launch` (a
     claim ends when its window closes; a helper start ends the claims of the
     launches that have answered and keeps those of launches still waiting for
     their window; the agent keeps the 1024 newest claims);

@@ -52,6 +52,12 @@ func sized(id, title string, pid, w, h int) map[string]any {
 		"w": float64(w), "h": float64(h)}
 }
 
+func minimized(id, title string, pid int) map[string]any {
+	w := sized(id, title, pid, 0, 0)
+	w["state"] = "minimized"
+	return w
+}
+
 func TestLaunchStartsProcessAndReportsExit(t *testing.T) {
 	c, _ := newRPCClient(t, Options{})
 	res := c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 3"}, "wait_window_ms": 0})
@@ -488,6 +494,10 @@ func TestPickLaunchWindow(t *testing.T) {
 		{"a small window of the tree wins over a large window of another process", []map[string]any{sized("0x25", "Other", 90, 1200, 700), sized("0x26", "Own", 50, 200, 100)}, true, "0x26"},
 		{"a window of another process is not chosen while foreign is unset", []map[string]any{foreign}, false, ""},
 		{"a window of another process is chosen when foreign is set", []map[string]any{old, foreign}, true, "0x12"},
+		{"a window of the tree with an empty rectangle is not chosen", []map[string]any{sized("0x27", "OLEChannelWnd", 50, 0, 0)}, true, ""},
+		{"a window of another process with an empty rectangle is not chosen", []map[string]any{sized("0x28", "Hidden", 90, 0, 40)}, true, ""},
+		{"a window with a rectangle is chosen beside one with an empty rectangle", []map[string]any{sized("0x29", "OLEChannelWnd", 50, 0, 0), sized("0x2a", "Services", 50, 806, 593)}, false, "0x2a"},
+		{"a minimized window is chosen", []map[string]any{minimized("0x2b", "Tray app", 50)}, false, "0x2b"},
 	}
 	for _, c := range cases {
 		got := ""

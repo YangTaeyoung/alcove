@@ -329,16 +329,20 @@ func growTree(tree map[int]bool, parents map[int]int) {
 }
 
 // pickLaunchWindow chooses among the titled windows that were not listed
-// before the launch and are not already claimed by another launch: the largest
-// one that belongs to a process of tree; without such a window and with foreign
-// set, the largest one of any process. Of windows of the same size the one
-// listed first is chosen.
+// before the launch, are not already claimed by another launch and have a
+// rectangle that is not empty or are minimized: the largest one that belongs
+// to a process of tree; without such a window and with foreign set, the
+// largest one of any process. Of windows of the same size the one listed
+// first is chosen.
 func pickLaunchWindow(windows []map[string]any, before map[string]bool, tree map[int]bool, foreign bool, claimed map[string]bool, own string) map[string]any {
 	var ownWin, other map[string]any
 	for _, w := range windows {
 		id := windowID(w)
 		title, _ := w["title"].(string)
 		if title == "" || before[id] || (claimed[id] && id != own) {
+			continue
+		}
+		if state, _ := w["state"].(string); windowArea(w) <= 0 && state != "minimized" {
 			continue
 		}
 		if tree[windowPID(w)] {
