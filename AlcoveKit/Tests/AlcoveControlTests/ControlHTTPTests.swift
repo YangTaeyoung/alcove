@@ -1289,7 +1289,7 @@ final class ProxyProcessTests: XCTestCase {
 
     func testProxyProcessFailsACallWhoseAnswerOutgrowsTheLimitBeforeItsLineEnds() async throws {
         let script = try standIn(Self.ready + "\nIFS= read -r line\nprintf '{\"id\":1,\"ok\":true,\"body\":\"'\nhead -c 2000000 /dev/zero | tr '\\0' 'x'\nexec sleep 600")
-        let proxy = ProxyProcess(executable: script.path, caDirectory: script.dir, limits: .init(call: .seconds(3600), exit: .milliseconds(100), lineBytes: 1 << 20))
+        let proxy = ProxyProcess(executable: script.path, caDirectory: script.dir, limits: .init(exit: .milliseconds(100), lineBytes: 1 << 20))
         _ = try await proxy.start()
         let text = await proxyFailure { _ = try await proxy.call("get", ["exchange": 1, "part": "response"]) }
         XCTAssertEqual(text, "alcove-proxy sent an answer larger than 1 MiB; ask for less with limit, offset or length")
