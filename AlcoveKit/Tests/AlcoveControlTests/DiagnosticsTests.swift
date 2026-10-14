@@ -262,6 +262,17 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(lines.last, "steps that failed: none")
     }
 
+    func testFileListKeepsTheFoldersOfABundleWhoseDirIsGivenWithThePrivatePrefix() async throws {
+        let r = try await rig { $0.tails["C:\\logs\\app.log"] = "one\ntwo\n" }
+        try XCTSkipUnless(scratch.path.hasPrefix("/var/") || scratch.path.hasPrefix("/tmp/"), "the scratch folder \(scratch.path) has no /private form")
+        let dir = URL(fileURLWithPath: "/private" + scratch.path).appendingPathComponent("private-bundle")
+        let result = try await collect(r.handler, ["logFiles": ["C:\\logs\\app.log"]], dir: dir)
+        XCTAssertEqual(result["dir"]?.stringValue, dir.path)
+        XCTAssertTrue(files(result).contains("logs/app.log"), "\(files(result))")
+        XCTAssertFalse(files(result).contains("app.log"), "\(files(result))")
+        XCTAssertEqual(ControlHandler.bundleFiles(dir), files(result))
+    }
+
     func testProcessesJSONHasTheShapeOfProcessListWithSecretAssignmentsMasked() async throws {
         let r = try await rig()
         _ = try await collect(r.handler)

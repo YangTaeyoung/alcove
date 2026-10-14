@@ -366,15 +366,12 @@ extension ControlHandler {
         return (url, created, key)
     }
 
-    /// The files below `root` as paths relative to it, sorted; what lies below a `.partial` folder is left out.
+    /// The regular files below `root` as paths relative to it, sorted; what lies below a `.partial` folder is left out.
     nonisolated static func bundleFiles(_ root: URL) -> [String] {
-        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
         var files: [String] = []
-        let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey])
-        while let url = walker?.nextObject() as? URL {
-            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
-            let path = url.standardizedFileURL.path
-            let relative = path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)) : url.lastPathComponent
+        let walker = FileManager.default.enumerator(atPath: root.path)
+        while let relative = walker?.nextObject() as? String {
+            guard walker?.fileAttributes?[.type] as? FileAttributeType == .typeRegular else { continue }
             if !relative.hasPrefix(DiagnosticsBundle.partialName) { files.append(relative) }
         }
         return files.sorted()
