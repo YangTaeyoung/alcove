@@ -566,10 +566,10 @@ it logs `the ProgramData folder could not be located (<system error>)`, opens
 no log file (`log: <path> is not opened because the ProgramData folder could not be located`
 on stderr), logs to stderr, starts no helper, and answers every `ui.*` and
 `win.*` operation with
-`the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task`.
+`the UI helper cannot start because the ProgramData folder could not be located (<reason>); fix the ProgramData value of HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList, then restart alcove-agent through its scheduled task`.
 An `app.launch` that waits for a window (`wait_window_ms` above 0, the
 default) starts nothing and answers
-`'<path>' was not started because the windows could not be listed: the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task`;
+`'<path>' was not started because the windows could not be listed: the UI helper cannot start because the ProgramData folder could not be located (<reason>); fix the ProgramData value of HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList, then restart alcove-agent through its scheduled task`;
 with `wait_window_ms: 0` it starts the program.
 
 Before a start the agent waits up to 10 s for the previous helper process to

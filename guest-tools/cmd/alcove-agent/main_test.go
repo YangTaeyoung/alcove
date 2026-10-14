@@ -80,7 +80,7 @@ func TestInsideDir(t *testing.T) {
 
 func TestDataFoldersLieUnderProgramData(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "ProgramData")
-	alcoveDir, uiaDir, err := dataFolders(base)
+	alcoveDir, uiaDir, err := dataFolders(base, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,8 +93,8 @@ func TestDataFoldersLieUnderProgramData(t *testing.T) {
 }
 
 func TestDataFoldersNameNoFolderWithoutProgramData(t *testing.T) {
-	alcoveDir, uiaDir, err := dataFolders("")
-	want := "the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task"
+	alcoveDir, uiaDir, err := dataFolders("", errors.New("HKLM\\x: missing"))
+	want := `the UI helper cannot start because the ProgramData folder could not be located (HKLM\x: missing); fix the ProgramData value of HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList, then restart alcove-agent through its scheduled task`
 	if err == nil || err.Error() != want {
 		t.Fatalf("err %v", err)
 	}
@@ -158,11 +158,11 @@ func TestPeerFlagRefusesAnythingElse(t *testing.T) {
 }
 
 func TestNoHelperAnswersEveryCallWithItsError(t *testing.T) {
-	_, _, err := dataFolders("")
+	_, _, err := dataFolders("", nil)
 	ui := noHelper{err}
 	for _, op := range []string{"ping", "win.list", "ui.tree", "ui.at"} {
 		out, got := ui.CallContext(context.Background(), op, map[string]any{"window": "foreground"}, 0)
-		if out != nil || got == nil || got.Error() != errNoProgramData {
+		if out != nil || got == nil || got.Error() != err.Error() {
 			t.Fatalf("%s: %v %v", op, out, got)
 		}
 	}

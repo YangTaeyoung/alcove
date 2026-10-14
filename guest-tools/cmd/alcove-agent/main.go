@@ -57,7 +57,7 @@ func main() {
 	if uia.Available() {
 		var programData string
 		programData, programDataErr = programDataFolder()
-		alcoveDir, uiaDir, dataErr = dataFolders(programData)
+		alcoveDir, uiaDir, dataErr = dataFolders(programData, programDataErr)
 		if dataErr == nil {
 			movedData, lockErr = uia.LockHelperFolders(alcoveDir, uiaDir)
 		}
@@ -130,15 +130,24 @@ func main() {
 // Windows guest.
 const deployRoot = `C:\alcove-apps`
 
-// errNoProgramData is the answer of every UI operation of an agent for which
-// no ProgramData folder could be located.
-const errNoProgramData = "the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task"
+// profileListKey holds the ProgramData value of the machine.
+const profileListKey = `SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`
+
+// noProgramData is the answer of every UI operation of an agent for which no
+// ProgramData folder could be located; reason says why.
+func noProgramData(reason error) error {
+	if reason == nil {
+		reason = errors.New("the ProgramData value is empty")
+	}
+	return fmt.Errorf(`the UI helper cannot start because the ProgramData folder could not be located (%v); fix the ProgramData value of HKLM\%s, then restart alcove-agent through its scheduled task`, reason, profileListKey)
+}
 
 // dataFolders returns the Alcove folder under programData and the uia folder
-// inside it. An empty programData is an error and names no folder.
-func dataFolders(programData string) (alcoveDir, uiaDir string, err error) {
+// inside it. An empty programData is the error noProgramData of reason and
+// names no folder.
+func dataFolders(programData string, reason error) (alcoveDir, uiaDir string, err error) {
 	if programData == "" {
-		return "", "", errors.New(errNoProgramData)
+		return "", "", noProgramData(reason)
 	}
 	alcoveDir = filepath.Join(programData, "Alcove")
 	return alcoveDir, filepath.Join(alcoveDir, "uia"), nil
