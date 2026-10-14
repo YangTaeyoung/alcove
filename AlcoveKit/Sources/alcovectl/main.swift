@@ -160,7 +160,7 @@ case "agent":
     Task.detached {
         let client = AgentClient()
         do {
-            try await client.connect(port: c.agentHostPort, expectedToken: c.agentToken, timeout: .seconds(8))
+            try await client.connect(port: c.agentHostPort, expectedToken: c.agentToken, agentKey: c.agentKey, timeout: .seconds(8))
             let hello = await client.hello
             print("connected on port \(c.agentHostPort): os=\(hello?.os ?? "?") agent=\(hello?.agentVersion ?? "?") caps=\(hello?.capabilities ?? [])")
             if let command {

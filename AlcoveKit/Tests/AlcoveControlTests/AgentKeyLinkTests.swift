@@ -1,0 +1,44 @@
+import XCTest
+@testable import AlcoveControl
+import AlcoveAgent
+import AlcoveQMP
+import AlcoveTestSupport
+
+final class AgentKeyLinkTests: XCTestCase {
+    private let key = String(repeating: "5a", count: 32)
+    private let nonce = String(repeating: "c3", count: 32)
+    private let sentence = "this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again"
+
+    func testTheLinkPairsTheAgentWithTheKeyOfTheVM() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": false]
+        agent.handler = { m, _ in m["t"]?.stringValue == "pair" ? [["t": "authed"]] : [] }
+        let key = self.key
+        let link = AgentLink(events: EventBuffer(), isRunning: { true }, endpoint: { (agent.port, "tok") }, agentKey: { key })
+        let client = await link.agent(timeout: .seconds(30))
+        XCTAssertNotNil(client)
+        XCTAssertEqual(agent.received.first?["t"]?.stringValue, "pair")
+        XCTAssertEqual(agent.received.first?["key"]?.stringValue, key)
+        let refusal = await link.lastRefusal()
+        XCTAssertNil(refusal)
+    }
+
+    func testTheLinkKeepsTheSentenceOfAnAgentThatRefusedIt() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": false]
+        let sentence = self.sentence
+        agent.handler = { m, a in
+            guard m["t"]?.stringValue == "pair" else { return [] }
+            a.sendLine(["t": "refused", "error": .string(sentence)])
+            a.drop()
+            return []
+        }
+        let key = self.key
+        let link = AgentLink(events: EventBuffer(), retryDelay: .milliseconds(10), isRunning: { true },
+                             endpoint: { (agent.port, "tok") }, agentKey: { key })
+        let client = await link.agent(timeout: .seconds(1))
+        XCTAssertNil(client)
+        let refusal = await link.lastRefusal()
+        XCTAssertEqual(refusal, sentence)
+    }
+}

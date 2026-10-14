@@ -61,6 +61,13 @@ public protocol VMTarget: Sendable {
     func agentHostPort() async -> Int
     /// The standardized file path of the VM's bundle; nil when the target has no bundle.
     func bundlePath() async -> String?
+    /// The sentence of the agent's `refused` line from the latest connection attempt that the agent refused, kept
+    /// until an attempt connects; nil when there is none.
+    func agentRefusal() async -> String?
+}
+
+extension VMTarget {
+    public func agentRefusal() async -> String? { nil }
 }
 
 /// What a VM's agent connection is at one moment.
@@ -100,6 +107,10 @@ public protocol VMProvisioning: Sendable {
 actor AgentLink {
     private let isRunning: @Sendable () async -> Bool
     private let endpoint: @Sendable () async -> (port: Int, token: String?)
+    /// The VM's agent key, read for every connection attempt.
+    private let agentKey: @Sendable () async -> String?
+    /// The sentence of the agent's `refused` line from the latest refused attempt; cleared when an attempt connects.
+    private var refusal: String?
     private let events: EventBuffer
     private let retryDelay: Duration
     private var client: AgentClient?
@@ -128,14 +139,20 @@ actor AgentLink {
     /// was last dropped.
     var isConnecting: Bool { attempts > 0 && !lastAttemptFailed }
 
-    /// `isRunning` says whether the VM runs; `endpoint` gives the forwarded agent port and the token the agent must present.
+    /// `isRunning` says whether the VM runs; `endpoint` gives the forwarded agent port and the token the agent must
+    /// present; `agentKey` gives the key the client pairs or authenticates with.
     init(events: EventBuffer, retryDelay: Duration = .seconds(1), isRunning: @escaping @Sendable () async -> Bool,
-         endpoint: @escaping @Sendable () async -> (port: Int, token: String?)) {
+         endpoint: @escaping @Sendable () async -> (port: Int, token: String?),
+         agentKey: @escaping @Sendable () async -> String? = { nil }) {
         self.events = events
         self.retryDelay = retryDelay
         self.isRunning = isRunning
         self.endpoint = endpoint
+        self.agentKey = agentKey
     }
+
+    /// The sentence of the agent's `refused` line from the latest refused attempt; nil once an attempt connected.
+    func lastRefusal() -> String? { refusal }
 
     /// The connected agent client; nil when the VM is not running or the agent is not reachable within `timeout`.
     /// A zero `timeout` returns the client only when it is already connected and starts one connection attempt in the background.
@@ -177,12 +194,15 @@ actor AgentLink {
         while true {
             let begun = generation
             let target = await endpoint()
+            let key = await agentKey()
             let candidate = AgentClient()
             let left = ContinuousClock.now.duration(to: deadline)
             do {
-                try await candidate.connect(port: target.port, expectedToken: target.token,
+                try await candidate.connect(port: target.port, expectedToken: target.token, agentKey: key,
                                             timeout: left > .zero ? min(.seconds(5), left) : .seconds(5))
+                refusal = nil
             } catch {
+                if case AgentClient.AgentError.refused(let text) = error { refusal = text }
                 if begun == generation { lastAttemptFailed = true }
                 guard ContinuousClock.now + retryDelay < deadline else {
                     attempts -= 1
@@ -308,8 +328,10 @@ public actor ControllerTarget: VMTarget {
         }, endpoint: {
             let config = await controller.config
             return (config.agentHostPort, config.agentToken)
-        })
+        }, agentKey: { await controller.config.agentKey })
     }
+
+    public func agentRefusal() async -> String? { await link.lastRefusal() }
 
     public func guestOS() async -> VMConfig.GuestOS { await controller.config.guestOS }
     public func state() async -> VMController.State { await controller.state }
