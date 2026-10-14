@@ -2,7 +2,7 @@
 import { z } from "zod";
 import { ControlError } from "../control.js";
 import { isLeaseLost, type LeasedControlClient } from "../leases.js";
-import { fail, text, vmName, type Registrar } from "../toolkit.js";
+import { DOCTOR_TIMEOUT_MS, fail, setEnvironmentTimeout, text, vmName, type Registrar } from "../toolkit.js";
 
 const snapshotName = z.string().min(1).max(128).describe("Snapshot name (non-empty, at most 128 characters, no newline)");
 const LONG_MS = 660000;
@@ -375,7 +375,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
         if (locale !== undefined) params.locale = locale;
         if (keyboard_layouts !== undefined) params.keyboardLayouts = keyboard_layouts;
         if (dpi_scale !== undefined) params.dpiScale = dpi_scale;
-        const res = await client.call("vm.set_environment", params, 180000);
+        const res = await client.call("vm.set_environment", params, setEnvironmentTimeout(Object.keys(params).length - 1));
         const rows = (res.applied as EnvRow[]) ?? [];
         const lines = rows.map((a) => `${a.setting}: ${a.ok ? "ok" : "FAILED"} — ${a.detail} (takes effect: ${a.takesEffect})`);
         const result = text(lines.length ? lines.join("\n") : "no settings given", { applied: rows });
@@ -397,7 +397,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     },
     async ({ name }) => {
       try {
-        const res = await client.call("vm.doctor", { name }, 120000);
+        const res = await client.call("vm.doctor", { name }, DOCTOR_TIMEOUT_MS);
         const checks = (res.checks as CheckRow[]) ?? [];
         const lines = checks.flatMap((c) => [
           `${c.ok ? "ok     " : "PROBLEM"} ${c.id}: ${c.detail}`,

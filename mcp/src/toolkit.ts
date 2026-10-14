@@ -87,8 +87,55 @@ export function uiCallTimeout(helperCalls = 1): number {
 export const TEXT_TURN_MS = 60000;
 /** Allowance in ms for the recognition of `vm.find_text` once its turn has come. */
 export const TEXT_READING_MS = 10000;
-/** `client.call` timeout in ms of `alcove_find_text`: the wait for its turn, the recognition and the margin. */
-export const FIND_TEXT_TIMEOUT_MS = TEXT_TURN_MS + TEXT_READING_MS + CALL_MARGIN_MS;
+/**
+ * `client.call` timeout in ms of `alcove_find_text`: `vm.find_text` reads the screen a second time after a failed
+ * recognition, so two waits for a turn with their recognitions, then the margin.
+ */
+export const FIND_TEXT_TIMEOUT_MS = 2 * (TEXT_TURN_MS + TEXT_READING_MS) + CALL_MARGIN_MS;
+
+/** Most key events `vm.type` sends per character: a change of the shift key, the key down and the key up. */
+export const KEY_EVENTS_PER_CHAR = 3;
+/** Allowance in ms for sending one key event beyond the delay `vm.type` waits after it. */
+export const KEY_EVENT_MS = 10;
+/** Allowance in ms of `vm.type` besides its key events: the frame read, or the clipboard paste through the guest tools. */
+export const TYPE_BASE_MS = 60000;
+
+/** Longest `vm.type` takes, in ms, for `chars` characters with `delayMs` after each key event, the shift release included. */
+export function typeMs(chars: number, delayMs: number): number {
+  return TYPE_BASE_MS + (KEY_EVENTS_PER_CHAR * chars + 1) * (delayMs + KEY_EVENT_MS);
+}
+
+/** Longest one guest recipe of the control server runs, in ms: 60 s in the guest and 15 s more on the host. */
+export const RECIPE_MS = 75000;
+/** Longest the control server waits for the guest tools before a recipe, in ms. */
+export const TOOLS_WAIT_MS = 25000;
+/** Allowance in ms for reading one frame of the guest screen. */
+export const FRAME_MS = 30000;
+/** Allowance in ms for the way of a long control op's reply back to this server. */
+export const LONG_MARGIN_MS = 15000;
+/**
+ * `client.call` timeout in ms of `alcove_doctor`: the screen, the 5 s wait for the guest tools, the probe recipe and
+ * the proxy recipe, then the margin.
+ */
+export const DOCTOR_TIMEOUT_MS = FRAME_MS + 5000 + 2 * RECIPE_MS + LONG_MARGIN_MS;
+
+/** `client.call` timeout in ms of `alcove_set_environment` with `settings` settings: the tools wait, one recipe per setting and the margin. */
+export function setEnvironmentTimeout(settings: number): number {
+  return TOOLS_WAIT_MS + Math.max(1, settings) * RECIPE_MS + LONG_MARGIN_MS;
+}
+
+/**
+ * Longest `vm.start` takes to launch the engine, in ms: the end of an earlier capture's proxy (6 s), the TPM and QMP
+ * sockets (10 s and 20 s) and the QMP commands that follow (30 s).
+ */
+export const ENGINE_LAUNCH_MS = 66000;
+/** Longest the engine loads a session saved to disk, in ms (`VMController.resumeTimeout`). */
+export const RESUME_LOAD_MS = 600000;
+
+/** `client.call` timeout in ms of `vm.start` with `waitToolsS`: launch, the load of a saved session, the tools wait, the clock sync recipe and the margin. */
+export function startTimeout(waitToolsS: number): number {
+  return ENGINE_LAUNCH_MS + RESUME_LOAD_MS + waitToolsS * 1000 + RECIPE_MS + LONG_MARGIN_MS;
+}
 
 /** `uiCallTimeout` of a control op that makes one helper call. */
 export const UI_CALL_TIMEOUT_MS = uiCallTimeout(1);

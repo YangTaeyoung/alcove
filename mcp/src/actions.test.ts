@@ -54,11 +54,11 @@ test("the basic action tools send the parameter names the control ops read", asy
   assert.deepEqual(sent(await run("alcove_press_keys", { name: "W", keys: "ctrl+c", hold_ms: 7 })), { op: "vm.key.press", params: { name: "W", keys: "ctrl+c", hold: 7, observe: "summary" } });
 });
 
-test("alcove_find_text waits for the turn the control server gives a text search, a recognition and the margin", async () => {
+test("alcove_find_text waits for two turns of the control server with their recognitions, and the margin", async () => {
   const { run, timeouts } = rig({ matches: [] });
   await run("alcove_find_text", { name: "W" });
   assert.deepEqual([TEXT_TURN_MS, TEXT_READING_MS, CALL_MARGIN_MS], [60000, 10000, 5000]);
-  assert.deepEqual(timeouts, [75000]);
+  assert.deepEqual(timeouts, [145000]);
 });
 
 test("find_text, screenshot, wait_for and batch send the parameter names the control ops read", async () => {

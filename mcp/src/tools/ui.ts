@@ -4,7 +4,7 @@ import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, eventSeqLine, observeParams, observePayload, type ObserveArgs } from "../observation.js";
 import { selectorParams, toSelector } from "../selector.js";
-import { clip, fail, text, vmName, DEPLOY_TIMEOUT_MS, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
+import { clip, fail, text, typeMs, vmName, DEPLOY_TIMEOUT_MS, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -231,7 +231,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(clear !== undefined ? { clear } : {}),
         ...(submit !== undefined ? { submit } : {}),
         ...observePayload(obs, "summary"),
-      }, actionTimeout(obs, UI_CALL_TIMEOUT_MS + typed.length * 20));
+      }, actionTimeout(obs, UI_CALL_TIMEOUT_MS + typeMs(typed.length, 12)));
       const line = `typed ${typed.length} characters into ${nodeLabel(reply.node as Obj | undefined)}${clear ? " (cleared first)" : ""}${submit ? " and pressed enter" : ""}`;
       return actionResult(line, reply, settle_timeout_ms);
     } catch (e) {

@@ -3,7 +3,7 @@
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, batchResult, observationTime, observeParams, observePayload, waitForResult, type ObserveArgs } from "../observation.js";
-import { FIND_TEXT_TIMEOUT_MS, fail, text, vmName, type Registrar } from "../toolkit.js";
+import { FIND_TEXT_TIMEOUT_MS, fail, text, typeMs, vmName, type Registrar } from "../toolkit.js";
 
 const buttonEnum = z.enum(["left", "right", "middle"]);
 const regionSchema = z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() });
@@ -47,6 +47,39 @@ export function mapBatchStep(step: Record<string, unknown>, index: number): Reco
   const renamed: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) renamed[spec.rename?.[k] ?? k] = v;
   return { op: spec.op, ...(camelKeys(renamed) as Record<string, unknown>) };
+}
+
+/** What a wait op may run past its own timeout, in ms: the condition reading in flight at the deadline and the reply. */
+export const WAIT_MARGIN_MS = 30000;
+/** Allowance in ms for one batch step besides the waits its parameters ask for: the frame size and the display messages. */
+export const BATCH_STEP_MS = 10000;
+/** Allowance in ms of a batch besides its steps: the frame read before the first step and the reply. */
+export const BATCH_BASE_MS = 60000;
+
+/** A number at least 0 from a step field, `fallback` for anything else. */
+function amount(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
+/** Longest one `alcove_batch` step runs, in ms, from its parameters as the caller gave them. */
+export function batchStepMs(step: Record<string, unknown>): number {
+  switch (step.op) {
+    case "type":
+      return typeMs(typeof step.text === "string" ? step.text.length : 0, amount(step.delay_ms, 12));
+    case "wait_for":
+    case "wait_idle":
+      return amount(step.timeout_s, 30) * 1000 + WAIT_MARGIN_MS;
+    case "sleep":
+      return BATCH_STEP_MS + amount(step.ms, 0);
+    default:
+      return BATCH_STEP_MS + amount(step.hold_ms ?? step.hold, 0) * Math.max(1, amount(step.count, 1));
+  }
+}
+
+/** `client.call` timeout in ms of `alcove_batch`: the base, every step's limit and the observation the batch asks for. */
+export function batchTimeout(steps: Array<Record<string, unknown>>, obs: ObserveArgs): number {
+  const stepsMs = steps.reduce((sum, step) => sum + batchStepMs(step), 0);
+  return BATCH_BASE_MS + stepsMs + observationTime({ ...obs, observe: obs.observe ?? "summary" });
 }
 
 const optX = z.number().int().optional().describe("Guest pixel X; the pointer moves here first");
@@ -161,7 +194,7 @@ export function register(r: Registrar, client: ControlClient): void {
           conditions: (a.conditions as unknown[]).map(camelKeys),
           timeout,
           ...observePayload(a as ObserveArgs, "none"),
-        }, (timeout + 30) * 1000 + observationTime(a as ObserveArgs));
+        }, timeout * 1000 + WAIT_MARGIN_MS + observationTime(a as ObserveArgs));
         return waitForResult(reply, timeout, a.settle_timeout_ms);
       } catch (e) {
         return fail(e);
@@ -186,7 +219,7 @@ export function register(r: Registrar, client: ControlClient): void {
       try {
         const sent = a.steps as Array<Record<string, unknown>>;
         const steps = sent.map((s, i) => mapBatchStep(s, i));
-        const reply = await client.call("vm.batch", { name: a.name, steps, ...observePayload(a as ObserveArgs, "summary") }, 600000);
+        const reply = await client.call("vm.batch", { name: a.name, steps, ...observePayload(a as ObserveArgs, "summary") }, batchTimeout(sent, a as ObserveArgs));
         return batchResult(sent, reply, a.settle_timeout_ms);
       } catch (e) {
         return fail(e);

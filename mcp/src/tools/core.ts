@@ -2,7 +2,7 @@
 import { z } from "zod";
 import type { ControlClient } from "../control.js";
 import { actionResult, actionTimeout, changeResult, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
-import { clip, commandParams, commandPayload, fail, streamSections, text, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
+import { clip, commandParams, commandPayload, fail, startTimeout, streamSections, text, typeMs, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
 
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("core",
@@ -62,10 +62,11 @@ export function register(r: Registrar, client: ControlClient): void {
     async ({ name, wait_for_tools, wait_timeout_s, discard_changes }) => {
       try {
         const wait = wait_for_tools ?? true;
+        const waitS = wait ? wait_timeout_s ?? 180 : 0;
         const r = await client.call(
           "vm.start",
-          { name, ...(discard_changes !== undefined ? { discardChanges: discard_changes } : {}), ...(wait ? {} : { waitTools: 0 }) },
-          300000,
+          { name, ...(discard_changes !== undefined ? { discardChanges: discard_changes } : {}), waitTools: waitS },
+          startTimeout(waitS),
         );
         if (r.resumed === true) {
           const next = r.tools === true
@@ -77,7 +78,7 @@ export function register(r: Registrar, client: ControlClient): void {
               (r.clockSynced === true ? "guest clock synced" : `guest clock not synced; ${next}`),
           );
         }
-        const deadline = Date.now() + (wait_timeout_s ?? 180) * 1000;
+        const deadline = Date.now() + waitS * 1000;
         let tools = false;
         if (wait) {
           while (Date.now() < deadline) {
@@ -245,7 +246,7 @@ export function register(r: Registrar, client: ControlClient): void {
     },
     async ({ name, text: t, delay_ms, ...obs }) => {
       try {
-        const r = await client.call("vm.type", { name, text: t, delay: delay_ms ?? 12, ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs, 600000));
+        const r = await client.call("vm.type", { name, text: t, delay: delay_ms ?? 12, ...observePayload(obs as ObserveArgs, "summary") }, actionTimeout(obs as ObserveArgs, typeMs(t.length, delay_ms ?? 12)));
         return actionResult(`typed ${t.length} characters`, r, obs.settle_timeout_ms);
       } catch (e) {
         return fail(e);

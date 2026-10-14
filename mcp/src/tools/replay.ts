@@ -166,7 +166,8 @@ export function register(r: Registrar, client: ControlClient): void {
     } catch (e) {
       const failed = fail(e);
       const sentence = maskSecrets((failed.content[0] as { text: string }).text, variables);
-      return { ...failed, content: [{ type: "text", text: /^script\.run timed out after /.test(sentence) ? `${sentence}. ${RUN_TIMEOUT_ADVICE}` : sentence }] };
+      const timedOut = /^script\.run timed out after [^;]*/.exec(sentence);
+      return { ...failed, content: [{ type: "text", text: timedOut ? `${timedOut[0]}. ${RUN_TIMEOUT_ADVICE}` : sentence }] };
     }
   });
 }

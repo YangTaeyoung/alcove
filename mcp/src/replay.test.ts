@@ -158,14 +158,14 @@ test("a control error sentence is returned with secret values hidden", async () 
 });
 
 test("a client timeout says that the run may still be going in the guest", async () => {
-  const client = { call: async () => { throw new ControlError("script.run timed out after 7925s"); } };
+  const client = { call: async () => { throw new ControlError("script.run timed out after 7925 s; the control server may still be running it: check alcove_vm_status before you call the tool again"); } };
   const handlers = new Map<string, ToolHandler>();
   register({ tool: (_set, name, _config, handler) => { handlers.set(name, handler); } }, client as never);
   const r = await handlers.get("alcove_script_run")!({ path: "/x" });
   assert.equal(r.isError, true);
   assert.equal(
     textOf(r),
-    "script.run timed out after 7925s. The run may still be going in the guest and holding the VM's lease; look with alcove_vm_status or alcove_screenshot, wait for it to end, then run the script again.",
+    "script.run timed out after 7925 s. The run may still be going in the guest and holding the VM's lease; look with alcove_vm_status or alcove_screenshot, wait for it to end, then run the script again.",
   );
 });
 

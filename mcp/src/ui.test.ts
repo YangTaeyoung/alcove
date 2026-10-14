@@ -176,7 +176,7 @@ test("the ui tools wait longer than the control op can take", async () => {
   await t.run("alcove_ui_action", { name: "vm", ref: "e1", action: "invoke", settle_timeout_ms: 5000 });
   await t.run("alcove_window_action", { name: "vm", window: "T", action: "focus" });
   await t.run("alcove_deploy", { name: "vm", path: "/b" });
-  assert.deepEqual(t.timeouts, [300000, 300000, 300000, 300000, 302000, 302100, 305000, 302000, 5400000]);
+  assert.deepEqual(t.timeouts, [300000, 300000, 300000, 300000, 302000, 362352, 305000, 302000, 5400000]);
 });
 
 test("the ui call timeout is the helper queue, the helper call, the observation's UI facts and a margin", () => {

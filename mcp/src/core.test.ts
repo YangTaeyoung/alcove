@@ -7,7 +7,7 @@ test("alcove_start_vm reports a resumed session with the tools and a synced cloc
   const { run, calls } = rig(register, { state: "running", ephemeral: false, resumed: true, tools: true, clockSynced: true });
   const r = await run("alcove_start_vm", { name: "Win" });
   assert.equal(textOf(r), "Win: running; resumed a suspended session; guest tools reconnected; guest clock synced");
-  assert.deepEqual(calls, [{ op: "vm.start", params: { name: "Win" } }]);
+  assert.deepEqual(calls, [{ op: "vm.start", params: { name: "Win", waitTools: 180 } }]);
 });
 
 test("alcove_start_vm names alcove_set_environment when a resumed session has an unsynced clock", async () => {
