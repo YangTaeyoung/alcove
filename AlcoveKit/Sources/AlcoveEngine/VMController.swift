@@ -145,6 +145,7 @@ public actor VMController {
     /// (`VMBundle.advanceDiskEpoch`) and carries the new value in `config` and `runningConfig`;
     /// when that cannot be saved the start is refused.
     /// A VM whose `config.json` is missing or does not decode is refused, whatever kind of start is asked for.
+    /// A VM whose engine runs under another live host is refused (`engineOfAnotherHost()`).
     public func start(bootFromCDROM: Bool = false, discardChanges: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
         guard bundle.storedConfig() != nil else {
@@ -164,6 +165,7 @@ public actor VMController {
         if let mismatch = VMBundle.templateMismatch(for: resuming ? (bundle.loadSuspendedConfig() ?? config) : config) {
             throw ControllerError.engineDidNotStart(mismatch)
         }
+        if let refusal = engineOfAnotherHost() { throw ControllerError.engineDidNotStart(refusal) }
         if !discardChanges, !resuming {
             do {
                 if let epoch = try bundle.advanceDiskEpoch() { config.diskEpoch = epoch }
@@ -265,6 +267,7 @@ public actor VMController {
                 throw ControllerError.engineDidNotStart(early)
             }
             var message = "\(error)"
+            if case .engineDidNotStart(let reason)? = error as? ControllerError { message = reason }
             // give a dying engine a moment to flush its error output
             var status: Int32?
             if let q = qemu { status = await q.waitForExit(timeout: .seconds(2)) }
@@ -632,13 +635,26 @@ public actor VMController {
 
     // MARK: orphaned engines
 
+    /// The refusal for an engine that holds this VM's pidfile lock while its parent, a process other than
+    /// launchd (pid 1) and this one, is alive; nil when no engine holds the lock or the engine is an orphan
+    /// or this process's own.
+    func engineOfAnotherHost() -> String? {
+        guard let pid = Self.pidfileLockHolder(bundle.pidFileURL.path), let parent = Self.parentPID(of: pid),
+              parent != 1, parent != getpid() else { return nil }
+        return "'\(config.name)' is running in another Alcove host (\(Self.processName(parent)) pid \(parent)); "
+            + "stop the VM there or quit that host, then start it here"
+    }
+
     /// An engine from a previous app instance (crash, force-quit) may still own
     /// this VM's disks. QEMU holds a write lock on its pidfile while alive, so
-    /// the lock holder is the live process, never a reused pid. Stop it
-    /// (SIGTERM, then SIGKILL) before touching the run directory; swtpm follows
-    /// on its own (`--ctrl ...,terminate`).
+    /// the lock holder is the live process, never a reused pid. An engine whose
+    /// parent is launchd or this process is stopped (SIGTERM, then SIGKILL)
+    /// before touching the run directory; swtpm follows on its own
+    /// (`--ctrl ...,terminate`). An engine of another live host is refused
+    /// (`engineOfAnotherHost()`).
     private func stopOrphanedEngine() async throws {
         let path = bundle.pidFileURL.path
+        if let refusal = engineOfAnotherHost() { throw ControllerError.engineDidNotStart(refusal) }
         guard let pid = Self.pidfileLockHolder(path) else { return }
         Darwin.kill(pid, SIGTERM)
         var deadline = ContinuousClock.now + .seconds(10)
@@ -668,5 +684,22 @@ public actor VMController {
         lock.l_len = 0
         guard fcntl(fd, F_GETLK, &lock) == 0, lock.l_type != Int16(F_UNLCK) else { return nil }
         return lock.l_pid
+    }
+
+    /// The parent pid of `pid` (`sysctl` `KERN_PROC_PID`), or nil when no such process exists.
+    nonisolated static func parentPID(of pid: pid_t) -> pid_t? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info.kp_eproc.e_ppid
+    }
+
+    /// The name of the process `pid` (`proc_name`), or "a process" when it cannot be read.
+    nonisolated static func processName(_ pid: pid_t) -> String {
+        var buffer = [CChar](repeating: 0, count: 2 * Int(MAXCOMLEN) + 1)
+        guard proc_name(pid, &buffer, UInt32(buffer.count)) > 0 else { return "a process" }
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return bytes.isEmpty ? "a process" : String(decoding: bytes, as: UTF8.self)
     }
 }
