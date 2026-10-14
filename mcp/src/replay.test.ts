@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { register, isSecretName, runLines, maskSecrets } from "./tools/replay.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { register, isSecretName, runLines, maskSecrets, scriptDefaults } from "./tools/replay.js";
 import { CALL_MARGIN_MS, SCRIPT_RUN_TIMEOUT_MS, SCRIPT_STEPS_BUDGET_MS, SNAPSHOT_RESTORE_MS, SCREENSHOT_CALL_MS } from "./toolkit.js";
 import { ControlError } from "./control.js";
 import type { ToolHandler } from "./toolkit.js";
@@ -164,4 +167,21 @@ test("a client timeout says that the run may still be going in the guest", async
     textOf(r),
     "script.run timed out after 7925s. The run may still be going in the guest and holding the VM's lease; look with alcove_vm_status or alcove_screenshot, wait for it to end, then run the script again.",
   );
+});
+
+test("secret defaults of the script file are hidden like passed variables", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "replay-defaults-"));
+  const file = path.join(dir, "flow.json");
+  fs.writeFileSync(file, JSON.stringify({ version: 1, variables: { password: "from-file-secret", message: "hi", count: 3 }, steps: [] }));
+  assert.deepEqual(scriptDefaults(file), { password: "from-file-secret", message: "hi" });
+  assert.deepEqual(scriptDefaults(path.join(dir, "missing.json")), {});
+  const t = rig(register, {
+    passed: false, stepsRun: 1, failedStep: 1, seconds: 1, error: "step 1 failed: typed from-file-secret",
+    steps: [step(1, { ok: false, error: "typed from-file-secret", result: { text: "from-file-secret" } })],
+  });
+  const r = await t.run("alcove_script_run", { path: file, variables: { message: "override" } });
+  fs.rmSync(dir, { recursive: true });
+  assert.doesNotMatch(textOf(r), /from-file-secret/);
+  assert.doesNotMatch(JSON.stringify(r.structuredContent), /from-file-secret/);
+  assert.equal(textOf(r).split("\n")[0], "variables: message=override");
 });

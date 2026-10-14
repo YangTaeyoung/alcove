@@ -1,4 +1,5 @@
 // The replay toolset: scripts saved from a recording and replayed without a model.
+import fs from "node:fs";
 import { z } from "zod";
 import { type ControlClient } from "../control.js";
 import { fail, text, SCRIPT_RUN_TIMEOUT_MS, SCRIPT_SAVE_TIMEOUT_MS, MODEL_IMAGE_MAX_WIDTH, type Registrar, type ToolResult } from "../toolkit.js";
@@ -84,6 +85,17 @@ export function saveLines(reply: Obj): string[] {
   ];
 }
 
+/** The `variables` defaults of the script file at `path`; empty when it cannot be read as a script. */
+export function scriptDefaults(path: string): Record<string, string> {
+  try {
+    const variables = (JSON.parse(fs.readFileSync(path, "utf8")) as { variables?: unknown }).variables;
+    if (!variables || typeof variables !== "object") return {};
+    return Object.fromEntries(Object.entries(variables).filter((e): e is [string, string] => typeof e[1] === "string"));
+  } catch {
+    return {};
+  }
+}
+
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("replay", "alcove_script_save", {
     title: "Save a recording as a script",
@@ -126,7 +138,8 @@ export function register(r: Registrar, client: ControlClient): void {
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   }, async (a): Promise<ToolResult> => {
-    const variables = (a.variables ?? {}) as Record<string, string>;
+    const passed = (a.variables ?? {}) as Record<string, string>;
+    const variables = { ...scriptDefaults(a.path), ...passed };
     try {
       const reply = await client.call("script.run", {
         path: a.path,
@@ -136,7 +149,7 @@ export function register(r: Registrar, client: ControlClient): void {
         maxWidth: MODEL_IMAGE_MAX_WIDTH,
       }, SCRIPT_RUN_TIMEOUT_MS);
       const failure = reply.failure as Obj | undefined;
-      const lines = [...variablesLine(variables), ...runLines(reply, variables)];
+      const lines = [...variablesLine(passed), ...runLines(reply, variables)];
       const structured: Obj = maskValue({
         passed: reply.passed,
         stepsRun: reply.stepsRun,
