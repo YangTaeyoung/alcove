@@ -1562,8 +1562,12 @@ lets a caller answer, delay or drop chosen requests. For each capturing VM the
 control server runs `alcove-proxy`, an intercepting proxy, as its child
 process. The proxy listens on `127.0.0.1` on a port it picks, and the guest
 reaches it at `10.0.2.2:<port>`, the address of the Mac on the guest's
-user-mode network. HTTPS is intercepted with certificates the proxy signs with
-the Alcove CA; the guest trusts that CA while the capture runs.
+user-mode network. The listener takes no credentials: while the capture runs,
+any process on the Mac that reaches that port, also one of another macOS
+user, can send requests through it, and they are captured and answered by the
+capture's rules like the guest's. HTTPS is intercepted with certificates the
+proxy signs with the Alcove CA; the guest trusts that CA while the capture
+runs.
 
 The server looks for `alcove-proxy` in this order: the file `$ALCOVE_PROXY`
 names (and only that file when the variable is set), `alcove-proxy` next to
@@ -1574,9 +1578,15 @@ not found; build it with scripts/test/all.sh or set ALCOVE_PROXY`.
 
 The CA lives in `~/Library/Application Support/Alcove/proxy-ca/` (`ca.pem`
 and `ca.key`, mode 0600, in a folder of mode 0700). The first capture creates
-it, valid for 5 years; every capture of the Mac user uses it. A new CA is made
-by deleting both files while no capture runs. Leaf certificates are valid for
-7 days and kept per host for the life of one proxy process.
+it, valid for 5 years; every capture of the Mac user uses it, and captures
+that start at the same time on a Mac without a CA end with one CA. A new CA is
+made by deleting both files while no capture runs. A start refuses a key that
+does not belong to the certificate, a certificate that is not a CA, and one
+that is expired or not yet valid; the error names the problem, e.g. `ca.pem
+expired on <time>`, and ends `delete ca.pem and ca.key in <folder> to create a
+new CA`. Files of the CA that group or others may read are set back to mode
+0600. Leaf certificates are valid for 7 days; one proxy process keeps them for
+up to 1000 hosts and drops the least recently used beyond that.
 
 All `vm.http.*` ops run in the serial lane. `vm.http.requests`,
 `vm.http.request` and `vm.http.rule.list` are read-only; the others are
@@ -1689,11 +1699,15 @@ pending}`:
 
 - each exchange is `{id, time, kind, method, url, status, ms, reqBytes,
   resBytes, rule?, error?, bodyDropped?}`; `kind` is `http`, `tunnel` (a host
-  outside `hosts`, a WebSocket, or a plain `http://` request to such a host)
-  or `tlsError` (the guest program refused the proxy's certificate); `rule` is
-  the id of the rule that answered it; `error` says why the proxy answered
-  502 itself, e.g. `the upstream request failed: dial tcp …: connect: no route
-  to host`;
+  outside `hosts`, a plain `http://` request to such a host, a WebSocket, or a
+  `CONNECT` connection that starts with neither TLS nor an HTTP request) or
+  `tlsError` (the TLS handshake with the guest program failed, mostly because
+  it refused the proxy's certificate; `error` ends with the next step:
+  install the CA where the program looks for trusted certificates, or exclude
+  the host with `hosts`); `rule` is the id of the rule that answered it;
+  `error` says why the exchange did not end normally, e.g. `the upstream
+  request failed: dial tcp …: connect: no route to host` for a 502 the proxy
+  answered itself, or `the client gave up during the rule delay`;
 - `next` is the id to pass as `since` for the following page;
 - `pending` lists requests in flight and open tunnels (at most 200, oldest
   first) without an id.
@@ -1701,8 +1715,10 @@ pending}`:
 **`vm.http.request`** reads one side of an exchange: `exchange` (the id),
 `part` (`request` or `response`, required), `offset` and `length` (default and
 at most 200,000 bytes of the body). The result is `{headers, body, total,
-bodyTruncated, base64?, encoding?, bodyDropped?, trailers?}`: `headers` and
-`trailers` as `[[name, value]]`; a `gzip` or `deflate` body is decoded; a
+bodyTruncated, base64?, encoding?, bodyDropped?, headersTruncated?,
+trailers?}`: `headers` and `trailers` as `[[name, value]]` (up to 64 KiB of
+them per exchange; `headersTruncated: true` when pairs beyond that were left
+out); a `gzip` or `deflate` body is decoded; a
 body that is not UTF-8 text comes as base64 with `base64: true`, and a body
 with another content encoding comes as base64 with `encoding` naming it. A
 missing id answers `no exchange with id <n>; the store keeps the newest 2000
@@ -1711,10 +1727,31 @@ exchanges and 'clear' removes them all`.
 **`vm.http.clear`** discards the captured exchanges; the capture goes on.
 
 The proxy keeps up to 2 MiB of each body (`bodyTruncated` beyond) and the
-newest 2000 exchanges. Bodies take at most 256 MiB together; beyond that the
-oldest exchanges lose their bodies and report `bodyDropped: true`. A streamed
-response (server-sent events, a chunked model reply) is passed to the guest
-as each piece arrives; the capture holds it once it has ended.
+newest 2000 exchanges. The bodies and headers of the stored exchanges and the
+bodies of exchanges in flight take at most 256 MiB together; beyond that the
+oldest exchanges lose their bodies and report `bodyDropped: true`, and an
+exchange in flight keeps no more of its body when no stored body is left to
+drop. A streamed response (server-sent events, a chunked model reply) is
+passed to the guest as each piece arrives; the capture holds it once it has
+ended.
+
+A WebSocket (an HTTP/1.1 request with `Connection: upgrade` and `Upgrade:
+websocket`) passes through: the upgrade request goes through the rules like
+any request and is forwarded with those headers; when the server answers 101
+the proxy joins the two connections until either side closes. Its row is a
+`tunnel` row with status 101 and the bytes sent each way after the handshake;
+for a host in `hosts` it keeps the handshake headers, never the frames. A
+server that refuses the upgrade gives an `http` row. A plain `http://` request
+a program sends through `CONNECT` (a `ws://` socket, or a program that sends
+everything through `ALL_PROXY`) is captured as an `http` row; other protocols
+through `CONNECT`, and a program that sends nothing for 5 s after connecting,
+are tunnelled.
+
+The proxy adds nothing of its own to what it forwards: no `User-Agent` when
+the program sent none, no `Date` or `Content-Type` when the server sent none.
+It relays the server's informational answers (such as `103 Early Hints`), and
+for a request with `Expect: 100-continue` it asks the program for the body
+only when the server does (or after 1 s without an answer).
 
 A guest request to `10.0.2.2:<port>`, a server on the Mac, is captured: the
 proxy connects to the Mac's `127.0.0.1:<port>` and keeps the URL. The proxy
@@ -1735,7 +1772,13 @@ optional, so `{}` matches every request) and `action`:
   content type to `application/json` when the body parses as JSON, otherwise
   `text/plain; charset=utf-8`;
 - `delayMs` (0 to 600,000) waits before answering, or before forwarding when
-  the rule has no `status` or `body`;
+  the rule has no `status` or `body`. Before the delay the proxy reads the
+  request body: all of it for a rule that answers or drops, up to 2 MiB of an
+  HTTP/1.1 body for a rule that forwards, 30 s at most (a forwarding rule
+  then answers `408`). A program that gives up during the delay ends it: the
+  row's `error` reads `the client gave up during the rule delay` and nothing
+  is forwarded. `vm.http.stop` ends running delays (`the proxy stopped during
+  the rule delay`);
 - `drop: true` closes the connection without an answer;
 - `times` (at least 1) applies the rule that many times.
 
