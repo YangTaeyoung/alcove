@@ -56,7 +56,8 @@ public struct RunScriptOptions: Equatable, Sendable {
     interrupted by SIGINT, 143 by SIGTERM, 129 by SIGHUP
     """
 
-    /// Parses the arguments that follow `run-script`.
+    /// Parses the arguments that follow `run-script`. An error names an argument by its position (counted from 1), and
+    /// shows its text only for an unknown option that `looksLikeAnOption`.
     public static func parse(_ argv: [String], environment: [String: String] = ProcessInfo.processInfo.environment) throws -> RunScriptOptions {
         var file: String?
         var vm: String?, snapshot: String?, socket: String?
@@ -73,7 +74,9 @@ public struct RunScriptOptions: Equatable, Sendable {
         while index < argv.count {
             let argument = argv[index]
             if optionsEnded || !argument.hasPrefix("-") || argument == "-" {
-                guard file == nil else { throw RunScriptUsageError("run-script takes one script file; got '\(file!)' and '\(argument)'") }
+                guard file == nil else {
+                    throw RunScriptUsageError("run-script takes one script file; argument \(index + 1) is a second one; pass one file, and give each variable as --var KEY=VALUE or --var KEY")
+                }
                 file = argument
                 index += 1
                 continue
@@ -110,11 +113,12 @@ public struct RunScriptOptions: Equatable, Sendable {
                     }
                     text = fromEnvironment
                 }
-                guard !key.isEmpty else { throw RunScriptUsageError("--var needs KEY=VALUE, for example --var message=hello; got '\(pair)'") }
+                guard !key.isEmpty else { throw RunScriptUsageError("--var needs a name before '=' in argument \(index + 1), for example --var message=hello") }
                 if variables[key] != nil, !repeated.contains(key) { repeated.append(key) }
                 variables[key] = text
             default:
-                throw RunScriptUsageError("unknown option '\(argument)'; see alcovectl run-script --help, and put -- before a file name that starts with a dash")
+                let named = RunScriptOptions.looksLikeAnOption(argument) ? "unknown option '\(argument)'" : "argument \(index + 1) is an unknown option"
+                throw RunScriptUsageError("\(named); see alcovectl run-script --help, and put -- before a file name that starts with a dash")
             }
             index += 1
         }
@@ -123,6 +127,11 @@ public struct RunScriptOptions: Equatable, Sendable {
         let absolute = expanded.hasPrefix("/") ? expanded : FileManager.default.currentDirectoryPath + "/" + expanded
         return RunScriptOptions(file: URL(fileURLWithPath: absolute).standardized.path, givenFile: file, vm: vm, variables: variables,
                                 snapshot: snapshot, socket: socket, inProcess: inProcess, repeatedVariables: repeated)
+    }
+
+    /// Whether `argument` is `--` followed by lowercase ASCII letters and inner dashes, the shape of an option name.
+    static func looksLikeAnOption(_ argument: String) -> Bool {
+        argument.range(of: "^--[a-z]+(-[a-z]+)*$", options: .regularExpression) != nil
     }
 
     /// The sentence that says why the script file cannot be run, or nil when it is a readable file.
@@ -221,8 +230,8 @@ public enum ScriptReport {
         try? FileManager.default.removeItem(atPath: failureImagePath(forScript: file))
     }
 
-    /// Replaces the failure screenshot file of the script at `file` by the one of a failed run, and removes it when the
-    /// run passed or produced none. Returns a sentence when the file could not be written.
+    /// Replaces the failure screenshot file of the script at `file` by the one of a failed run, with mode 0600, and
+    /// removes it when the run passed or produced none. Returns a sentence when the file could not be written.
     public static func storeFailureImage(_ reply: JSON, scriptFile file: String) -> String? {
         let path = failureImagePath(forScript: file)
         guard reply["passed"]?.boolValue != true, let png = failureImage(reply) else {
@@ -230,7 +239,7 @@ public enum ScriptReport {
             return nil
         }
         do {
-            try png.write(to: URL(fileURLWithPath: path), options: .atomic)
+            _ = try ControlHandler.writeHostFile(png, to: URL(fileURLWithPath: path), replacing: true)
             return nil
         } catch {
             return "cannot write the failure screenshot '\(path)'; check that the folder of the script is writable"

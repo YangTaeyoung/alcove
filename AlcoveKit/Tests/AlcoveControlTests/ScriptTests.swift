@@ -866,6 +866,23 @@ final class ScriptTests: XCTestCase {
         XCTAssertEqual(result.stepResults[2]["result"]?["state"]?.stringValue, "running")
     }
 
+    func testJpegOfAStepResultIsOmittedLikeAPng() async throws {
+        let rig = try await rig()
+        let shot = "{\"op\": \"vm.screenshot\", \"params\": {\"format\": \"jpeg\"}}"
+        let result = await run(rig, try script(steps([shot])))
+        XCTAssertTrue(result.passed, result.error ?? "")
+        let jpeg = try XCTUnwrap(result.stepResults[0]["result"]?["jpeg"]?.stringValue)
+        XCTAssertTrue(jpeg.hasPrefix("<omitted: ") && jpeg.hasSuffix(" bytes>"), String(jpeg.prefix(80)))
+    }
+
+    func testScriptRunNeedsAnAbsolutePath() async throws {
+        let rig = try await rig()
+        for path in ["flow.json", "~/flow.json", "./flow.json"] {
+            do { _ = try await rig.handler.handle(op: "script.run", params: ["path": .string(path)]); XCTFail(path) }
+            catch { XCTAssertEqual("\(error)", "path must be an absolute path", path) }
+        }
+    }
+
     func testStepResultsPastTheCapKeepOnlyTheirOutcome() async throws {
         let rig = try await rig()
         let long = String(repeating: "b", count: 3000)

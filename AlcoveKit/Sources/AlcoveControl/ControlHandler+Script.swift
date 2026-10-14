@@ -179,9 +179,10 @@ extension ControlHandler {
     }
 
     func scriptRun(_ params: JSON) async throws -> JSON {
-        let path = try string(params, "path")
-        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-        let unreadable = ControlError.failed("cannot read the script '\(path)'; check that it is a file on the host and use an absolute path")
+        _ = try string(params, "path")
+        let path = try absolutePath(params["path"] ?? .null, "path")
+        let url = URL(fileURLWithPath: path)
+        let unreadable = ControlError.failed("cannot read the script '\(path)'; check that it is a file on the host")
         guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]), values.isRegularFile == true,
               let size = values.fileSize else { throw unreadable }
         guard size <= ScriptLimits.fileBytes else {

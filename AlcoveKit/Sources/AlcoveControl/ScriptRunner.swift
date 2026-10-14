@@ -249,11 +249,12 @@ struct ScriptRunner: Sendable {
     /// The sentence of a run cancelled while step `number` ran.
     static func cancelledDuring(_ number: Int) -> String { "the run was cancelled during step \(number); start it again" }
 
-    /// A copy of `value` with every `png` string replaced by its size and every other long string shortened.
+    /// A copy of `value` with every string under a key of `TraceSanitizer.imageKeys` replaced by its size and every other
+    /// long string shortened.
     static func bounded(_ value: JSON, key: String? = nil) -> JSON {
         switch value {
         case .string(let text):
-            if key == "png" { return .string("<omitted: \(text.utf8.count) bytes>") }
+            if let key, TraceSanitizer.imageKeys.contains(key) { return .string("<omitted: \(text.utf8.count) bytes>") }
             guard text.count > ScriptLimits.stringCharacters else { return value }
             return .string(String(text.prefix(ScriptLimits.stringCharacters)) + "… (\(text.count - ScriptLimits.stringCharacters) more characters)")
         case .array(let items): return .array(items.map { bounded($0) })

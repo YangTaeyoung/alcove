@@ -31,13 +31,29 @@ final class ScriptCommandTests: XCTestCase {
 
     func testRefusesBadArguments() {
         XCTAssertTrue(usageError([]).hasPrefix("run-script needs the script file"))
-        XCTAssertEqual(usageError(["/a.json", "/b.json"]), "run-script takes one script file; got '/a.json' and '/b.json'")
+        XCTAssertEqual(usageError(["/a.json", "/b.json"]), "run-script takes one script file; argument 2 is a second one; pass one file, and give each variable as --var KEY=VALUE or --var KEY")
         XCTAssertEqual(usageError(["/a.json", "--var", "no_such_env_variable_for_alcove"]), "--var no_such_env_variable_for_alcove needs a value: pass no_such_env_variable_for_alcove=VALUE or set the environment variable no_such_env_variable_for_alcove")
-        XCTAssertEqual(usageError(["/a.json", "--var", "=1"]), "--var needs KEY=VALUE, for example --var message=hello; got '=1'")
+        XCTAssertEqual(usageError(["/a.json", "--var", "=1"]), "--var needs a name before '=' in argument 3, for example --var message=hello")
         XCTAssertEqual(usageError(["/a.json", "--var"]), "--var needs a value; see alcovectl run-script --help")
         XCTAssertEqual(usageError(["/a.json", "--vm", ""]), "--vm needs a VM name; see alcovectl run-script --help")
         XCTAssertEqual(usageError(["/a.json", "--other"]), "unknown option '--other'; see alcovectl run-script --help, and put -- before a file name that starts with a dash")
-        XCTAssertEqual(usageError(["-x", "/a.json"]), "unknown option '-x'; see alcovectl run-script --help, and put -- before a file name that starts with a dash")
+        XCTAssertEqual(usageError(["-x", "/a.json"]), "argument 1 is an unknown option; see alcovectl run-script --help, and put -- before a file name that starts with a dash")
+    }
+
+    func testArgumentErrorsNeverShowAValueThatMayBeASecret() {
+        func error(_ argv: [String]) -> String {
+            do { _ = try RunScriptOptions.parse(argv, environment: ["PASSWORD": "from-env"]); XCTFail("accepted \(argv)"); return "" } catch { return "\(error)" }
+        }
+        let secret = "hunter2-Secret!"
+        let errors = [
+            error(["--var", "PASSWORD", secret, "/flow.json"]),
+            error(["/flow.json", "--var", "PASSWORD", secret]),
+            error(["/flow.json", "--var", "=" + secret]),
+            error(["/flow.json", "-" + secret]),
+            error(["/flow.json", "--" + secret]),
+        ]
+        for message in errors { XCTAssertFalse(message.contains("hunter2"), message) }
+        XCTAssertEqual(errors[1], "run-script takes one script file; argument 4 is a second one; pass one file, and give each variable as --var KEY=VALUE or --var KEY")
     }
 
     func testVarWithoutValueReadsTheEnvironment() throws {
@@ -172,6 +188,19 @@ final class ScriptCommandTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: script + ".failure.png"))
     }
 
+    func testFailureImageIsReadableByItsOwnerOnly() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("script-cmd-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+        let script = folder.appendingPathComponent("flow.json").path
+        let failed: JSON = ["passed": false, "failure": ["png": .string(Data([0x89, 0x50]).base64EncodedString())]]
+        let path = ScriptReport.failureImagePath(forScript: script)
+        for _ in 0..<2 {
+            XCTAssertNil(ScriptReport.storeFailureImage(failed, scriptFile: script))
+            XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int, 0o600)
+        }
+    }
+
     func testFailureImageThatCannotBeWrittenIsReported() {
         let failed: JSON = ["passed": false, "failure": ["png": .string(Data([1]).base64EncodedString())]]
         let problem = ScriptReport.storeFailureImage(failed, scriptFile: "/nonexistent-folder/flow.json")
@@ -187,7 +216,7 @@ final class ScriptCommandTests: XCTestCase {
         let hello = try ControlSocketClient.call(op: "hello", params: [:], socketPath: path)
         XCTAssertEqual(hello["host"]?.stringValue, "test")
         XCTAssertThrowsError(try ControlSocketClient.call(op: "script.run", params: ["path": "/nonexistent/flow.json"], socketPath: path)) {
-            XCTAssertEqual("\($0)", "cannot read the script '/nonexistent/flow.json'; check that it is a file on the host and use an absolute path")
+            XCTAssertEqual("\($0)", "cannot read the script '/nonexistent/flow.json'; check that it is a file on the host")
         }
         XCTAssertThrowsError(try ControlSocketClient.call(op: "hello", params: [:], socketPath: "/tmp/alcove-cmd-none.sock")) {
             XCTAssertEqual("\($0)", "no control server answers at '/tmp/alcove-cmd-none.sock'")
