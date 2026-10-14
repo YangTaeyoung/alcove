@@ -224,6 +224,17 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(UITreeText.render([]), "")
     }
 
+    func testUITreeTextIndentsAtMostSixtyFourLevels() {
+        let deep: JSON = ["ref": "e2", "depth": 1_099_511_627_776, "role": "Pane", "name": ""]
+        XCTAssertEqual(UITreeText.line(deep), String(repeating: "  ", count: 64) + "[e2] Pane \"\"")
+        for depth in [64, 65] {
+            let node: JSON = ["ref": "e3", "depth": .int(Int64(depth)), "role": "Pane", "name": ""]
+            XCTAssertEqual(UITreeText.line(node), String(repeating: "  ", count: 64) + "[e3] Pane \"\"", "depth \(depth)")
+        }
+        let negative: JSON = ["ref": "e4", "depth": -3, "role": "Pane", "name": ""]
+        XCTAssertEqual(UITreeText.line(negative), "[e4] Pane \"\"")
+    }
+
     func testUITreeTextKeepsOneNodeOnOneLine() {
         let breaks = "a\u{2028}b\u{2029}c\u{85}d\u{0B}e\u{0C}f\u{1B}g\u{7F}h\u{9F}i\u{0}j"
         XCTAssertEqual(UITreeText.quoted(breaks), "\"a\\u{2028}b\\u{2029}c\\u{85}d\\u{b}e\\u{c}f\\u{1b}g\\u{7f}h\\u{9f}i\\u{0}j\"")

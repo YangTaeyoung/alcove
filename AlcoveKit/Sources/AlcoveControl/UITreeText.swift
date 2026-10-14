@@ -9,7 +9,8 @@ enum UITreeText {
         nodes.map(line).joined(separator: "\n")
     }
 
-    /// The line of one node, indented by two spaces per depth level. A node without a rectangle has no `(x,y WxH)` part.
+    /// The line of one node, indented by two spaces per depth level up to `maxDepth` levels. A node without a rectangle
+    /// has no `(x,y WxH)` part.
     static func line(_ node: JSON) -> String {
         var parts = ["[\(node["ref"]?.stringValue ?? "?")]", label(node)]
         if let x = node["x"]?.intValue, let y = node["y"]?.intValue, let w = node["w"]?.intValue, let h = node["h"]?.intValue {
@@ -17,8 +18,11 @@ enum UITreeText {
         }
         parts += (node["flags"]?.arrayValue ?? []).compactMap(\.stringValue)
         if let value = node["value"]?.stringValue { parts.append("value=\(quoted(cut(value)))") }
-        return String(repeating: "  ", count: max(0, node["depth"]?.intValue ?? 0)) + parts.joined(separator: " ")
+        return String(repeating: "  ", count: min(maxDepth, max(0, node["depth"]?.intValue ?? 0))) + parts.joined(separator: " ")
     }
+
+    /// The most depth levels a line is indented by.
+    static let maxDepth = 64
 
     /// The most characters of a name or a value a line shows.
     static let nameLimit = 200

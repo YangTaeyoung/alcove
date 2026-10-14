@@ -5,8 +5,6 @@ import AlcoveQMP
 /// The clocks of the UI ops.
 enum UITiming {
     /// Longest the host waits for the agent's answer to one window or element op, counted from the moment it is sent.
-    /// It covers what the agent may spend on one call: 60 s in its queue for the helper, 120 s for a helper start and
-    /// 30 s for the call itself, and leaves 5 s for the answer's way back.
     nonisolated(unsafe) static var callTimeout = Duration.seconds(215)
     /// Longest a window or element op waits for its turn at the UI helper.
     nonisolated(unsafe) static var queueTimeout = Duration.seconds(60)
