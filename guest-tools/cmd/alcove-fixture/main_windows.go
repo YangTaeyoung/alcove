@@ -49,6 +49,7 @@ const (
 	replyWords    = 30
 	wordInterval  = 80 // ms
 	hangDuration  = 60 * time.Second
+	titlesFor     = 5 * time.Second
 	fetchTimeout  = 30 * time.Second
 	baseDPI       = 96
 	windowWidth   = 720
@@ -117,7 +118,6 @@ const (
 	streamTimer    = 1
 	titlesTimer    = 2
 	titlesInterval = 50 // ms
-	titlesTicks    = 100
 )
 
 var (
@@ -205,9 +205,10 @@ type app struct {
 	dpi                                     int
 	font                                    uintptr
 
-	words      []string
-	wordsSent  int
-	titlesTick int
+	words       []string
+	wordsSent   int
+	titlesTick  int
+	titlesSince time.Time
 
 	mu      sync.Mutex
 	fetched []string
@@ -447,15 +448,16 @@ func (a *app) onTitles() {
 	}
 	a.log("titles")
 	a.titlesTick = 1
+	a.titlesSince = time.Now()
 	setWindowText(a.main, fmt.Sprintf("Alcove Fixture %d", a.titlesTick))
 	procSetTimer.Call(a.main, titlesTimer, titlesInterval, 0)
 }
 
 // onTitlesTimer changes the title once more: to the next numbered title until
-// titlesTicks ticks have passed, then to the base title.
+// titlesFor has passed since the button was pressed, then to the base title.
 func (a *app) onTitlesTimer() {
 	a.titlesTick++
-	if a.titlesTick < titlesTicks {
+	if time.Since(a.titlesSince) < titlesFor {
 		setWindowText(a.main, fmt.Sprintf("Alcove Fixture %d", a.titlesTick))
 		return
 	}
