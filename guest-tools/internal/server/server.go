@@ -47,6 +47,18 @@ type Options struct {
 	// AuthTimeout bounds the time from the hello to the pair or auth message;
 	// 0 means 30 s.
 	AuthTimeout time.Duration
+	// DeployRoot is a folder the agent keeps locked; nil means none.
+	DeployRoot *DeployRoot
+}
+
+// DeployRoot names a folder that the fs operations create through Lock when
+// they would create it, and whose lock fs.stat reports.
+type DeployRoot struct {
+	Path string
+	// Lock creates the folder locked.
+	Lock func() error
+	// Locked reports whether the folder is locked now.
+	Locked func() bool
 }
 
 // DefaultPeers is the address from which QEMU's user-mode network delivers the
@@ -68,6 +80,8 @@ type Server struct {
 
 	// pairMu orders the pair messages of all connections.
 	pairMu sync.Mutex
+	// deployMu orders the creations of the deploy root.
+	deployMu sync.Mutex
 
 	launchMu sync.Mutex
 	// claimed holds the ids of windows an app.launch has taken; a concurrent

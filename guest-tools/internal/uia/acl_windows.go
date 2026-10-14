@@ -196,6 +196,12 @@ func LockDeployRoot(dir string) (moved string, err error) {
 	return moved, nil
 }
 
+// DeployRootLocked reports whether dir is a directory, not a reparse point,
+// locked as deployRootSDDL says, read as keepExistingDeployRoot reads it.
+func DeployRootLocked(dir string) bool {
+	return keepExistingDeployRoot(dir)
+}
+
 // keepExistingDeployRoot reports what keepDeployRoot says of the entry at dir,
 // read through a handle opened without following a reparse point; an entry
 // that cannot be opened or read is not kept.

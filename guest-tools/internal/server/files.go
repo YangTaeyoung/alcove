@@ -101,6 +101,47 @@ func fileDigest(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// withoutLongPrefix returns p without a \\?\ prefix before a drive letter.
+func withoutLongPrefix(p string) string {
+	if strings.HasPrefix(p, `\\?\`) && len(p) >= 6 && p[5] == ':' {
+		return p[4:]
+	}
+	return p
+}
+
+// inDeployRoot reports whether path is the deploy root or lies below it;
+// root reports whether it is the root itself.
+func (s *Server) inDeployRoot(path string) (inside, root bool) {
+	r := s.opt.DeployRoot
+	if r == nil {
+		return false, false
+	}
+	fold := runtime.GOOS == "windows"
+	dir, target := filepath.Clean(r.Path), filepath.Clean(withoutLongPrefix(path))
+	if !pathContains(dir, target, filepath.Separator, fold) {
+		return false, false
+	}
+	return true, pathContains(target, dir, filepath.Separator, fold)
+}
+
+// ensureDeployRoot creates the deploy root through DeployRoot.Lock when path
+// is the root or lies below it and the root does not exist.
+func (s *Server) ensureDeployRoot(path string) error {
+	if inside, _ := s.inDeployRoot(path); !inside {
+		return nil
+	}
+	r := s.opt.DeployRoot
+	s.deployMu.Lock()
+	defer s.deployMu.Unlock()
+	if _, err := os.Lstat(r.Path); !errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err := r.Lock(); err != nil {
+		return fmt.Errorf("%s is missing and could not be created locked (%v); remove what is in its way as an administrator and retry", r.Path, err)
+	}
+	return nil
+}
+
 func (s *Server) registerFiles() {
 	s.register("fs.stat", true, s.fsStat)
 	s.register("fs.list", true, s.fsList)
@@ -177,6 +218,9 @@ func (s *Server) fsStat(_ context.Context, req proto.Message) (proto.Message, er
 	}
 	if hasOwner {
 		out["owner"] = owner
+	}
+	if _, root := s.inDeployRoot(path); root {
+		out["locked"] = s.opt.DeployRoot.Locked()
 	}
 	if !fi.IsDir() {
 		out["size"] = fi.Size()
@@ -506,6 +550,9 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 		if !req.Bool("mkdirs") {
 			return nil, fmt.Errorf("directory '%s' does not exist; pass mkdirs to create it", dir)
 		}
+		if err := s.ensureDeployRoot(dir); err != nil {
+			return nil, err
+		}
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("cannot create '%s': %v", dir, err)
 		}
@@ -555,6 +602,9 @@ func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, 
 		}
 		return nil, fmt.Errorf("cannot stat '%s': %v", from, err)
 	}
+	if err := s.ensureDeployRoot(to); err != nil {
+		return nil, err
+	}
 	if dst, err := os.Lstat(to); err == nil {
 		if !req.Bool("overwrite") {
 			return nil, fmt.Errorf("'%s' exists; pass overwrite to replace it", to)
@@ -572,6 +622,9 @@ func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, 
 func (s *Server) fsMkdir(_ context.Context, req proto.Message) (proto.Message, error) {
 	path, err := s.pathArg(req, "path")
 	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureDeployRoot(path); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
@@ -629,11 +682,7 @@ func (s *Server) protectedFromDelete(path string) bool {
 // and its last element kept; it returns path when the parent cannot be
 // resolved.
 func resolveParent(path string) string {
-	p := path
-	if strings.HasPrefix(p, `\\?\`) && len(p) >= 6 && p[5] == ':' {
-		p = p[4:]
-	}
-	p = filepath.Clean(p)
+	p := filepath.Clean(withoutLongPrefix(path))
 	dir, err := filepath.EvalSymlinks(filepath.Dir(p))
 	if err != nil {
 		return p

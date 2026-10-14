@@ -117,8 +117,19 @@ func main() {
 		helper.SetLogPath(filepath.Join(uiaDir, "helper.log"))
 		ui = helper
 	}
+	var root *server.DeployRoot
+	if uia.Available() {
+		root = &server.DeployRoot{Path: deployRoot, Locked: func() bool { return uia.DeployRootLocked(deployRoot) },
+			Lock: func() error {
+				moved, err := uia.LockDeployRoot(deployRoot)
+				if moved != "" {
+					logger.Printf("%s was a link, belonged to another owner or let other users change it; it was moved to %s, which an administrator may remove after checking it", deployRoot, moved)
+				}
+				return err
+			}}
+	}
 	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui, AllowPeers: allowed,
-		HostKey: newHostKeyStore(alcoveDir, dataErr, lockErr)})
+		HostKey: newHostKeyStore(alcoveDir, dataErr, lockErr), DeployRoot: root})
 	err = s.Serve(l)
 	s.Close()
 	logger.Fatal(err)
