@@ -17,8 +17,8 @@
 //   - "Crash": the process ends through RaiseFailFastException, which
 //     Windows Error Reporting records;
 //   - "Hang": the window thread sleeps for 60 s;
-//   - "Fetch": an HTTPS GET of --url on another goroutine, which appends
-//     "Fetch: <status code or error>" to the transcript;
+//   - "Fetch": an HTTPS GET of --url on another goroutine that reads the whole
+//     body and appends "Fetch: <status code or error>" to the transcript;
 //   - "Titles": changes the window title every 50 ms for 5 s and ends with
 //     "Alcove Fixture";
 //   - two buttons that are both named "Same": each appends "Same 1" or
@@ -32,6 +32,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"runtime"
@@ -392,6 +393,7 @@ func (a *app) onFetch() {
 		if err != nil {
 			result = err.Error()
 		} else {
+			_, _ = io.Copy(io.Discard, res.Body)
 			res.Body.Close()
 			result = fmt.Sprint(res.StatusCode)
 		}
