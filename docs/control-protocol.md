@@ -1958,7 +1958,9 @@ next connect`.
 A `vm.http.stop` whose client disconnects or whose request is cancelled still
 waits for the guest tools and restores the guest to its end, within the same
 limits; so does the undo of a cancelled `vm.http.start`, and the restore of a
-cancelled `vm.stop`.
+cancelled `vm.stop`. A cancelled `vm.http.start` lets its guest steps (the CA
+copy and the recipes) run to their end before it undoes them, so a recipe still
+running in the guest cannot set the system proxy after the undo.
 
 The restore puts back exactly the values the state file recorded, and only
 while `ProxyServer` is still `10.0.2.2:<port of the state file>` (the WinHTTP

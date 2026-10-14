@@ -234,8 +234,13 @@ extension ControlHandler {
                 }
                 capture.guestChanged = true
                 do {
-                    bundle = try await prepareGuest(&capture, &warnings, t, agent, hostCAPath: started.caPath, guestPath: guestPath,
-                                                    systemProxy: request.systemProxy)
+                    let ready = capture
+                    let systemProxy = request.systemProxy
+                    let prepared = await Task {
+                        await self.prepareGuestToItsEnd(ready, t, agent, hostCAPath: started.caPath, guestPath: guestPath, systemProxy: systemProxy)
+                    }.value
+                    (capture, warnings, bundle) = try prepared.get()
+                    try Task.checkCancellation()
                 } catch {
                     let undo = httpTiming.undo
                     let undone = await Task { await self.restoreGuest(t, agent, os: os, thumbprint: thumbprint, op: "vm.http.start", limit: undo) }.value
@@ -277,6 +282,19 @@ extension ControlHandler {
         } catch {
             await proxy.stop()
             throw error
+        }
+    }
+
+    /// `prepareGuest` on a copy of `capture`: the changed capture, the warnings and the CA bundle, or the error.
+    private func prepareGuestToItsEnd(_ capture: HTTPCapture, _ t: VMTarget, _ agent: AgentClient, hostCAPath: String, guestPath: String,
+                                      systemProxy: Bool) async -> Result<(HTTPCapture, [String], String?), Error> {
+        var changed = capture
+        var warnings: [String] = []
+        do {
+            let bundle = try await prepareGuest(&changed, &warnings, t, agent, hostCAPath: hostCAPath, guestPath: guestPath, systemProxy: systemProxy)
+            return .success((changed, warnings, bundle))
+        } catch {
+            return .failure(error)
         }
     }
 

@@ -531,7 +531,7 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.factory.latest.stopCount, 1)
     }
 
-    func testACancelledStartStillUndoesItsGuestSteps() async throws {
+    func testTheUndoOfACancelledStartWaitsForTheRecipeThatWasRunning() async throws {
         let c = try await capture()
         c.held.value = ["recipe.setProxy(49152)"]
         let h = c.h
@@ -539,12 +539,18 @@ final class ControlHTTPTests: XCTestCase {
         let asked = await eventually("the start asks the guest to set its system proxy") { c.waiting.value.count == 1 }
         XCTAssertTrue(asked)
         caller.cancel()
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "push \(GuestRecipes.windowsProxyCAPath)", "recipe.installCA",
+                                       "recipe.setProxy(49152)"])
+        c.release("recipe.setProxy(49152)", printing: ControlHTTPTests.defaultOutput("recipe.setProxy(49152)"))
         _ = try? await caller.value
         let ended = await c.factory.latest.stopped()
         XCTAssertTrue(ended)
         XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "push \(GuestRecipes.windowsProxyCAPath)", "recipe.installCA",
                                        "recipe.setProxy(49152)", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
         XCTAssertNil(c.journal.entry(for: "Win"))
+        let after = await c.failure("vm.http.requests")
+        XCTAssertEqual(after, "'Win' is not capturing; call vm.http.start first")
     }
 
     func testACopyThatFailsIsUndoneAndNamed() async throws {
