@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -10,9 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
-
-	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
 
 const createNoWindow = 0x08000000
@@ -37,8 +37,24 @@ func setRawCommandLine(c *exec.Cmd, line string) {
 
 func prepareTree(*exec.Cmd) {}
 
+// listTimeout bounds the PowerShell run that lists the processes.
+const listTimeout = 30 * time.Second
+
+var procGetSystemDirectory = syscall.NewLazyDLL("kernel32.dll").NewProc("GetSystemDirectoryW")
+
+// systemProgram returns the path of a program in the Windows system folder,
+// or name alone when that folder cannot be read.
+func systemProgram(name string) string {
+	buf := make([]uint16, syscall.MAX_PATH)
+	n, _, _ := procGetSystemDirectory.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if n == 0 || int(n) >= len(buf) {
+		return name
+	}
+	return filepath.Join(syscall.UTF16ToString(buf[:n]), name)
+}
+
 func taskkill(args ...string) ([]byte, error) {
-	c := exec.Command("taskkill", args...)
+	c := exec.Command(systemProgram("taskkill.exe"), args...)
 	hideWindow(c)
 	return c.CombinedOutput()
 }
@@ -53,12 +69,15 @@ func killTree(pid int) error {
 
 func listProcesses() ([]procInfo, error) {
 	script := "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,WorkingSetSize | ConvertTo-Json -Compress"
-	c, err := buildCommand(proto.Message{"cmd": script}, "windows")
-	if err != nil {
-		return nil, err
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+	defer cancel()
+	c := exec.CommandContext(ctx, systemProgram(`WindowsPowerShell\v1.0\powershell.exe`),
+		"-NoProfile", "-NonInteractive", "-Command", powershellUTF8Prefix+script)
 	hideWindow(c)
 	out, err := c.Output()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("listing the processes took longer than %d s; retry", int(listTimeout.Seconds()))
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"unicode/utf8"
 )
 
@@ -10,8 +11,10 @@ const (
 	clipboardMaxBytes = 700000
 )
 
-// cutChars keeps the first max characters of s and appends "…" when it cut.
+// cutChars keeps the first max characters of s, with each run of invalid
+// UTF-8 bytes replaced by one U+FFFD first, and appends "…" when it cut.
 func cutChars(s string, max int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	n := 0
 	for i := range s {
 		if n == max {

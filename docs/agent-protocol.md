@@ -145,8 +145,10 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 ### Commands (`exec.run`, `exec.start`)
 
 - With `argv` the program `argv[0]` starts directly with the remaining
-  elements as arguments, and `shell` is not consulted. `shell: "none"` without
-  `argv` is an error.
+  elements as arguments. `shell` is then left out or `none`; another `shell`
+  answers `shell '<shell>' does not run argv; pass shell 'none' or leave shell out`,
+  and `cmd` together with `argv` answers `pass cmd or argv, not both`.
+  `shell: "none"` without `argv` is an error.
 - With `cmd` the text runs through `shell`; the default is `powershell` on
   Windows and `sh` elsewhere:
 
@@ -157,8 +159,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   | `sh` | `/bin/sh -c <cmd>` |
 
 - `cwd` is the working directory; `~`, `~/x` and relative paths resolve
-  against the home directory of the agent's user. `env` adds variables to the
-  agent's environment.
+  against the home directory of the agent's user, which is also the working
+  directory without `cwd`. `env` adds variables to the agent's environment.
 - On Windows every child starts with `CREATE_NO_WINDOW`: it has no console
   window, and a GUI program started directly shows its own windows.
 - `exec.run` gives the child a pipe that carries the `stdin` text and then
@@ -171,7 +173,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   dropped, so a truncated stream starts on a character boundary. Other
   invalid UTF-8 becomes U+FFFD.
 - Killing a tree (timeout, `exec.kill`, `proc.kill` with `tree`) runs
-  `taskkill /F /T /PID <pid>` on Windows; elsewhere each child leads its own
+  `taskkill /F /T /PID <pid>` (`taskkill.exe` of the system folder) on Windows; elsewhere each child leads its own
   process group and the group receives SIGKILL. `taskkill` follows parent
   process ids, so on Windows a process whose parent had already exited (for
   example a server started by `cmd /c start /b`) is not part of the tree and
@@ -210,15 +212,21 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 
 ### Processes (`proc.list`, `proc.kill`)
 
-- Windows lists `Win32_Process` (`mem_kb` is the working set); elsewhere
+- Windows lists `Win32_Process` (`mem_kb` is the working set) through the
+  system folder's Windows PowerShell, at most 30 s
+  (`listing the processes took longer than 30 s; retry`); elsewhere
   `ps axo pid=,ppid=,rss=,args=` (`name` is the base name of the first
   argument, `path` is set when that argument is absolute). Each `cmd` is cut to
-  8192 characters with a trailing `…` when longer.
+  8192 characters with a trailing `…` when longer, after each run of invalid
+  UTF-8 bytes became one U+FFFD (`exec.list` cuts its `cmd` the same way).
 - `proc.kill` with `pid` answers `killed: 1` or an error. With `name` it kills
   every process of that exact name: on Windows through
   `taskkill /F [/T] /IM <name>` (`.exe` is added to a name without an
-  extension) and `killed` counts the processes `taskkill` reports, which with
-  `tree` includes children; elsewhere by case-insensitive name comparison.
+  extension) and `killed` counts the lines of `taskkill` output that begin
+  with `SUCCESS` (English) or `성공` (Korean), which with `tree` includes
+  children; on other display languages it is 0 even when processes were
+  killed, and a refused kill also answers `killed: 0`. Elsewhere by
+  case-insensitive name comparison.
   No match answers `killed: 0`.
 
 ### App launch (`app.launch`)

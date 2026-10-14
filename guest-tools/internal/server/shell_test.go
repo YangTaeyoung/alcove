@@ -148,6 +148,29 @@ func TestBuildCommandForms(t *testing.T) {
 	if err == nil || err.Error() != "missing cmd or argv" {
 		t.Fatalf("empty request: %v", err)
 	}
+
+	_, err = buildCommand(proto.Message{"cmd": "ls", "argv": []any{"ls"}}, "linux")
+	if err == nil || err.Error() != "pass cmd or argv, not both" {
+		t.Fatalf("cmd with argv: %v", err)
+	}
+	_, err = buildCommand(proto.Message{"shell": "powershell", "argv": []any{"git"}}, "windows")
+	if err == nil || err.Error() != "shell 'powershell' does not run argv; pass shell 'none' or leave shell out" {
+		t.Fatalf("shell with argv: %v", err)
+	}
+	if cmd, err := buildCommand(proto.Message{"argv": []any{"git"}}, "windows"); err != nil || !reflect.DeepEqual(cmd.Args, []string{"git"}) {
+		t.Fatalf("argv without shell: %v %v", cmd, err)
+	}
+}
+
+func TestExecRunWithoutCwdRunsInTheHomeDirectory(t *testing.T) {
+	home := t.TempDir()
+	real, _ := filepath.EvalSymlinks(home)
+	c, _ := newRPCClient(t, Options{HomeDir: home})
+	res := c.ok("exec.run", proto.Message{"cmd": "pwd"})
+	got, err := filepath.EvalSymlinks(strings.TrimSpace(res.String("stdout")))
+	if err != nil || got != real {
+		t.Fatalf("stdout %q, expected %q", res.String("stdout"), real)
+	}
 }
 
 func TestCmdExeLineWrapsCommandInOuterQuotes(t *testing.T) {

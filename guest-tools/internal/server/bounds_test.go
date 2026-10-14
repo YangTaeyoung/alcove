@@ -16,6 +16,12 @@ func TestCutChars(t *testing.T) {
 	if got := cutChars("가나다라", 2); got != "가나…" {
 		t.Fatalf("cut at a rune boundary: %q", got)
 	}
+	if got := cutChars("a\xff\xfeb\x80c", 3); got != "a\uFFFDb…" {
+		t.Fatalf("invalid bytes: %q", got)
+	}
+	if got := cutChars("a\xffb", 5); got != "a\uFFFDb" {
+		t.Fatalf("short text with an invalid byte: %q", got)
+	}
 }
 
 func TestCutUTF8Bytes(t *testing.T) {

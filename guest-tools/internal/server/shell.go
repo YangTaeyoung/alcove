@@ -35,6 +35,12 @@ func buildCommand(req proto.Message, goos string) (*exec.Cmd, error) {
 	if shell == "none" && len(argv) == 0 {
 		return nil, errors.New("shell 'none' needs argv")
 	}
+	if cmdline != "" && len(argv) > 0 {
+		return nil, errors.New("pass cmd or argv, not both")
+	}
+	if len(argv) > 0 && shell != "" && shell != "none" {
+		return nil, fmt.Errorf("shell '%s' does not run argv; pass shell 'none' or leave shell out", shell)
+	}
 
 	var c *exec.Cmd
 	switch {
@@ -108,8 +114,9 @@ func resolveHomePath(home, p string) string {
 	return filepath.Join(home, p)
 }
 
-// newCommand builds a request's command with the working directory resolved,
-// no console window and its own process tree.
+// newCommand builds a request's command with the working directory resolved
+// (the home directory without cwd), no console window and its own process
+// tree.
 func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
 	c, err := buildCommand(req, runtime.GOOS)
 	if err != nil {
@@ -117,6 +124,8 @@ func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
 	}
 	if c.Dir != "" {
 		c.Dir = resolveHomePath(s.opt.HomeDir, c.Dir)
+	} else {
+		c.Dir = s.opt.HomeDir
 	}
 	hideWindow(c)
 	prepareTree(c)
