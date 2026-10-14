@@ -84,13 +84,13 @@ final class VMSession: Identifiable {
     /// what an earlier HTTP capture left in the guest.
     private func connectTools() {
         guard agentTask == nil else { return }
-        let port = config.agentHostPort, token = config.agentToken
+        let port = config.agentHostPort, token = config.agentToken, key = config.agentKey
         agentTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.state.isActive else { return }
                 let client = AgentClient()
                 do {
-                    try await client.connect(port: port, expectedToken: token, timeout: .seconds(5))
+                    try await client.connect(port: port, expectedToken: token, agentKey: key, timeout: .seconds(5))
                     self.agent = client
                     self.toolsConnected = true
                     AppControlServer.shared.guestToolsConnected(vm: self.name)
