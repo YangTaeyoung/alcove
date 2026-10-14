@@ -361,15 +361,43 @@ final class GuestRecipeTests: XCTestCase {
     private func check(_ r: JSON, _ id: String) -> JSON? { checks(r).first { $0["id"]?.stringValue == id } }
 
     func testDoctorWhenStopped() async throws {
-        let (h, _, _) = try await setup(state: .stopped, engine: "/opt/qemu/bin/qemu-system-aarch64")
+        let (h, _, _) = try await setup(state: .stopped, engine: "/bin/sh")
         let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(checks(r).compactMap { $0["id"]?.stringValue }, ["engine", "host", "state"])
         XCTAssertEqual(check(r, "engine")?["ok"]?.boolValue, true)
-        XCTAssertEqual(check(r, "engine")?["detail"]?.stringValue, "/opt/qemu/bin/qemu-system-aarch64")
+        XCTAssertEqual(check(r, "engine")?["detail"]?.stringValue, "/bin/sh")
         XCTAssertEqual(check(r, "host")?["detail"]?.stringValue, "test")
         XCTAssertEqual(check(r, "state")?["ok"]?.boolValue, false)
         XCTAssertEqual(check(r, "state")?["detail"]?.stringValue, "stopped")
         XCTAssertTrue(check(r, "state")?["hint"]?.stringValue?.contains("vm.start") == true)
+    }
+
+    func testDoctorEngineRowIsNotOkWhenTheEngineFileIsGone() async throws {
+        let (h, _, _) = try await setup(state: .stopped, engine: "/nonexistent/alcove/qemu-system-aarch64")
+        let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(r, "engine"), ["id": "engine", "ok": false, "detail": "/nonexistent/alcove/qemu-system-aarch64 is not there or cannot be run",
+                                              "hint": "build the engine with scripts/build-qemu.sh, then restart alcovectl serve"])
+    }
+
+    func testDoctorStateHintNamesTheNextStepOfEachState() {
+        XCTAssertEqual(ControlHandler.stateHint(.paused), "call vm.resume")
+        XCTAssertEqual(ControlHandler.stateHint(.starting), "wait until vm.status shows running, then retry")
+        XCTAssertEqual(ControlHandler.stateHint(.stopping), "wait until vm.status shows stopped, then call vm.start")
+        XCTAssertEqual(ControlHandler.stateHint(.suspending), "wait until vm.status shows stopped, then call vm.start")
+        XCTAssertEqual(ControlHandler.stateHint(.stopped), "call vm.start")
+        XCTAssertEqual(ControlHandler.stateHint(.failed("the engine exited")), "call vm.start")
+    }
+
+    func testDoctorRowsOfAProbeWithoutFreeSpaceOrNameResolutionAreNotChecked() async throws {
+        let text = ISO8601DateFormatter().string(from: hostNow)
+        let (h, _, _) = try await setup(os: .linux) { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m, stdout: "{\"user\":\"alcove\",\"freeBytes\":null,\"utc\":\"\(text)\"}\n")] : []
+        }
+        let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(r, "disk"), ["id": "disk", "ok": true, "detail": "free space not checked on this guest"])
+        XCTAssertEqual(check(r, "network"), ["id": "network", "ok": true, "detail": "name resolution not checked on this guest"])
+        let linux = try XCTUnwrap(GuestRecipes.doctorProbe(os: .linux))
+        XCTAssertTrue(linux.contains("\"${free:-null}\""), linux)
     }
 
     func testDoctorEngineManagedByAppWhenUnknown() async throws {
@@ -450,7 +478,7 @@ final class GuestRecipeTests: XCTestCase {
         let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(check(r, "session")?["ok"]?.boolValue, false)
         XCTAssertNotNil(check(r, "session")?["hint"]?.stringValue)
-        XCTAssertEqual(check(r, "disk")?["ok"]?.boolValue, false)
+        XCTAssertEqual(check(r, "disk")?["detail"]?.stringValue, "free space not checked on this guest")
         XCTAssertEqual(check(r, "clock")?["ok"]?.boolValue, false)
     }
 

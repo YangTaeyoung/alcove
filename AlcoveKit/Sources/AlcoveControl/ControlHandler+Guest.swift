@@ -204,12 +204,9 @@ extension ControlHandler {
     private func doctor(_ params: JSON) async throws -> JSON {
         let t = try await target(params)
         let state = await t.state()
-        var rows: [JSON] = [
-            check("engine", true, engineDescription ?? "managed by the Alcove app"),
-            check("host", true, hostKind),
-        ]
+        var rows: [JSON] = [engineCheck(), check("host", true, hostKind)]
         let running = state == .running
-        rows.append(check("state", running, describe(state), hint: state == .paused ? "call vm.resume" : "call vm.start"))
+        rows.append(check("state", running, describe(state), hint: ControlHandler.stateHint(state)))
         guard running else { return ["checks": .array(rows)] }
 
         if let frame = try? await screenshot(t) {
@@ -247,6 +244,24 @@ extension ControlHandler {
         return ["checks": .array(rows)]
     }
 
+    /// The `engine` row: the engine binary the host runs VMs with, not ok when that file is no longer there.
+    private func engineCheck() -> JSON {
+        guard let engine = engineDescription else { return check("engine", true, "managed by the Alcove app") }
+        guard engine.hasPrefix("/"), !FileManager.default.isExecutableFile(atPath: engine) else { return check("engine", true, engine) }
+        return check("engine", false, "\(engine) is not there or cannot be run",
+                     hint: "build the engine with scripts/build-qemu.sh, then restart alcovectl serve")
+    }
+
+    /// The next step for a VM in `state` that is not running.
+    static func stateHint(_ state: VMController.State) -> String {
+        switch state {
+        case .paused: return "call vm.resume"
+        case .starting: return "wait until vm.status shows running, then retry"
+        case .stopping, .suspending: return "wait until vm.status shows stopped, then call vm.start"
+        case .running, .stopped, .failed: return "call vm.start"
+        }
+    }
+
     private static func probeJSON(_ output: String) -> JSON? {
         for line in output.split(whereSeparator: \.isNewline).reversed() where line.hasPrefix("{") {
             if let json = try? JSON.parse(Data(line.utf8)), json.objectValue != nil { return json }
@@ -270,7 +285,7 @@ extension ControlHandler {
         if let free = probe["freeBytes"]?.intValue {
             rows.append(check("disk", Int64(free) >= ControlHandler.minimumFreeBytes, "\(free) bytes free", hint: "free disk space in the guest"))
         } else {
-            rows.append(check("disk", false, "the guest reported no free space", hint: "check the guest shell with vm.exec"))
+            rows.append(check("disk", true, "free space \(notChecked)"))
         }
         if let text = probe["utc"]?.stringValue, let utc = ISO8601DateFormatter().date(from: text) {
             let skew = abs(received.timeIntervalSince(utc))
@@ -278,9 +293,12 @@ extension ControlHandler {
         } else {
             rows.append(check("clock", false, "the guest reported no valid UTC time", hint: "vm.set_environment clock=host"))
         }
-        let dns = probe["dns"]?.boolValue ?? false
-        rows.append(check("network", dns, dns ? "example.com resolves" : "example.com does not resolve",
-                          hint: "call vm.set_network up=true and check the guest DNS settings"))
+        if let dns = probe["dns"]?.boolValue {
+            rows.append(check("network", dns, dns ? "example.com resolves" : "example.com does not resolve",
+                              hint: "call vm.set_network up=true and check the guest DNS settings"))
+        } else {
+            rows.append(check("network", true, "name resolution \(notChecked)"))
+        }
         if let scale = probe["scale"]?.intValue {
             rows.append(check("scale", true, "\(scale) %"))
         } else {
@@ -375,8 +393,17 @@ extension ControlHandler {
         return (1...255).contains(s.unicodeScalars.count) && !s.hasPrefix("-") && s.unicodeScalars.allSatisfy(allowed.contains)
     }
 
-    private static func cutMessage(_ s: String) -> String {
-        s.count > GuestRecipes.eventMessageLimit ? String(s.prefix(GuestRecipes.eventMessageLimit)) : s
+    /// `s` cut at `GuestRecipes.eventMessageLimit` UTF-16 units, one less where the cut would split a surrogate pair.
+    static func cutMessage(_ s: String) -> String {
+        guard s.utf16.count > GuestRecipes.eventMessageLimit else { return s }
+        var units = 0
+        var kept = String.UnicodeScalarView()
+        for scalar in s.unicodeScalars {
+            units += scalar.utf16.count
+            guard units <= GuestRecipes.eventMessageLimit else { break }
+            kept.append(scalar)
+        }
+        return String(kept)
     }
 
     /// The entries of the Windows recipe output, newest `time` first and in the output's order within one time:

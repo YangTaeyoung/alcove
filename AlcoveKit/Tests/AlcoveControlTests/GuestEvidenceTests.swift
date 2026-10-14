@@ -96,6 +96,19 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertEqual(r["truncated"]?.boolValue, true)
     }
 
+    func testLinuxEventMessagesAreCutAtTheSameUTF16LimitAsWindowsOnes() async throws {
+        let emoji = String(repeating: "a", count: 1999) + "\u{1F600}"
+        let accented = String(repeating: "e\u{301}", count: 1500)
+        let lines = [emoji, accented].enumerated().map { index, text in
+            "{\"__REALTIME_TIMESTAMP\":\"180000000\(index)000000\",\"PRIORITY\":\"6\",\"MESSAGE\":\"\(text)\"}"
+        }
+        let (h, _) = try await setup(os: .linux, stdout: lines.joined(separator: "\n") + "\n")
+        let r = try await h.handle(op: "vm.event_log", params: ["name": "Win"])
+        XCTAssertEqual(r["entries"]?[1]?["message"]?.stringValue, String(repeating: "a", count: 1999))
+        XCTAssertEqual(r["entries"]?[0]?["message"]?.stringValue?.utf16.count, 2000)
+        XCTAssertEqual(ControlHandler.cutMessage("short"), "short")
+    }
+
     func testEventLogLevelMapping() async throws {
         let expected = ["critical": " and (Level=1)", "error": " and (Level=1 or Level=2)", "warning": " and (Level=1 or Level=2 or Level=3)"]
         for (level, clause) in expected {
@@ -375,7 +388,82 @@ final class GuestEvidenceTests: XCTestCase {
         XCTAssertEqual(positions.compactMap { $0 }, positions.compactMap { $0 }.sorted(), script)
         XCTAssertTrue(script.contains("$existing = $hklm.OpenSubKey($root)"), script)
         XCTAssertTrue(script.contains("[pscustomobject]@{ folder = $folder; createdKey = $createdKey } | ConvertTo-Json -Compress"), script)
-        XCTAssertEqual(script.components(separatedBy: "AlcoveCreated").count - 1, 1, script)
+        XCTAssertEqual(script.components(separatedBy: "$parent.SetValue('AlcoveCreated'").count - 1, 1, script)
+    }
+
+    func testEnableDumpsRefusesALinkOrAForeignOwnerAndLocksTheFolderItself() throws {
+        let script = try XCTUnwrap(GuestRecipes.enableDumps(exe: "a.exe", full: false, os: .windows))
+        let steps = [
+            "$item = Get-Item -LiteralPath $folder -Force -ErrorAction SilentlyContinue",
+            "if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { [Console]::Error.WriteLine('C:\\alcove-dumps is a link; delete that link with vm.exec (Remove-Item without -Recurse), then call vm.crash_dumps.enable again'); exit 2 }",
+            "if (-not $createdFolder) {",
+            "$owner = (Get-Acl -LiteralPath $folder).GetOwner([Security.Principal.SecurityIdentifier]).Value",
+            "if ($owner -ne 'S-1-5-32-544' -and $owner -ne 'S-1-5-18') { [Console]::Error.WriteLine('C:\\alcove-dumps belongs to ' + $owner + ', not to Administrators or SYSTEM, so another user may have changed it; delete that folder with vm.exec, then call vm.crash_dumps.enable again'); exit 2 }",
+            "$null = & icacls.exe $folder /L /setowner '*S-1-5-32-544' 2>&1",
+            "$null = & icacls.exe $folder /L /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)(IO)M' 2>&1",
+            "$null = & icacls.exe $folder /L /grant '*S-1-5-32-545:(RX,WD)' 2>&1",
+            "if ((Get-Item -LiteralPath $folder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { [Console]::Error.WriteLine('C:\\alcove-dumps became a link while its permissions were set; delete that link with vm.exec, then call vm.crash_dumps.enable again'); exit 2 }",
+            "OpenBaseKey",
+        ]
+        let positions = steps.map { script.range(of: $0)?.lowerBound }
+        XCTAssertFalse(positions.contains { $0 == nil }, script)
+        XCTAssertEqual(positions.compactMap { $0 }, positions.compactMap { $0 }.sorted(), script)
+        let icacls = script.components(separatedBy: "\n").filter { $0.contains("icacls.exe") }
+        XCTAssertEqual(icacls.count, 3, script)
+        XCTAssertTrue(icacls.allSatisfy { $0.contains("icacls.exe $folder /L ") }, script)
+        XCTAssertFalse(script.contains("New-Item -ItemType Directory -Force"), script)
+        assertBalanced(script)
+    }
+
+    func testEnableDumpsKeepsTheValuesOfAnImageKeyItDidNotCreate() throws {
+        let script = try XCTUnwrap(GuestRecipes.enableDumps(exe: "a.exe", full: false, os: .windows))
+        let steps = [
+            "$image = $hklm.OpenSubKey($sub)",
+            "$marked = $null -ne $image.GetValue('AlcoveCreated') -or $null -ne $image.GetValue('AlcovePrior')",
+            "$key = $hklm.CreateSubKey($sub)",
+            "if ($createdImage) {\n    $key.SetValue('AlcoveCreated', 1, [Microsoft.Win32.RegistryValueKind]::DWord)\n  } elseif (-not $marked) {",
+            "foreach ($name in 'DumpFolder', 'DumpCount', 'DumpType') {",
+            "$key.SetValue('AlcovePrior' + $name, $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames), $key.GetValueKind($name))",
+            "$key.SetValue('AlcovePrior', 1, [Microsoft.Win32.RegistryValueKind]::DWord)",
+            "$key.SetValue('DumpFolder', $folder,",
+        ]
+        let positions = steps.map { script.range(of: $0)?.lowerBound }
+        XCTAssertFalse(positions.contains { $0 == nil }, script)
+        XCTAssertEqual(positions.compactMap { $0 }, positions.compactMap { $0 }.sorted(), script)
+    }
+
+    func testDisableDumpsPutsBackAnImageKeyItDidNotCreateAndLeavesOthersAlone() throws {
+        let script = try XCTUnwrap(GuestRecipes.disableDumps(exe: "a.exe", os: .windows))
+        let steps = [
+            "$key = $hklm.OpenSubKey($sub, $true)",
+            "$remove = $names -contains 'AlcoveCreated' -or (-not ($names -contains 'AlcovePrior') -and -not ($names | Where-Object { $_ -like 'Alcove*' }) -and $setFolder -eq $folder)",
+            "$hklm.DeleteSubKeyTree($sub, $false)",
+            "} elseif ($names -contains 'AlcovePrior') {",
+            "$key.SetValue($name, $key.GetValue('AlcovePrior' + $name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames), $key.GetValueKind('AlcovePrior' + $name))",
+            "$key.DeleteValue($name, $false)",
+            "$key.DeleteValue('AlcovePrior', $false)",
+            "$parent = $hklm.OpenSubKey($root)",
+        ]
+        let positions = steps.map { script.range(of: $0)?.lowerBound }
+        XCTAssertFalse(positions.contains { $0 == nil }, script)
+        XCTAssertEqual(positions.compactMap { $0 }, positions.compactMap { $0 }.sorted(), script)
+        XCTAssertEqual(script.components(separatedBy: "DeleteSubKeyTree").count - 1, 1, script)
+        assertBalanced(script)
+    }
+
+    /// Records a failure unless `script` has an even number of single quotes and, outside them, as many closing as
+    /// opening braces, parentheses and brackets.
+    private func assertBalanced(_ script: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(script.filter { $0 == "'" }.count % 2, 0, file: file, line: line)
+        var code = ""
+        var quoted = false
+        for ch in script {
+            if ch == "'" { quoted.toggle(); continue }
+            if !quoted { code.append(ch) }
+        }
+        for (open, close) in [("{", "}"), ("(", ")"), ("[", "]")] {
+            XCTAssertEqual(code.filter { String($0) == open }.count, code.filter { String($0) == close }.count, "\(open)\(close)", file: file, line: line)
+        }
     }
 
     func testEnableDumpsReportsThatItLeftAnExistingLocalDumpsKeyAlone() async throws {
@@ -473,11 +561,10 @@ final class GuestEvidenceTests: XCTestCase {
         let (h, agent) = try await setup()
         _ = try await h.handle(op: "vm.crash_dumps.enable", params: ["name": "Win", "exe": "a.exe"])
         let enable = try XCTUnwrap(commands(agent).first)
-        XCTAssertTrue(enable.contains("$null = & icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M' 2>&1\n"), enable)
-        XCTAssertTrue(enable.contains("$LASTEXITCODE -ne 0"), enable)
+        XCTAssertTrue(enable.contains("if ($owned -ne 0 -or $locked -ne 0 -or $writable -ne 0) {"), enable)
         XCTAssertLessThan(try XCTUnwrap(enable.range(of: "try {")).lowerBound, try XCTUnwrap(enable.range(of: "OpenBaseKey")).lowerBound, enable)
-        XCTAssertTrue(enable.contains("[Console]::Error.WriteLine('could not make C:\\alcove-dumps writable for the Users group; check that alcove-agent runs elevated and may change the permissions of that folder'); exit 2"), enable)
-        XCTAssertTrue(enable.contains("if (-not (Test-Path -LiteralPath $folder -PathType Container)) { [Console]::Error.WriteLine('C:\\alcove-dumps is not a folder; remove or rename that file, then call vm.crash_dumps.enable again'); exit 2 }"), enable)
+        XCTAssertTrue(enable.contains("[Console]::Error.WriteLine('could not lock C:\\alcove-dumps and make it writable for the Users group; check that alcove-agent runs elevated and may change the owner and the permissions of that folder'); exit 2"), enable)
+        XCTAssertTrue(enable.contains("if (-not $item.PSIsContainer) { [Console]::Error.WriteLine('C:\\alcove-dumps is not a folder; remove or rename that file, then call vm.crash_dumps.enable again'); exit 2 }"), enable)
         XCTAssertTrue(enable.contains("catch {"), enable)
         XCTAssertTrue(enable.contains("check that alcove-agent runs elevated"), enable)
         _ = try await h.handle(op: "vm.crash_dumps.disable", params: ["name": "Win", "exe": "a.exe"])

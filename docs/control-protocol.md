@@ -1305,18 +1305,18 @@ that makes the later ones impossible:
 
 | `id` | `detail` | not ok when | ends the list |
 |---|---|---|---|
-| `engine` | the engine binary the server runs VMs with, or `managed by the Alcove app` | never | |
+| `engine` | the engine binary the server runs VMs with, or `managed by the Alcove app` | the binary is no longer there or cannot be run: `<path> is not there or cannot be run` (hint `build the engine with scripts/build-qemu.sh, then restart alcovectl serve`) | |
 | `host` | `app` or `headless` | never | |
-| `state` | the VM's state | not `running` (hint `call vm.start`, or `call vm.resume` when paused) | when not running |
+| `state` | the VM's state | not `running` (hint `call vm.start`; `call vm.resume` when paused; `wait until vm.status shows running, then retry` while starting; `wait until vm.status shows stopped, then call vm.start` while stopping or suspending) | when not running |
 | `display` | `<W>x<H>` of the current frame | no frame can be read | |
 | `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s | when not ok |
 | `rpc` | `proto <n>` | below 2 | when `rpc` or `exec` is not ok |
 | `exec` | `enabled` or `disabled` | the tools were started without `--allow-exec` | |
 | `probe` | why the guest probe gave nothing | present only on failure: the guest OS has no probe script, the script failed or printed no JSON | always |
 | `session` | `<user>, unlocked` / `<user>, locked` / `<user>, lock state not checked on this guest` | locked, or the guest reported no user | |
-| `disk` | `<n> bytes free` on the system drive | below 2 GiB, or not reported | |
+| `disk` | `<n> bytes free` on the system drive, or `free space not checked on this guest` | below 2 GiB | |
 | `clock` | `skew <n> s` between guest and host | above 5 s (hint `vm.set_environment clock=host`), or no valid time reported | |
-| `network` | `example.com resolves` / `does not resolve` | the name does not resolve in the guest | |
+| `network` | `example.com resolves` / `does not resolve`, or `name resolution not checked on this guest` | the name does not resolve in the guest | |
 | `scale` | `<p> %` or `not checked on this guest` | never | |
 | `proxy` | the guest's system proxy held against the VM's HTTP capture, see [Doctor row](#doctor-row) | something of an earlier capture is left in the guest, the system proxy points at another port than the capture's, or the guest printed no proxy settings | |
 
@@ -1427,14 +1427,17 @@ changing screen, `vm.record.start` and `vm.record.stop` each answered within
   `info`; journal priorities 0–2, 0–3, 0–4 and 0–6. Entries are labelled
   `critical` (Windows 1), `error` (2), `warning` (3) and `info` (everything
   else, also the level 0 of Security audit entries).
-- `provider` is the provider's exact name in any case, without wildcards (on
-  Linux the syslog identifier); a provider no entry has gives an empty list.
+- `provider` is the provider's exact name without wildcards: in any letter
+  case on Windows, in the same case on Linux, where it is the syslog
+  identifier given to `journalctl -t`; a provider no entry has gives an empty
+  list.
 - `contains` keeps the entries whose message holds the text, in any case. It
   is searched in every entry of the time window, which is the slow part of a
   large log.
 - `provider` and `contains` are at most 1000 characters and hold no NUL.
 - `id` is the event id (on Linux the process id); `message` is cut at 2000
-  UTF-16 units, one less where the cut would split a surrogate pair. `time`
+  UTF-16 units on every guest, one less where the cut would split a surrogate
+  pair. `time`
   is ISO 8601 in UTC from the guest's clock.
 - `truncated: true` says that more entries matched than the output holds: the
   guest prints at most 150000 bytes of entries, and the newest ones are kept.
@@ -1470,20 +1473,36 @@ They need guest tools that run commands, elevated.
   image `exe` (a file name ending in `.exe`, no folder, no character a Windows
   file name cannot hold, not a device name such as `CON`) into
   `C:\alcove-dumps`: mini dumps, or full dumps with `full: true`. It creates
-  the folder, grants the Users group modify rights on it (so a crashing
-  program of any user can write there; the grant stays after `disable`), and
-  writes `DumpFolder`, `DumpCount` 5 and `DumpType` under
+  the folder when it is missing and refuses one that is a link (`C:\alcove-dumps
+  is a link; delete that link with vm.exec (Remove-Item without -Recurse), then
+  call vm.crash_dumps.enable again`) or that belongs to anyone but the
+  Administrators group or SYSTEM (`C:\alcove-dumps belongs to <SID>, not to
+  Administrators or SYSTEM, so another user may have changed it; delete that
+  folder with vm.exec, then call vm.crash_dumps.enable again`). It then makes
+  Administrators the owner, removes the inherited entries and leaves full
+  control to Administrators and SYSTEM, read and add-file rights on the folder
+  and modify rights on what it holds to the Users group, so a crashing program
+  of any user can write there but no standard user can rename or replace the
+  folder; `icacls` gets `/L`, so it never changes what a link points to. The
+  permissions stay after `disable`. It writes `DumpFolder`, `DumpCount` 5 and
+  `DumpType` under
   `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<exe>`
   in the 64-bit registry view, which serves ARM64, x64 and x86 programs. When
   the `LocalDumps` key did not exist, it creates it with the value
-  `AlcoveCreated` (1) and answers `createdKey: true`. The result's `folder`
-  is `C:\alcove-dumps`.
+  `AlcoveCreated` (1) and answers `createdKey: true`; an image key it creates
+  gets `AlcoveCreated` too. An image key that existed keeps a copy of its
+  `DumpFolder`, `DumpCount` and `DumpType` as `AlcovePriorDumpFolder` and so
+  on, marked with `AlcovePrior` (1). The result's `folder` is
+  `C:\alcove-dumps`.
 - While a `LocalDumps` key exists, Windows also writes a mini dump of every
   other crashing program into that user's `%LOCALAPPDATA%\CrashDumps`. Windows
   keeps the newest 5 dumps of `C:\alcove-dumps`, counted over all enabled
   images.
-- `vm.crash_dumps.disable` removes the image's key with every value in it,
-  then the `LocalDumps` key when its only value is `AlcoveCreated` and it has
+- `vm.crash_dumps.disable` removes the image's key when `enable` created it
+  (or, without any `Alcove` value, when its `DumpFolder` is
+  `C:\alcove-dumps`); an image key `enable` found gets back the values it had
+  then and loses the `Alcove` values; any other image key stays as it is. Then
+  it removes the `LocalDumps` key when its only value is `AlcoveCreated` and it has
   no subkey: a key made by someone else, one that holds another value, or
   one that still holds another image's key stays. Dumps stay in the folder. An
   image that was never enabled succeeds and changes nothing else.

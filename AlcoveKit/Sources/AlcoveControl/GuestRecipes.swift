@@ -11,8 +11,8 @@ enum GuestRecipes {
 
     private static let windowsPrelude = "$ErrorActionPreference = 'Stop'\n$WarningPreference = 'SilentlyContinue'\n"
 
-    /// Quotes a value for a single-quoted PowerShell or sh string. Works on Unicode scalars, so a quote
-    /// followed by a combining mark is still escaped.
+    /// Quotes a value for a single-quoted PowerShell or sh string, one Unicode scalar at a time: for PowerShell it
+    /// doubles `'` and U+2018 to U+201B, for sh it writes `'\''` in place of `'`.
     static func quote(_ s: String, os: VMConfig.GuestOS) -> String {
         var out = String.UnicodeScalarView()
         for scalar in s.unicodeScalars {
@@ -215,7 +215,7 @@ enum GuestRecipes {
             return """
             dns=false; getent hosts example.com >/dev/null 2>&1 && dns=true
             free=$(df -Pk / | awk 'NR==2 { printf "%.0f", $4 * 1024 }')
-            printf '{"user":"%s","freeBytes":%s,"utc":"%s","dns":%s}\\n' "$(id -un)" "${free:-0}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dns"
+            printf '{"user":"%s","freeBytes":%s,"utc":"%s","dns":%s}\\n' "$(id -un)" "${free:-null}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dns"
             """
         case .other:
             return nil
@@ -263,7 +263,7 @@ enum GuestRecipes {
     /// without an apostrophe are selected by an XPath query; a provider name with an apostrophe and `contains` are
     /// matched in the pipeline. A log that is missing or closed to the agent's user and a failed read each print one
     /// sentence on stderr and exit with 2.
-    /// Linux: prints the journal as one JSON object per line in time order, so a cut output loses the oldest lines.
+    /// Linux: prints the journal as one JSON object per line, oldest first.
     /// `level` is `critical`, `error`, `warning` or `info`.
     static func eventLog(log: String, level: String?, provider: String?, sinceMinutes: Int, contains: String?, max: Int,
                          os: VMConfig.GuestOS) -> String? {
@@ -355,9 +355,17 @@ enum GuestRecipes {
     private static let openLocalMachine =
         "$hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)"
 
-    /// Windows only: creates `dumpFolder`, grants the Users group modify rights on it and sets the Windows Error Reporting
-    /// local dump values for `exe` (`DumpFolder`, `DumpCount` 5, `DumpType` 1 mini or 2 full). A `LocalDumps` key that
-    /// does not exist yet is created with the value `AlcoveCreated` (DWord 1). Prints `{"folder": ..., "createdKey": ...}`
+    /// The values `enableDumps` sets in the local dump key of an image.
+    private static let dumpValues = "'DumpFolder', 'DumpCount', 'DumpType'"
+
+    /// Windows only: makes `dumpFolder` a folder owned by the Administrators group that Administrators and SYSTEM
+    /// control fully and the Users group can add files to, with no inherited entries, and sets the Windows Error
+    /// Reporting local dump values for `exe` (`DumpFolder`, `DumpCount` 5, `DumpType` 1 mini or 2 full).
+    /// An existing `dumpFolder` that is a link (a reparse point) or is owned by anyone but Administrators or SYSTEM is
+    /// refused; `icacls` changes the folder itself, never what a link points to. A `LocalDumps` key that does not exist
+    /// yet is created with the value `AlcoveCreated` (DWord 1), and so is an image key that does not exist yet. An
+    /// existing image key without `AlcoveCreated` or `AlcovePrior` keeps a copy of each of its dump values as
+    /// `AlcovePrior<name>` of the same kind and gets `AlcovePrior` (DWord 1). Prints `{"folder": ..., "createdKey": ...}`
     /// where `createdKey` tells whether it created the `LocalDumps` key.
     /// A failure prints one sentence on stderr and exits with 2.
     static func enableDumps(exe: String, full: Bool, os: VMConfig.GuestOS) -> String? {
@@ -365,12 +373,28 @@ enum GuestRecipes {
         return windowsPrelude + localDumpsKey(exe) + """
         $folder = '\(dumpFolder)'
         try {
-          [void](New-Item -ItemType Directory -Force -Path $folder)
-          if (-not (Test-Path -LiteralPath $folder -PathType Container)) { [Console]::Error.WriteLine('\(dumpFolder) is not a folder; remove or rename that file, then call vm.crash_dumps.enable again'); exit 2 }
+          $item = Get-Item -LiteralPath $folder -Force -ErrorAction SilentlyContinue
+          $createdFolder = -not $item
+          if ($createdFolder) {
+            [void](New-Item -ItemType Directory -Path $folder)
+            $item = Get-Item -LiteralPath $folder -Force
+          }
+          if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { [Console]::Error.WriteLine('\(dumpFolder) is a link; delete that link with vm.exec (Remove-Item without -Recurse), then call vm.crash_dumps.enable again'); exit 2 }
+          if (-not $item.PSIsContainer) { [Console]::Error.WriteLine('\(dumpFolder) is not a folder; remove or rename that file, then call vm.crash_dumps.enable again'); exit 2 }
+          if (-not $createdFolder) {
+            $owner = (Get-Acl -LiteralPath $folder).GetOwner([Security.Principal.SecurityIdentifier]).Value
+            if ($owner -ne 'S-1-5-32-544' -and $owner -ne 'S-1-5-18') { [Console]::Error.WriteLine('\(dumpFolder) belongs to ' + $owner + ', not to Administrators or SYSTEM, so another user may have changed it; delete that folder with vm.exec, then call vm.crash_dumps.enable again'); exit 2 }
+          }
           $ErrorActionPreference = 'Continue'
-          $null = & icacls.exe $folder /grant '*S-1-5-32-545:(OI)(CI)M' 2>&1
+          $null = & icacls.exe $folder /L /setowner '*S-1-5-32-544' 2>&1
+          $owned = $LASTEXITCODE
+          $null = & icacls.exe $folder /L /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)(IO)M' 2>&1
+          $locked = $LASTEXITCODE
+          $null = & icacls.exe $folder /L /grant '*S-1-5-32-545:(RX,WD)' 2>&1
+          $writable = $LASTEXITCODE
           $ErrorActionPreference = 'Stop'
-          if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('could not make \(dumpFolder) writable for the Users group; check that alcove-agent runs elevated and may change the permissions of that folder'); exit 2 }
+          if ($owned -ne 0 -or $locked -ne 0 -or $writable -ne 0) { [Console]::Error.WriteLine('could not lock \(dumpFolder) and make it writable for the Users group; check that alcove-agent runs elevated and may change the owner and the permissions of that folder'); exit 2 }
+          if ((Get-Item -LiteralPath $folder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { [Console]::Error.WriteLine('\(dumpFolder) became a link while its permissions were set; delete that link with vm.exec, then call vm.crash_dumps.enable again'); exit 2 }
           \(openLocalMachine)
           $existing = $hklm.OpenSubKey($root)
           if ($existing) { $existing.Close() }
@@ -380,7 +404,24 @@ enum GuestRecipes {
             $parent.SetValue('AlcoveCreated', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
             $parent.Close()
           }
+          $image = $hklm.OpenSubKey($sub)
+          $createdImage = -not $image
+          $marked = $false
+          if ($image) {
+            $marked = $null -ne $image.GetValue('AlcoveCreated') -or $null -ne $image.GetValue('AlcovePrior')
+            $image.Close()
+          }
           $key = $hklm.CreateSubKey($sub)
+          if ($createdImage) {
+            $key.SetValue('AlcoveCreated', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+          } elseif (-not $marked) {
+            foreach ($name in \(dumpValues)) {
+              if ($key.GetValueNames() -contains $name) {
+                $key.SetValue('AlcovePrior' + $name, $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames), $key.GetValueKind($name))
+              }
+            }
+            $key.SetValue('AlcovePrior', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+          }
           $key.SetValue('DumpFolder', $folder, [Microsoft.Win32.RegistryValueKind]::ExpandString)
           $key.SetValue('DumpCount', 5, [Microsoft.Win32.RegistryValueKind]::DWord)
           $key.SetValue('DumpType', \(full ? 2 : 1), [Microsoft.Win32.RegistryValueKind]::DWord)
@@ -393,15 +434,41 @@ enum GuestRecipes {
         """
     }
 
-    /// Windows only: removes the local dump key of `exe`, then the `LocalDumps` key itself when its only value is
-    /// `AlcoveCreated` and it holds no subkey; other images keep theirs. A failure to remove the `LocalDumps` key is ignored. A failure prints one sentence on stderr and exits with 2.
+    /// Windows only: undoes `enableDumps` for `exe`. An image key with `AlcoveCreated`, or without any `Alcove` value
+    /// whose `DumpFolder` is `dumpFolder`, is removed; one with `AlcovePrior` gets back each dump value it had (a value
+    /// it did not have is removed) and loses the `Alcove` values; any other image key is left as it is. Then the
+    /// `LocalDumps` key itself is removed when its only value is `AlcoveCreated` and it holds no subkey. A failure to
+    /// remove the `LocalDumps` key is ignored. A failure prints one sentence on stderr and exits with 2.
     static func disableDumps(exe: String, os: VMConfig.GuestOS) -> String? {
         guard os == .windows else { return nil }
         return windowsPrelude + localDumpsKey(exe) + """
+        $folder = '\(dumpFolder)'
         try {
           \(openLocalMachine)
-          $hklm.DeleteSubKeyTree($sub, $false)
-          if ($hklm.OpenSubKey($sub)) { [Console]::Error.WriteLine('the crash dump setting is still there after its removal; check that alcove-agent runs elevated'); exit 2 }
+          $key = $hklm.OpenSubKey($sub, $true)
+          if ($key) {
+            $names = $key.GetValueNames()
+            $setFolder = [string]$key.GetValue('DumpFolder', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $remove = $names -contains 'AlcoveCreated' -or (-not ($names -contains 'AlcovePrior') -and -not ($names | Where-Object { $_ -like 'Alcove*' }) -and $setFolder -eq $folder)
+            if ($remove) {
+              $key.Close()
+              $hklm.DeleteSubKeyTree($sub, $false)
+              if ($hklm.OpenSubKey($sub)) { [Console]::Error.WriteLine('the crash dump setting is still there after its removal; check that alcove-agent runs elevated'); exit 2 }
+            } elseif ($names -contains 'AlcovePrior') {
+              foreach ($name in \(dumpValues)) {
+                if ($names -contains ('AlcovePrior' + $name)) {
+                  $key.SetValue($name, $key.GetValue('AlcovePrior' + $name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames), $key.GetValueKind('AlcovePrior' + $name))
+                  $key.DeleteValue('AlcovePrior' + $name, $false)
+                } else {
+                  $key.DeleteValue($name, $false)
+                }
+              }
+              $key.DeleteValue('AlcovePrior', $false)
+              $key.Close()
+            } else {
+              $key.Close()
+            }
+          }
           $parent = $hklm.OpenSubKey($root)
           if ($parent) {
             $owned = $null -ne $parent.GetValue('AlcoveCreated') -and $parent.ValueCount -eq 1 -and $parent.SubKeyCount -eq 0
