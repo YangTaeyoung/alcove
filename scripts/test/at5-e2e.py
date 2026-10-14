@@ -64,7 +64,7 @@ MARKER = "alcove e2e marker"
 MARKUP_MARKER = "alcove e2e a&b <c> d>e"
 MARKUP_PROVIDERS = ["a&b", "a<b", "a>b", "a]b", "a<![CDATA["]
 DISABLE_IMAGES = ["alcove-e2e-a.exe", "alcove-e2e-b.exe", "alcove-e2e-x.exe"]
-COPY_NOTE = "video.mp4: copied while recording, up to the last second may be missing"
+COPY_NOTE = "video.mp4: copied while recording; its last seconds may be missing"
 LONG_RECORDING_S = 185
 AGENT_STOP_S = 45
 RESTART_AGENT_LATER = ("$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "
