@@ -231,6 +231,7 @@ extension ControlHandler {
                         try? captureJournal.remove(vm: vm, now: wallClock())
                         throw error
                     }
+                    if ControlHandler.failureReason(error, fallback: "") == GuestRecipes.unreadableProxyState { throw error }
                     throw ControlError.failed("\(ControlHandler.failureReason(error, fallback: "vm.http.start failed in the guest")); the guest keeps what this "
                         + "attempt changed, and Alcove restores it when its guest tools next connect; call vm.http.stop to restore it now")
                 }
@@ -624,7 +625,9 @@ extension ControlHandler {
             return check("proxy", false, "no capture is running, but " + left.joined(separator: " and "),
                          hint: "vm.http.stop clears stale proxy settings")
         }
-        return check("proxy", true, enabled ? "system proxy \(server)" : "no system proxy")
+        guard enabled else { return check("proxy", true, "no system proxy") }
+        let foreign = ControlHandler.capturePort(in: server) != nil ? " (not set by Alcove; if a capture left it, change it by hand)" : ""
+        return check("proxy", true, "system proxy \(server)\(foreign)")
     }
 
     /// The port of `text` when the whole text is `10.0.2.2:<port>`; nil for any other text.

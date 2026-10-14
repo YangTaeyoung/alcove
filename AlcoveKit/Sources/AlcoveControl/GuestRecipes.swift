@@ -500,14 +500,19 @@ enum GuestRecipes {
         + "put the proxy settings right by hand, delete that file and call vm.http.stop again"
 
     /// `AlcoveState`: the object stored in `$statePath`; nothing when the file is missing; the text `unreadable` when
-    /// the file is there and does not hold a version 1 state with a thumbprint, a port and `systemProxy`.
+    /// the file is there and does not hold a version 1 state with a thumbprint, a port and `systemProxy`. A read that
+    /// fails is tried three times, 200 ms apart.
     /// `AlcoveSafe`: a string of base64 characters as it is, nothing for any other value.
     /// `AlcoveKindText`: `String`, `ExpandString` or `DWord` when the value is one of these names, nothing otherwise.
     private static let proxyStateReader = #"""
         function AlcoveState {
           if (-not [System.IO.File]::Exists($statePath)) { return $null }
+          $text = $null
+          foreach ($attempt in 1, 2, 3) {
+            try { $text = [System.IO.File]::ReadAllText($statePath); break } catch { Start-Sleep -Milliseconds 200 }
+          }
           $s = $null
-          try { $s = ConvertFrom-Json ([System.IO.File]::ReadAllText($statePath)) } catch { $s = $null }
+          try { $s = ConvertFrom-Json $text } catch { $s = $null }
           if (($s -is [System.Management.Automation.PSCustomObject]) -and ([string]$s.version -ceq '1') -and ([string]$s.thumbprint -match '^[0-9A-Fa-f]{40}\z') -and ([string]$s.port -match '^[1-9][0-9]{0,4}\z') -and ($s.systemProxy -is [bool])) {
             if ([int]$s.port -le 65535) { return $s }
           }
@@ -523,14 +528,15 @@ enum GuestRecipes {
 
     /// `AlcoveBlobText`: the bytes of a registry value as Latin-1 text without NUL characters.
     /// `AlcovePort`: the port of a `10.0.2.2:<port>` that stands in a text as a whole address, with no name, address
-    /// or proxy list around it; 0 when the text holds none.
+    /// or proxy list around it (no letter, digit, `.`, `;`, `:`, `-`, space or comma right next to it, nor `=` or `/`
+    /// right before it); 0 when the text holds none.
     private static let proxyAddressReader = #"""
         function AlcoveBlobText($raw) {
           if ($raw -isnot [byte[]]) { return '' }
           return [System.Text.Encoding]::GetEncoding(28591).GetString($raw).Replace([string][char]0, '')
         }
         function AlcovePort($text) {
-          $m = [regex]::Match([string]$text, '(?<![0-9A-Za-z.=;:/-])10\.0\.2\.2:([0-9]{1,5})(?![0-9A-Za-z.;:-])')
+          $m = [regex]::Match([string]$text, '(?<![0-9A-Za-z.=;:/ ,-])10\.0\.2\.2:([0-9]{1,5})(?![0-9A-Za-z.;: ,-])')
           if ($m.Success) { return [int]$m.Groups[1].Value }
           return 0
         }
@@ -559,9 +565,10 @@ enum GuestRecipes {
     /// The WinINET values a capture changes: the registry value name and its field in the state file.
     private static let wininetTextValues = [("ProxyServer", "proxyServer"), ("ProxyOverride", "proxyOverride"), ("AutoConfigURL", "autoConfigURL")]
 
-    /// Windows: gives the pushed CA file the access list "Administrators and SYSTEM: full control, Users: read" without
-    /// inheritance, checks that its certificate has `thumbprint` (the SHA-1 of the certificate as 40 hexadecimal
-    /// digits) and adds it to the machine's trusted roots unless it is there. Prints `{"installed":true,"added":<bool>}`.
+    /// Windows: refuses a state file that cannot be read before anything else, gives the pushed CA file the access list
+    /// "Administrators and SYSTEM: full control, Users: read" without inheritance, checks that its certificate has
+    /// `thumbprint` (the SHA-1 of the certificate as 40 hexadecimal digits) and adds it to the machine's trusted roots
+    /// unless it is there. Prints `{"installed":true,"added":<bool>}`.
     /// Linux: makes the pushed CA file world-readable and runs `update-ca-certificates`. Prints
     /// `{"installed":<bool>,"bundle":"<path>"}`: `installed` is false when the guest has no `update-ca-certificates`;
     /// `bundle` is the system bundle that holds the CA, or the CA file when there is none.
@@ -569,10 +576,11 @@ enum GuestRecipes {
     static func installProxyCA(thumbprint: String, os: VMConfig.GuestOS) -> String? {
         switch os {
         case .windows:
-            return windowsPrelude + proxyPaths + proxyCAReader + proxyRootStore + "$thumb = \(quote(thumbprint, os: os))\n" + #"""
+            return windowsPrelude + proxyPaths + proxyCAReader + proxyRootStore + proxyStateReader + "$thumb = \(quote(thumbprint, os: os))\n" + #"""
             $added = $false
             try {
-              if (-not [System.IO.File]::Exists($caPath)) { [Console]::Error.WriteLine('the proxy CA file C:\ProgramData\Alcove\proxy-ca.pem is missing in the guest; call vm.http.start again'); exit 2 }
+              $state = AlcoveState
+            \#(refuseUnreadableState)  if (-not [System.IO.File]::Exists($caPath)) { [Console]::Error.WriteLine('the proxy CA file C:\ProgramData\Alcove\proxy-ca.pem is missing in the guest; call vm.http.start again'); exit 2 }
               $allow = [System.Security.AccessControl.AccessControlType]::Allow
               $acl = New-Object System.Security.AccessControl.FileSecurity
               $acl.SetAccessRuleProtection($true, $false)
@@ -608,8 +616,9 @@ enum GuestRecipes {
     }
 
     /// Windows: removes the certificate with `thumbprint` from the machine's trusted roots, or without a thumbprint the
-    /// certificate of the CA file, and deletes the CA file. Linux: deletes the CA file and runs
-    /// `update-ca-certificates --fresh` when the guest has it.
+    /// certificate of the CA file, and deletes the CA file. Linux: renames the CA file to `<CA file>.removing`, runs
+    /// `update-ca-certificates --fresh` when the guest has it, and deletes `<CA file>.removing` once that worked; a
+    /// `<CA file>.removing` that is there is refreshed and deleted the same way.
     /// Prints `{"removed":<bool>,"fileRemoved":<bool>}`: whether a certificate left the trusted roots and whether the
     /// file was there. A failure prints one sentence on stderr and exits with 2.
     static func removeProxyCA(thumbprint: String?, os: VMConfig.GuestOS) -> String? {
@@ -637,11 +646,13 @@ enum GuestRecipes {
         case .linux:
             return #"""
             ca=\#(linuxProxyCAPath)
-            [ -e "$ca" ] || { printf '{"removed":false,"fileRemoved":false}\n'; exit 0; }
-            rm -f "$ca" || { echo "could not delete $ca; check that alcove-agent runs as root, then call vm.http.stop again" >&2; exit 2; }
+            gone="$ca.removing"
+            if [ -e "$ca" ]; then mv -f "$ca" "$gone" || { echo "could not move $ca aside; check that alcove-agent runs as root, then call vm.http.stop again" >&2; exit 2; }; fi
+            [ -e "$gone" ] || { printf '{"removed":false,"fileRemoved":false}\n'; exit 0; }
             if command -v update-ca-certificates >/dev/null 2>&1; then
-              update-ca-certificates --fresh >/dev/null 2>&1 || { echo "update-ca-certificates failed in the guest; run it with vm.exec to see why" >&2; exit 2; }
+              update-ca-certificates --fresh >/dev/null 2>&1 || { echo "update-ca-certificates --fresh failed in the guest, so the guest still trusts the proxy CA; run it with vm.exec to see why, then call vm.http.stop again" >&2; exit 2; }
             fi
+            rm -f "$gone" || { echo "could not delete $gone; check that alcove-agent runs as root, then call vm.http.stop again" >&2; exit 2; }
             printf '{"removed":true,"fileRemoved":true}\n'
             """#
         case .other:
@@ -670,8 +681,8 @@ enum GuestRecipes {
     /// `AlcoveRestoreText`: puts a remembered text value back with its remembered kind, or deletes the value when it
     /// is remembered as absent.
     /// `AlcoveRestore`: puts back what the state remembers, where the settings are still the ones its capture set: the
-    /// four WinINET values when `ProxyServer` is exactly `10.0.2.2:<port of the state>`, and the raw `WinHttpSettings`
-    /// value when it holds exactly that address. Returns whether a value was put back.
+    /// four WinINET values when `ProxyServer` is exactly `10.0.2.2:<port of the state>`, `ProxyServer` last, and the raw
+    /// `WinHttpSettings` value when it holds exactly that address. Returns whether a value was put back.
     private static let proxyStateRestorer = #"""
         function AlcoveRestoreText($key, $name, $stored, $kindName) {
           if ($null -eq $stored) { $key.DeleteValue($name, $false); return }
@@ -684,10 +695,10 @@ enum GuestRecipes {
           $key = $hkcu.CreateSubKey($inet)
           $serverNow = $key.GetValue('ProxyServer', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
           if (($serverNow -is [string]) -and ($serverNow -ceq ('10.0.2.2:' + [int]$state.port))) {
-            AlcoveRestoreText $key 'ProxyServer' (AlcoveSafe $state.proxyServer) $state.proxyServerKind
+            if ($null -eq $state.proxyEnable) { $key.DeleteValue('ProxyEnable', $false) } elseif ((AlcoveKindText $state.proxyEnableKind) -ceq 'String') { $key.SetValue('ProxyEnable', [string][int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::String) } else { $key.SetValue('ProxyEnable', [int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::DWord) }
             AlcoveRestoreText $key 'ProxyOverride' (AlcoveSafe $state.proxyOverride) $state.proxyOverrideKind
             AlcoveRestoreText $key 'AutoConfigURL' (AlcoveSafe $state.autoConfigURL) $state.autoConfigURLKind
-            if ($null -eq $state.proxyEnable) { $key.DeleteValue('ProxyEnable', $false) } elseif ((AlcoveKindText $state.proxyEnableKind) -ceq 'String') { $key.SetValue('ProxyEnable', [string][int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::String) } else { $key.SetValue('ProxyEnable', [int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::DWord) }
+            AlcoveRestoreText $key 'ProxyServer' (AlcoveSafe $state.proxyServer) $state.proxyServerKind
             $restored = $true
           }
           $key.Close()
@@ -810,7 +821,8 @@ enum GuestRecipes {
             """#
     }
 
-    /// Windows only: puts back what the state file remembers and deletes the file. With `systemProxy` in the state
+    /// Windows only: puts back what the state file remembers and deletes the file and a `<state file>.new` left by a
+    /// write that did not finish. With `systemProxy` in the state
     /// file, the WinINET values come back, with their kinds, when `ProxyServer` is still exactly
     /// `10.0.2.2:<port of the state file>`, and the raw `WinHttpSettings` value when it still holds exactly that
     /// address; a value remembered as absent is deleted. Settings that are anything else stay as they are, and
@@ -834,6 +846,7 @@ enum GuestRecipes {
                 if ($state.systemProxy) { $restored = AlcoveRestore $state $hkcu $hklm }
                 [System.IO.File]::Delete($statePath)
               }
+              [System.IO.File]::Delete($statePath + '.new')
               if ($restored) { $refreshed = AlcoveRefresh }
             } catch {
               [Console]::Error.WriteLine('could not restore the proxy settings of the guest: ' + ($_.Exception.GetBaseException().Message -replace '\s+', ' ') + '; check that alcove-agent runs elevated, then call vm.http.stop again')
@@ -850,7 +863,8 @@ enum GuestRecipes {
     /// and `systemProxy` of a readable one, whether the CA file is there, whether the certificate of the CA file or
     /// of the state file's thumbprint is among the machine's trusted roots, the per-user WinINET proxy, and the port
     /// of a `10.0.2.2` address that is the whole WinHTTP proxy (0 without one).
-    /// Linux prints `{"caFile":<bool>}`.
+    /// Linux prints `{"caFile":<bool>,"caRemoving":<bool>}`: whether the CA file or `<CA file>.removing` is there, and
+    /// whether `<CA file>.removing` is.
     /// A failure prints one sentence on stderr and exits with 2.
     static func readSystemProxy(os: VMConfig.GuestOS) -> String? {
         switch os {
@@ -904,7 +918,14 @@ enum GuestRecipes {
             '{"previous":' + (AlcoveBool $previous) + ',"previousUnreadable":' + (AlcoveBool $unreadable) + ',"previousPort":' + $previousPort + ',"previousSystemProxy":' + (AlcoveBool $previousSystem) + ',"caFile":' + (AlcoveBool $caFile) + ',"caInStore":' + (AlcoveBool $caInStore) + ',"wininetEnabled":' + (AlcoveBool $enabled) + ',"wininetServer":"' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($server)) + '","winhttpPort":' + $winhttpPort + '}'
             """#
         case .linux:
-            return "ca=\(linuxProxyCAPath)\nif [ -e \"$ca\" ]; then printf '{\"caFile\":true}\\n'; else printf '{\"caFile\":false}\\n'; fi"
+            return #"""
+            ca=\#(linuxProxyCAPath)
+            file=false
+            removing=false
+            if [ -e "$ca.removing" ]; then file=true; removing=true; fi
+            if [ -e "$ca" ]; then file=true; fi
+            printf '{"caFile":%s,"caRemoving":%s}\n' "$file" "$removing"
+            """#
         case .other:
             return nil
         }

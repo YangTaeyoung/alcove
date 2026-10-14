@@ -236,9 +236,10 @@ final class ControlHTTPTests: XCTestCase {
     }
 
     private func capture(os: VMConfig.GuestOS = .windows, connected: Bool = true, caps: [String]? = nil, vmPoll: Duration = .milliseconds(20),
+                         directory: URL? = nil, bundle: String? = nil, adjust: (@Sendable (inout HTTPTiming) -> Void)? = nil,
                          registry: (@Sendable (FakeTarget) -> VMRegistry)? = nil,
                          makeProxy: (@Sendable () -> ProxyControlling)? = nil) async throws -> Capture {
-        let dir = try tempDir()
+        let dir = try directory ?? tempDir()
         let caPath = dir.appendingPathComponent("ca.pem").path
         try Data(caPEM.utf8).write(to: URL(fileURLWithPath: caPath))
         let log = CallLog()
@@ -291,6 +292,7 @@ final class ControlHTTPTests: XCTestCase {
         addTeardownBlock { agent.stop() }
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         await t.setOS(os)
+        await t.setBundle(bundle)
         if connected {
             let client = AgentClient()
             try await client.connect(port: agent.port, expectedToken: nil)
@@ -298,7 +300,9 @@ final class ControlHTTPTests: XCTestCase {
         }
         let now = ISO8601DateFormatter().date(from: "2027-01-15T08:00:00Z")!
         let targets = registry?(t) ?? FakeRegistry(targets: ["Win": t])
-        let timing = ControlHTTPTests.timing(vmPoll: vmPoll)
+        var adjusted = ControlHTTPTests.timing(vmPoll: vmPoll)
+        adjust?(&adjusted)
+        let timing = adjusted
         let makeHandler: @Sendable () -> ControlHandler = {
             ControlHandler(registry: targets, hostKind: "test", captureDirectory: dir, now: { now }, httpTiming: timing,
                            makeProxy: makeProxy ?? { factory.make() })
@@ -517,6 +521,41 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
         XCTAssertEqual(c.limits.value, [12_000, 12_000])
         XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
+    func testEachRequestOfTheCACopyWaitsAtMostThePushStep() async throws {
+        let c = try await capture(adjust: { $0.pushStep = .milliseconds(300) })
+        let files = c.agentHandler
+        c.agent.handler = { m, a in m["op"]?.stringValue == "fs.stat" ? [] : files(m, a) }
+        let text = LockedBox("")
+        let ended = await finishes("vm.http.start gives up on the CA copy") { text.value = await c.failure("vm.http.start") }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(text.value, "could not copy the proxy CA into the guest: guest tools in 'Win' did not answer vm.http.start in time; "
+                       + "check vm.status and retry")
+        XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+    }
+
+    func testTheHostWaitsForARecipeNoLongerThanItsLimit() async throws {
+        let c = try await capture(adjust: { $0.recipe = RecipeLimit(guestMilliseconds: 1_000, marginSeconds: 1) })
+        c.held.value = ["recipe.installCA"]
+        let text = LockedBox("")
+        let ended = await finishes("vm.http.start gives up on the recipe the guest does not answer") { text.value = await c.failure("vm.http.start") }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(text.value, "guest tools in 'Win' did not answer vm.http.start in time; check vm.status and retry")
+        XCTAssertEqual(c.limits.value, [1_000, 12_000, 12_000])
+        XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "push \(GuestRecipes.windowsProxyCAPath)", "recipe.installCA",
+                                       "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+    }
+
+    func testAStartOverAStateFileThatCannotBeReadIsRefusedBeforeTheCAIsTrusted() async throws {
+        let c = try await capture()
+        c.failures.value["recipe.installCA"] = GuestRecipes.unreadableProxyState
+        c.failures.value["recipe.clearProxy"] = GuestRecipes.unreadableProxyState
+        let text = await c.failure("vm.http.start")
+        XCTAssertEqual(text, GuestRecipes.unreadableProxyState)
+        XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "push \(GuestRecipes.windowsProxyCAPath)", "recipe.installCA",
+                                       "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertEqual(c.journal.entry(for: "Win")?.port, 49152)
     }
 
     func testARecipeThatGivesNoReasonBecomesASentence() async throws {
@@ -771,7 +810,7 @@ final class ControlHTTPTests: XCTestCase {
         c.outputs.value["recipe.readProxy"] = guestProxy(enabled: true, server: "10.0.2.2:8888", winhttp: 8888)
         let doctor = try await c.h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(check(doctor, "proxy")?["ok"]?.boolValue, true)
-        XCTAssertEqual(check(doctor, "proxy")?["detail"]?.stringValue, "system proxy 10.0.2.2:8888")
+        XCTAssertEqual(check(doctor, "proxy")?["detail"]?.stringValue, "system proxy 10.0.2.2:8888 (not set by Alcove; if a capture left it, change it by hand)")
 
         c.log.clear()
         let stopped = await c.failure("vm.http.stop")
@@ -1900,9 +1939,9 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertFalse(set.contains("$enable = 0"), set)
 
         for (name, script) in recipes where script.contains("function AlcovePort") {
-            XCTAssertTrue(script.contains("[regex]::Match([string]$text, '(?<![0-9A-Za-z.=;:/-])10\\.0\\.2\\.2:([0-9]{1,5})(?![0-9A-Za-z.;:-])')"), name)
+            XCTAssertTrue(script.contains("[regex]::Match([string]$text, '(?<![0-9A-Za-z.=;:/ ,-])10\\.0\\.2\\.2:([0-9]{1,5})(?![0-9A-Za-z.;: ,-])')"), name)
         }
-        let pattern = try NSRegularExpression(pattern: "(?<![0-9A-Za-z.=;:/-])10\\.0\\.2\\.2:([0-9]{1,5})(?![0-9A-Za-z.;:-])")
+        let pattern = try NSRegularExpression(pattern: "(?<![0-9A-Za-z.=;:/ ,-])10\\.0\\.2\\.2:([0-9]{1,5})(?![0-9A-Za-z.;: ,-])")
         func port(_ text: String) -> String? {
             guard let match = pattern.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
                   let digits = Range(match.range(at: 1), in: text) else { return nil }
@@ -1910,8 +1949,11 @@ final class ControlHTTPTests: XCTestCase {
         }
         XCTAssertEqual(port("\u{18}\u{3}\u{e}10.0.2.2:49152\u{7}<local>"), "49152")
         XCTAssertEqual(port("10.0.2.2:8080"), "8080")
+        XCTAssertEqual(port("\u{18}\u{3}\u{d}10.0.2.2:8080\u{7}<local>"), "8080")
+        XCTAssertEqual(port("\u{18}\u{3}\u{a}10.0.2.2:5\u{7}<local>"), "5")
         for other in ["110.0.2.2:3128", "210.0.2.2:80", "host10.0.2.2:80", "http=10.0.2.2:8080", "x;10.0.2.2:8080", "10.0.2.2:8080;10.0.2.2:8081",
-                      "10.0.2.2:808080", "10.0.2.2:80.example", "a.10.0.2.2:80", "//10.0.2.2:80"] {
+                      "10.0.2.2:808080", "10.0.2.2:80.example", "a.10.0.2.2:80", "//10.0.2.2:80", "proxy.corp:3128 10.0.2.2:49152",
+                      "10.0.2.2:49152 proxy.corp:3128", "proxy.corp:3128,10.0.2.2:49152", "10.0.2.2:49152,proxy.corp:3128"] {
             XCTAssertNil(port(other), other)
         }
     }
@@ -1933,10 +1975,10 @@ final class ControlHTTPTests: XCTestCase {
                   $key = $hkcu.CreateSubKey($inet)
                   $serverNow = $key.GetValue('ProxyServer', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
                   if (($serverNow -is [string]) -and ($serverNow -ceq ('10.0.2.2:' + [int]$state.port))) {
-                    AlcoveRestoreText $key 'ProxyServer' (AlcoveSafe $state.proxyServer) $state.proxyServerKind
+                    if ($null -eq $state.proxyEnable) { $key.DeleteValue('ProxyEnable', $false) } elseif ((AlcoveKindText $state.proxyEnableKind) -ceq 'String') { $key.SetValue('ProxyEnable', [string][int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::String) } else { $key.SetValue('ProxyEnable', [int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::DWord) }
                     AlcoveRestoreText $key 'ProxyOverride' (AlcoveSafe $state.proxyOverride) $state.proxyOverrideKind
                     AlcoveRestoreText $key 'AutoConfigURL' (AlcoveSafe $state.autoConfigURL) $state.autoConfigURLKind
-                    if ($null -eq $state.proxyEnable) { $key.DeleteValue('ProxyEnable', $false) } elseif ((AlcoveKindText $state.proxyEnableKind) -ceq 'String') { $key.SetValue('ProxyEnable', [string][int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::String) } else { $key.SetValue('ProxyEnable', [int]$state.proxyEnable, [Microsoft.Win32.RegistryValueKind]::DWord) }
+                    AlcoveRestoreText $key 'ProxyServer' (AlcoveSafe $state.proxyServer) $state.proxyServerKind
                     $restored = $true
                   }
                   $key.Close()
@@ -1954,6 +1996,11 @@ final class ControlHTTPTests: XCTestCase {
 
                 """, name)
         }
+        let restore = try part(of: try XCTUnwrap(recipes["clearSystemProxy"]), from: "function AlcoveRestore($state, $hkcu, $hklm) {", to: "  $key.Close()")
+        assertOrder(restore, "'ProxyEnable'", "AlcoveRestoreText $key 'ProxyServer'")
+        assertOrder(restore, "AlcoveRestoreText $key 'ProxyOverride'", "AlcoveRestoreText $key 'ProxyServer'")
+        assertOrder(restore, "AlcoveRestoreText $key 'AutoConfigURL'", "AlcoveRestoreText $key 'ProxyServer'")
+        XCTAssertTrue(restore.hasSuffix("AlcoveRestoreText $key 'ProxyServer' (AlcoveSafe $state.proxyServer) $state.proxyServerKind\n    $restored = $true\n  }\n"), restore)
         let kinds = try part(of: try XCTUnwrap(recipes["setSystemProxy"]), from: "function AlcoveKindName($key, $name) {", to: "function AlcoveWriteState")
         XCTAssertEqual(kinds, """
             function AlcoveKindName($key, $name) {
@@ -1979,6 +2026,7 @@ final class ControlHTTPTests: XCTestCase {
                 if ($state.systemProxy) { $restored = AlcoveRestore $state $hkcu $hklm }
                 [System.IO.File]::Delete($statePath)
               }
+              [System.IO.File]::Delete($statePath + '.new')
               if ($restored) { $refreshed = AlcoveRefresh }
 
             """)
@@ -1994,8 +2042,12 @@ final class ControlHTTPTests: XCTestCase {
         let reader = """
             function AlcoveState {
               if (-not [System.IO.File]::Exists($statePath)) { return $null }
+              $text = $null
+              foreach ($attempt in 1, 2, 3) {
+                try { $text = [System.IO.File]::ReadAllText($statePath); break } catch { Start-Sleep -Milliseconds 200 }
+              }
               $s = $null
-              try { $s = ConvertFrom-Json ([System.IO.File]::ReadAllText($statePath)) } catch { $s = $null }
+              try { $s = ConvertFrom-Json $text } catch { $s = $null }
               if (($s -is [System.Management.Automation.PSCustomObject]) -and ([string]$s.version -ceq '1') -and ([string]$s.thumbprint -match '^[0-9A-Fa-f]{40}\\z') -and ([string]$s.port -match '^[1-9][0-9]{0,4}\\z') -and ($s.systemProxy -is [bool])) {
                 if ([int]$s.port -le 65535) { return $s }
               }
@@ -2003,17 +2055,18 @@ final class ControlHTTPTests: XCTestCase {
             }
 
             """
-        for name in ["setSystemProxy", "setSystemProxy(record)", "clearSystemProxy"] {
+        for name in ["installProxyCA", "setSystemProxy", "setSystemProxy(record)", "clearSystemProxy"] {
             let script = try XCTUnwrap(recipes[name])
             XCTAssertTrue(script.contains(reader), name)
             let main = try mainPart(of: script)
             XCTAssertTrue(main.contains(refusal), name)
             XCTAssertEqual(count("AlcoveState\n", in: main), 1, name)
             for touching in ["CreateSubKey(", "OpenSubKey(", "$store.Remove(", "AlcoveWriteState $json", "::Delete(", "AlcoveRestore $state", "SetValue(",
-                             "DeleteValue(", "& $netsh"] where main.contains(touching) {
+                             "DeleteValue(", "& $netsh", "SetAccessControl(", "AlcoveRoot 'ReadWrite'", "$store.Add("] where main.contains(touching) {
                 assertOrder(main, refusal, touching)
             }
         }
+        XCTAssertTrue(try mainPart(of: try XCTUnwrap(recipes["installProxyCA"])).contains("  $state = AlcoveState\n"))
         let read = try XCTUnwrap(recipes["readSystemProxy"])
         XCTAssertTrue(read.contains(reader), read)
         XCTAssertTrue(read.contains("  $state = AlcoveState\n  if ($state -is [string]) {\n    $unreadable = $true\n  } elseif ($state) {\n"), read)
@@ -2069,6 +2122,76 @@ final class ControlHTTPTests: XCTestCase {
             check.waitUntilExit()
             XCTAssertEqual(check.terminationStatus, 0, script)
         }
+    }
+
+    /// Runs `script` with `/bin/sh`, with `caPath` in place of the Linux CA path and `bin` first on the PATH.
+    private func runShell(_ script: String, caPath: String, bin: URL) throws -> (status: Int32, stdout: String, stderr: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script.replacingOccurrences(of: GuestRecipes.linuxProxyCAPath, with: caPath)]
+        process.environment = ["PATH": bin.path + ":/usr/bin:/bin"]
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        try process.run()
+        let printed = out.fileHandleForReading.readDataToEndOfFile()
+        let errors = err.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: printed, as: UTF8.self), String(decoding: errors, as: UTF8.self))
+    }
+
+    func testLinuxRemovalKeepsTheCAAsideUntilTheBundleIsRefreshed() throws {
+        let dir = try tempDir()
+        let bin = dir.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let calls = dir.appendingPathComponent("calls").path
+        let fail = dir.appendingPathComponent("fail").path
+        let stub = bin.appendingPathComponent("update-ca-certificates").path
+        try "#!/bin/sh\necho \"$*\" >> '\(calls)'\nif [ -e '\(fail)' ]; then rm -f '\(fail)'; exit 1; fi\nexit 0\n"
+            .write(toFile: stub, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
+        let ca = dir.appendingPathComponent("alcove-proxy.crt").path
+        let aside = ca + ".removing"
+        let remove = try XCTUnwrap(GuestRecipes.removeProxyCA(thumbprint: nil, os: .linux))
+        let read = try XCTUnwrap(GuestRecipes.readSystemProxy(os: .linux))
+        let files = FileManager.default
+        func refreshes() -> [String] { ((try? String(contentsOfFile: calls, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init) }
+
+        try "pem".write(toFile: ca, atomically: true, encoding: .utf8)
+        try "".write(toFile: fail, atomically: true, encoding: .utf8)
+        let failed = try runShell(remove, caPath: ca, bin: bin)
+        XCTAssertEqual(failed.status, 2)
+        XCTAssertEqual(failed.stdout, "")
+        XCTAssertEqual(failed.stderr, "update-ca-certificates --fresh failed in the guest, so the guest still trusts the proxy CA; "
+                       + "run it with vm.exec to see why, then call vm.http.stop again\n")
+        XCTAssertFalse(files.fileExists(atPath: ca))
+        XCTAssertTrue(files.fileExists(atPath: aside))
+        XCTAssertEqual(try runShell(read, caPath: ca, bin: bin).stdout, "{\"caFile\":true,\"caRemoving\":true}\n")
+
+        let retried = try runShell(remove, caPath: ca, bin: bin)
+        XCTAssertEqual(retried.status, 0)
+        XCTAssertEqual(retried.stdout, "{\"removed\":true,\"fileRemoved\":true}\n")
+        XCTAssertEqual(refreshes(), ["--fresh", "--fresh"])
+        XCTAssertFalse(files.fileExists(atPath: aside))
+        XCTAssertEqual(try runShell(read, caPath: ca, bin: bin).stdout, "{\"caFile\":false,\"caRemoving\":false}\n")
+
+        let idle = try runShell(remove, caPath: ca, bin: bin)
+        XCTAssertEqual(idle.stdout, "{\"removed\":false,\"fileRemoved\":false}\n")
+        XCTAssertEqual(refreshes().count, 2)
+
+        try "pem".write(toFile: ca, atomically: true, encoding: .utf8)
+        try "old".write(toFile: aside, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try runShell(read, caPath: ca, bin: bin).stdout, "{\"caFile\":true,\"caRemoving\":true}\n")
+        let both = try runShell(remove, caPath: ca, bin: bin)
+        XCTAssertEqual(both.stdout, "{\"removed\":true,\"fileRemoved\":true}\n")
+        XCTAssertEqual(refreshes().count, 3)
+        XCTAssertFalse(files.fileExists(atPath: ca))
+        XCTAssertFalse(files.fileExists(atPath: aside))
+
+        let script = remove
+        assertOrder(script, "mv -f \"$ca\" \"$gone\"", "update-ca-certificates --fresh")
+        assertOrder(script, "update-ca-certificates --fresh", "rm -f \"$gone\"")
+        XCTAssertFalse(script.contains("rm -f \"$ca\""), script)
     }
 
     func testOtherGuestOSStartsWithoutGuestSteps() async throws {

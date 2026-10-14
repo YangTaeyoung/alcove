@@ -179,6 +179,10 @@ actor FakeTarget: VMTarget {
     func setFrames(_ f: [Frame]) { frames = f }
     func setFailingFrameCalls(_ calls: Set<Int>) { failingFrameCalls = calls }
     func setState(_ s: VMController.State) { stateValue = s }
+    /// What `bundlePath()` answers.
+    var bundle: String?
+    func setBundle(_ path: String?) { bundle = path }
+    func bundlePath() async -> String? { bundle }
 }
 
 /// What `FakeTarget.frame()` throws for a call listed in `failingFrameCalls`.
