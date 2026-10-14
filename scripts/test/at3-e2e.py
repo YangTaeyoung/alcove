@@ -236,7 +236,8 @@ class Run:
             time.sleep(0.3)
 
     def launch_notepad(self):
-        """Starts Notepad on the text file with its saved tabs as they were before the run and waits for its window."""
+        """Starts Notepad on the text file with its saved tabs as they were before the run, moves the pointer to the
+        bottom right corner of the frame, away from the text, and waits for the window."""
         if self.notepad_before is None:
             before = self.notepad_pids()
             expect(not before, f"notepad.exe runs already (pids {sorted(before)}); close it in the guest before this run")
@@ -253,6 +254,8 @@ class Run:
         started = self.start_job(argv=["notepad.exe", OCR_FILE], shell="none")
         self.notepad_job, self.notepad_stub = started["job"], started["pid"]
         self.notepad_dirty = False
+        width, height = self.frame()
+        self.call("vm.mouse.move", x=width - 2, y=height - 2)
         end = time.time() + 60
         while True:
             windows = {int(pid) for pid in lines(self.exec(NOTEPAD_WINDOWS))} & self.started_notepads()
@@ -454,7 +457,7 @@ def _(run):
     expect("observation" not in run.call("vm.mouse.click", x=match["cx"], y=match["cy"]), "a click without observe carries an observation")
 
     run.notepad_dirty = True
-    typed = run.call("vm.type", text="xyz", observe="diff")
+    typed = run.call("vm.type", text="xyz", observe="diff", settleTimeoutMs=8000)
     seen = typed["observation"]
     expect(seen["settled"] is True and "changed" in seen and seen["changedFraction"] > 0, f"typing reports settled {seen.get('settled')!r} and fields {sorted(seen)!r}")
     box, shown = seen["changed"], seen["imageRect"]
@@ -469,7 +472,8 @@ def _(run):
     scale = seen["imageScale"]
     expect(image == (round(shown["w"] * scale), round(shown["h"] * scale)) and image[0] <= width and image[1] <= height and image[0] * image[1] < width * height,
            f"the diff image is {image[0]}x{image[1]} for the rectangle {shown!r} at scale {scale!r} in a {width}x{height} frame")
-    expect(run.refusal("vm.type", text="x", observe="loud") == "observe must be one of none, summary, diff, image", "an unknown observe level was not refused")
+    message = run.refusal("vm.type", text="x", observe="loud")
+    expect(message == "observe must be one of none, summary, diff, image, ui", f"an unknown observe level failed with {message!r}")
     return (f"click settled, changed {clicked['observation'].get('changed')!r}; typing changed {box['x']},{box['y']} {box['w']}x{box['h']} "
             f"({seen['changedFraction']:.3f} of the frame), diff image {image[0]}x{image[1]}, {len(data)} bytes")
 
@@ -579,11 +583,13 @@ def _(run):
 
     err, out, images = m.call("alcove_click", {"name": run.vm, "x": x, "y": y})
     rows = lines(out)
-    expect(not err and rows[0] == f"clicked left at ({x}, {y})" and len(rows) >= 3 and rows[1] == "screen settled" and not images
-           and (rows[2] == "nothing changed" or re.fullmatch(r"changed \(\d+,\d+\) \d+x\d+ = \d+\.\d% of the frame", rows[2])),
+    expect(not err and rows[0] == f"clicked left at ({x}, {y})" and len(rows) >= 4 and re.fullmatch(r"eventSeq \d+", rows[1])
+           and rows[2] == "screen settled" and not images
+           and (rows[3] == "nothing changed" or re.fullmatch(r"changed \(\d+,\d+\) \d+x\d+ = \d+\.\d% of the frame", rows[3])),
            f"alcove_click with the default observe answered error={err} {out!r}")
     err, none, _ = m.call("alcove_click", {"name": run.vm, "x": x, "y": y, "observe": "none"})
-    expect(not err and lines(none) == [f"clicked left at ({x}, {y})"], f"alcove_click with observe none answered error={err} {none!r}")
+    expect(not err and len(lines(none)) == 2 and lines(none)[0] == f"clicked left at ({x}, {y})" and re.fullmatch(r"eventSeq \d+", lines(none)[1]),
+           f"alcove_click with observe none answered error={err} {none!r}")
     err, missing, _ = m.call("alcove_find_text", {"name": run.vm, "query": "no such text on this screen"})
     expect(not err and re.fullmatch(r"no matches \(\d+ lines of text on screen\)", missing), f"alcove_find_text without a match answered error={err} {missing!r}")
     m.close()

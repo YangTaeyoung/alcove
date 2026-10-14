@@ -432,9 +432,17 @@ def tool(m, name, args, timeout=120):
     return out
 
 
+def changing(m, name, args, timeout=120):
+    """Calls an MCP tool that changes the guest and returns its text without the `eventSeq <n>` line, its second line."""
+    out = tool(m, name, args, timeout)
+    rows = out.split("\n")
+    expect(len(rows) >= 2 and re.fullmatch(r"eventSeq \d+", rows[1]), f"{name} has no eventSeq line after its first line: {out!r}")
+    return "\n".join(rows[:1] + rows[2:])
+
+
 def mcp_start(run, m, command):
     """Starts a job through alcove_exec_start, registers it for cleanup and returns its id."""
-    out = tool(m, "alcove_exec_start", {"name": run.vm, **command})
+    out = changing(m, "alcove_exec_start", {"name": run.vm, **command})
     started = re.fullmatch(r"started job (\S+) \(pid (\d+)\)", out)
     expect(started, f"alcove_exec_start: {out!r}")
     run.jobs.append(started.group(1))
@@ -467,7 +475,7 @@ def _(run):
               "alcove_sync_dir", "alcove_pull_file", "alcove_push_file"}
     expect(driven <= names, f"the default tool list lacks {sorted(driven - names)}")
 
-    out = tool(m, "alcove_exec", {"name": vm, "command": "(Get-Location).Path; Write-Output '한글 mcp'", "cwd": "C:\\Windows", "timeout_s": 60})
+    out = changing(m, "alcove_exec", {"name": vm, "command": "(Get-Location).Path; Write-Output '한글 mcp'", "cwd": "C:\\Windows", "timeout_s": 60})
     expect(out.startswith("exit code 0") and "C:\\Windows" in out and "한글 mcp" in out, f"alcove_exec: {out!r}")
 
     job = mcp_start(run, m, {"command": "'job-out 한글'; Start-Sleep -Milliseconds 300; [Console]::Error.WriteLine('job-err')"})
@@ -476,11 +484,11 @@ def _(run):
            f"alcove_exec_read over all polls: {seen!r}")
 
     filt = mcp_start(run, m, {"command": LINE_FILTER})
-    out = tool(m, "alcove_exec_write", {"name": vm, "job": filt, "data": "한글 줄\n"})
+    out = changing(m, "alcove_exec_write", {"name": vm, "job": filt, "data": "한글 줄\n"})
     expect(out == "wrote 5 characters", f"alcove_exec_write: {out!r}")
     seen = mcp_read_until(run, m, filt, lambda seen, last: "got:한글 줄" in seen)
     expect("exited" not in seen, f"the line filter exited before its input ended: {seen!r}")
-    out = tool(m, "alcove_exec_write", {"name": vm, "job": filt, "data": "", "eof": True})
+    out = changing(m, "alcove_exec_write", {"name": vm, "job": filt, "data": "", "eof": True})
     expect(out == "wrote 0 characters and closed stdin", f"alcove_exec_write with eof: {out!r}")
     mcp_read_until(run, m, filt, lambda seen, last: "exited with code 0" in last)
 
@@ -492,14 +500,14 @@ def _(run):
     rows = {l.split(" ", 1)[0]: l for l in out.split("\n")}
     expect("exited (code 0)" in rows.get(job, "") and "running" in rows.get(ping, "") and "PING.EXE -t 127.0.0.1" in rows.get(ping, ""),
            f"alcove_exec_list: {out!r}")
-    out = tool(m, "alcove_exec_kill", {"name": vm, "job": ping})
+    out = changing(m, "alcove_exec_kill", {"name": vm, "job": ping})
     expect(out == f"job {ping}: exited", f"alcove_exec_kill: {out!r}")
     out = tool(m, "alcove_process_list", {"name": vm, "filter": "PING"})
     expect(out == "no matching processes", f"after alcove_exec_kill, alcove_process_list filter=PING: {out!r}")
 
     ping = mcp_start(run, m, {"command": "ping -t 127.0.0.1"})
     mcp_read_until(run, m, ping, lambda seen, last: "Reply from 127.0.0.1" in seen)
-    out = tool(m, "alcove_process_kill", {"name": vm, "process_name": "PING.EXE", "tree": True})
+    out = changing(m, "alcove_process_kill", {"name": vm, "process_name": "PING.EXE", "tree": True})
     killed = re.fullmatch(r"killed (\d+) process\(es\)", out)
     expect(killed and int(killed.group(1)) >= 1, f"alcove_process_kill: {out!r}")
     mcp_read_until(run, m, ping, lambda seen, last: "exited with code" in last)
