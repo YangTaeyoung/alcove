@@ -7,6 +7,8 @@ import AlcoveQMP
 enum DeployTarget {
     /// The folder below which a Windows guest keeps deployed apps by default.
     static let defaultRoot = "C:\\alcove-apps"
+    /// The owners `fs.stat` reports for a `defaultRoot` that only elevated processes can change.
+    static let trustedOwners: Set<String> = ["administrators", "system"]
     /// The file `vm.deploy` writes into every folder it copied to.
     static let marker = ".alcove-deploy"
     static let markerText = "vm.deploy of Alcove copied the files of this folder and replaces them on the next deploy.\n"
@@ -141,27 +143,30 @@ enum DeployTarget {
         ControlHandler.isPath(directory, under: defaultRoot, windows: true)
     }
 
-    /// Whether the guest path `path` is absolute: it starts with a separator or a drive letter.
-    static func isAbsolute(_ path: String) -> Bool {
-        if path.hasPrefix("/") || path.hasPrefix("\\") { return true }
+    /// Whether the guest path `path` is absolute: on Windows it starts with a separator or a drive letter, on other
+    /// guests with `/`.
+    static func isAbsolute(_ path: String, windows: Bool) -> Bool {
+        if path.hasPrefix("/") { return true }
+        guard windows else { return false }
+        if path.hasPrefix("\\") { return true }
         let scalars = Array(path.unicodeScalars.prefix(2))
         return scalars.count == 2 && scalars[1] == ":" && scalars[0].isASCII && scalars[0].properties.isAlphabetic
     }
 
-    /// The segments of the relative guest path `path`, which `/` and `\` separate.
-    private static func segments(of path: String) -> [String] {
-        path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).map(String.init)
+    /// The segments of the relative guest path `path`, which `/` separates, and on Windows `\` as well.
+    private static func segments(of path: String, windows: Bool) -> [String] {
+        path.split(whereSeparator: { $0 == "/" || (windows && $0 == "\\") }).map(String.init)
     }
 
     /// Whether the relative guest path `path` has a `.` or `..` segment.
-    static func leavesFolder(_ path: String) -> Bool {
-        segments(of: path).contains { $0 == "." || $0 == ".." }
+    static func leavesFolder(_ path: String, windows: Bool) -> Bool {
+        segments(of: path, windows: windows).contains { $0 == "." || $0 == ".." }
     }
 
-    /// The first segment of the relative guest path `path` that Windows cannot use as a file or folder name, such as
-    /// `.. `, `x.` or `NUL`; nil when it has none.
+    /// The first segment of the relative Windows guest path `path` that Windows cannot use as a file or folder name,
+    /// such as `.. `, `x.` or `NUL`; nil when it has none.
     static func unusableSegment(of path: String) -> String? {
-        segments(of: path).first { !isWindowsName($0) }
+        segments(of: path, windows: true).first { !isWindowsName($0) }
     }
 }
 
@@ -220,15 +225,24 @@ extension ControlHandler {
         }
         let t = try await running(params)
         let windows = await t.guestOS() == .windows
+        let relative = [("install.file", install?.file, "run"), ("launch.exe", launching?.exe, "start")].compactMap { field, path, verb in
+            path.flatMap { DeployTarget.isAbsolute($0, windows: windows) ? nil : (field, $0, verb) }
+        }
+        for (field, path, verb) in relative where DeployTarget.leavesFolder(path, windows: windows) {
+            throw ControlError.failed("\(field) must stay inside guestDir; pass an absolute path to \(verb) something else")
+        }
         if windows {
-            for (field, path) in [("install.file", install?.file), ("launch.exe", launching?.exe)] {
-                guard let path, !DeployTarget.isAbsolute(path), let segment = DeployTarget.unusableSegment(of: path) else { continue }
+            for (field, path, _) in relative {
+                guard let segment = DeployTarget.unusableSegment(of: path) else { continue }
                 throw ControlError.failed("'\(segment)' in \(field) cannot be used as a file or folder name on Windows")
             }
         }
         let names = isDirectory.boolValue ? (try? FileManager.default.contentsOfDirectory(atPath: source.path)) ?? [] : [source.lastPathComponent]
         if names.contains(where: { DeployTarget.isMarker($0, windows: windows) }) {
             throw ControlError.failed("a file named \(DeployTarget.marker) cannot be deployed, vm.deploy keeps its own file under that name; rename the file")
+        }
+        if windows, !isDirectory.boolValue, !DeployTarget.isWindowsName(source.lastPathComponent.precomposedStringWithCanonicalMapping) {
+            throw ControlError.failed("'\(source.lastPathComponent)' cannot be used as a file name on Windows; rename the file")
         }
         let base = (isDirectory.boolValue ? source.lastPathComponent : source.deletingPathExtension().lastPathComponent)
             .precomposedStringWithCanonicalMapping
@@ -259,6 +273,7 @@ extension ControlHandler {
         let guestDir = plan.guestDir
         var out: [String: JSON] = ["guestDir": .string(guestDir)]
         do {
+            if plan.windows, DeployTarget.isUnderDefaultRoot(guestDir) { try await checkDefaultRoot(agent) }
             let marked = try await checkFolder(plan, agent)
             if plan.killRunning { try await stopProcesses(plan, agent) }
             if !marked {
@@ -313,9 +328,6 @@ extension ControlHandler {
             guard let items = list.arrayValue, items.allSatisfy(isString) else { throw ControlError.failed("install.args must be an array of strings") }
             args = items
         }
-        guard DeployTarget.isAbsolute(file) || !DeployTarget.leavesFolder(file) else {
-            throw ControlError.failed("install.file must stay inside guestDir; pass an absolute path to run something else")
-        }
         return InstallPlan(msi: kind == "msi", file: file, args: args)
     }
 
@@ -335,9 +347,6 @@ extension ControlHandler {
             guard cwd.stringValue != nil else { throw ControlError.failed("launch.cwd must be a string") }
             fields["cwd"] = cwd
         }
-        guard DeployTarget.isAbsolute(exe) || !DeployTarget.leavesFolder(exe) else {
-            throw ControlError.failed("launch.exe must stay inside guestDir; pass an absolute path to start something else")
-        }
         return LaunchPlan(exe: exe, fields: fields)
     }
 
@@ -345,7 +354,7 @@ extension ControlHandler {
 
     /// `path` when it is absolute in the guest, otherwise `path` below `directory` with the guest's separator.
     static func guestPath(_ path: String, in directory: String, windows: Bool) -> String {
-        if DeployTarget.isAbsolute(path) { return path }
+        if DeployTarget.isAbsolute(path, windows: windows) { return path }
         let separator = windows ? "\\" : "/"
         let tail = windows ? path.replacingOccurrences(of: "/", with: "\\") : path
         return directory.hasSuffix(separator) ? directory + tail : directory + separator + tail
@@ -361,6 +370,23 @@ extension ControlHandler {
     }
 
     // MARK: - steps
+
+    /// Refuses `DeployTarget.defaultRoot` when the agent reports it as a link, or as owned by anyone but the
+    /// Administrators group or SYSTEM. An agent that reports no owner leaves the owner unchecked; a root that does not
+    /// exist is accepted.
+    private func checkDefaultRoot(_ agent: AgentClient) async throws {
+        let root = DeployTarget.defaultRoot
+        let found = try await agent.call("fs.stat", ["path": .string(root)])
+        let fix = "restart the guest, so that alcove-agent moves it aside and creates the folder again when it starts, or pass a guestDir outside it"
+        if found["link"]?.boolValue == true {
+            throw ControlError.failed("'\(root)' is a link in the guest; \(fix)")
+        }
+        guard found["exists"]?.boolValue == true, let owner = found["owner"]?.stringValue,
+              !DeployTarget.trustedOwners.contains(owner) else { return }
+        let who = owner == "user" ? "a user" : owner
+        throw ControlError.failed("'\(root)' in the guest belongs to \(who), not to Administrators or SYSTEM, so another user may have "
+                                  + "changed what it holds; \(fix)")
+    }
 
     /// Accepts the guest folder when it does not exist, is empty, lies below the default root or holds the deploy marker
     /// as a plain file, and returns whether it holds that marker. A folder the agent reports as a link is refused, and

@@ -1115,7 +1115,7 @@ final class ControlUITests: XCTestCase {
             XCTAssertEqual(text, "pass guestDir; '\(name)' cannot be used as a folder name")
         }
         let file = await failure(h, "vm.deploy", ["name": "Win", "path": .string(parent.appendingPathComponent("aux.exe").path)])
-        XCTAssertEqual(file, "pass guestDir; 'aux' cannot be used as a folder name")
+        XCTAssertEqual(file, "'aux.exe' cannot be used as a file name on Windows; rename the file")
         let top = await failure(h, "vm.deploy", ["name": "Win", "path": "/"])
         XCTAssertEqual(top, "pass guestDir; '/' cannot be used as a folder name")
         let up = await failure(h, "vm.deploy", ["name": "Win", "path": "/.."])
@@ -1152,6 +1152,58 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(r["guestDir"], "C:\\alcove-apps\\앱 build")
         XCTAssertEqual(r["sent"], ["app.exe"])
         XCTAssertFalse(agent.received.contains { ($0["path"]?.stringValue ?? "").contains("..") })
+    }
+
+    func testDeployRefusesADefaultRootThatIsALinkOrBelongsToAnotherOwner() async throws {
+        let dir = try tempDir("app")
+        try Data("x".utf8).write(to: dir.appendingPathComponent("app.exe"))
+        let root = LockedBox<[String: JSON]>([:])
+        let fs = FakeFS()
+        let (h, agent) = try await deployRig(fs: fs, [
+            "proc.list": { _, _ in .ok(["procs": []]) },
+            "fs.stat": { m, _ in m["path"]?.stringValue == "C:\\alcove-apps" ? .ok(root.value) : .fileSystem },
+        ])
+        let fix = "restart the guest, so that alcove-agent moves it aside and creates the folder again when it starts, or pass a guestDir outside it"
+        let refused: [([String: JSON], String)] = [
+            (["exists": true, "dir": true, "link": true], "'C:\\alcove-apps' is a link in the guest; \(fix)"),
+            (["exists": true, "dir": true, "link": true, "owner": "administrators"], "'C:\\alcove-apps' is a link in the guest; \(fix)"),
+            (["exists": true, "dir": true, "owner": "user"], "'C:\\alcove-apps' in the guest belongs to a user, not to Administrators or SYSTEM, "
+                + "so another user may have changed what it holds; \(fix)"),
+            (["exists": true, "dir": true, "owner": "S-1-5-21-1-2-3-1001"], "'C:\\alcove-apps' in the guest belongs to S-1-5-21-1-2-3-1001, "
+                + "not to Administrators or SYSTEM, so another user may have changed what it holds; \(fix)"),
+        ]
+        for (stat, sentence) in refused {
+            root.value = stat
+            let plain = await failure(h, "vm.deploy", ["name": "Win", "path": .string(dir.path)])
+            XCTAssertEqual(plain, sentence)
+            let below = await failure(h, "vm.deploy", ["name": "Win", "path": .string(dir.path), "guestDir": "c:/ALCOVE-APPS/mine"])
+            XCTAssertEqual(below, sentence)
+        }
+        XCTAssertEqual(agentRequests(agent, "proc.list").count, 0)
+        XCTAssertEqual(fs.written(), [])
+
+        for stat: [String: JSON] in [["exists": true, "dir": true, "owner": "administrators"], ["exists": true, "dir": true, "owner": "system"],
+                                     ["exists": true, "dir": true], ["exists": false]] {
+            root.value = stat
+            let r = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path)])
+            XCTAssertEqual(r["guestDir"], "C:\\alcove-apps\\app")
+        }
+        root.value = ["exists": true, "dir": true, "link": true]
+        let outside = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "guestDir": "D:\\apps"])
+        XCTAssertEqual(outside["guestDir"], "D:\\apps")
+    }
+
+    func testDeployRefusesAHostFileWhoseNameWindowsCannotUse() async throws {
+        let dir = try tempDir("names")
+        let fs = FakeFS()
+        let (h, agent) = try await deployRig(fs: fs, ["proc.list": { _, _ in .ok(["procs": []]) }])
+        for name in ["a\\..\\..\\x.dll", "setup.exe:stream", "tool.exe.", "COM1.exe", "a<b.exe"] {
+            let file = dir.appendingPathComponent(name)
+            try Data("MZ".utf8).write(to: file)
+            let text = await failure(h, "vm.deploy", ["name": "Win", "path": .string(file.path), "guestDir": "D:\\apps"])
+            XCTAssertEqual(text, "'\(name)' cannot be used as a file name on Windows; rename the file", name)
+        }
+        XCTAssertEqual(requestCount(agent), 0)
     }
 
     func testDeployRefusesAFolderThatHoldsForeignFiles() async throws {
@@ -1526,7 +1578,7 @@ final class ControlUITests: XCTestCase {
             XCTAssertEqual(file, "install.file must stay inside guestDir; pass an absolute path to run something else", exe)
         }
         XCTAssertEqual(requestCount(agent), 0)
-        for name in ["bin/a:b", "bin/x.", "bin/NUL", "bin/x ", "bin/.../x", "a<b/x"] {
+        for name in ["bin/a:b", "bin/x.", "bin/NUL", "bin/x ", "bin/.../x", "a<b/x", "..\\x", "bin/.\\x", "\\x", "C:x"] {
             let r = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": path, "guestDir": "/opt/tool", "waitWindow": 0,
                                                                    "install": ["kind": "exe", "file": .string(name)], "launch": ["exe": .string(name)]])
             XCTAssertEqual(r["pid"]?.intValue, 5, name)

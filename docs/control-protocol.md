@@ -873,12 +873,23 @@ Rules for `guestDir`, checked before any file is written:
 | a guest path that is a file | `'<dir>' is a file in the guest; pass a folder as guestDir` |
 | a folder that holds entries, lies outside `C:\alcove-apps` and has no marker | `'<dir>' already holds files that Alcove did not deploy; choose an empty or new folder, or one under C:\alcove-apps` |
 | a marker path that is a folder or a link | `'<dir>\.alcove-deploy' is not a plain file; remove it or deploy to another folder` |
+| Windows, a `guestDir` below `C:\alcove-apps`: `C:\alcove-apps` is a link | `'C:\alcove-apps' is a link in the guest; restart the guest, so that alcove-agent moves it aside and creates the folder again when it starts, or pass a guestDir outside it` |
+| Windows, a `guestDir` below `C:\alcove-apps`: `fs.stat` names an owner of `C:\alcove-apps` other than the Administrators group or SYSTEM | `'C:\alcove-apps' in the guest belongs to <owner>, not to Administrators or SYSTEM, so another user may have changed what it holds; restart the guest, …` (`<owner>` is `a user` or a SID) |
 | a link, or a file, in the guest where the host directory has a folder | `'<path>' in the guest is a link; remove it or deploy to another folder` (`… is not a folder; …` for a file) |
 
 `<example>` is `C:\alcove-apps\<name>` on a Windows guest and `/opt/<name>`
 on others. A folder that does
 not exist, an empty folder, a folder below `C:\alcove-apps` and a folder with
-the marker are accepted. A link in a parent of `guestDir` is not looked for.
+the marker are accepted. A link in a parent of `guestDir` is not looked for,
+except `C:\alcove-apps` itself; an agent whose `fs.stat` names no owner
+leaves its owner unchecked. The agent creates `C:\alcove-apps` when it
+starts, writable only by Administrators and SYSTEM, so what the install and
+launch steps run there with the agent's elevated token can only be changed by
+an elevated process. A `guestDir` outside it is used as it is: a guest user
+who can write to that folder can change the files that `install` and
+`launch` then run elevated. In `install.file` and `launch.exe` both `/` and
+`\` separate segments on a Windows guest, only `/` on other guests, where
+only a path starting with `/` is absolute.
 The refusal for a link below the folder comes after the processes were
 stopped and the marker was written; nothing is written through the link.
 Further refusals: a host file or folder named `.alcove-deploy` (`a file named
@@ -888,7 +899,9 @@ name; rename the file`), a host name that cannot be the default folder name
 of a Windows short name and cannot be used as a folder name`), and on a
 Windows guest a segment of `install.file` or `launch.exe` that Windows cannot
 use (`'<s>' in launch.exe cannot be used as a file or folder name on
-Windows`).
+Windows`) and a single host file whose name Windows cannot use as a file
+name, such as `a\b.dll`, `x.exe:s` or `COM1.exe` (`'<name>' cannot be used
+as a file name on Windows; rename the file`).
 
 ## Guest events
 
