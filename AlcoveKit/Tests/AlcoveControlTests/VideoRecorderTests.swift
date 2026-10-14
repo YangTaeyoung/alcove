@@ -166,14 +166,55 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertNil(recorder.errorMessage)
     }
 
-    func testExistingFileIsReplaced() async throws {
-        let url = base.appendingPathComponent("replace.mp4")
+    func testExistingFileIsLeftAsItIsAndTheVideoFails() async throws {
+        let url = base.appendingPathComponent("existing.mp4")
         try Data("old".utf8).write(to: url)
         let recorder = VideoRecorder(url: url, fps: 5)
-        for i in 0..<3 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)) }
+        XCTAssertEqual(try Data(contentsOf: url), Data("old".utf8))
+        for i in 0..<3 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
         await recorder.finish()
-        let info = try await inspect(url)
-        XCTAssertEqual(info.tracks, 1)
+        XCTAssertNotNil(recorder.errorMessage)
+        XCTAssertEqual(try Data(contentsOf: url), Data("old".utf8))
+    }
+
+    func testFinishWithoutAWriterLeavesAFileItDidNotWrite() async throws {
+        let url = base.appendingPathComponent("other.mp4")
+        try Data("another recorder's video".utf8).write(to: url)
+        let recorder = VideoRecorder(url: url, fps: 5)
+        await recorder.finish()
+        XCTAssertEqual(recorder.errorMessage, "no frame could be recorded for the video")
+        XCTAssertEqual(try Data(contentsOf: url), Data("another recorder's video".utf8))
+    }
+
+    func testRecorderReleasedWhileWritingKeepsTheFramesItWrote() async throws {
+        let url = base.appendingPathComponent("released.mp4")
+        do {
+            let recorder = VideoRecorder(url: url, fps: 5)
+            for i in 0..<15 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testRecorderReleasedBeforeItsFirstFrameWasAppendedLeavesNoFile() async throws {
+        let url = base.appendingPathComponent("released-empty.mp4")
+        do {
+            let recorder = VideoRecorder(url: url, fps: 5)
+            recorder.failNextRenders(1)
+            recorder.append(frame: frame(320, 240, step: 0), at: .milliseconds(0))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testVideoFileIsReadableByItsOwnerOnly() async throws {
+        let url = base.appendingPathComponent("mode.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        for i in 0..<3 { recorder.append(frame: frame(320, 240, step: i), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
+        let during = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int
+        XCTAssertEqual(during, 0o600)
+        await recorder.finish()
+        XCTAssertNil(recorder.errorMessage)
+        let after = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int
+        XCTAssertEqual(after, 0o600)
     }
 
     func testFinishWithoutFramesWritesNoFile() async {
@@ -318,7 +359,7 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.path))
     }
 
-    func testStaleVideoFileIsRemovedAtStart() async throws {
+    func testVideoFileTheRecordingDidNotWriteIsNeitherReportedNorRemoved() async throws {
         let dir = base.appendingPathComponent("stale")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("video.mp4")
@@ -329,7 +370,7 @@ final class VideoRecorderTests: XCTestCase {
         let summary = await recording.stop()
         XCTAssertNil(summary.video)
         XCTAssertNil(summary.json["video"])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try Data(contentsOf: url), Data("old video".utf8))
     }
 
     func testBrokenVideoIsNotReportedAsTheRecording() async throws {

@@ -271,6 +271,23 @@ extension ControlHandler {
 
     func setRecordingSeams(_ seams: RecordingSeams) { recordingSeams = seams }
 
+    /// Ends every active recording and waits for every recording that is ending; their summaries wait for `vm.record.stop`.
+    func endRecordings() async {
+        for (vm, recording) in recordings.active { await retireRecording(vm, recording) }
+        for vm in Array(recordings.retiring.keys) { await settleRetirements(vm) }
+    }
+
+    /// Drops every entry of `vm` from the recording tables; its active recording, if any, is ended in a task of its own.
+    func forgetRecording(_ vm: String) {
+        if let recording = recordings.active[vm] { Task { _ = await recording.stop() } }
+        recordings.active[vm] = nil
+        recordings.ended[vm] = nil
+        recordings.lastDirectory[vm] = nil
+        recordings.vmGone[vm] = nil
+        recordings.retiring[vm] = nil
+        recordings.latest[vm] = nil
+    }
+
     /// Notes that the VM was found not running; its recording ends once the op that found out is traced.
     func noteVMGone(_ vm: String) {
         if let recording = recordings.active[vm] { recordings.vmGone[vm] = recording }
@@ -340,10 +357,7 @@ extension ControlHandler {
             guard let flag = value.boolValue else { throw ControlError.wrongType("video", .boolean) }
             video = flag
         }
-        let directory = try recordingDirectory(params, vm: t.name)
-        if FileManager.default.fileExists(atPath: directory.appendingPathComponent(TraceWriter.traceName).path) {
-            throw ControlError.failed("'\(directory.path)' already holds a recording; choose another directory")
-        }
+        let directory = try newRecordingDirectory(params, vm: t.name)
         let seams = recordingSeams
         let sink: VideoSink = video ? seams.makeSink(directory, fps) : NoVideoSink()
         let recording = Recording(vm: t.name, directory: directory, fps: fps, video: video, maxSeconds: maxSeconds,
@@ -370,6 +384,33 @@ extension ControlHandler {
             throw ControlError.failed("\(key) must be an integer between \(range.lowerBound) and \(range.upperBound)")
         }
         return number
+    }
+
+    /// The folder of a new recording: `dir` when it is missing or an empty folder; without `dir` a folder named after
+    /// the VM and the time below the recordings folder, with `-2`, `-3`, … added while that name is taken. A `dir`
+    /// that holds anything or is a file is refused.
+    private func newRecordingDirectory(_ params: JSON, vm: String) throws -> URL {
+        let first = try recordingDirectory(params, vm: vm)
+        let fm = FileManager.default
+        guard params["dir"] != nil else {
+            var url = first
+            var number = 1
+            while fm.fileExists(atPath: url.path) {
+                number += 1
+                url = first.deletingLastPathComponent().appendingPathComponent("\(first.lastPathComponent)-\(number)")
+            }
+            return url
+        }
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: first.path, isDirectory: &isDirectory) else { return first }
+        guard isDirectory.boolValue else { throw ControlError.failed("'\(first.path)' is a file; choose a directory that is missing or empty") }
+        if fm.fileExists(atPath: first.appendingPathComponent(TraceWriter.traceName).path) {
+            throw ControlError.failed("'\(first.path)' already holds a recording; choose another directory")
+        }
+        guard ((try? fm.contentsOfDirectory(atPath: first.path)) ?? []).isEmpty else {
+            throw ControlError.failed("'\(first.path)' is not empty; choose a directory that is missing or empty, or leave dir out for a new folder")
+        }
+        return first
     }
 
     /// The `dir` parameter as an absolute path; without it a folder named after the VM and the time below `base`

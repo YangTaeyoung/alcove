@@ -1337,16 +1337,27 @@ unless `video` is false, the screen is written to a video. A VM has at most
 one recording; a second start answers `'<vm>' is already recording to <dir>;
 call vm.record.stop first`.
 
-- `dir` is an absolute host path (`dir must be an absolute path`). Without it
-  the recording goes to `~/Library/Application Support/Alcove/Recordings/<vm>-<yyyyMMdd-HHmmss>`
-  (a `/` in the VM name becomes `-`). A directory that already holds a
-  `trace.jsonl` is refused: `'<dir>' already holds a recording; choose another
-  directory`.
-- The directory holds `trace.jsonl`, `frames/` and `video.mp4`.
+- `dir` is an absolute host path to a missing or empty folder (`dir must be an
+  absolute path`). A folder that holds a `trace.jsonl` is refused with
+  `'<dir>' already holds a recording; choose another directory`, any other
+  folder that is not empty with `'<dir>' is not empty; choose a directory that
+  is missing or empty, or leave dir out for a new folder`, and a file with
+  `'<dir>' is a file; choose a directory that is missing or empty`; nothing in
+  a refused `dir` is changed. Without `dir` the recording goes to a new folder
+  `~/Library/Application Support/Alcove/Recordings/<vm>-<yyyyMMdd-HHmmss>`
+  (a `/` in the VM name becomes `-`; `-2`, `-3`, … when it exists).
+- The directory holds `trace.jsonl`, `frames/` and `video.mp4`. The folders the
+  recording creates have mode 0700, its files mode 0600.
 - The recording ends by itself after `maxSeconds`, after a `vm.stop` of its VM
   succeeded, when an op finds its VM not running, and after 20 trace lines in
   a row could not be written. Its summary then waits for the next
   `vm.record.stop`, which returns it once.
+- When the control server shuts down (the app quits with VMs running, or
+  `alcovectl serve` and `alcovectl run-script --in-process` end), every
+  recording is ended and its files completed before the HTTP captures end.
+  When its VM is deleted (`vm.delete` or in the app), the recording is ended
+  and the server forgets it: `vm.record.status` answers `recording: false`
+  without `dir`, and `vm.record.stop` answers `'<vm>' is not recording`.
 - `vm.record.stop` ends the recording and answers its summary: `dir`, `trace`
   (the path of `trace.jsonl`), `frames` (frame files written), `seconds`,
   `ops` (trace lines written), `writeErrors` and `lastWriteError` (frames,
@@ -1374,7 +1385,7 @@ server ends abruptly:
 | `ok` | whether the op succeeded |
 | `result` / `error` | the reply's fields, or its error sentence |
 | `durationMs` | how long the op took |
-| `before`, `after` | `frames/<seq>-before.jpg` and `frames/<seq>-after.jpg`, paths relative to the directory |
+| `before`, `after` | `frames/<nnnnnn>-before.jpg` and `frames/<nnnnnn>-after.jpg`, where `<nnnnnn>` is `seq` with six digits (`000012`), paths relative to the directory |
 | `target` | the element the op was aimed at, asked of the UI helper before the op ran: `{window?, role, name, automationId?, rect?, password?, byAutomationId?, byName?}` |
 | `script` | for an op that `script.run` made: `step`, `expect`, `lease`, `snapshot` or `failure` |
 
@@ -1409,7 +1420,9 @@ recording continues without it, `vm.record.status` shows `videoError` at
 once, and the summary has no `video` and carries the reason in
 `lastWriteError` (`the video could not be written: …`, or `no frame could be
 recorded for the video` when no frame could be read); a file the failed
-writer left that still plays is kept in the directory. Measured on Windows
+writer left that still plays is kept in the directory. A recording that is
+not ended before its server goes away leaves `video.mp4` as written so far,
+playable up to its last whole fragment. Measured on Windows
 11 at 1280x800 and `fps` 5: 0.83 MB for 6 s and 35 MB for 192 s of a
 changing screen, `vm.record.start` and `vm.record.stop` each answered within
 0.05 s.

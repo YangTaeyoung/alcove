@@ -301,6 +301,65 @@ final class TraceTests: XCTestCase {
         XCTAssertTrue(unknown.contains("no VM named"), unknown)
     }
 
+    func testStartRefusesADirThatHoldsAnythingAndLeavesItAsItIs() async throws {
+        let (h, _, _) = setup()
+        let dir = base.appendingPathComponent("busy")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let video = dir.appendingPathComponent("video.mp4")
+        try Data("someone's video".utf8).write(to: video)
+        let message = await failure(h, "vm.record.start", ["name": "Win", "dir": .string(dir.path), "video": true])
+        XCTAssertEqual(message, "'\(dir.path)' is not empty; choose a directory that is missing or empty, or leave dir out for a new folder")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["video.mp4"])
+        XCTAssertEqual(try Data(contentsOf: video), Data("someone's video".utf8))
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status["recording"]?.boolValue, false)
+    }
+
+    func testStartRefusesADirThatIsAFile() async throws {
+        let (h, _, _) = setup()
+        let file = base.appendingPathComponent("plain")
+        try Data("x".utf8).write(to: file)
+        let message = await failure(h, "vm.record.start", ["name": "Win", "dir": .string(file.path)])
+        XCTAssertEqual(message, "'\(file.path)' is a file; choose a directory that is missing or empty")
+        XCTAssertEqual(try Data(contentsOf: file), Data("x".utf8))
+    }
+
+    func testStartUsesAnEmptyDir() async throws {
+        let (h, _, _) = setup()
+        let dir = base.appendingPathComponent("empty")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let started = try await start(h, ["dir": .string(dir.path)])
+        XCTAssertEqual(started.path, dir.path)
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+    }
+
+    func testDefaultDirGetsANumberWhenItsNameIsTaken() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        let fixed = Date(timeIntervalSince1970: 1_800_000_000)
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory,
+                               now: { fixed }, recordingsDirectory: base)
+        let first = try await start(h)
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        let second = try await start(h)
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(second.lastPathComponent, first.lastPathComponent + "-2")
+        XCTAssertEqual(second.deletingLastPathComponent().path, first.deletingLastPathComponent().path)
+    }
+
+    func testRecordingFilesAreReadableByTheirOwnerOnly() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        func mode(_ url: URL) throws -> Int? { try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int }
+        XCTAssertEqual(try mode(dir), 0o700)
+        XCTAssertEqual(try mode(dir.appendingPathComponent("frames")), 0o700)
+        XCTAssertEqual(try mode(dir.appendingPathComponent("trace.jsonl")), 0o600)
+        let frames = try FileManager.default.contentsOfDirectory(at: dir.appendingPathComponent("frames"), includingPropertiesForKeys: nil)
+        XCTAssertEqual(frames.count, 2)
+        for frame in frames { XCTAssertEqual(try mode(frame), 0o600, frame.lastPathComponent) }
+    }
+
     func testDoubleStartRefused() async throws {
         let (h, _, _) = setup()
         let dir = try await start(h)

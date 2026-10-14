@@ -7,6 +7,9 @@ import CoreVideo
 /// Writes frames as an H.264 MP4 file in movie fragments of `fragmentInterval`: a copy of the file made while it is
 /// written plays up to its last whole fragment. Frames are encoded in display order.
 ///
+/// The file is created by the writer when the first frame arrives, readable and writable by its owner only; a file
+/// already at `url` makes the video fail and is left as it is.
+///
 /// The output size is fixed by the first frame: rounded down to even numbers and scaled down so the longer side is at most
 /// `maxLongSide`. Frames of another size are drawn aspect-fit on black.
 ///
@@ -32,20 +35,21 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     private var finished = false
     private var failure: String?
     private var dropped = 0
+    /// Whether this recorder's writer created the file at `url`.
+    private var createdFile = false
 
     private var renderFailures = 0
     private var pool: CVPixelBufferPool?
     private var beforeEndSession: (@Sendable () -> Void)?
 
+    /// A writer without an appended frame is cancelled; a writer that appended frames leaves its file as written so far.
     deinit {
-        if let writer, writer.status == .writing { writer.cancelWriting() }
+        if let writer, writer.status == .writing, !lastTime.isValid { writer.cancelWriting() }
     }
 
-    /// Removes a file already at `url`.
     init(url: URL, fps: Int) {
         self.url = url
         self.fps = fps
-        try? FileManager.default.removeItem(at: url)
     }
 
     /// The size of the video for a first frame of `width` x `height`.
@@ -155,7 +159,8 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
 
     /// Completes the file; later calls do nothing, and later frames are ignored. A writer that failed leaves the file it
     /// wrote when that file opens as a movie and removes it when it does not; a session without an appended frame is
-    /// cancelled and its file removed; without any writer the error is that no frame could be recorded.
+    /// cancelled and its file removed; without any writer the error is that no frame could be recorded. A file this
+    /// recorder's writer did not create is never removed.
     func finish() async {
         let pending: (AVAssetWriter, CMTime)? = lock.withLock {
             guard !finished else { return nil }
@@ -199,6 +204,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
     }
 
     private func removeFileUnlessPlayable() async {
+        guard lock.withLock({ createdFile }) else { return }
         if await !VideoRecorder.isPlayable(url) { try? FileManager.default.removeItem(at: url) }
     }
 
@@ -247,6 +253,8 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
                 failure = describe(writer.error)
                 return false
             }
+            createdFile = true
+            chmod(url.path, 0o600)
             self.writer = writer
             self.input = input
             self.adaptor = adaptor

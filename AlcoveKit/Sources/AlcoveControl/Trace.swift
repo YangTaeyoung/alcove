@@ -264,13 +264,16 @@ final class TraceWriter: TraceStore, @unchecked Sendable {
     private let lock = NSLock()
     private var handle: FileHandle?
 
-    /// Creates the directory, `frames/` and an empty `trace.jsonl`; throws `WriterError.exists` when `trace.jsonl` is already there.
+    /// Creates the directory and `frames/` with mode 0700 where they are missing, and an empty `trace.jsonl` with mode
+    /// 0600; throws `WriterError.exists` when `trace.jsonl` is already there.
     init(directory: URL) throws {
         self.directory = directory
         let fm = FileManager.default
-        try fm.createDirectory(at: directory.appendingPathComponent(TraceWriter.framesName), withIntermediateDirectories: true)
+        let owned: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: owned)
+        try fm.createDirectory(at: directory.appendingPathComponent(TraceWriter.framesName), withIntermediateDirectories: true, attributes: owned)
         let trace = directory.appendingPathComponent(TraceWriter.traceName)
-        let descriptor = open(trace.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+        let descriptor = open(trace.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
         guard descriptor >= 0 else {
             if errno == EEXIST { throw WriterError.exists }
             throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: trace.path])
@@ -289,12 +292,13 @@ final class TraceWriter: TraceStore, @unchecked Sendable {
         try handle.write(contentsOf: line)
     }
 
-    /// Writes `frame` as a half-size JPEG (quality 0.6) to `frames/<name>` and returns its path relative to the directory.
+    /// Writes `frame` as a half-size JPEG (quality 0.6) with mode 0600 to `frames/<name>`, replacing a file there in one
+    /// rename, and returns its path relative to the directory.
     func writeFrame(_ frame: Frame, name: String) throws -> String {
         let data = frame.scaled(by: 0.5).encoded(.jpeg, quality: 0.6)
         guard !data.isEmpty else { throw WriterError.unencodable }
         let relative = "\(TraceWriter.framesName)/\(name)"
-        try data.write(to: directory.appendingPathComponent(relative), options: .atomic)
+        _ = try ControlHandler.writeHostFile(data, to: directory.appendingPathComponent(relative), replacing: true)
         return relative
     }
 
