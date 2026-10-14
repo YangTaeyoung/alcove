@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	"net/textproto"
 	"net/url"
 	"sort"
 	"strings"
@@ -281,6 +283,24 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 	p.forward(w, r, u, ex, resCap, sw)
 }
 
+// relayInformational sends an upstream 1xx answer other than 100 Continue to
+// the client. The server sends its own 100 Continue when the body is read.
+func relayInformational(w http.ResponseWriter, code int, header http.Header) {
+	if code == http.StatusContinue {
+		return
+	}
+	header = header.Clone()
+	removeHopByHop(header)
+	h := w.Header()
+	for k, vs := range header {
+		h[k] = vs
+	}
+	w.WriteHeader(code)
+	for k := range header {
+		delete(h, k)
+	}
+}
+
 func respondText(w http.ResponseWriter, ex *Exchange, resCap *capBuf, status int, text string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	ex.Status = status
@@ -339,6 +359,15 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *
 		out.ContentLength = -1
 	}
 	out.Host = r.Host
+	if _, ok := r.Header["User-Agent"]; !ok {
+		out.Header["User-Agent"] = []string{""}
+	}
+	out = out.WithContext(httptrace.WithClientTrace(out.Context(), &httptrace.ClientTrace{
+		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+			relayInformational(w, code, http.Header(header))
+			return nil
+		},
+	}))
 
 	resp, err := p.upstream().RoundTrip(out)
 	if err != nil {
@@ -360,6 +389,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *
 	h := w.Header()
 	for k, vs := range resp.Header {
 		h[k] = vs
+	}
+	for _, name := range []string{"Date", "Content-Type"} {
+		if _, ok := resp.Header[name]; !ok {
+			h[name] = nil
+		}
 	}
 	if len(resp.Trailer) > 0 {
 		h.Del("Content-Length")

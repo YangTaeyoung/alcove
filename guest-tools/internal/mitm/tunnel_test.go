@@ -144,4 +144,7 @@ func TestTunnelEndsAfterTheIdleTimeWhenTheUpstreamHoldsOn(t *testing.T) {
 	if d := time.Since(start); d > 3*time.Second || x["url"] != addr {
 		t.Fatalf("row %v after %v", x, d)
 	}
+	if x["error"] != "one side of the tunnel ended and the other sent nothing for 300ms, so the tunnel was closed" {
+		t.Fatalf("row %v", x)
+	}
 }

@@ -1,6 +1,8 @@
 package mitm
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
@@ -49,13 +51,17 @@ func (p *Proxy) tunnel(client *bufConn, authority string, replied bool) {
 	endPending := p.beginPending(&pendingEntry{time: start, kind: "tunnel", method: "CONNECT", url: authority, req: down2up.Load, res: up2down.Load})
 	defer endPending()
 
-	var ended atomic.Bool
+	var ended, idle atomic.Bool
 	done := make(chan struct{}, 2)
 	// pipe copies src to dst. At EOF it half-closes dst and bounds the idle
 	// time of the other direction (otherSrc); any other error closes both.
 	pipe := func(dst net.Conn, src io.Reader, otherSrc net.Conn, n *atomic.Int64) {
 		_, err := io.Copy(dst, &countingReader{r: src, n: n, ended: &ended, conn: srcConn(src, client, up)})
 		if err != nil {
+			var ne net.Error
+			if ended.Load() && errors.As(err, &ne) && ne.Timeout() {
+				idle.Store(true)
+			}
 			up.Close()
 			client.Close()
 		} else {
@@ -75,6 +81,9 @@ func (p *Proxy) tunnel(client *bufConn, authority string, replied bool) {
 	<-done
 	up.Close()
 	client.Close()
+	if idle.Load() {
+		ex.Error = fmt.Sprintf("one side of the tunnel ended and the other sent nothing for %s, so the tunnel was closed", tunnelIdleAfterHalfClose)
+	}
 	ex.ReqBytes = down2up.Load()
 	ex.ResBytes = up2down.Load()
 	ex.Ms = time.Since(start).Milliseconds()

@@ -112,6 +112,7 @@ func (p *Proxy) upstream() *http.Transport {
 			DisableCompression:     true,
 			ResponseHeaderTimeout:  responseTimeout,
 			MaxResponseHeaderBytes: maxUpstreamHeaderBytes,
+			ExpectContinueTimeout:  time.Second,
 			TLSHandshakeTimeout:    dialTimeout,
 			MaxIdleConnsPerHost:    32,
 			IdleConnTimeout:        90 * time.Second,
