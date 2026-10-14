@@ -140,7 +140,7 @@ final class AgentClientTests: XCTestCase {
             try await client.setClipboard(text: String(repeating: "x", count: 1 << 20))
             XCTFail("expected a refusal")
         } catch AgentClient.AgentError.remote(let text) {
-            XCTAssertEqual(text, "clipboard text is too large for the guest agent (limit about 700 KB of UTF-8)")
+            XCTAssertEqual(text, "the clipboard text is too large for one message to the guest tools (1048576 bytes of UTF-8; a message holds less than 1 MiB); set a shorter text")
         }
         _ = try await client.call("ping")
         XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "clipboard.set" })
@@ -213,6 +213,65 @@ final class AgentClientTests: XCTestCase {
         agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true, "n": 2]] : [] }
         let next = try await client.call("again")
         XCTAssertEqual(next["n"]?.intValue, 2)
+    }
+
+    func testAReplyLongerThanTheLineLimitFailsTheCallsWithASentence() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let big = String(repeating: "<", count: TCPLineTransport.maxLineBytes + 256 * 1024)
+        agent.handler = { m, _ in m["op"]?.stringValue == "ui.tree" ? [["t": "res", "id": m["id"] ?? .null, "ok": true, "tree": .string(big)]] : [] }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let waiting = Task { try await client.call("ping", timeout: .seconds(30)) }
+        while agent.receivedCount() < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        do { _ = try await client.call("ui.tree", timeout: .seconds(30)); XCTFail("expected a failure") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, AgentClient.replyTooLong) }
+        do { _ = try await waiting.value; XCTFail("expected a failure") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, AgentClient.replyTooLong) }
+        XCTAssertEqual(AgentClient.replyTooLong,
+                       "the guest tools sent an answer longer than 8 MiB, so the connection to them was closed; ask for less (a smaller max, depth or range) and retry")
+    }
+
+    func testACancelledCallEndsAtOnceAndItsLateReplyIsIgnored() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let pending = Task { try await client.call("ping", timeout: .seconds(30)) }
+        while agent.receivedCount() < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        pending.cancel()
+        do { _ = try await pending.value; XCTFail("expected a cancellation") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        let req = agent.received.first { $0["t"]?.stringValue == "req" }
+        agent.sendLine(["t": "res", "id": req?["id"] ?? .null, "ok": true])
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true, "n": 2]] : [] }
+        let next = try await client.call("again")
+        XCTAssertEqual(next["n"]?.intValue, 2)
+    }
+
+    func testACallCancelledBeforeItIsSentSendsNothing() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let pending = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await client.call("ping", timeout: .seconds(30))
+        }
+        do { _ = try await pending.value; XCTFail("expected a cancellation") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        agent.handler = { m, _ in m["t"]?.stringValue == "req" ? [["t": "res", "id": m["id"] ?? .null, "ok": true]] : [] }
+        _ = try await client.call("after")
+        XCTAssertEqual(agent.received.filter { $0["t"]?.stringValue == "req" }.compactMap { $0["op"]?.stringValue }, ["after"])
+    }
+
+    func testAnOverlappingV1RequestTimesOutItsOwnWaiter() async throws {
+        let agent = FakeAgent(); agent.proto = nil
+        _ = agent.start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        let long = Task { try await client.getClipboard(timeout: .seconds(30)) }
+        while agent.received.filter({ $0["t"]?.stringValue == "clipboard.get" }).count < 1 { try await Task.sleep(for: .milliseconds(5)) }
+        do { _ = try await client.getClipboard(timeout: .milliseconds(150)); XCTFail("expected a timeout") }
+        catch AgentClient.AgentError.timeout(let what) { XCTAssertEqual(what, "clipboard.text") }
+        agent.sendLine(["t": "clipboard.text", "text": "kept"])
+        let text = try await long.value
+        XCTAssertEqual(text, "kept")
     }
 
     func testDisconnectFailsPendingCalls() async throws {

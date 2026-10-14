@@ -5,8 +5,10 @@ import CryptoKit
 final class TCPLineTransport: @unchecked Sendable {
     enum TransportError: Error, Equatable { case socket(errno: Int32), connect(errno: Int32) }
 
-    /// The most bytes buffered while waiting for a newline; a longer line ends the connection.
+    /// The most bytes buffered while waiting for a newline; a longer line ends the connection with `lineTooLong`.
     static let maxLineBytes = 8 << 20
+    /// The reason `onEnd` receives when a line passed `maxLineBytes`.
+    static let lineTooLong = "line too long"
 
     private let queue = DispatchQueue(label: "alcove.agent.transport")
     private var fd: Int32
@@ -65,7 +67,7 @@ final class TCPLineTransport: @unchecked Sendable {
                     pending.removeSubrange(pending.startIndex...nl)
                     if !line.isEmpty { onLine(line) }
                 }
-                if pending.count > TCPLineTransport.maxLineBytes { finish("line too long"); return }
+                if pending.count > TCPLineTransport.maxLineBytes { finish(TCPLineTransport.lineTooLong); return }
                 if n < buffer.count { return }
                 continue
             }

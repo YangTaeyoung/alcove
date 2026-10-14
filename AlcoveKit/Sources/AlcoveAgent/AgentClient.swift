@@ -1,5 +1,5 @@
 import Foundation
-import AlcoveQMP   // JSON value type and the unix/tcp line transport helpers live there
+import AlcoveQMP
 
 /// Host side of the guest agent protocol (docs/agent-protocol.md): connects
 /// to the forwarded agent port, validates the token, and exchanges messages.
@@ -47,7 +47,9 @@ public actor AgentClient {
     private var helloWaiter: CheckedContinuation<JSON, Error>?
     private var pendingCalls: [Int: CheckedContinuation<JSON, Error>] = [:]
     private var nextCallID = 1
-    private var waiters: [String: [CheckedContinuation<JSON, Error>]] = [:]
+    /// The callers of `request` by the message type they wait for, oldest first, each with its own number.
+    private var waiters: [String: [(id: Int, continuation: CheckedContinuation<JSON, Error>)]] = [:]
+    private var nextWaiterID = 1
     public private(set) var hello: Hello?
     public private(set) var isConnected = false
 
@@ -120,7 +122,7 @@ public actor AgentClient {
     /// Set the guest clipboard text. Throws `.remote` without sending when the message would be longer than the agent reads.
     public func setClipboard(text: String) throws {
         guard AgentClient.clipboardMessageFits(text) else {
-            throw AgentError.remote("clipboard text is too large for the guest agent (limit about 700 KB of UTF-8)")
+            throw AgentError.remote("the clipboard text is too large for one message to the guest tools (\(text.utf8.count) bytes of UTF-8; a message holds less than 1 MiB); set a shorter text")
         }
         send(["t": "clipboard.set", "text": .string(text)])
     }
@@ -178,13 +180,18 @@ public actor AgentClient {
         return r["path"]?.stringValue ?? ""
     }
 
+    /// What the calls waiting on a connection get when the agent sent a line longer than `TCPLineTransport.maxLineBytes`.
+    public static let replyTooLong = "the guest tools sent an answer longer than 8 MiB, so the connection to them was closed; ask for less (a smaller max, depth or range) and retry"
+
     /// The longest request line the agent reads, newline included (`proto.MaxLine` in guest-tools).
     static let maxRequestBytes = 1 << 20
 
     /// Send `{"t":"req","id":n,"op":op, ...params}` and return the matching `res` object.
     /// Throws `.remote` on `ok:false` and for a request longer than `maxRequestBytes`, which is not sent,
-    /// and `.unsupported` when the agent has no RPC layer.
+    /// and `.unsupported` when the agent has no RPC layer. A cancelled task throws `CancellationError` at once; a
+    /// request it has not sent yet is not sent, and the reply to one it has sent is ignored.
     public func call(_ op: String, _ params: [String: JSON] = [:], timeout: Duration = .seconds(30)) async throws -> JSON {
+        try Task.checkCancellation()
         guard transport != nil else { throw AgentError.notConnected }
         guard (hello?.rpcVersion ?? 1) >= 2 else { throw AgentError.unsupported(op) }
         let id = nextCallID
@@ -202,9 +209,17 @@ public actor AgentClient {
             await self?.timeOutCall(id: id, op: op)
         }
         defer { timeoutTask.cancel() }
-        let res = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<JSON, Error>) in
-            pendingCalls[id] = cont
-            transport?.send(line)
+        let res = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<JSON, Error>) in
+                if Task.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                pendingCalls[id] = cont
+                transport?.send(line)
+            }
+        } onCancel: {
+            Task { await self.cancelCall(id: id) }
         }
         if res["ok"]?.boolValue == false {
             throw AgentError.remote(res["error"]?.stringValue ?? "request '\(op)' failed")
@@ -229,13 +244,15 @@ public actor AgentClient {
     private func request(_ message: JSON, waitFor type: String, timeout: Duration, matchID: String? = nil) async throws -> JSON {
         guard transport != nil else { throw AgentError.notConnected }
         let key = matchID.map { "\(type)#\($0)" } ?? type
+        let waiter = nextWaiterID
+        nextWaiterID += 1
         let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
-            await self?.timeOut(key: key, type: type)
+            do { try await Task.sleep(for: timeout) } catch { return }
+            await self?.timeOut(key: key, waiter: waiter, type: type)
         }
         defer { timeoutTask.cancel() }
         return try await withCheckedThrowingContinuation { cont in
-            waiters[key, default: []].append(cont)
+            waiters[key, default: []].append((waiter, cont))
             send(message)
         }
     }
@@ -260,22 +277,25 @@ public actor AgentClient {
         default:
             let idKey = m["id"]?.stringValue.map { "\(t)#\($0)" }
             if let idKey, var list = waiters[idKey], !list.isEmpty {
-                let c = list.removeFirst(); waiters[idKey] = list; c.resume(returning: m)
+                let c = list.removeFirst(); waiters[idKey] = list; c.continuation.resume(returning: m)
             } else if var list = waiters[t], !list.isEmpty {
-                let c = list.removeFirst(); waiters[t] = list; c.resume(returning: m)
+                let c = list.removeFirst(); waiters[t] = list; c.continuation.resume(returning: m)
             }
         }
     }
 
+    /// Fails every waiting caller: with `.remote(replyTooLong)` when the agent sent a line longer than the transport
+    /// reads, otherwise with `.disconnected`.
     private func handleEnd(_ reason: String) {
         transport = nil
         isConnected = false
-        if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: AgentError.disconnected) }
-        for (_, list) in waiters { for c in list { c.resume(throwing: AgentError.disconnected) } }
+        let failure = reason == TCPLineTransport.lineTooLong ? AgentError.remote(AgentClient.replyTooLong) : AgentError.disconnected
+        if let w = helloWaiter { helloWaiter = nil; w.resume(throwing: failure) }
+        for (_, list) in waiters { for c in list { c.continuation.resume(throwing: failure) } }
         waiters.removeAll()
         let calls = pendingCalls
         pendingCalls.removeAll()
-        for (_, c) in calls { c.resume(throwing: AgentError.disconnected) }
+        for (_, c) in calls { c.resume(throwing: failure) }
         eventContinuation.yield(.disconnected)
     }
 
@@ -287,10 +307,15 @@ public actor AgentClient {
         if let c = pendingCalls.removeValue(forKey: id) { c.resume(throwing: AgentError.timeout(op)) }
     }
 
-    private func timeOut(key: String, type: String) {
-        if var list = waiters[key], !list.isEmpty {
-            let c = list.removeFirst(); waiters[key] = list
-            c.resume(throwing: AgentError.timeout(type))
-        }
+    private func cancelCall(id: Int) {
+        if let c = pendingCalls.removeValue(forKey: id) { c.resume(throwing: CancellationError()) }
+    }
+
+    /// Fails the caller `waiter` of `request` with a timeout when it still waits for `key`.
+    private func timeOut(key: String, waiter: Int, type: String) {
+        guard var list = waiters[key], let index = list.firstIndex(where: { $0.id == waiter }) else { return }
+        let c = list.remove(at: index)
+        waiters[key] = list.isEmpty ? nil : list
+        c.continuation.resume(throwing: AgentError.timeout(type))
     }
 }

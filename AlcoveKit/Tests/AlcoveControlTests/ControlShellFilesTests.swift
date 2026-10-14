@@ -150,7 +150,7 @@ final class ControlShellFilesTests: XCTestCase {
     func testClipboardSetRefusesTextTheAgentCannotRead() async throws {
         let (h, agent) = try await setup { _, _ in [] }
         let text = await failure(h, "vm.clipboard.set", ["name": "Win", "text": .string(String(repeating: "x", count: 1_200_000))])
-        XCTAssertEqual(text, "clipboard text is too large for the guest agent (limit about 700 KB of UTF-8)")
+        XCTAssertEqual(text, "the clipboard text is too large for one message to the guest tools (1200000 bytes of UTF-8; a message holds less than 1 MiB); set a shorter text")
         XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "clipboard.set" })
     }
 
