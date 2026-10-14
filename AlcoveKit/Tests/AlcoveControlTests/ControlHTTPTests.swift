@@ -1172,9 +1172,12 @@ final class ControlHTTPTests: XCTestCase {
         await c.h.snapshotCreated(vm: "Win", snapshot: "live")
         XCTAssertNil(c.journal.snapshotEntry("live", vm: "Win"))
         XCTAssertEqual(c.journal.snapshotEntry("unrestored", vm: "Win")?.port, 49152)
+        let unknown = CaptureJournal.Entry(vm: "Nope", port: 49153, thumbprint: otherThumbprint, systemProxy: true, since: "x")
+        try c.journal.record(unknown, now: Date())
+        try c.journal.record(CaptureJournal.Entry(vm: "Win", port: 49154, thumbprint: otherThumbprint, systemProxy: true, since: "x"), now: Date())
         await c.h.snapshotCreated(vm: "Nope", snapshot: "s")
-        let calls = await c.t.snapshotCalls
-        XCTAssertEqual(calls, [])
+        XCTAssertNil(c.journal.snapshotEntry("s", vm: "Nope"))
+        XCTAssertNil(c.journal.snapshotEntry("s", vm: "Win"))
     }
 
     func testASnapshotTheAppRestoresGetsItsCaptureCleanedOverANewConnection() async throws {
@@ -1202,6 +1205,72 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertNotNil(c.journal.snapshotEntry("mid-capture", vm: "Win"))
         let calls = await c.t.snapshotCalls
         XCTAssertEqual(calls, ["create:mid-capture"])
+    }
+
+    func testARestoreInTheAppWhoseFirstConnectionAttemptFailsCleansOverTheConnectionTheWaitingAttemptAdopts() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        _ = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        let next = c.makeHandler()
+        let late = try await newConnection(c)
+        await c.t.setAgentHook { target in await target.connectAgent(late) }
+        let waitsBefore = await c.t.agentTimeouts.count
+        c.log.clear()
+        c.outputs.value["recipe.clearProxy"] = restoredState(caThumbprint)
+
+        await next.snapshotRestored(vm: "Win", snapshot: "mid-capture")
+        let cleaned = await eventually("the entry is gone") { c.journal.entry(for: "Win") == nil }
+        XCTAssertTrue(cleaned)
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+        let timeouts = await c.t.agentTimeouts
+        XCTAssertEqual(Array(timeouts.dropFirst(waitsBefore)), [.milliseconds(50)])
+        let adopted = await c.t.agentClient
+        XCTAssertTrue(adopted === late)
+    }
+
+    func testARestoreInTheAppWhoseFirstAttemptAdoptsStartsOneCleanupWhenTheWaitingAttemptAdoptsToo() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        _ = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        let next = c.makeHandler()
+        await c.t.setLinkAgent(try await newConnection(c))
+        let waitsBefore = await c.t.agentTimeouts.count
+        c.log.clear()
+        c.outputs.value["recipe.clearProxy"] = restoredState(caThumbprint)
+
+        await next.snapshotRestored(vm: "Win", snapshot: "mid-capture")
+        let cleaned = await next.runningCleanup(of: "Win")?.value
+        XCTAssertEqual(cleaned, true)
+        let waited = await eventually("the waiting attempt ended") { await c.t.agentTimeouts.count == waitsBefore + 1 }
+        XCTAssertTrue(waited)
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
+    func testAnUnansweredCleanupLeavesNoRetryForTheNextCleanupWhenItsReconnectGetsNoConnection() async throws {
+        let c = try await capture(adjust: { $0.recipe = RecipeLimit(guestMilliseconds: 1000, marginSeconds: 0) })
+        _ = try await c.start()
+        let next = c.makeHandler()
+        _ = try await next.handle(op: "vm.status", params: ["name": "Win"])
+        c.agent.drop()
+        await c.t.setLinkAgent(try await newConnection(c))
+        c.held.value = ["recipe.clearProxy"]
+        c.log.clear()
+
+        await next.guestToolsSeen(vm: "Win")
+        let first = await next.runningCleanup(of: "Win")?.value
+        XCTAssertEqual(first, false)
+        let afterFirst = await c.t.drops
+        XCTAssertEqual(afterFirst, [true])
+
+        await c.t.connectAgent(try await newConnection(c))
+        let second = await next.runningCleanup(of: "Win")?.value
+        XCTAssertEqual(second, false)
+        let drops = await c.t.drops
+        XCTAssertEqual(drops, [true])
+        XCTAssertEqual(c.hostLog.value.count, 2)
     }
 
     func testARestoreInTheAppEndsTheLiveCaptureAsTheOpDoes() async throws {
@@ -1234,7 +1303,18 @@ final class ControlHTTPTests: XCTestCase {
         let cleanup = await c.h.runningCleanup(of: "Win")
         XCTAssertNil(cleanup)
         XCTAssertEqual(c.log.entries, [])
+        let unknown = CaptureJournal.Entry(vm: "Nope", port: 49153, thumbprint: otherThumbprint, systemProxy: true, since: "x")
+        try c.journal.record(unknown, now: Date())
+        try c.journal.noteSnapshot("s", during: unknown, now: Date())
         await c.h.snapshotRestored(vm: "Nope", snapshot: "s")
+        let dropsAfter = await c.t.drops
+        XCTAssertEqual(dropsAfter, drops)
+        let callsAfter = await c.t.agentCalls.count
+        XCTAssertEqual(callsAfter, calls)
+        let unknownCleanup = await c.h.runningCleanup(of: "Nope")
+        XCTAssertNil(unknownCleanup)
+        XCTAssertEqual(c.log.entries, [])
+        XCTAssertEqual(c.hostLog.value, [])
     }
 
     func testASnapshotTheAppDeletesLosesItsNote() async throws {
@@ -1263,6 +1343,14 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertNil(c.journal.snapshotEntry("mid-capture", vm: here))
         XCTAssertEqual(c.journal.entry(for: other.owner), other)
         XCTAssertEqual(c.log.entries, ["proxy.stop"])
+    }
+
+    func testTheHeadlessLogWritesEachLineToStandardErrorAndTheSystemLog() {
+        let written = LockedBox<[String]>([])
+        let log = ControlHandler.standardErrorAndSystemLog(write: { written.value = written.value + [$0] })
+        log("the cleanup after an earlier HTTP capture of 'Win' failed to remove the proxy CA (x)")
+        log("second")
+        XCTAssertEqual(written.value, ["the cleanup after an earlier HTTP capture of 'Win' failed to remove the proxy CA (x)\n", "second\n"])
     }
 
     func testACleanupThatFailsKeepsTheEntryForTheNextConnection() async throws {

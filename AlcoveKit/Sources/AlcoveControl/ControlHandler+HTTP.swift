@@ -489,12 +489,19 @@ extension ControlHandler {
     /// Called after the app restored `snapshot` of `vm` without the control protocol. Drops the control target's agent
     /// connection, ends a live capture of the VM and makes the snapshot's note the VM's entry, as `vm.snapshot.restore`
     /// does; when the VM then has an entry, the control target connects its tools, and that connection starts the cleanup.
+    /// A task that is not awaited also waits up to `HTTPTiming.toolsWait` for a tools connection, so that a connection
+    /// adopted after the first attempt ended starts the cleanup as well.
     public func snapshotRestored(vm: String, snapshot: String) async {
         guard let t = await lookUp(vm) else { return }
         await t.dropAgent(nil)
         await endCapture(vm)
-        if let noted = captureJournal.snapshotEntry(snapshot, vm: await journalVM(t)) { try? captureJournal.record(noted, now: wallClock()) }
+        let owner = await journalVM(t)
+        if let noted = captureJournal.snapshotEntry(snapshot, vm: owner) { try? captureJournal.record(noted, now: wallClock()) }
         await connectForCleanup(t)
+        if captures[vm] == nil, captureJournal.entry(for: owner) != nil {
+            let wait = httpTiming.toolsWait
+            Task { _ = await t.agent(timeout: wait) }
+        }
     }
 
     /// Called after the app deleted `snapshot` of `vm` without the control protocol: removes the snapshot's note.
@@ -527,8 +534,8 @@ extension ControlHandler {
     /// The cleanup of `t` that is running, or a new one: under the capture gate of the VM it restores the guest from
     /// the VM's journal entry, with `HTTPTiming.recipe` for each recipe, and removes the entry when every step worked.
     /// A failed cleanup writes one line to `log`. When a step failed because the guest gave no answer, the cleanup then
-    /// drops `agent` and asks the target for its agent connection once more, unless it runs over a connection asked
-    /// for that way. Its value tells whether it removed anything of a capture from the guest.
+    /// drops `agent` and asks the target for its agent connection once more, unless it is the cleanup created right
+    /// after a cleanup that did so. Its value tells whether it removed anything of a capture from the guest.
     func staleCleanup(_ t: VMTarget, _ agent: AgentClient) -> Task<Bool, Never> {
         let vm = t.name
         if let running = staleCleanups[vm] { return running.task }
@@ -616,7 +623,7 @@ extension ControlHandler {
     }
 
     /// Drops `agent` when the target of `t` still holds it, and asks the target for its agent connection; the next
-    /// cleanup of the VM does not ask again.
+    /// cleanup created for the VM, over whichever connection, does not ask again.
     private func reconnect(_ t: VMTarget, droppingUnanswered agent: AgentClient) async {
         staleRetries.insert(t.name)
         await t.dropAgent(agent)

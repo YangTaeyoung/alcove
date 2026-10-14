@@ -9,6 +9,17 @@ public actor ControlHandler {
     /// Where the lines of a handler without its own `log` go.
     static let systemLog = Logger(subsystem: "io.github.yangtaeyoung.Alcove", category: "control")
 
+    /// A `log` for a handler of a process that has a terminal: each line goes to the system log as the default does,
+    /// and to `write` as the line followed by a newline, which standard error receives by default.
+    public static func standardErrorAndSystemLog(
+        write: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data($0.utf8)) }
+    ) -> @Sendable (String) -> Void {
+        { line in
+            systemLog.notice("\(line, privacy: .public)")
+            write(line + "\n")
+        }
+    }
+
     /// The JSON type of an optional boolean or integer parameter.
     public enum ParamType: Sendable {
         case boolean, integer
@@ -122,8 +133,8 @@ public actor ControlHandler {
     var endedCleanups: [String: (id: UUID, cleaned: Bool)] = [:]
     /// Per VM: the target object this handler observes the agent connections of.
     var observedTargets: [String: EventMark] = [:]
-    /// The VMs whose next cleanup after an earlier capture runs over the connection asked for after a cleanup whose
-    /// guest did not answer.
+    /// The VMs whose next cleanup after an earlier capture, over whichever connection, does not ask for another
+    /// connection when its guest does not answer.
     var staleRetries: Set<String> = []
     /// Receives one line for each event of the handler that no op reports.
     let log: @Sendable (String) -> Void

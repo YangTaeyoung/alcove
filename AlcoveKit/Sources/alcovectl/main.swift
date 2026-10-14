@@ -182,7 +182,8 @@ case "serve":
     }
     let registry = HeadlessRegistry(directory: vmDir, engine: engine)
     let handler = ControlHandler(registry: registry, hostKind: "headless", captureDirectory: ProxyProcess.defaultCADirectory,
-                                 engineDescription: engine.qemuSystem)
+                                 engineDescription: engine.qemuSystem,
+                                 log: ControlHandler.standardErrorAndSystemLog())
     let server = ControlServer(handler: handler, socketPath: socketPath)
     do { try server.start(loadingRecognizers: true) } catch { fail("cannot start control server: \(error)") }
     print("alcove control server (headless) listening at \(socketPath); VMs in \(vmDir.path)")
