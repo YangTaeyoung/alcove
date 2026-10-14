@@ -6,22 +6,38 @@ import { clip, fail, text, vmName, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
-/** `#id time METHOD url -> status (ms, req/res bytes) [rule n]`; tunnel and TLS error rows say so. */
+/** Longest `vm.http.start` runs before it answers, in ms: a cleanup after an earlier capture that holds the VM (45 s), the wait for guest tools (31 s), the proxy becoming ready (15 s) and taking its settings (30 s), the CA copy (24 s), two guest recipes (30 s each), and after a failed last step the undo (45 s) and the end of the proxy (6 s). */
+export const START_WORST_MS = 256000;
+/** Longest `vm.http.stop` runs before it answers, in ms: a cleanup that holds the VM (45 s), the exchange count (30 s), the wait for guest tools (31 s), three guest recipes (30 s each) and the end of the proxy (6 s). */
+export const STOP_WORST_MS = 202000;
+/** What `client.call` waits beyond the longest run of a capture op, in ms. */
+export const CAPTURE_MARGIN_MS = 15000;
+
+/** `#id time METHOD url -> status (ms, req/res bytes) [rule n]`; tunnel and TLS error rows say so, and a row whose bodies the capture dropped says `[bodies dropped]`. */
 export function exchangeLine(e: Obj): string {
   const kind = e.kind === "tunnel" ? "TUNNEL" : e.kind === "tlsError" ? "TLS-ERROR" : String(e.method ?? "?");
   const status = e.status === undefined || e.status === null || e.status === 0 ? "-" : String(e.status);
   const parts = [`#${e.id} ${e.time} ${kind} ${e.url} -> ${status} (${e.ms ?? 0} ms, ${e.reqBytes ?? 0}/${e.resBytes ?? 0} bytes)`];
   if (e.rule !== undefined && e.rule !== null) parts.push(`[rule ${e.rule}]`);
+  if (e.bodyDropped === true) parts.push("[bodies dropped]");
   if (e.error) parts.push(`error: ${e.error}`);
   return parts.join(" ");
+}
+
+/** `in flight: time METHOD url (ms so far, req/res bytes) [rule n]` for a request or tunnel that has not finished. */
+export function pendingLine(e: Obj): string {
+  const kind = e.kind === "tunnel" ? "TUNNEL" : String(e.method ?? "?");
+  const rule = e.rule !== undefined && e.rule !== null ? ` [rule ${e.rule}]` : "";
+  return `in flight: ${e.time} ${kind} ${e.url} (${e.ms ?? 0} ms so far, ${e.reqBytes ?? 0}/${e.resBytes ?? 0} bytes)${rule}`;
 }
 
 const DETAIL_CHARS = 60000;
 const BASE64_BYTES_PER_PAGE = 45000;
 
-/** Headers, a blank line, then the body clipped at 60000 characters; the paging hint counts bytes of the part. */
+/** Headers, trailers as `trailer name: value`, a blank line, then the body clipped at 60000 characters; the paging hint counts bytes of the part. */
 export function exchangeDetail(id: number, part: string, r: Obj, offset: number): string {
   const headers = ((r.headers as string[][]) ?? []).map(([k, v]) => `${k}: ${v}`);
+  const trailers = ((r.trailers as string[][]) ?? []).map(([k, v]) => `trailer ${k}: ${v}`);
   const body = String(r.body ?? "");
   const base64 = r.base64 === true;
   const total = Number(r.total ?? 0);
@@ -29,7 +45,8 @@ export function exchangeDetail(id: number, part: string, r: Obj, offset: number)
   if (base64) notes.push("body is base64 (not text)");
   if (r.encoding) notes.push(`content encoding ${r.encoding} not decoded`);
   if (r.bodyTruncated === true) notes.push("the capture kept only the first 2 MiB of this body");
-  const returned = typeof r.length === "number" ? r.length : base64 ? Math.floor((body.length * 3) / 4) : Buffer.byteLength(body, "utf8");
+  if (r.bodyDropped === true) notes.push("the capture dropped the bodies of this exchange to make room for newer ones");
+  const returned = base64 ? Buffer.from(body, "base64").length : Buffer.byteLength(body, "utf8");
   let hint = "";
   if (body.length > DETAIL_CHARS) {
     hint = base64
@@ -40,7 +57,7 @@ export function exchangeDetail(id: number, part: string, r: Obj, offset: number)
   }
   const shown = body.length > DETAIL_CHARS ? clip(body, DETAIL_CHARS, hint) : body;
   const tail = body.length <= DETAIL_CHARS && hint ? `\n...[more; ${hint}]` : "";
-  return [notes.join("; "), ...headers, "", shown + tail].join("\n");
+  return [notes.join("; "), ...headers, ...trailers, "", shown + tail].join("\n");
 }
 
 function ruleLine(rule: Obj): string {
@@ -68,7 +85,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(a.secrets !== undefined ? { secrets: a.secrets } : {}),
         ...(a.bodies !== undefined ? { bodies: a.bodies } : {}),
         ...(a.system_proxy !== undefined ? { systemProxy: a.system_proxy } : {}),
-      }, 180000);
+      }, START_WORST_MS + CAPTURE_MARGIN_MS);
       const lines = [
         `capturing through proxy ${reply.proxy}`,
         `CA certificate ${reply.caInstalled ? "installed in the guest" : "NOT installed in the guest (HTTPS will fail certificate checks)"}`,
@@ -78,6 +95,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...Object.entries((reply.env as Record<string, unknown>) ?? {}).map(([k, v]) => `${k}=${v}`),
       ];
       if (reply.guestCAPath) lines.push(`CA file in the guest: ${reply.guestCAPath}`);
+      if (reply.warning) lines.push(`warning: ${reply.warning}`);
       return text(lines.join("\n"), reply);
     } catch (e) {
       return fail(e);
@@ -86,13 +104,17 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("http", "alcove_http_capture_stop", {
     title: "Stop HTTP capture",
-    description: "Stop the capture of a VM: restores the guest's proxy settings, removes the CA certificate from the guest and stops the proxy. Returns how many exchanges were captured; read them with alcove_http_requests before stopping, they are discarded. To empty the list and keep capturing use alcove_http_requests with clear.",
+    description: "Stop the capture of a VM: restores the guest's proxy settings, removes the CA certificate from the guest and stops the proxy. Returns how many exchanges were captured; read them with alcove_http_requests before stopping, they are discarded. To empty the list and keep capturing use alcove_http_requests with clear. On a VM without a capture it clears what an earlier capture left in the guest.",
     inputSchema: { name: vmName },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async ({ name }) => {
     try {
-      const reply = await client.call("vm.http.stop", { name }, 180000);
-      return text(`capture stopped; ${reply.exchanges ?? 0} exchanges were captured`, reply);
+      const reply = await client.call("vm.http.stop", { name }, STOP_WORST_MS + CAPTURE_MARGIN_MS);
+      const lines = [reply.staleCleared === true
+        ? "no capture was running; what an earlier capture left in the guest (proxy settings, CA certificate) was cleared"
+        : `capture stopped; ${reply.exchanges ?? 0} exchanges were captured`];
+      if (reply.warning) lines.push(`warning: ${reply.warning}`);
+      return text(lines.join("\n"), reply);
     } catch (e) {
       return fail(e);
     }
@@ -100,7 +122,7 @@ export function register(r: Registrar, client: ControlClient): void {
 
   r.tool("http", "alcove_http_requests", {
     title: "List or read captured requests",
-    description: "Without id: list the newest captured exchanges (limit, default 50), one per line as `#id time METHOD url -> status (ms, request/response bytes) [rule n]`, filtered by host, path or status; tunnelled hosts appear as TUNNEL rows. With id: read one exchange part (request or response) as headers and body, paged with offset and length, which count bytes of that part (length defaults to 60000, at most 200000; the text shows at most 60000 characters per call and ends with the offset to continue from). Prefer a list with filters over reading everything. With clear: true (alone) the captured exchanges are discarded and capture continues.",
+    description: "Without id: list the newest captured exchanges (limit, default 50), one per line as `#id time METHOD url -> status (ms, request/response bytes) [rule n]`, filtered by host, path or status; tunnelled hosts appear as TUNNEL rows and requests that have not finished as `in flight:` rows. With id: read one exchange part (request or response) as headers and body, paged with offset and length, which count bytes of that part (length defaults to 60000, at most 200000; the text shows at most 60000 characters per call and ends with the offset to continue from). Prefer a list with filters over reading everything. With clear: true (alone) the captured exchanges are discarded and capture continues.",
     inputSchema: {
       name: vmName,
       id: z.number().int().min(0).optional().describe("Exchange id to read; with it the list filters are ignored"),
@@ -128,12 +150,14 @@ export function register(r: Registrar, client: ControlClient): void {
         const offset = a.offset ?? 0;
         const reply = await client.call("vm.http.request", {
           name: a.name,
-          id: a.id,
+          exchange: a.id,
           part,
           ...(a.offset !== undefined ? { offset: a.offset } : {}),
           length: a.length ?? DETAIL_CHARS,
         }, 60000);
-        return text(exchangeDetail(a.id, part, reply, offset), { total: reply.total, bodyTruncated: reply.bodyTruncated, base64: reply.base64, encoding: reply.encoding });
+        return text(exchangeDetail(a.id, part, reply, offset), {
+          total: reply.total, bodyTruncated: reply.bodyTruncated, base64: reply.base64, encoding: reply.encoding, bodyDropped: reply.bodyDropped,
+        });
       }
       const reply = await client.call("vm.http.requests", {
         name: a.name,
@@ -144,9 +168,9 @@ export function register(r: Registrar, client: ControlClient): void {
         ...(a.limit !== undefined ? { limit: a.limit } : {}),
       }, 60000);
       const exchanges = (reply.exchanges as Obj[]) ?? [];
-      const pending = Number(reply.pending ?? 0);
+      const pending = Array.isArray(reply.pending) ? (reply.pending as Obj[]) : [];
       const lines = exchanges.length === 0 ? ["no captured exchanges"] : exchanges.map(exchangeLine);
-      if (pending > 0) lines.push(`${pending} more request(s) still in flight`);
+      lines.push(...pending.map(pendingLine));
       if (reply.next !== undefined) lines.push(`next: ${reply.next}`);
       return text(clip(lines.join("\n"), 60000, "narrow with host, path, status or since"), { exchanges, next: reply.next, pending: reply.pending });
     } catch (e) {
@@ -166,7 +190,7 @@ export function register(r: Registrar, client: ControlClient): void {
         method: z.string().optional().describe("HTTP method"),
       }).optional().describe("add: which requests the rule applies to"),
       response: z.object({
-        status: z.number().int().min(100).max(599).optional().describe("Status code of the canned answer (default 200 when body is given)"),
+        status: z.number().int().min(200).max(599).optional().describe("Status code of the canned answer, 200 to 599 (default 200 when body is given)"),
         headers: z.record(z.string()).optional().describe("Response headers as {name: value}; they replace defaults such as content-type"),
         body: z.string().optional().describe("Response body; content-type defaults to application/json when it parses as JSON, else text/plain"),
         delay_ms: z.number().int().min(0).max(600000).optional().describe("Wait this long before answering or forwarding"),

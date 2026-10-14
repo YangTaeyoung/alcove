@@ -1,7 +1,37 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { register, exchangeLine, exchangeDetail } from "./tools/http.js";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
+import { register, exchangeLine, exchangeDetail, pendingLine, START_WORST_MS, STOP_WORST_MS, CAPTURE_MARGIN_MS } from "./tools/http.js";
+import { ControlClient } from "./control.js";
 import { rig, textOf } from "./test-rig.js";
+import type { Registrar, ToolHandler } from "./toolkit.js";
+
+/** A control server on a unix socket in a new temporary folder; it records every request line and answers it with `reply` under the line's own id. */
+async function controlServer(reply: Record<string, unknown>) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alcove-mcp-"));
+  const socketPath = path.join(dir, "control.sock");
+  const lines: Array<Record<string, unknown>> = [];
+  const server = net.createServer((sock) => {
+    let buffer = "";
+    sock.setEncoding("utf8");
+    sock.on("data", (chunk: string) => {
+      buffer += chunk;
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const request = JSON.parse(buffer.slice(0, nl));
+        buffer = buffer.slice(nl + 1);
+        lines.push(request);
+        sock.write(JSON.stringify({ ...reply, ok: true, id: request.id }) + "\n");
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  const close = () => { server.close(); fs.rmSync(dir, { recursive: true, force: true }); };
+  return { socketPath, lines, close };
+}
 
 test("exchangeLine prints the documented list format", () => {
   assert.equal(
@@ -26,23 +56,110 @@ test("exchangeDetail hints 45000-byte pages for a clipped base64 body", () => {
   assert.match(out, /use offset 45005 and length 45000 to read further\]$/);
 });
 
-test("exchangeDetail uses the reply's returned length for the next offset when more remains", () => {
-  const out = exchangeDetail(1, "response", { headers: [], body: "abc", length: 3, total: 10 }, 0);
-  assert.match(out, /\n\nabc\n\.\.\.\[more; offsets count bytes; use offset 3 to read further\]$/);
+test("exchangeDetail counts the bytes of the returned body for the next offset when more remains", () => {
+  const out = exchangeDetail(1, "response", { headers: [], body: "ab\u00e9", length: 99, total: 10 }, 2);
+  assert.match(out, /\n\nab\u00e9\n\.\.\.\[more; offsets count bytes; use offset 6 to read further\]$/);
+  const binary = exchangeDetail(1, "response", { headers: [], body: "AAECAw==", base64: true, total: 10 }, 0);
+  assert.match(binary, /use offset 4 to read further\]$/);
+});
+
+test("exchangeDetail shows trailers and says when the capture dropped the bodies", () => {
+  const out = exchangeDetail(3, "response", { headers: [["content-type", "text/plain"]], trailers: [["x-checksum", "9"]], body: "", total: 0, bodyDropped: true }, 0);
+  assert.equal(out, "#3 response: 0 bytes in total, body from byte 0; the capture dropped the bodies of this exchange to make room for newer ones\ncontent-type: text/plain\ntrailer x-checksum: 9\n\n");
+});
+
+test("exchangeLine marks a row whose bodies were dropped", () => {
+  assert.equal(
+    exchangeLine({ id: 7, time: "t", kind: "http", method: "GET", url: "https://a.test/x", status: 200, ms: 1, reqBytes: 0, resBytes: 5, bodyDropped: true }),
+    "#7 t GET https://a.test/x -> 200 (1 ms, 0/5 bytes) [bodies dropped]",
+  );
+});
+
+test("pendingLine prints a request that has not finished", () => {
+  assert.equal(pendingLine({ time: "t", kind: "http", method: "POST", url: "https://a.test/x", ms: 1200, reqBytes: 10, resBytes: 0, rule: 2 }),
+    "in flight: t POST https://a.test/x (1200 ms so far, 10/0 bytes) [rule 2]");
+});
+
+test("the envelope id of a call is the client's own, whatever the parameters hold", async () => {
+  const server = await controlServer({ headers: [], body: "x", total: 1, bodyTruncated: false });
+  const client = new ControlClient(server.socketPath);
+  try {
+    await client.call("hello", {});
+    const handlers = new Map<string, ToolHandler>();
+    const registrar: Registrar = { tool: (_set, name, _config, handler) => { handlers.set(name, handler); } };
+    register(registrar, client);
+    const r = await handlers.get("alcove_http_requests")!({ name: "vm", id: 4, part: "request" });
+    assert.equal(r.isError, undefined);
+    assert.deepEqual(server.lines[1], { id: 2, op: "vm.http.request", name: "vm", exchange: 4, part: "request", length: 60000 });
+
+    const reply = await client.call("vm.http.request", { id: 99, op: "other", name: "vm" });
+    assert.equal(reply.id, 3);
+    assert.deepEqual(server.lines[2], { id: 3, op: "vm.http.request", name: "vm" });
+  } finally {
+    client.close();
+    server.close();
+  }
 });
 
 test("alcove_http_requests with id reads one exchange part with a default length and metadata-only structuredContent", async () => {
   const t = rig(register, { headers: [["a", "b"]], body: "x", total: 1, bodyTruncated: false });
   const r = await t.run("alcove_http_requests", { name: "vm", id: 4, part: "request", offset: 5 });
-  assert.deepEqual(t.calls[0], { op: "vm.http.request", params: { name: "vm", id: 4, part: "request", offset: 5, length: 60000 } });
-  assert.deepEqual(r.structuredContent, { total: 1, bodyTruncated: false, base64: undefined, encoding: undefined });
+  assert.deepEqual(t.calls[0], { op: "vm.http.request", params: { name: "vm", exchange: 4, part: "request", offset: 5, length: 60000 } });
+  assert.deepEqual(r.structuredContent, { total: 1, bodyTruncated: false, base64: undefined, encoding: undefined, bodyDropped: undefined });
 });
 
-test("alcove_http_requests shows the pending count when it is not zero", async () => {
-  const t = rig(register, { exchanges: [], next: 0, pending: 2 });
+test("alcove_http_requests lists the requests that are still in flight", async () => {
+  const pending = [{ time: "t", kind: "http", method: "GET", url: "https://a.test/slow", ms: 900, reqBytes: 0, resBytes: 0 }];
+  const t = rig(register, { exchanges: [], next: 0, pending });
   const r = await t.run("alcove_http_requests", { name: "vm", status: "4xx" });
   assert.equal(t.calls[0].op, "vm.http.requests");
-  assert.match(textOf(r), /2 more request\(s\) still in flight/);
+  assert.equal(textOf(r), "no captured exchanges\nin flight: t GET https://a.test/slow (900 ms so far, 0/0 bytes)\nnext: 0");
+});
+
+test("no http tool sends a parameter named like a field of the envelope", async () => {
+  const t = rig(register, { rule: 1, rules: [] });
+  await t.run("alcove_http_capture_start", { name: "vm", hosts: ["a"], secrets: true, bodies: true, system_proxy: true });
+  await t.run("alcove_http_capture_stop", { name: "vm" });
+  await t.run("alcove_http_requests", { name: "vm", id: 1, part: "request", offset: 1, length: 2 });
+  await t.run("alcove_http_requests", { name: "vm", since: 1, host: "a", path: "/", status: 404, limit: 5 });
+  await t.run("alcove_http_requests", { name: "vm", clear: true });
+  for (const action of ["add", "list", "remove", "clear"]) {
+    await t.run("alcove_http_rule", { name: "vm", action, match: { host: "a" }, response: { status: 500 }, rule: 1 });
+  }
+  assert.equal(t.calls.length, 9);
+  for (const call of t.calls) {
+    for (const field of ["id", "op", "ok", "error"]) assert.equal(field in call.params, false, `${call.op} sends ${field}`);
+  }
+});
+
+test("capture start and stop wait 15 s longer than the op may take", async () => {
+  const t = rig(register, { proxy: "10.0.2.2:1", env: {} });
+  await t.run("alcove_http_capture_start", { name: "vm" });
+  await t.run("alcove_http_capture_stop", { name: "vm" });
+  assert.deepEqual(t.timeouts, [271000, 217000]);
+  assert.equal(START_WORST_MS + CAPTURE_MARGIN_MS, 271000);
+  assert.equal(STOP_WORST_MS + CAPTURE_MARGIN_MS, 217000);
+});
+
+test("capture start and stop print the op's warning, and stop says when it only cleared leftovers", async () => {
+  const started = rig(register, { proxy: "10.0.2.2:1", env: {}, caInstalled: true, systemProxySet: true, warning: "hosts is set: no trust store variables" });
+  assert.match(textOf(await started.run("alcove_http_capture_start", { name: "vm" })), /\nwarning: hosts is set: no trust store variables$/);
+  const stopped = rig(register, { exchanges: 3, warning: "the guest keeps the proxy settings" });
+  assert.equal(textOf(await stopped.run("alcove_http_capture_stop", { name: "vm" })), "capture stopped; 3 exchanges were captured\nwarning: the guest keeps the proxy settings");
+  const stale = rig(register, { exchanges: 0, staleCleared: true });
+  assert.equal(textOf(await stale.run("alcove_http_capture_stop", { name: "vm" })),
+    "no capture was running; what an earlier capture left in the guest (proxy settings, CA certificate) was cleared");
+});
+
+test("alcove_http_rule takes a status from 200 to 599", async () => {
+  let schema: Record<string, unknown> = {};
+  const registrar: Registrar = { tool: (_set, name, config) => { if (name === "alcove_http_rule") schema = config.inputSchema as Record<string, unknown>; } };
+  register(registrar, {} as ControlClient);
+  const response = (schema.response as { safeParse(v: unknown): { success: boolean } });
+  assert.equal(response.safeParse({ status: 199 }).success, false);
+  assert.equal(response.safeParse({ status: 200 }).success, true);
+  assert.equal(response.safeParse({ status: 599 }).success, true);
+  assert.equal(response.safeParse({ status: 600 }).success, false);
 });
 
 test("alcove_http_requests clear calls vm.http.clear on its own", async () => {

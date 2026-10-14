@@ -88,11 +88,11 @@ export class ControlClient {
     this.pending.clear();
   }
 
-  /** Send one request and await its reply; throws ControlError on `ok: false`. */
+  /** Send one request and await its reply; throws ControlError on `ok: false`. The request's `id` and `op` are the envelope's, whatever `params` holds under those names. */
   async call(op: string, params: Record<string, unknown> = {}, timeoutMs = 600000): Promise<ControlReply> {
     await this.connect();
     const id = this.nextId++;
-    const line = JSON.stringify({ id, op, ...params }) + "\n";
+    const line = JSON.stringify({ ...params, id, op }) + "\n";
     const reply = await new Promise<ControlReply>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
