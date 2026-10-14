@@ -517,6 +517,26 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertEqual(sink.times.count, count)
     }
 
+    func testStopEndsWhileTheFrameSourceDoesNotAnswer() async throws {
+        let dir = base.appendingPathComponent("stuck")
+        let gate = Latch()
+        let sink = ProbeSink()
+        let wait = Recording.finalFrameWait
+        Recording.finalFrameWait = .milliseconds(100)
+        defer { Recording.finalFrameWait = wait }
+        let recording = Recording(vm: "Win", directory: dir, fps: 10, video: true, maxSeconds: 60, frames: {
+            await gate.pass()
+            return nil
+        }, sink: sink)
+        try await recording.start()
+        let asked = await eventually("the sampler asked for a frame") { await gate.arrivals >= 1 }
+        XCTAssertTrue(asked)
+        let stopped = await finishes("stop with a frame source that does not answer", within: .seconds(10)) { _ = await recording.stop() }
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(sink.finishedLast)
+        await gate.open()
+    }
+
     func testVideoErrorIsReportedAsWriteError() async throws {
         let dir = base.appendingPathComponent("broken")
         let sink = ProbeSink()

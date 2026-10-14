@@ -1413,7 +1413,8 @@ rounded down to even numbers and scaled so that the longer side is at most
 screen is read `fps` times a second; a frame equal to the previous one is
 written again only after 2 s. The frame read when the recording ends closes
 the video: the video lasts until that moment and shows the last frame
-sampled before it. The file is written in movie fragments of one second, so a
+sampled before it. That read is waited for 2 s at most; without its frame the
+last sampled frame closes the video. The file is written in movie fragments of one second, so a
 copy taken while the recording runs plays up to its last whole fragment; a
 finished file is an ordinary MP4. When the video cannot be written the
 recording continues without it, `vm.record.status` shows `videoError` at

@@ -139,6 +139,8 @@ actor Recording {
 
     /// Longest stretch without an encoded frame while the screen does not change.
     static let videoKeepAlive = Duration.seconds(2)
+    /// Longest wait for the frame that closes the video when the recording ends.
+    nonisolated(unsafe) static var finalFrameWait = Duration.seconds(2)
 
     /// Creates the recording directory, starts the `maxSeconds` timer and, with video, the frame sampler.
     func start() async throws {
@@ -190,6 +192,19 @@ actor Recording {
 
     /// The current guest frame; nil when none can be captured.
     func capture() async -> Frame? { await framesSource() }
+
+    /// The current guest frame, or nil when none came within `limit`; a read that has not answered by then goes on in
+    /// its own task and its frame is dropped.
+    private func frame(within limit: Duration) async -> Frame? {
+        let answer = CallAnswer<Frame?>()
+        let source = framesSource
+        let read = Task { await answer.finish(await source()) }
+        guard let got = await answer.outcome(until: .now + limit) else {
+            read.cancel()
+            return nil
+        }
+        return got.result
+    }
 
     /// Ends the recording when its `maxSeconds` have elapsed on the injected clock.
     func endIfDue() async {
@@ -269,12 +284,9 @@ actor Recording {
         let seconds = elapsedSeconds
         writer?.close()
         writer = nil
-        if let sampler {
-            sampler.cancel()
-            await sampler.value
-            self.sampler = nil
-        }
-        if video, let last = await framesSource() ?? lastVideoFrame {
+        sampler?.cancel()
+        sampler = nil
+        if video, let last = await frame(within: Recording.finalFrameWait) ?? lastVideoFrame {
             await sink.appendFinal(frame: last, at: startedInstant.duration(to: clock()))
         }
         await sink.finish()
