@@ -40,12 +40,16 @@ type Options struct {
 	// AllowPeers holds the address ranges whose connections are served; empty
 	// means DefaultPeers.
 	AllowPeers []netip.Prefix
-	// HostKey keeps the public key of the host the agent is paired with; a
-	// connection is served after it paired or signed its nonce with that key. Nil serves every
-	// connection from AllowPeers without pairing.
-	HostKey KeyStore
-	// AuthTimeout bounds the time from the hello to the pair or auth message;
-	// 0 means 30 s.
+	// HostKey is the host's Ed25519 public key (the SMBIOS alcove-hostkey). A
+	// connection is served after the host signed its nonce and Token with the
+	// matching private key. Without a HostKey of 32 bytes and a Token the
+	// server serves nothing, unless Unauthenticated is set.
+	HostKey []byte
+	// Unauthenticated serves every connection from AllowPeers without a
+	// signature and sends a hello without auth.
+	Unauthenticated bool
+	// AuthTimeout bounds the time from the hello to the auth message; 0 means
+	// 30 s.
 	AuthTimeout time.Duration
 	// DeployRoot is a folder the agent keeps locked; nil means none.
 	DeployRoot *DeployRoot
@@ -78,8 +82,9 @@ type Server struct {
 	conns  map[*conn]struct{}
 	jobs   *jobTable
 
-	// pairMu orders the pair messages of all connections.
-	pairMu sync.Mutex
+	// handshakes holds one entry for each connection between its hello and
+	// authed.
+	handshakes chan struct{}
 	// deployMu orders the creations of the deploy root.
 	deployMu sync.Mutex
 
@@ -107,7 +112,8 @@ func New(opt Options) *Server {
 	if opt.HomeDir == "" {
 		opt.HomeDir, _ = os.UserHomeDir()
 	}
-	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable()}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable(),
+		handshakes: make(chan struct{}, maxHandshakes)}
 	s.registerBuiltins()
 	return s
 }
@@ -202,13 +208,14 @@ func (s *Server) handle(c net.Conn) {
 	addr, ok := s.peerAllowed(c.RemoteAddr())
 	if !ok {
 		sentence := refusal(s.allowPeers(), addr)
-		s.refusals.write(lg, c.RemoteAddr(), sentence)
+		s.refusals.write(lg, reasonPeer, c.RemoteAddr(), sentence)
 		_ = c.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
 		_ = proto.NewWriter(c).Send(proto.Message{"t": "refused", "error": sentence})
 		return
 	}
-	r := proto.NewReader(c)
-	if !s.handshake(c, r) {
+	limit := &lineLimit{r: c, max: preAuthLineMax}
+	r := proto.NewReader(limit)
+	if !s.handshake(c, r, limit) {
 		return
 	}
 	lg.Printf("connection from %s", c.RemoteAddr())

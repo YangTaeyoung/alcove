@@ -3,122 +3,82 @@ package server
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"io"
 	"net"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
 
-// KeyStore keeps the Ed25519 public key of the host the agent is paired with.
-type KeyStore interface {
-	// Load returns the stored public key, or nil and no error when none is stored.
-	Load() ([]byte, error)
-	// Save stores key; it fails when a key is stored already.
-	Save(key []byte) error
-}
+// NonceSize is the length in bytes of a hello nonce.
+const NonceSize = 32
 
-// KeySize is the length in bytes of a host public key and of a hello nonce.
-const KeySize = 32
-
-// authContext comes before the nonce in the message the host signs.
-const authContext = "alcove-agent-auth-v1"
+// authContext comes first in the message the host signs, before the token and
+// the nonce.
+const authContext = "alcove-agent-auth-v2"
 
 // defaultAuthTimeout is how long a connection may take from the hello to its
-// pair or auth message.
+// auth message.
 const defaultAuthTimeout = 30 * time.Second
 
+// preAuthLineMax bounds a line the agent reads before authed.
+const preAuthLineMax = 64 << 10
+
+// maxHandshakes bounds the connections between their hello and authed.
+const maxHandshakes = 16
+
 const (
-	errAuthMismatch    = "the host did not prove the key this alcove-agent is paired with; when the VM's agentKey changed (a re-created VM, or a disk taken from another VM), run alcove-agent --forget-host-key as an administrator in the guest and connect again"
-	errPairedOther     = "this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again"
-	errNotPaired       = "this alcove-agent holds no host key; connect again to pair it"
-	errBadPairKey      = "the publicKey in pair is not 64 hexadecimal digits; send the public key of the VM's agentKey"
-	errUnauthenticated = "this alcove-agent serves only a host that pairs with it or proves its key; update the Alcove app on the host"
-	errAuthTimeout     = "no pair or auth message arrived within 30 s; the host pairs or authenticates right after the hello"
+	errNoHostKey       = "this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later"
+	errAuthMismatch    = "the host's signature does not match this VM's alcove-hostkey and alcove-token; restart the VM with Alcove so the guest reads the key and token in its config.json"
+	errUnauthenticated = "this alcove-agent serves only a host that proves the VM's key; update the Alcove app on the host"
+	errAuthTimeout     = "no auth message arrived within 30 s; the host authenticates right after the hello"
+	errPreAuthLine     = "a line before auth is longer than 65536 bytes; the host sends only auth before authed"
+	errHandshakesBusy  = "16 connections are authenticating; connect again when one of them ended"
 )
 
-// keyError is the refusal for a stored key that cannot be read or a key that
-// cannot be stored.
-func keyError(err error) string {
-	return "this alcove-agent cannot use its host key: " + err.Error()
-}
+// refusalReason names the kind of a refusal; the refusal log counts by it.
+type refusalReason string
 
-// sameSecret reports whether a and b hold the same bytes, taking a time that
-// depends on their lengths only.
-func sameSecret(a, b []byte) bool {
-	return subtle.ConstantTimeCompare(a, b) == 1
-}
+const (
+	reasonPeer            refusalReason = "peer"
+	reasonNoHostKey       refusalReason = "no host key"
+	reasonSignature       refusalReason = "signature"
+	reasonUnauthenticated refusalReason = "unauthenticated"
+	reasonTimeout         refusalReason = "timeout"
+	reasonLongLine        refusalReason = "long line"
+	reasonBusy            refusalReason = "busy"
+)
 
 // hostSigned reports whether signatureText is the hex Ed25519 signature by
-// the private key of public of authContext followed by nonce.
-func hostSigned(public, nonce []byte, signatureText string) bool {
-	if len(public) != ed25519.PublicKeySize || len(signatureText) != 2*ed25519.SignatureSize {
+// the private key of public of authContext, token and nonce. An empty token
+// or a public key of another length is never signed.
+func hostSigned(public []byte, token string, nonce []byte, signatureText string) bool {
+	if len(public) != ed25519.PublicKeySize || token == "" || len(signatureText) != 2*ed25519.SignatureSize {
 		return false
 	}
 	signature, err := hex.DecodeString(signatureText)
 	if err != nil {
 		return false
 	}
-	message := append([]byte(authContext), nonce...)
-	return ed25519.Verify(ed25519.PublicKey(public), message, signature)
+	return ed25519.Verify(ed25519.PublicKey(public), authMessage(token, nonce), signature)
 }
 
-// decodeSecret returns the KeySize bytes that 2*KeySize hexadecimal digits
-// encode, or false.
-func decodeSecret(text string) ([]byte, bool) {
-	if len(text) != 2*KeySize {
-		return nil, false
-	}
-	b, err := hex.DecodeString(text)
-	return b, err == nil
+// authMessage is authContext, the UTF-8 bytes of token and nonce.
+func authMessage(token string, nonce []byte) []byte {
+	m := make([]byte, 0, len(authContext)+len(token)+len(nonce))
+	m = append(m, authContext...)
+	m = append(m, token...)
+	return append(m, nonce...)
 }
 
-// pair stores the public key keyText encodes when no key is stored and
-// accepts a key equal to the stored one. It returns the refusal sentence, or
-// "" when the host is served.
-func (s *Server) pair(keyText string) string {
-	key, ok := decodeSecret(keyText)
-	if !ok {
-		return errBadPairKey
-	}
-	s.pairMu.Lock()
-	defer s.pairMu.Unlock()
-	stored, err := s.opt.HostKey.Load()
-	if err != nil {
-		return keyError(err)
-	}
-	if stored != nil {
-		if sameSecret(stored, key) {
-			return ""
-		}
-		return errPairedOther
-	}
-	if err := s.opt.HostKey.Save(key); err != nil {
-		return keyError(err)
-	}
-	s.opt.Logger.Printf("paired with a host key")
-	return ""
-}
-
-// auth checks that signatureText is the host's signature of nonce under the
-// stored public key. It returns the refusal sentence, or "" when the host is
-// served.
-func (s *Server) auth(signatureText string, nonce []byte) string {
-	stored, err := s.opt.HostKey.Load()
-	if err != nil {
-		return keyError(err)
-	}
-	if stored == nil {
-		return errNotPaired
-	}
-	if !hostSigned(stored, nonce, signatureText) {
-		return errAuthMismatch
-	}
-	return ""
+// keyed reports whether the server has a host key and a token to check a
+// signature with.
+func (s *Server) keyed() bool {
+	return len(s.opt.HostKey) == ed25519.PublicKeySize && s.opt.Token != ""
 }
 
 // authTimeout returns Options.AuthTimeout, or defaultAuthTimeout when it is 0.
@@ -129,36 +89,93 @@ func (s *Server) authTimeout() time.Duration {
 	return defaultAuthTimeout
 }
 
-// handshake writes the hello and, with a HostKey, reads messages until the
-// host paired or authenticated. It reports whether the connection is served.
-// A refused connection gets the answer unauthenticatedAnswer gives, if any,
-// and a refused line.
-func (s *Server) handshake(c net.Conn, r *proto.Reader) bool {
+// errLongLine is the read error of a line longer than preAuthLineMax.
+var errLongLine = errors.New("line longer than the limit before authentication")
+
+// lineLimit passes reads through and fails one that makes the bytes since the
+// last newline exceed max, while max is above 0.
+type lineLimit struct {
+	r   io.Reader
+	mu  sync.Mutex
+	max int
+	run int
+}
+
+func (l *lineLimit) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.max <= 0 {
+		return n, err
+	}
+	for _, b := range p[:n] {
+		if b == '\n' {
+			l.run = 0
+			continue
+		}
+		l.run++
+		if l.run > l.max {
+			return 0, errLongLine
+		}
+	}
+	return n, err
+}
+
+// lift ends the limit.
+func (l *lineLimit) lift() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.max = 0
+}
+
+// handshakeSlot takes one of the maxHandshakes places; it reports false when
+// all are taken.
+func (s *Server) handshakeSlot() bool {
+	select {
+	case s.handshakes <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// handshake writes the hello and, unless the server is Unauthenticated, reads
+// messages until the host signed the nonce. It reports whether the
+// connection is served. A refused connection gets the answer
+// unauthenticatedAnswer gives, if any, and a refused line. limit is lifted
+// once the connection is served.
+func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 	w := proto.NewWriter(c)
 	write := func(m proto.Message) bool {
 		_ = c.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
 		return w.Send(m) == nil
 	}
+	refuse := func(reason refusalReason, text string) bool {
+		s.refusals.write(s.opt.Logger, reason, c.RemoteAddr(), text)
+		write(proto.Message{"t": "refused", "error": text})
+		return false
+	}
 	hello := proto.Message{"t": "hello", "v": proto.Version, "proto": proto.RPCVersion, "os": runtime.GOOS, "agent": AgentVersion,
 		"token": s.opt.Token, "caps": s.caps()}
-	if s.opt.HostKey == nil {
+	if s.opt.Unauthenticated {
+		limit.lift()
 		return write(hello)
 	}
-	nonce := make([]byte, KeySize)
+	if !s.keyed() {
+		return refuse(reasonNoHostKey, errNoHostKey)
+	}
+	if !s.handshakeSlot() {
+		return refuse(reasonBusy, errHandshakesBusy)
+	}
+	defer func() { <-s.handshakes }()
+	nonce := make([]byte, NonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		s.opt.Logger.Printf("refused the connection from %s: no random nonce: %v", c.RemoteAddr(), err)
 		return false
 	}
-	stored, _ := s.opt.HostKey.Load()
 	hello["auth"] = "key"
 	hello["nonce"] = hex.EncodeToString(nonce)
-	hello["paired"] = stored != nil
 	if !write(hello) {
-		return false
-	}
-	refuse := func(text string) bool {
-		s.refusals.write(s.opt.Logger, c.RemoteAddr(), text)
-		write(proto.Message{"t": "refused", "error": text})
 		return false
 	}
 	_ = c.SetReadDeadline(time.Now().Add(s.authTimeout()))
@@ -166,32 +183,31 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader) bool {
 		m, err := r.Next()
 		if err != nil {
 			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				return refuse(errAuthTimeout)
-			}
-			if err != io.EOF {
+			switch {
+			case errors.Is(err, errLongLine):
+				return refuse(reasonLongLine, errPreAuthLine)
+			case errors.As(err, &ne) && ne.Timeout():
+				return refuse(reasonTimeout, errAuthTimeout)
+			case err != io.EOF:
 				s.opt.Logger.Printf("read before authentication: %v", err)
 			}
 			return false
 		}
-		var refusal string
 		switch m.Type() {
 		case "welcome", "ping", "pong":
 			continue
-		case "pair":
-			refusal = s.pair(m.String("publicKey"))
 		case "auth":
-			refusal = s.auth(m.String("signature"), nonce)
+			if !hostSigned(s.opt.HostKey, s.opt.Token, nonce, m.String("signature")) {
+				return refuse(reasonSignature, errAuthMismatch)
+			}
 		default:
 			if answer := unauthenticatedAnswer(m); answer != nil {
 				write(answer)
 			}
-			refusal = errUnauthenticated
-		}
-		if refusal != "" {
-			return refuse(refusal)
+			return refuse(reasonUnauthenticated, errUnauthenticated)
 		}
 		_ = c.SetReadDeadline(time.Time{})
+		limit.lift()
 		return write(proto.Message{"t": "authed"})
 	}
 }

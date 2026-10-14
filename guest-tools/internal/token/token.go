@@ -1,12 +1,20 @@
-// Package token finds the per-VM authentication token that the engine passes
-// as an SMBIOS type 11 (OEM strings) entry: "alcove-token=<uuid>".
+// Package token finds the per-VM token and the host's public key that the
+// engine passes as SMBIOS type 11 (OEM strings) entries:
+// "alcove-token=<uuid>" and "alcove-hostkey=<64 hexadecimal digits>".
 package token
 
 import (
+	"encoding/hex"
 	"strings"
 )
 
-const prefix = "alcove-token="
+const (
+	prefix        = "alcove-token="
+	hostKeyPrefix = "alcove-hostkey="
+)
+
+// HostKeySize is the length in bytes of the host's Ed25519 public key.
+const HostKeySize = 32
 
 // FromOEMStrings picks the token out of a list of OEM strings.
 func FromOEMStrings(strs []string) string {
@@ -16,6 +24,27 @@ func FromOEMStrings(strs []string) string {
 		}
 	}
 	return ""
+}
+
+// HostKeyFromOEMStrings returns the HostKeySize bytes the first
+// "alcove-hostkey=" string encodes as 64 hexadecimal digits, or nil when
+// there is no such string or it holds anything else.
+func HostKeyFromOEMStrings(strs []string) []byte {
+	for _, s := range strs {
+		if !strings.HasPrefix(s, hostKeyPrefix) {
+			continue
+		}
+		text := strings.TrimPrefix(s, hostKeyPrefix)
+		if len(text) != 2*HostKeySize {
+			return nil
+		}
+		key, err := hex.DecodeString(text)
+		if err != nil {
+			return nil
+		}
+		return key
+	}
+	return nil
 }
 
 // ParseType11 extracts the strings of an SMBIOS type 11 structure from a raw

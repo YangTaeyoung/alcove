@@ -94,7 +94,7 @@ func TestDataFoldersLieUnderProgramData(t *testing.T) {
 
 func TestDataFoldersNameNoFolderWithoutProgramData(t *testing.T) {
 	alcoveDir, uiaDir, err := dataFolders("")
-	want := "the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task"
+	want := "the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task"
 	if err == nil || err.Error() != want {
 		t.Fatalf("err %v", err)
 	}

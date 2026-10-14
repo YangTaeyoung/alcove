@@ -36,12 +36,12 @@ func refuseReparse(path string) error {
 	return nil
 }
 
-// lockDataFolder locks the Alcove folder under %ProgramData% and its uia
-// folder to Administrators and SYSTEM and returns the Alcove folder.
+// lockDataFolder locks the Alcove folder under the ProgramData folder and its
+// uia folder to Administrators and SYSTEM and returns the Alcove folder.
 func lockDataFolder() (string, error) {
-	base := os.Getenv("ProgramData")
-	if base == "" {
-		return "", errors.New("the ProgramData environment variable is empty, so the Alcove data folder cannot be located; set it (normally C:\\ProgramData) and run alcove-agent --install again")
+	base, err := programDataFolder()
+	if err != nil {
+		return "", fmt.Errorf("the ProgramData folder could not be located (%v), so the Alcove data folder cannot be located; run alcove-agent --install again as an administrator", err)
 	}
 	dir := filepath.Join(base, "Alcove")
 	if _, err := uia.LockHelperFolders(dir, filepath.Join(dir, "uia")); err != nil {

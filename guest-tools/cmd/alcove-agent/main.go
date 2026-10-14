@@ -1,20 +1,19 @@
 // alcove-agent runs inside a guest and serves docs/agent-protocol.md on TCP 7645
 // to connections from 10.0.2.2 and from the ranges given with --allow-peer,
-// once the host paired with it or signed the connection's nonce with the key
-// whose public key is stored.
+// once the host signed the connection's nonce and the VM's token with the key
+// whose public key the SMBIOS string alcove-hostkey holds.
 //
 //	alcove-agent [--port 7645] [--allow-exec] [--allow-peer CIDR]... [--token T]
 //	alcove-agent --install   (Windows: scheduled task at logon + firewall rule)
-//	alcove-agent --forget-host-key   (removes the stored host key)
 package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -32,19 +31,9 @@ func main() {
 	tok := flag.String("token", "", "override the SMBIOS token")
 	install := flag.Bool("install", false, "install to start at logon (Windows) and exit")
 	logPath := flag.String("log", "", "log file (default: stderr)")
-	forget := flag.Bool("forget-host-key", false, "remove the stored host key, so the next host that connects pairs with this agent, and exit (as an administrator or root)")
 	var peers peerFlag
 	flag.Var(&peers, "allow-peer", "also serve connections from this address or CIDR range (repeatable; 10.0.2.2 is always served)")
 	flag.Parse()
-
-	if *forget {
-		path, err := forgetHostKeyPath()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		os.Exit(forgetHostKey(path, os.Stdout, os.Stderr))
-	}
 
 	if *install {
 		dir, err := lockDataFolder()
@@ -64,9 +53,11 @@ func main() {
 
 	var alcoveDir, uiaDir, movedApps string
 	var movedData []string
-	var dataErr, lockErr, appsErr error
+	var dataErr, lockErr, appsErr, programDataErr error
 	if uia.Available() {
-		alcoveDir, uiaDir, dataErr = dataFolders(os.Getenv("ProgramData"))
+		var programData string
+		programData, programDataErr = programDataFolder()
+		alcoveDir, uiaDir, dataErr = dataFolders(programData)
 		if dataErr == nil {
 			movedData, lockErr = uia.LockHelperFolders(alcoveDir, uiaDir)
 		}
@@ -75,15 +66,15 @@ func main() {
 	logger := log.Default()
 	if *logPath != "" {
 		if dataErr != nil {
-			fmt.Fprintf(os.Stderr, "log: %s is not opened because %%ProgramData%% is not set\n", *logPath)
+			fmt.Fprintf(os.Stderr, "log: %s is not opened because the ProgramData folder could not be located\n", *logPath)
 		} else if f, err := openLog(*logPath, alcoveDir, lockErr); err != nil {
 			fmt.Fprintln(os.Stderr, "log:", err)
 		} else {
 			logger = log.New(f, "", log.LstdFlags)
 		}
 	}
-	if dataErr != nil {
-		logger.Print(dataErr)
+	if programDataErr != nil {
+		logger.Printf("the ProgramData folder could not be located (%v)", programDataErr)
 	}
 	for _, m := range movedData {
 		logger.Printf("a data folder of another owner was moved to %s; remove it as an administrator", m)
@@ -97,15 +88,14 @@ func main() {
 	if appsErr != nil {
 		logger.Printf("the deploy root is not locked (%v)", appsErr)
 	}
+	oem := token.OEMStrings()
 	if *tok == "" {
-		*tok = token.Read()
+		*tok = token.FromOEMStrings(oem)
 	}
-	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port))
-	if err != nil {
-		logger.Fatalf("listen: %v", err)
-	}
+	hostKey := token.HostKeyFromOEMStrings(oem)
+	l := listenUntilBound(fmt.Sprintf("0.0.0.0:%d", *port), listenExclusive, logger.Printf, time.Sleep)
 	allowed := append(append([]netip.Prefix{}, server.DefaultPeers...), peers...)
-	logger.Printf("alcove-agent %s listening on %s for %s (token %s, exec %v)", server.AgentVersion, l.Addr(), peerList(allowed).String(), mask(*tok), *allowExec)
+	logger.Printf("alcove-agent %s listening on %s for %s (token %s, host key %s, exec %v)", server.AgentVersion, l.Addr(), peerList(allowed).String(), mask(*tok), hostKeyState(hostKey), *allowExec)
 	var s *server.Server
 	var ui server.UI
 	if dataErr != nil {
@@ -130,8 +120,8 @@ func main() {
 			}}
 	}
 	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui, AllowPeers: allowed,
-		HostKey: newHostKeyStore(alcoveDir, dataErr, lockErr), DeployRoot: root})
-	err = s.Serve(l)
+		HostKey: hostKey, DeployRoot: root})
+	err := s.Serve(l)
 	s.Close()
 	logger.Fatal(err)
 }
@@ -140,9 +130,9 @@ func main() {
 // Windows guest.
 const deployRoot = `C:\alcove-apps`
 
-// errNoProgramData is the answer of every UI operation of an agent that was
-// started without %ProgramData%.
-const errNoProgramData = "the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task"
+// errNoProgramData is the answer of every UI operation of an agent for which
+// no ProgramData folder could be located.
+const errNoProgramData = "the UI helper cannot start because the ProgramData folder could not be located; restart alcove-agent through its scheduled task"
 
 // dataFolders returns the Alcove folder under programData and the uia folder
 // inside it. An empty programData is an error and names no folder.
@@ -226,6 +216,15 @@ func (p peerFlag) args() []string {
 		out = append(out, "--allow-peer", r.String())
 	}
 	return out
+}
+
+// hostKeyState names the host key in the start line: the first and last four
+// hexadecimal digits, or "(none)".
+func hostKeyState(key []byte) string {
+	if len(key) != token.HostKeySize {
+		return "(none)"
+	}
+	return mask(hex.EncodeToString(key))
 }
 
 func mask(t string) string {

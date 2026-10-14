@@ -9,19 +9,16 @@ import (
 )
 
 // refusalLogInterval is the least time between two log lines of one refusal
-// sentence.
+// reason.
 const refusalLogInterval = time.Minute
 
-// refusalLogEntries bounds the sentences refusalLog remembers; past it, the
-// sentences last written more than refusalLogInterval ago are forgotten.
-const refusalLogEntries = 256
-
-// refusalLog writes refused connections to a log, each sentence at most once
-// per refusalLogInterval, with the count of the refusals it left out.
+// refusalLog writes refused connections to a log, each reason at most once
+// per refusalLogInterval, with the count of the refusals it left out. It
+// keeps one entry per reason.
 type refusalLog struct {
 	mu      sync.Mutex
 	now     func() time.Time
-	entries map[string]*refusalEntry
+	entries map[refusalReason]*refusalEntry
 }
 
 type refusalEntry struct {
@@ -37,8 +34,8 @@ func (r *refusalLog) setClock(now func() time.Time) {
 }
 
 // write logs the refusal of the connection from remote with sentence, unless
-// the same sentence was written less than refusalLogInterval ago.
-func (r *refusalLog) write(lg *log.Logger, remote net.Addr, sentence string) {
+// a refusal for the same reason was written less than refusalLogInterval ago.
+func (r *refusalLog) write(lg *log.Logger, reason refusalReason, remote net.Addr, sentence string) {
 	r.mu.Lock()
 	now := time.Now
 	if r.now != nil {
@@ -46,9 +43,9 @@ func (r *refusalLog) write(lg *log.Logger, remote net.Addr, sentence string) {
 	}
 	t := now()
 	if r.entries == nil {
-		r.entries = map[string]*refusalEntry{}
+		r.entries = map[refusalReason]*refusalEntry{}
 	}
-	e := r.entries[sentence]
+	e := r.entries[reason]
 	if e != nil && t.Sub(e.written) < refusalLogInterval {
 		e.skipped++
 		r.mu.Unlock()
@@ -58,15 +55,8 @@ func (r *refusalLog) write(lg *log.Logger, remote net.Addr, sentence string) {
 	if e != nil {
 		skipped = e.skipped
 	} else {
-		if len(r.entries) >= refusalLogEntries {
-			for s, old := range r.entries {
-				if t.Sub(old.written) >= refusalLogInterval {
-					delete(r.entries, s)
-				}
-			}
-		}
 		e = &refusalEntry{}
-		r.entries[sentence] = e
+		r.entries[reason] = e
 	}
 	e.written, e.skipped = t, 0
 	r.mu.Unlock()

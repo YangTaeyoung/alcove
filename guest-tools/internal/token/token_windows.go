@@ -14,20 +14,20 @@ var (
 
 const rsmb = 0x52534D42 // 'RSMB'
 
-// Read returns the token from the SMBIOS table, or "".
-func Read() string {
+// OEMStrings returns the SMBIOS type 11 strings of the firmware table, or nil.
+func OEMStrings() []string {
 	size, _, _ := procGetSystemFirmwareTbl.Call(rsmb, 0, 0, 0)
 	if size == 0 {
-		return ""
+		return nil
 	}
 	buf := make([]byte, size)
 	n, _, _ := procGetSystemFirmwareTbl.Call(rsmb, 0, uintptr(unsafe.Pointer(&buf[0])), size)
 	if n == 0 || n > size {
-		return ""
+		return nil
 	}
 	// RawSMBIOSData header: Used20CallingMethod, MajorVersion, MinorVersion, DmiRevision, Length(4), then the table
 	if n < 8 {
-		return ""
+		return nil
 	}
-	return FromOEMStrings(ParseType11(buf[8:n]))
+	return ParseType11(buf[8:n])
 }

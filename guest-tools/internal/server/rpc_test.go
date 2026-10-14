@@ -20,6 +20,9 @@ func startServerS(t *testing.T, opt Options) (*Server, *proto.Reader, *proto.Wri
 		t.Fatal(err)
 	}
 	opt.AllowPeers = loopbackPeers
+	if opt.HostKey == nil {
+		opt.Unauthenticated = true
+	}
 	s := New(opt)
 	go s.Serve(l)
 	c, err := net.Dial("tcp", l.Addr().String())

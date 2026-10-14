@@ -4,11 +4,11 @@ package token
 
 import "os"
 
-// Read returns the token from the DMI table, or "".
-func Read() string {
+// OEMStrings returns the SMBIOS type 11 strings of the DMI table, or nil.
+func OEMStrings() []string {
 	table, err := os.ReadFile("/sys/firmware/dmi/tables/DMI")
 	if err != nil {
-		return ""
+		return nil
 	}
-	return FromOEMStrings(ParseType11(table))
+	return ParseType11(table)
 }

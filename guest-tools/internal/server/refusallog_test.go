@@ -57,9 +57,9 @@ func (c *fakeClock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-func TestARepeatedRefusalIsLoggedOncePerMinutePerSentence(t *testing.T) {
+func TestARepeatedRefusalIsLoggedOncePerMinutePerReason(t *testing.T) {
 	logs := &logBuffer{}
-	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{Logger: log.New(logs, "", 0)})
+	a := startAuthServer(t, Options{Logger: log.New(logs, "", 0)})
 	clock := &fakeClock{t: time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)}
 	a.s.refusals.setClock(clock.now)
 
@@ -72,14 +72,14 @@ func TestARepeatedRefusalIsLoggedOncePerMinutePerSentence(t *testing.T) {
 		badSignature()
 	}
 	other := a.dial()
-	other.send(t, proto.Message{"t": "pair", "publicKey": hex.EncodeToString(otherKey)})
-	other.expectRefusedAndClosed(t, errPairedOther)
+	other.send(t, proto.Message{"t": "pair", "publicKey": hex.EncodeToString(testKey)})
+	other.expectRefusedAndClosed(t, errUnauthenticated)
 
 	if got := logs.lines(errAuthMismatch); len(got) != 1 || !strings.HasSuffix(got[0], ": "+errAuthMismatch) {
 		t.Fatalf("lines for the mismatch %q", got)
 	}
-	if got := logs.lines(errPairedOther); len(got) != 1 {
-		t.Fatalf("lines for the other key %q", got)
+	if got := logs.lines(errUnauthenticated); len(got) != 1 {
+		t.Fatalf("lines for the pair %q", got)
 	}
 
 	clock.advance(59 * time.Second)
@@ -103,9 +103,27 @@ func TestARepeatedRefusalIsLoggedOncePerMinutePerSentence(t *testing.T) {
 	}
 }
 
+func TestRefusalsFromManyAddressesAreOneReason(t *testing.T) {
+	logs := &logBuffer{}
+	lg := log.New(logs, "", 0)
+	var r refusalLog
+	r.setClock((&fakeClock{t: time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)}).now)
+	for i := 2; i < 5002; i++ {
+		addr := netip.AddrFrom4([4]byte{127, 0, byte(i >> 8), byte(i)})
+		remote := net.TCPAddrFromAddrPort(netip.AddrPortFrom(addr, 40000))
+		r.write(lg, reasonPeer, remote, refusal(DefaultPeers, addr))
+	}
+	if got := logs.lines("refused the connection from"); len(got) != 1 || !strings.HasPrefix(got[0], "refused the connection from 127.0.0.2:40000: ") {
+		t.Fatalf("lines %q", got)
+	}
+	if len(r.entries) != 1 {
+		t.Fatalf("%d entries", len(r.entries))
+	}
+}
+
 func TestARefusedConnectionWritesNoConnectionLine(t *testing.T) {
 	logs := &logBuffer{}
-	a := startAuthServer(t, &memoryKeyStore{key: testKey}, Options{Logger: log.New(logs, "", 0)})
+	a := startAuthServer(t, Options{Logger: log.New(logs, "", 0)})
 	refused := a.dial()
 	refused.send(t, proto.Message{"t": "auth", "signature": refused.sign(t, otherPrivate)})
 	refused.expectRefusedAndClosed(t, errAuthMismatch)
@@ -114,10 +132,7 @@ func TestARefusedConnectionWritesNoConnectionLine(t *testing.T) {
 	}
 
 	served := a.dial()
-	served.send(t, proto.Message{"t": "auth", "signature": served.sign(t, hostPrivate)})
-	if m := served.next(t); m.Type() != "authed" {
-		t.Fatalf("auth answered %v", m)
-	}
+	served.authenticate(t)
 	served.ping(t)
 	if got := logs.lines("connection from"); len(got) != 2 || !strings.HasPrefix(got[1], "connection from 127.0.0.1:") {
 		t.Fatalf("lines %q", got)

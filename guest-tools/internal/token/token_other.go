@@ -2,5 +2,5 @@
 
 package token
 
-// Read is unsupported on this platform (used only for host-side unit tests).
-func Read() string { return "" }
+// OEMStrings is unsupported on this platform (used only for host-side unit tests).
+func OEMStrings() []string { return nil }
