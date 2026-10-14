@@ -62,8 +62,8 @@ func open() error {
 	return errors.New("OpenClipboard failed")
 }
 
-// Text reads the text through serial, so the thread that opens the clipboard
-// closes it.
+// Text reads the text through serial: one OS thread opens and closes the
+// clipboard.
 func (windowsClipboard) Text() (string, error) { return serial(text) }
 
 func text() (string, error) {
@@ -93,8 +93,8 @@ func text() (string, error) {
 	return string(utf16.Decode(u[:end])), nil
 }
 
-// SetText writes the text through serial, so the thread that opens the
-// clipboard closes it.
+// SetText writes the text through serial: one OS thread opens and closes
+// the clipboard.
 func (windowsClipboard) SetText(s string) error {
 	_, err := serial(func() (struct{}, error) { return struct{}{}, setText(s) })
 	return err

@@ -73,7 +73,7 @@ func mtimeString(fi os.FileInfo) string {
 }
 
 // notRegular is the error for a path that is neither a regular file nor a
-// directory, such as a FIFO, whose reading could block.
+// directory, such as a FIFO.
 func notRegular(path string) error {
 	return fmt.Errorf("'%s' is not a regular file; fs.read, fs.tail and sha256 read regular files only", path)
 }
@@ -625,9 +625,9 @@ func (s *Server) protectedFromDelete(path string) bool {
 }
 
 // resolveParent returns path without a \\?\ prefix before a drive letter and
-// with the links, junctions and short names of its parent folder resolved,
-// so that it names the entry itself; it returns path when the parent cannot
-// be resolved.
+// with the links, junctions and short names of its parent folder resolved
+// and its last element kept; it returns path when the parent cannot be
+// resolved.
 func resolveParent(path string) string {
 	p := path
 	if strings.HasPrefix(p, `\\?\`) && len(p) >= 6 && p[5] == ':' {
