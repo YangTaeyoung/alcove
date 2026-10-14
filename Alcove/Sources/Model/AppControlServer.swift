@@ -16,6 +16,7 @@ final class AppControlServer {
     static let shared = AppControlServer()
 
     @ObservationIgnored private var server: ControlServer?
+    @ObservationIgnored private var handler: ControlHandler?
     @ObservationIgnored private let registry = AppVMRegistry()
     /// Why the server is not running (nil when it is). Informational when
     /// another server owns the socket; see `startFailure` for real failures.
@@ -36,10 +37,12 @@ final class AppControlServer {
             startFailure = nil
             return
         }
-        let s = ControlServer(handler: ControlHandler(registry: registry, hostKind: "app"), socketPath: path)
+        let h = ControlHandler(registry: registry, hostKind: "app", captureDirectory: ProxyProcess.defaultCADirectory)
+        let s = ControlServer(handler: h, socketPath: path)
         do {
             try s.start(loadingRecognizers: true)
             server = s
+            handler = h
             issue = nil
             startFailure = nil
         } catch {
@@ -52,6 +55,12 @@ final class AppControlServer {
     func stop() {
         server?.stop()
         server = nil
+        handler = nil
+    }
+
+    /// Restores the guests of the running HTTP captures and ends the captures; returns after 20 s at the latest.
+    func endCaptures() async {
+        await handler?.shutdown(within: .seconds(20))
     }
 }
 
