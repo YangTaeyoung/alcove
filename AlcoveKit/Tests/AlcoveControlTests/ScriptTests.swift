@@ -960,7 +960,13 @@ final class ScriptTests: XCTestCase {
         let parsed = try script(steps([wait, exec("after")]))
         let handler = rig.handler
         let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
-        while !rig.agent.received.contains(where: { $0["t"]?.stringValue == "req" }) { try await Task.sleep(for: .milliseconds(10)) }
+        let agent = rig.agent
+        let asked = await eventually(timeout: .seconds(10)) { agent.received.contains(where: { $0["t"]?.stringValue == "req" }) }
+        guard asked else {
+            task.cancel()
+            _ = await task.value
+            return XCTFail("the wait step sent no request to the fake agent within 10 s")
+        }
         try await Task.sleep(for: .milliseconds(200))
         task.cancel()
         let result = await task.value
