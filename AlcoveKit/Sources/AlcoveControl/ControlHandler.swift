@@ -523,6 +523,17 @@ public actor ControlHandler {
         return t
     }
 
+    /// The next step of an agent refusal when its sentence names none.
+    static let refusalFallbackFix = "reinstall alcove-agent in the guest with scripts/test/install-agent.py"
+
+    /// The next step an agent's refusal sentence names: the text after its first "; ", or `refusalFallbackFix` when
+    /// there is none.
+    static func refusalFix(_ sentence: String) -> String {
+        guard let range = sentence.range(of: "; ") else { return refusalFallbackFix }
+        let fix = sentence[range.upperBound...].trimmingCharacters(in: .whitespaces)
+        return fix.isEmpty ? refusalFallbackFix : fix
+    }
+
     /// The agent of `t`, waiting up to 25 s for it to connect; when it does not, the agent's refusal sentence, or
     /// `noTools` when the agent refused nothing.
     func tools(_ t: VMTarget) async throws -> AgentClient {
@@ -577,6 +588,7 @@ public actor ControlHandler {
                 obj["agentCaps"] = .array(hello.capabilities.map(JSON.string))
             } else {
                 obj["tools"] = false
+                if let refusal = await t.agentRefusal() { obj["toolsRefused"] = .string(refusal) }
             }
         }
         return .object(obj)

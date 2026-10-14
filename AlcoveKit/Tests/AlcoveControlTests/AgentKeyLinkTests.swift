@@ -59,4 +59,36 @@ final class AgentKeyLinkTests: XCTestCase {
             XCTAssertEqual(e.description, "the guest tools in 'Win' refused the connection: \(sentence)")
         }
     }
+
+    func testVMStatusNamesTheRefusalOfTheGuestTools() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        let quiet = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(quiet["tools"]?.boolValue, false)
+        XCTAssertNil(quiet["toolsRefused"])
+
+        await t.setRefusal(sentence)
+        let status = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(status["tools"]?.boolValue, false)
+        XCTAssertEqual(status["toolsRefused"]?.stringValue, sentence)
+    }
+
+    func testVMDoctorShowsTheRefusalOfTheGuestToolsAndItsFix() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
+        await t.setRefusal(sentence)
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        let doctor = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        let rows = doctor["checks"]?.arrayValue ?? []
+        XCTAssertEqual(rows.last?["id"]?.stringValue, "tools")
+        XCTAssertEqual(rows.last?["ok"]?.boolValue, false)
+        XCTAssertEqual(rows.last?["detail"]?.stringValue, "the guest tools refused the connection: \(sentence)")
+        XCTAssertEqual(rows.last?["hint"]?.stringValue,
+                       "run alcove-agent --forget-host-key as an administrator in the guest and connect again")
+    }
+
+    func testTheFixOfARefusalIsTheTextAfterItsFirstSemicolon() {
+        XCTAssertEqual(ControlHandler.refusalFix("a; b; c"), "b; c")
+        XCTAssertEqual(ControlHandler.refusalFix("no next step"), ControlHandler.refusalFallbackFix)
+        XCTAssertEqual(ControlHandler.refusalFix("trailing; "), ControlHandler.refusalFallbackFix)
+    }
 }

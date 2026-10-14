@@ -94,7 +94,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 |---|---|---|
 | `hello` | — | `{version: 1, host: "app"|"headless"}` |
 | `vm.list` | — | `{vms: [{name, guestOS, state, suspended, width?, height?, error?, leasedBy?, cloneOf?, ephemeral?}]}` — see [VM rows](#vm-rows) |
-| `vm.status` | `name` | the VM's row plus, while it is running or paused, `tools: bool` and, with tools, `agentCaps: [...]` |
+| `vm.status` | `name` | the VM's row plus, while it is running or paused, `tools: bool`, with tools `agentCaps: [...]`, and without them `toolsRefused` when the guest tools refused the host |
 | `vm.start` | `name`, `discardChanges?`, `waitTools?` | `{state, ephemeral}` after the guest is running; `{state, ephemeral, resumed, tools, clockSynced}` when it resumed a session saved to disk — see [Starting](#starting) |
 | `vm.stop` | `name`, `force?` | `{state, captureEnded?, warning?}` after the engine exited (graceful ACPI first); see [Stopping a capture](#stopping-a-capture) for the capture fields |
 | `vm.clone` | `name` (the template), `newName` | `{name}` — see [Linked clones](#linked-clones) |
@@ -998,7 +998,12 @@ events: events of an earlier session are in `vm.events` only.
 | `ephemeral` | `true` while a session started with `discardChanges` runs; absent otherwise |
 
 `vm.status` adds `tools` for a running or paused VM (it waits up to 2 s for
-the guest tools) and `agentCaps` when they are connected.
+the guest tools) and `agentCaps` when they are connected. When they are not
+connected because the agent refused the host's latest connection attempt
+(docs/agent-protocol.md, Host key), it adds `toolsRefused`: the agent's
+sentence, which names the fix, for example
+`this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again`.
+The sentence is kept until an attempt connects or the VM stops.
 
 ## Starting
 
@@ -1333,7 +1338,7 @@ that makes the later ones impossible:
 | `host` | `app` or `headless` | never | |
 | `state` | the VM's state | not `running` (hint `call vm.start`; `call vm.resume` when paused; `wait until vm.status shows running, then retry` while starting; `wait until vm.status shows stopped, then call vm.start` while stopping or suspending) | when not running |
 | `display` | `<W>x<H>` of the current frame | no frame can be read | |
-| `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s | when not ok |
+| `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s: `guest tools are not connected` (hint `install alcove-agent in the guest with scripts/test/install-agent.py`), or, when the agent refused the host, `the guest tools refused the connection: <the agent's sentence>` with the sentence's next step (the text after its first `; `) as hint | when not ok |
 | `rpc` | `proto <n>` | below 2 | when `rpc` or `exec` is not ok |
 | `exec` | `enabled` or `disabled` | the tools were started without `--allow-exec` | |
 | `probe` | why the guest probe gave nothing | present only on failure: the guest OS has no probe script, the script failed or printed no JSON | always |
@@ -2565,6 +2570,7 @@ Errors are plain strings that say what to do next:
 ```
 VM 'Win' is stopped; call vm.start first
 guest tools are not connected in 'Win'; install alcove-agent in the guest
+the guest tools in 'Win' refused the connection: this alcove-agent is already paired with another host key; run alcove-agent --forget-host-key as an administrator in the guest and connect again
 missing parameter; pass 'command' or 'argv'
 missing or invalid parameter 'env'
 parameter 'append' must be a boolean
