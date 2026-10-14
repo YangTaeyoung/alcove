@@ -39,7 +39,9 @@ brew install meson pkgconf ninja glib pixman dtc libslirp capstone libusb zstd l
 - `libpng` is not optional: `build-qemu.sh` passes `--enable-png`, and QMP
   `screendump` defaults to PNG, which is what `AlcoveQMP` and
   `scripts/test/install-windows.py` use.
-- `swtpm` backs the vTPM a Windows 11 guest needs; `xcodegen` generates
+- `swtpm` is built into the engine for the TPM device, which is off by
+  default (`tpm-tis-device` fails under HVF on Apple silicon; Windows 11
+  installs without it); `xcodegen` generates
   `Alcove.xcodeproj`; `go` builds the guest agent.
 - QEMU's `configure` needs Python 3.11+ (`tomllib`). The macOS system
   `python3` is 3.9 and cannot run it, so `build-qemu.sh` defaults `PYTHON` to
@@ -154,6 +156,10 @@ an installed guest:
 | `python3 scripts/test/agent-windows.py` | the `Windows 11` bundle with forwards `2222->22` and `7646->7645`, the harness SSH key, and `build/alcove-agent-windows-arm64.exe` |
 | `python3 scripts/test/agent-linux.py` | the Ubuntu bundle with forwards `2223->22` and `7647->7645`, and `build/alcove-agent-linux-arm64` |
 | `python3 scripts/test/mcp-smoke.py --list-only` | `mcp/dist/` — run `cd mcp && npm install && npm run build` first. `--vm "Windows 11"` drives a real guest end to end |
+| `python3 scripts/test/install-agent.py` | a running `Windows 11` guest with ssh on `2222`, the harness SSH key and `build/alcove-agent-windows-arm64.exe`; installs the agent with `--allow-exec` and checks hello |
+| `python3 scripts/test/agent-rpc-windows.py` | a running guest with the agent installed with `--allow-exec`; the agent operations on the forwarded port `7646` |
+| `python3 scripts/test/uia-helper-check.py` | the same guest, `build/alcove-fixture-windows-arm64.exe`, and neither Notepad nor the fixture running |
+| `python3 scripts/test/at1-e2e.py` … `at7-e2e.py` | the same guest with the agent installed with `--allow-exec`, a control server built from the tree, and `npm run build` in `mcp/`; each script header names what else it needs (at2 a headless `alcovectl serve`; at4 to at7 the fixture build) and each refuses to start when the guest holds leftovers of an earlier run |
 | `python3 scripts/test/ctl.py <op> key=value …` | not a test — a one-shot client for the control socket, handy while debugging |
 
 ## Working on the QEMU patch series

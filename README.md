@@ -55,8 +55,8 @@ clipboard and file sharing.
 | **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell commands and background jobs, processes, clipboard, file push, pull and folder sync, guest file read and write, recordings with a trace and a video, the guest event log, crash dumps, a one-call diagnostics bundle, and HTTP and HTTPS capture with canned, delayed or dropped answers. |
 | **No black boxes** | The engine is a pinned QEMU tag plus three readable patches (`qemu-patches/`). Build it yourself in one command. |
 
-Tested on an M3 Pro running macOS 26 with Windows 11 Pro ARM 25H2 and Ubuntu
-24.04 arm64 guests.
+Tested on an M3 Pro and an M5 Pro running macOS 27 with Windows 11 Pro ARM 25H2
+and Ubuntu 24.04 arm64 guests.
 
 ## Quick start
 
@@ -211,7 +211,7 @@ docs/            protocols, design, research notes
 scripts/test/all.sh                       # everything below, in order
 scripts/build-qemu.sh                     # engine
 python3 scripts/test/display-backend.py   # boots EDK2 only and drives the display protocol
-(cd AlcoveKit && swift test)              # 171 tests; VM tests boot the real engine
+(cd AlcoveKit && swift test)              # over 1100 tests; VM tests boot the real engine
 (cd guest-tools && go test ./...)         # guest agent
 (cd mcp && npm run build && npm test)     # MCP server helpers
 python3 scripts/test/mcp-smoke.py --list-only
@@ -229,6 +229,10 @@ Windows guest:
 python3 scripts/test/install-agent.py       # copies the built agent in, installs it with --allow-exec, checks hello
 python3 scripts/test/agent-rpc-windows.py   # agent operations on the forwarded agent port
 python3 scripts/test/at1-e2e.py             # control socket -> agent -> guest, and MCP server -> control socket
+python3 scripts/test/at2-e2e.py             # doctor, snapshots, forwards, leases, guest settings, linked clones, sessions that discard changes
+python3 scripts/test/at3-e2e.py             # screenshots, text recognition, observations after input, batches, waits
+python3 scripts/test/at4-e2e.py             # UI automation, app launch and deploy, and the window and process tools
+python3 scripts/test/uia-helper-check.py    # the agent's window and UI Automation operations and window events
 python3 scripts/test/at5-e2e.py             # recordings, event log, crash dumps and diagnostics bundles in the guest
 python3 scripts/test/at6-e2e.py             # a recording saved as a script and replayed with alcovectl run-script and alcove_script_run
 python3 scripts/test/at7-e2e.py             # HTTP capture: CA and system proxy in the guest, rules, a stream, restore, MCP tools
