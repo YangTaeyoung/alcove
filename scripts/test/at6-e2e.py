@@ -61,6 +61,8 @@ APP_DIR = APPS + "\\" + APP_NAME
 EXE = "alcove-fixture.exe"
 APP_EXE = APP_DIR + "\\" + EXE
 FIXTURE_LOG = GUEST + r"\fixture.log"
+# SENT_WAIT_S bounds the wait for the fixture to log the Send that a passed run clicked and the end of its reply.
+SENT_WAIT_S = 10
 AFTER_SIGNAL = GUEST + r"\after-signal.txt"
 TITLE = "Alcove Fixture"
 MESSAGE = 'replay "테스트" 1'
@@ -763,7 +765,13 @@ def _(run):
         if sig is None:
             code, out, err = run.finish(p, SIGNAL_WAIT_S + 60)
             expect_passed(code, out, err, name)
-            sent = [l for l in run.log()[before:] if " send" in l]
+            end = time.time() + SENT_WAIT_S
+            while True:
+                logged = run.log()[before:]
+                sent = [l for l in logged if " send" in l]
+                if (sent and logged[-1].endswith(" done")) or time.time() > end:
+                    break
+                time.sleep(0.2)
             expect(sent and after in run.guest_names(GUEST), f"{name} passed, but the fixture logged {run.log()[before:]!r} "
                    f"and the end mark is {'present' if after in run.guest_names(GUEST) else 'absent'}")
             continue
