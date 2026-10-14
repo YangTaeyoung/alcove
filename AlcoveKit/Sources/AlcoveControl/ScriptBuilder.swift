@@ -332,7 +332,7 @@ enum ScriptBuilder {
                 warnings.append("\(line): its \(id) belongs to the recorded session and a replay gets another one; change the step by hand")
             }
             if let param = ControlHandler.writtenTextParam(op: op), item.step.params[param]?.stringValue != nil,
-               item.step.params[param]?.stringValue == TraceSanitizer.mask
+               (item.step.params[param]?.stringValue == TraceSanitizer.mask && entry["target"] == nil)
                 || (op == "vm.type" ? passwordAimed : entry["target"]?["password"]?.boolValue == true || ControlHandler.isPasswordNode(entry["result"]?["node"])) {
                 let variable = newVariable("password")
                 item.secret = (param, variable)
