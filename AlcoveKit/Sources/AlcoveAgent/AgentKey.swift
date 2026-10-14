@@ -28,5 +28,36 @@ public enum AgentKey {
         return hex(signature)
     }
 
+    /// A failure of `signLines`: a sentence that names the next step.
+    public struct Failure: Error, Equatable, CustomStringConvertible {
+        public let sentence: String
+        public var description: String { sentence }
+    }
+
+    /// The `alcovectl agent-sign` usage sentence.
+    public static let signUsage = "usage: alcovectl agent-sign --vm NAME [--nonce HEX] [--public-key] [--dir DIR]; pass --nonce, --public-key or both"
+    /// The `alcovectl agent-sign` sentence for a nonce that is not 64 hexadecimal digits.
+    public static let badSignNonce = "--nonce must be 64 hexadecimal digits: the nonce of the agent's hello"
+
+    /// The lines `alcovectl agent-sign` prints: the signature by `agentKey` of `nonce` (64 hexadecimal digits) when
+    /// `nonce` is given, then the public key when `publicKey` is true. Throws `Failure` when neither is asked for, the
+    /// nonce is not 64 hexadecimal digits, or `agentKey` is missing or not 64 hexadecimal digits.
+    public static func signLines(agentKey: String?, nonce: String?, publicKey: Bool) throws -> [String] {
+        guard nonce != nil || publicKey else { throw Failure(sentence: signUsage) }
+        var nonceBytes: Data?
+        if let nonce {
+            guard let bytes = AgentClient.hexBytes(nonce), bytes.count == 32 else { throw Failure(sentence: badSignNonce) }
+            nonceBytes = bytes
+        }
+        guard let agentKey, let key = AgentKey.publicKey(agentKey) else { throw Failure(sentence: AgentClient.badAgentKey) }
+        var lines: [String] = []
+        if let nonceBytes {
+            guard let signature = signature(agentKey, nonce: nonceBytes) else { throw Failure(sentence: AgentClient.badAgentKey) }
+            lines.append(signature)
+        }
+        if publicKey { lines.append(key) }
+        return lines
+    }
+
     static func hex(_ data: Data) -> String { data.map { String(format: "%02x", $0) }.joined() }
 }

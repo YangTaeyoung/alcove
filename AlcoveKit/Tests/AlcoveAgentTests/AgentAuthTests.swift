@@ -45,6 +45,30 @@ final class AgentAuthTests: XCTestCase {
         XCTAssertNil(AgentClient.hexBytes("abc"))
     }
 
+    func testAgentSignPrintsTheSignatureOfTheNonceAndThePublicKey() throws {
+        let both = try AgentKey.signLines(agentKey: key, nonce: nonce, publicKey: true)
+        XCTAssertEqual(both.count, 2)
+        XCTAssertTrue(verifies(both[0], publicKey: vectorPublicKey, nonce: nonce))
+        XCTAssertEqual(both[1], vectorPublicKey)
+        let signature = try AgentKey.signLines(agentKey: key, nonce: nonce.uppercased(), publicKey: false)
+        XCTAssertEqual(signature.count, 1)
+        XCTAssertTrue(verifies(signature[0], publicKey: vectorPublicKey, nonce: nonce))
+        XCTAssertEqual(try AgentKey.signLines(agentKey: key, nonce: nil, publicKey: true), [vectorPublicKey])
+
+        let failures: [(String?, String?, Bool, String)] = [
+            (key, nil, false, AgentKey.signUsage),
+            (key, "abc", false, AgentKey.badSignNonce),
+            (key, String(repeating: "0", count: 62), true, AgentKey.badSignNonce),
+            (String(repeating: "a5", count: 31), nonce, false, AgentClient.badAgentKey),
+            (nil, nonce, false, AgentClient.badAgentKey),
+        ]
+        for (agentKey, nonce, publicKey, sentence) in failures {
+            XCTAssertThrowsError(try AgentKey.signLines(agentKey: agentKey, nonce: nonce, publicKey: publicKey)) {
+                XCTAssertEqual(($0 as? AgentKey.Failure)?.sentence, sentence)
+            }
+        }
+    }
+
     func testAnUnpairedAgentIsPairedWithTheKeyBeforeTheConnectionIsReady() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         agent.helloExtra = ["auth": "key", "nonce": .string(nonce), "paired": false]

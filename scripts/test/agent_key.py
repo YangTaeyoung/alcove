@@ -1,47 +1,66 @@
 """The host side of the agent's host key (docs/agent-protocol.md, "Host key").
 
-agent_key(vm) reads the VM's agentKey from its config.json in ALCOVE_VM_DIR (default
-~/Library/Application Support/Alcove/VMs). first_message(hello, key) returns the
-message the host sends after the agent's hello: pair for an unpaired agent, auth
-with the HMAC-SHA256 of the hello's nonce for a paired one, or None for an agent
-without key support. check_answer(message) raises AgentKeyError with the agent's
-sentence unless the message is authed.
+The VM's agentKey is the seed of an Ed25519 key; the scripts sign with it through
+`alcovectl agent-sign` (ALCOVE_CTL, or the development build in AlcoveKit/.build-ctl),
+which reads the VM's config.json in ALCOVE_VM_DIR (default
+~/Library/Application Support/Alcove/VMs). agent_key(vm) returns the VM's AgentKey
+with its public key. first_message(hello, key) returns the message the host sends
+after the agent's hello: pair with the public key for an unpaired agent, auth with
+the signature of the hello's nonce for a paired one, or None for an agent without
+key support. check_answer(message) raises AgentKeyError with the agent's sentence
+unless the message is authed.
 """
-import glob, hashlib, hmac, json, os
+import os, re, subprocess
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HEX64 = re.compile(r"[0-9a-f]{64}")
+HEX128 = re.compile(r"[0-9a-f]{128}")
 
 
 class AgentKeyError(Exception):
     pass
 
 
-def vm_dir():
-    return os.environ.get("ALCOVE_VM_DIR") or os.path.expanduser("~/Library/Application Support/Alcove/VMs")
+def ctl_path():
+    return os.environ.get("ALCOVE_CTL") or os.path.join(ROOT, "AlcoveKit", ".build-ctl", "debug", "alcovectl")
 
 
-def config_path(vm):
-    """The config.json of the bundle whose config names vm, else <vm>.alcovevm/config.json."""
-    for path in sorted(glob.glob(os.path.join(vm_dir(), "*.alcovevm", "config.json"))):
-        try:
-            with open(path, encoding="utf-8") as f:
-                if json.load(f).get("name") == vm:
-                    return path
-        except (OSError, ValueError):
-            continue
-    return os.path.join(vm_dir(), vm + ".alcovevm", "config.json")
+def agent_sign(vm, *options):
+    """The lines `alcovectl agent-sign --vm vm <options>` prints; AgentKeyError with a sentence when it fails."""
+    ctl = ctl_path()
+    try:
+        done = subprocess.run([ctl, "agent-sign", "--vm", vm, *options], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise AgentKeyError(f"cannot run {ctl} ({e}); build it with `cd AlcoveKit && swift build --product alcovectl "
+                            "--scratch-path .build-ctl` or set ALCOVE_CTL") from None
+    if done.returncode != 0:
+        raise AgentKeyError(done.stderr.strip() or f"{ctl} agent-sign exited with {done.returncode}")
+    return done.stdout.split()
+
+
+class AgentKey:
+    """The agentKey of one VM: its public key, and signatures made by alcovectl."""
+
+    def __init__(self, vm, public_key):
+        self.vm = vm
+        self.public_key = public_key
+
+    def sign(self, nonce):
+        """The hex signature of the auth context and nonce (64 hexadecimal digits)."""
+        if not isinstance(nonce, str) or not HEX64.fullmatch(nonce):
+            raise AgentKeyError(f"the agent's hello carries no nonce of 64 hexadecimal digits ({nonce!r}); reinstall alcove-agent in the guest")
+        lines = agent_sign(self.vm, "--nonce", nonce)
+        if len(lines) != 1 or not HEX128.fullmatch(lines[0]):
+            raise AgentKeyError(f"alcovectl agent-sign printed {lines!r} in place of one signature; rebuild alcovectl")
+        return lines[0]
 
 
 def agent_key(vm):
-    """The agentKey of the VM named vm; AgentKeyError with a sentence when there is none."""
-    path = config_path(vm)
-    try:
-        with open(path, encoding="utf-8") as f:
-            key = json.load(f).get("agentKey")
-    except (OSError, ValueError) as e:
-        raise AgentKeyError(f"cannot read {path} ({e}); pass the VM's name with --vm") from None
-    if not isinstance(key, str) or len(key) != 64:
-        raise AgentKeyError(f"{path} has no agentKey of 64 hexadecimal digits; load the VM once with the current "
-                            f"Alcove build (for example `alcovectl agent '{vm}'`), which adds it")
-    return key
+    """The AgentKey of the VM named vm; AgentKeyError with a sentence when alcovectl cannot read it."""
+    lines = agent_sign(vm, "--public-key")
+    if len(lines) != 1 or not HEX64.fullmatch(lines[0]):
+        raise AgentKeyError(f"alcovectl agent-sign printed {lines!r} in place of one public key; rebuild alcovectl")
+    return AgentKey(vm, lines[0])
 
 
 def first_message(hello, key):
@@ -49,9 +68,8 @@ def first_message(hello, key):
     if hello.get("auth") != "key":
         return None
     if hello.get("paired"):
-        mac = hmac.new(bytes.fromhex(key), bytes.fromhex(hello.get("nonce", "")), hashlib.sha256).hexdigest()
-        return {"t": "auth", "mac": mac}
-    return {"t": "pair", "key": key}
+        return {"t": "auth", "signature": key.sign(hello.get("nonce", ""))}
+    return {"t": "pair", "publicKey": key.public_key}
 
 
 def check_answer(message):
