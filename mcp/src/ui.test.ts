@@ -94,10 +94,10 @@ test("alcove_launch_app maps wait_window_s to waitWindow", async () => {
   assert.deepEqual(t.calls[0].params, { name: "vm", path: "C:\\a.exe", waitWindow: 7 });
 });
 
-test("alcove_launch_app always sends waitWindow: 20 by default and passes 0 through", async () => {
+test("alcove_launch_app sends the control default waitWindow 15 when none is given and passes 0 through", async () => {
   const t = rig(register, { pid: 4 });
   await t.run("alcove_launch_app", { name: "vm", path: "C:\\a.exe" });
-  assert.equal(t.calls[0].params.waitWindow, 20);
+  assert.equal(t.calls[0].params.waitWindow, 15);
   await t.run("alcove_launch_app", { name: "vm", path: "C:\\a.exe", wait_window_s: 0 });
   assert.equal(t.calls[1].params.waitWindow, 0);
 });
@@ -115,7 +115,7 @@ test("alcove_launch_app says that no window appeared only when the reply carries
   assert.equal(textOf(late), "started pid 4\nno window appeared within 7 s; check alcove_list_windows\neventSeq 12");
   assert.deepEqual(late.structuredContent, { pid: 4, window: undefined, windowTimedOut: true, eventSeq: 12 });
   const byDefault = await timedOut.run("alcove_launch_app", { name: "vm", path: "C:\\a.exe" });
-  assert.match(textOf(byDefault), /no window appeared within 20 s;/);
+  assert.match(textOf(byDefault), /no window appeared within 15 s;/);
 
   const unwaited = rig(register, { pid: 4 });
   const quiet = await unwaited.run("alcove_launch_app", { name: "vm", path: "C:\\a.exe", wait_window_s: 0 });

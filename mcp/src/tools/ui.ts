@@ -24,7 +24,10 @@ function nodeLabel(n: Obj | undefined): string {
   return `${n.ref ?? ""} ${n.role ?? ""} "${n.name ?? ""}"`.trim();
 }
 
-const WAIT_WINDOW_DEFAULT_S = 20;
+/** The `waitWindow` default of `vm.app.launch`, in seconds. */
+const LAUNCH_WAIT_WINDOW_S = 15;
+/** The `waitWindow` default of `vm.deploy`, in seconds. */
+const DEPLOY_WAIT_WINDOW_S = 20;
 
 /** One line per guest event: `seq time name` followed by the window title, by the exit code and the program or job, or by the count of dropped events. */
 export function eventLine(e: Obj): string {
@@ -283,12 +286,12 @@ export function register(r: Registrar, client: ControlClient): void {
       args: z.array(z.string()).optional().describe("Command-line arguments"),
       cwd: z.string().optional().describe("Working directory inside the guest"),
       env: z.record(z.string()).optional().describe("Extra environment variables"),
-      wait_window_s: z.number().min(0).max(300).optional().describe(`Seconds to wait for a window of the new process (default ${WAIT_WINDOW_DEFAULT_S}; 0 skips the wait)`),
+      wait_window_s: z.number().min(0).max(300).optional().describe(`Seconds to wait for a window of the new process (default ${LAUNCH_WAIT_WINDOW_S}; 0 skips the wait)`),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, async (a) => {
     try {
-      const wait = a.wait_window_s ?? WAIT_WINDOW_DEFAULT_S;
+      const wait = a.wait_window_s ?? LAUNCH_WAIT_WINDOW_S;
       const reply = await client.call("vm.app.launch", {
         name: a.name,
         path: a.path,
@@ -328,7 +331,7 @@ export function register(r: Registrar, client: ControlClient): void {
         env: z.record(z.string()).optional(),
         cwd: z.string().optional(),
       }).optional().describe("Program to start after the copy and install"),
-      wait_window_s: z.number().min(0).max(300).optional().describe(`Seconds to wait for the launched app's window (default ${WAIT_WINDOW_DEFAULT_S}; 0 skips the wait)`),
+      wait_window_s: z.number().min(0).max(300).optional().describe(`Seconds to wait for the launched app's window (default ${DEPLOY_WAIT_WINDOW_S}; 0 skips the wait)`),
       kill_running: z.boolean().optional().describe("Stop processes running from guest_dir before copying (default true)"),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
@@ -350,7 +353,7 @@ export function register(r: Registrar, client: ControlClient): void {
       if (reply.pid !== undefined) lines.push(`started pid ${reply.pid}`);
       const w = reply.window as Obj | undefined;
       if (w) lines.push(windowLine(w));
-      if (reply.windowTimedOut === true) lines.push(`no window appeared within ${a.wait_window_s ?? WAIT_WINDOW_DEFAULT_S} s; check alcove_list_windows`);
+      if (reply.windowTimedOut === true) lines.push(`no window appeared within ${a.wait_window_s ?? DEPLOY_WAIT_WINDOW_S} s; check alcove_list_windows`);
       const seq = eventSeqLine(reply);
       if (seq) lines.push(seq);
       return text(lines.join("\n"), reply);

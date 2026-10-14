@@ -3,10 +3,9 @@
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, batchResult, observationTime, observeParams, observePayload, waitForResult, type ObserveArgs } from "../observation.js";
-import { FIND_TEXT_TIMEOUT_MS, fail, text, typeMs, vmName, type Registrar } from "../toolkit.js";
+import { FIND_TEXT_TIMEOUT_MS, fail, regionSchema, text, typeMs, vmName, type Registrar } from "../toolkit.js";
 
 const buttonEnum = z.enum(["left", "right", "middle"]);
-const regionSchema = z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() });
 
 /** Converts snake_case object keys to camelCase, recursively through objects and arrays. */
 export function camelKeys(v: unknown): unknown {
@@ -82,8 +81,8 @@ export function batchTimeout(steps: Array<Record<string, unknown>>, obs: Observe
   return BATCH_BASE_MS + stepsMs + observationTime({ ...obs, observe: obs.observe ?? "summary" });
 }
 
-const optX = z.number().int().optional().describe("Guest pixel X; the pointer moves here first");
-const optY = z.number().int().optional().describe("Guest pixel Y; the pointer moves here first");
+const optX = z.number().int().optional().describe("Guest pixel X; the pointer moves here first; give it with y");
+const optY = z.number().int().optional().describe("Guest pixel Y; the pointer moves here first; give it with x");
 
 export function register(r: Registrar, client: ControlClient): void {
   const held = (
@@ -106,7 +105,10 @@ export function register(r: Registrar, client: ControlClient): void {
       });
   };
 
-  const buttonParams = (a: Record<string, unknown>) => ({ button: a.button ?? "left", ...(a.x !== undefined ? { x: a.x, y: a.y } : {}) });
+  const buttonParams = (a: Record<string, unknown>) => {
+    if ((a.x === undefined) !== (a.y === undefined)) throw new ControlError("pass x and y together, or neither");
+    return { button: a.button ?? "left", ...(a.x !== undefined ? { x: a.x, y: a.y } : {}) };
+  };
   const buttonLine = (verb: string) => (a: Record<string, unknown>) => `mouse ${a.button ?? "left"} ${verb}${a.x !== undefined ? ` at (${a.x}, ${a.y})` : ""}`;
 
   held("alcove_mouse_down", "Mouse button down",

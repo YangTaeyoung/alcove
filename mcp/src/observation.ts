@@ -1,6 +1,7 @@
 // Rendering of the `observation` object that control action results carry, and
 // the parameters that ask for it.
 import { z } from "zod";
+import { ControlError } from "./control.js";
 import { UI_FACTS_BUDGET_MS, type ToolResult } from "./toolkit.js";
 
 export interface TextContent { type: "text"; text: string }
@@ -147,16 +148,27 @@ export function batchResult(sent: Array<Record<string, unknown>>, reply: Record<
 
 export const observeParams = {
   observe: z.enum(["none", "summary", "diff", "image", "ui"]).optional().describe("What to report about the screen after the action: none, summary (settled or not, changed rectangle; on Windows guests also the foreground window, focused element and window events), diff (summary plus an image of the changed area), image (summary plus the full frame) or ui (summary plus the UI tree of the foreground window, Windows guests only)"),
-  settle_ms: z.number().int().min(0).max(10000).optional().describe("The screen counts as settled after this long without change (default 300)"),
+  settle_ms: z.number().int().min(0).max(10000).optional().describe("The screen counts as settled after this long without change (default 300, or settle_timeout_ms when that is lower); at most settle_timeout_ms"),
   settle_timeout_ms: z.number().int().min(100).max(30000).optional().describe("Stop waiting for the screen to settle after this long (default 2000)"),
 };
 
 export interface ObserveArgs { observe?: ObserveLevel; settle_ms?: number; settle_timeout_ms?: number }
 
-/** Control params for the observation request; `fallback` applies when the caller gave no level. */
+/** The settle time the control ops use when a request names none, in ms. */
+export const DEFAULT_SETTLE_MS = 300;
+
+/**
+ * Control params for the observation request; `fallback` applies when the caller gave no level. A settle timeout
+ * below the default settle time without a settle time sends that timeout as the settle time; a settle time above the
+ * settle timeout throws a ControlError.
+ */
 export function observePayload(a: ObserveArgs, fallback: ObserveLevel): Record<string, unknown> {
   const p: Record<string, unknown> = { observe: a.observe ?? fallback };
+  if (a.settle_ms !== undefined && a.settle_timeout_ms !== undefined && a.settle_ms > a.settle_timeout_ms) {
+    throw new ControlError(`settle_ms (${a.settle_ms}) must not exceed settle_timeout_ms (${a.settle_timeout_ms}); lower settle_ms or raise settle_timeout_ms`);
+  }
   if (a.settle_ms !== undefined) p.settleMs = a.settle_ms;
+  else if (a.settle_timeout_ms !== undefined && a.settle_timeout_ms < DEFAULT_SETTLE_MS) p.settleMs = a.settle_timeout_ms;
   if (a.settle_timeout_ms !== undefined) p.settleTimeoutMs = a.settle_timeout_ms;
   return p;
 }

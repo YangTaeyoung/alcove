@@ -1,8 +1,8 @@
 // The core toolset: VM lifecycle, screen, pointer, keyboard, clipboard, exec and file push.
 import { z } from "zod";
-import type { ControlClient } from "../control.js";
+import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, changeResult, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
-import { clip, commandParams, commandPayload, fail, startTimeout, streamSections, text, typeMs, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
+import { clip, commandParams, commandPayload, fail, regionSchema, startTimeout, stdinParam, streamSections, text, typeMs, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
 
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("core",
@@ -120,18 +120,19 @@ export function register(r: Registrar, client: ControlClient): void {
         "Capture the VM screen as a PNG or JPEG image. Coordinates for click/move/drag tools are guest pixels in the full-resolution frame. The text part gives the guest frame size and where the returned image sits: guest = origin + image_pixel / scale. Use region to capture one rectangle, window to capture one window (Windows guests), marks to number the interactive elements on the image and list them in the text, scale or max_width to shrink the image.",
       inputSchema: {
         name: vmName,
-        region: z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() }).optional().describe("Capture only this guest-pixel rectangle {x, y, w, h}"),
+        region: regionSchema.optional().describe("Capture only this guest-pixel rectangle {x, y, w, h}; not together with window"),
         scale: z.number().min(0.1).max(1).optional().describe("Scale the captured area by this factor (0.1 to 1)"),
         max_width: z.number().int().min(64).max(4096).optional().describe("Downscale the returned image to this width (default 1280) to save tokens; coordinates stay in full guest pixels"),
         format: z.enum(["png", "jpeg"]).optional().describe("Image format (default png); jpeg is smaller"),
         quality: z.number().min(0.1).max(1).optional().describe("JPEG quality (default 0.8)"),
-        window: z.string().optional().describe("Crop to this window: a window id from alcove_list_windows, \"foreground\", or a part of the title (Windows guests)"),
+        window: z.string().optional().describe("Crop to this window: a window id from alcove_list_windows, \"foreground\", or a part of the title (Windows guests); not together with region"),
         marks: z.boolean().optional().describe("Draw numbered rectangles over the interactive elements and list them (number, ref, role, name) in the text; pass the ref to alcove_ui_click (Windows guests)"),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ name, region, scale, max_width, format, quality, window, marks }) => {
       try {
+        if (region !== undefined && window !== undefined) throw new ControlError("pass region or window, not both");
         const helperCalls = (window !== undefined ? 1 : 0) + (marks ? 1 : 0);
         const r = await client.call("vm.screenshot", {
           name,
@@ -279,7 +280,7 @@ export function register(r: Registrar, client: ControlClient): void {
       title: "Run a shell command in the guest",
       description:
         "Run a command inside the guest through the Alcove guest tools and return its output and exit code. Windows guests run PowerShell, Linux guests /bin/sh. Requires the guest tools (alcove-agent) to be installed and started with exec allowed. Use this for anything scriptable instead of clicking around.",
-      inputSchema: { name: vmName, ...commandParams, timeout_s: z.number().int().min(1).max(3600).optional().describe("Default 120") },
+      inputSchema: { name: vmName, ...commandParams, ...stdinParam, timeout_s: z.number().int().min(1).max(3600).optional().describe("Default 120") },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
     async ({ name, timeout_s, ...cmd }) => {

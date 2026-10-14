@@ -162,21 +162,28 @@ export const commandParams = {
   argv: z.array(z.string()).min(1).optional().describe("Program and arguments run without a shell wrapper; give this or command"),
   cwd: z.string().optional().describe("Working directory inside the guest"),
   env: z.record(z.string()).optional().describe("Extra environment variables"),
-  stdin: z.string().optional().describe("Text written to the command's standard input"),
   shell: z.enum(["powershell", "cmd", "sh", "none"]).optional().describe("Shell that runs `command` (default: powershell on Windows, sh elsewhere); \"none\" requires argv"),
 };
 
+/** The `stdin` parameter of alcove_exec. */
+export const stdinParam = {
+  stdin: z.string().optional().describe("Text written to the command's standard input"),
+};
+
+/** A `region` parameter: a guest-pixel rectangle. */
+export const regionSchema = z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() });
+
 export interface CommandArgs { command?: string; argv?: string[]; cwd?: string; env?: Record<string, string>; stdin?: string; shell?: string }
 
-/** Control params for a command; throws a ControlError when neither command nor argv is given. */
-export function commandPayload(a: CommandArgs): Record<string, unknown> {
+/** Control params for a command, with `stdin` only when `withStdin`; throws a ControlError when neither command nor argv is given. */
+export function commandPayload(a: CommandArgs, withStdin = true): Record<string, unknown> {
   if (!a.command && !a.argv) throw new ControlError("give either `command` or `argv`");
   const p: Record<string, unknown> = {};
   if (a.command) p.command = a.command;
   if (a.argv) p.argv = a.argv;
   if (a.cwd !== undefined) p.cwd = a.cwd;
   if (a.env !== undefined) p.env = a.env;
-  if (a.stdin !== undefined) p.stdin = a.stdin;
+  if (withStdin && a.stdin !== undefined) p.stdin = a.stdin;
   if (a.shell !== undefined) p.shell = a.shell;
   return p;
 }

@@ -16,13 +16,13 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Start a background command in the guest",
       description:
-        "Start a command in the guest and return immediately with a job id and pid. Use this for builds, test runs and servers that take longer than a normal call; follow the output with alcove_exec_read. Takes the same command parameters as alcove_exec.",
+        "Start a command in the guest and return immediately with a job id and pid. Use this for builds, test runs and servers that take longer than a normal call; follow the output with alcove_exec_read. Takes the same command parameters as alcove_exec except stdin; write to the job's standard input with alcove_exec_write.",
       inputSchema: { name: vmName, ...commandParams },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
     async ({ name, ...cmd }) => {
       try {
-        const res = await client.call("vm.exec.start", { name, ...commandPayload(cmd) });
+        const res = await client.call("vm.exec.start", { name, ...commandPayload(cmd, false) });
         return changeResult(`started job ${res.job} (pid ${res.pid})`, res, { job: res.job, pid: res.pid });
       } catch (e) {
         return fail(e);
