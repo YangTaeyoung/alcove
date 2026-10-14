@@ -141,7 +141,8 @@ struct AlcoveCommands: Commands {
 
 /// Launch and quit handling: hosts the automation control socket while the
 /// app runs, and with active VMs offers to suspend or shut them all down;
-/// the guests of running HTTP captures are restored before either.
+/// before either, the guests of running HTTP captures are restored, for 20 s
+/// at most.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {

@@ -62,6 +62,13 @@ final class AppControlServer {
     func endCaptures() async {
         await handler?.shutdown(within: .seconds(20))
     }
+
+    /// Tells the control handler that the window of `vm` connected to its guest tools, so that what an earlier HTTP
+    /// capture left in the guest is cleaned up; nothing happens without a handler.
+    func guestToolsConnected(vm: String) {
+        guard let handler else { return }
+        Task { await handler.guestToolsSeen(vm: vm) }
+    }
 }
 
 /// `VMRegistry` over `AppModel.shared.sessions`; targets are cached per session

@@ -15,7 +15,7 @@ final class CallLog: @unchecked Sendable {
     func clear() { lock.lock(); items.removeAll(); lock.unlock() }
 }
 
-/// A scripted proxy: records its calls in a log and answers from `replies`.
+/// A scripted proxy: records its calls in a log and answers from `answers`.
 final class FakeProxy: ProxyControlling, @unchecked Sendable {
     let log: CallLog
     let port: Int

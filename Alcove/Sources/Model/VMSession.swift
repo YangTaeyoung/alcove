@@ -80,6 +80,8 @@ final class VMSession: Identifiable {
     /// Connect to the guest agent in the background while the VM runs, so the
     /// window can show whether the tools are present and drive the guest's
     /// display mode (viogpudo ignores QEMU's resize hint; the agent does not).
+    /// Each connection is reported to the control server, which cleans up
+    /// what an earlier HTTP capture left in the guest.
     private func connectTools() {
         guard agentTask == nil else { return }
         let port = config.agentHostPort, token = config.agentToken
@@ -91,6 +93,7 @@ final class VMSession: Identifiable {
                     try await client.connect(port: port, expectedToken: token, timeout: .seconds(5))
                     self.agent = client
                     self.toolsConnected = true
+                    AppControlServer.shared.guestToolsConnected(vm: self.name)
                     if let size = self.lastRequestedResolution {
                         await client.setResolution(width: size.width, height: size.height)
                     }
