@@ -59,7 +59,7 @@ type Proxy struct {
 	cfgMu sync.RWMutex
 	cfg   config
 
-	tOnce     sync.Once
+	tmu       sync.Mutex
 	transport *http.Transport
 
 	pmu  sync.Mutex
@@ -69,7 +69,9 @@ type Proxy struct {
 	listener net.Listener
 	conns    map[net.Conn]struct{}
 	closed   bool
-	wg       sync.WaitGroup
+	// done is closed by Close.
+	done chan struct{}
+	wg   sync.WaitGroup
 }
 
 // NewProxy returns a proxy that signs intercepted hosts with ca.
@@ -81,6 +83,7 @@ func NewProxy(ca *CA) *Proxy {
 		cfg:   config{bodies: true},
 		conns: map[net.Conn]struct{}{},
 		pend:  map[*pendingEntry]struct{}{},
+		done:  make(chan struct{}),
 	}
 }
 
@@ -91,7 +94,9 @@ func (p *Proxy) config() config {
 }
 
 func (p *Proxy) upstream() *http.Transport {
-	p.tOnce.Do(func() {
+	p.tmu.Lock()
+	defer p.tmu.Unlock()
+	if p.transport == nil {
 		dialer := &net.Dialer{Timeout: dialTimeout}
 		p.transport = &http.Transport{
 			Proxy:                 nil,
@@ -106,7 +111,7 @@ func (p *Proxy) upstream() *http.Transport {
 			},
 			TLSClientConfig: &tls.Config{RootCAs: p.UpstreamRoots},
 		}
-	})
+	}
 	return p.transport
 }
 
@@ -141,11 +146,14 @@ func (p *Proxy) Serve(l net.Listener) error {
 	}
 }
 
-// Close stops the listener, closes every open connection and waits for the
-// connection handlers to finish.
+// Close stops the listener, ends rule delays, closes every open connection and
+// waits for the connection handlers to finish.
 func (p *Proxy) Close() {
 	p.mu.Lock()
-	p.closed = true
+	if !p.closed {
+		p.closed = true
+		close(p.done)
+	}
 	if p.listener != nil {
 		p.listener.Close()
 	}
@@ -154,8 +162,11 @@ func (p *Proxy) Close() {
 	}
 	p.mu.Unlock()
 	p.wg.Wait()
-	if p.transport != nil {
-		p.transport.CloseIdleConnections()
+	p.tmu.Lock()
+	t := p.transport
+	p.tmu.Unlock()
+	if t != nil {
+		t.CloseIdleConnections()
 	}
 }
 

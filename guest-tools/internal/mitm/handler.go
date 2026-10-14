@@ -1,6 +1,7 @@
 package mitm
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ const (
 	websocketRefusal = "websocket interception is not supported; exclude this host with the hosts filter"
 	badTargetRefusal = "request target must start with '/'"
 	clientClosed     = "the client closed the connection"
+	incompleteBody   = "the request body was not received completely"
 	maxDrainBytes    = 64 << 20
 )
 
@@ -98,20 +100,67 @@ func (p *Proxy) handler(scheme, authority string) http.Handler {
 }
 
 // drainBody reads the rest of the request body through the capture tee, for at
-// most drainTimeout. The exchange records an incomplete body.
+// most drainTimeout. When the body does not arrive completely the exchange
+// records an incomplete body, the read deadline stays expired and an HTTP/1
+// connection closes after the answer.
 func drainBody(w http.ResponseWriter, r *http.Request, ex *Exchange) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(drainTimeout))
 	_, err := io.Copy(io.Discard, io.LimitReader(r.Body, maxDrainBytes))
-	_ = rc.SetReadDeadline(time.Time{})
-	if err != nil {
-		if ex.Error == "" {
-			ex.Error = "the request body was not received completely"
-		}
-		if r.ProtoMajor == 1 {
-			w.Header().Set("Connection", "close")
-		}
+	if err == nil {
+		_ = rc.SetReadDeadline(time.Time{})
+		return
 	}
+	if ex.Error == "" {
+		ex.Error = incompleteBody
+	}
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "close")
+	}
+}
+
+// readAhead reads up to maxBodyBytes of an HTTP/1 request body through the
+// capture tee, for at most drainTimeout, and replaces r.Body with one that
+// returns those bytes before the rest. A body read to its end lets the server
+// watch the connection, so a client that hangs up cancels r.Context(). It
+// reports false after answering 408 when the body did not arrive in time.
+func readAhead(w http.ResponseWriter, r *http.Request, ex *Exchange, resCap *capBuf) bool {
+	if r.ProtoMajor != 1 || r.ContentLength == 0 {
+		return true
+	}
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(drainTimeout))
+	head, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	if err != nil {
+		ex.Error = incompleteBody
+		w.Header().Set("Connection", "close")
+		respondText(w, ex, resCap, http.StatusRequestTimeout,
+			fmt.Sprintf("alcove-proxy did not receive the whole request body within %s; send it again", drainTimeout))
+		return false
+	}
+	_ = rc.SetReadDeadline(time.Time{})
+	body := r.Body
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(head), body), body}
+	return true
+}
+
+// waitDelay waits for a rule delay. It reports false, with the reason in ex,
+// when the client gives up or the proxy closes first.
+func (p *Proxy) waitDelay(r *http.Request, delayMs int, ex *Exchange) bool {
+	t := time.NewTimer(time.Duration(delayMs) * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-r.Context().Done():
+		ex.Error = "the client gave up during the rule delay"
+	case <-p.done:
+		ex.Error = "the proxy stopped during the rule delay"
+	}
+	return false
 }
 
 func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, authority string) {
@@ -177,26 +226,22 @@ func (p *Proxy) serveRequest(w http.ResponseWriter, r *http.Request, scheme, aut
 		return
 	}
 
-	var act ruleAction
-	if a, id, ok := p.rules.pick(host, r.URL.Path, r.Method); ok {
-		act, ex.Rule = a, id
+	if act, id, ok := p.rules.pick(host, r.URL.Path, r.Method); ok {
+		ex.Rule = id
 		pe.rule.Store(int64(id))
-		if act.DelayMs > 0 {
-			t := time.NewTimer(time.Duration(act.DelayMs) * time.Millisecond)
-			select {
-			case <-t.C:
-			case <-r.Context().Done():
-				t.Stop()
-				ex.Error = "the client gave up during the rule delay"
-				return
-			}
+		answers := act.Drop || act.synthesizes()
+		if answers {
+			drainBody(w, r, ex)
+		} else if act.DelayMs > 0 && !readAhead(w, r, ex, resCap) {
+			return
+		}
+		if act.DelayMs > 0 && !p.waitDelay(r, act.DelayMs, ex) {
+			panic(http.ErrAbortHandler)
 		}
 		if act.Drop {
-			drainBody(w, r, ex)
 			panic(http.ErrAbortHandler)
 		}
 		if act.synthesizes() {
-			drainBody(w, r, ex)
 			p.synthesize(w, ex, resCap, act)
 			return
 		}
