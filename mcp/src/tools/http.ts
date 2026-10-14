@@ -6,10 +6,10 @@ import { clip, fail, text, vmName, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
-/** Longest `vm.http.start` runs before it answers, in ms: a cleanup after an earlier capture that holds the VM (45 s), the wait for guest tools (31 s), the proxy becoming ready (15 s) and taking its settings (30 s), the CA copy (24 s), two guest recipes (30 s each), and after a failed last step the undo (45 s) and the end of the proxy (6 s). */
-export const START_WORST_MS = 256000;
-/** Longest `vm.http.stop` runs before it answers, in ms: a cleanup that holds the VM (45 s), the exchange count (30 s), the wait for guest tools (31 s), three guest recipes (30 s each) and the end of the proxy (6 s). */
-export const STOP_WORST_MS = 202000;
+/** Longest `vm.http.start` runs before it answers, in ms: a cleanup after an earlier capture that holds the VM (three guest recipes, 30 s each), the wait for guest tools (31 s), the proxy becoming ready (15 s) and taking its settings (30 s), the CA copy (24 s), two guest recipes (30 s each), and after a failed last step the undo (three recipes, 15 s each) and the end of the proxy (6 s). */
+export const START_WORST_MS = 301000;
+/** Longest `vm.http.stop` runs before it answers, in ms: a cleanup that holds the VM (90 s), the exchange count (30 s), the wait for guest tools (31 s), three guest recipes (30 s each) and the end of the proxy (6 s). */
+export const STOP_WORST_MS = 247000;
 /** What `client.call` waits beyond the longest run of a capture op, in ms. */
 export const CAPTURE_MARGIN_MS = 15000;
 

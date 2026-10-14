@@ -136,9 +136,9 @@ test("capture start and stop wait 15 s longer than the op may take", async () =>
   const t = rig(register, { proxy: "10.0.2.2:1", env: {} });
   await t.run("alcove_http_capture_start", { name: "vm" });
   await t.run("alcove_http_capture_stop", { name: "vm" });
-  assert.deepEqual(t.timeouts, [271000, 217000]);
-  assert.equal(START_WORST_MS + CAPTURE_MARGIN_MS, 271000);
-  assert.equal(STOP_WORST_MS + CAPTURE_MARGIN_MS, 217000);
+  assert.deepEqual(t.timeouts, [316000, 262000]);
+  assert.equal(START_WORST_MS + CAPTURE_MARGIN_MS, 316000);
+  assert.equal(STOP_WORST_MS + CAPTURE_MARGIN_MS, 262000);
 });
 
 test("capture start and stop print the op's warning, and stop says when it only cleared leftovers", async () => {
