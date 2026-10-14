@@ -188,6 +188,19 @@ final class ScriptCommandTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: script + ".failure.png"))
     }
 
+    func testAFolderNamedLikeTheFailureImageIsKept() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("script-cmd-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+        let script = folder.appendingPathComponent("flow.json").path
+        let image = URL(fileURLWithPath: ScriptReport.failureImagePath(forScript: script))
+        try FileManager.default.createDirectory(at: image, withIntermediateDirectories: true)
+        try Data("kept".utf8).write(to: image.appendingPathComponent("inside.txt"))
+        ScriptReport.removeFailureImage(forScript: script)
+        XCTAssertNil(ScriptReport.storeFailureImage(["passed": true], scriptFile: script))
+        XCTAssertEqual(try Data(contentsOf: image.appendingPathComponent("inside.txt")), Data("kept".utf8))
+    }
+
     func testFailureImageIsReadableByItsOwnerOnly() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("script-cmd-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

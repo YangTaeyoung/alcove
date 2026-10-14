@@ -225,9 +225,9 @@ public enum ScriptReport {
     /// Where the failure screenshot of the script at `file` is written.
     public static func failureImagePath(forScript file: String) -> String { file + ".failure.png" }
 
-    /// Removes the failure screenshot file of the script at `file`.
+    /// Removes the failure screenshot file of the script at `file`; a folder of that name stays.
     public static func removeFailureImage(forScript file: String) {
-        try? FileManager.default.removeItem(atPath: failureImagePath(forScript: file))
+        unlink(failureImagePath(forScript: file))
     }
 
     /// Replaces the failure screenshot file of the script at `file` by the one of a failed run, with mode 0600, and
