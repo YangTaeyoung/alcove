@@ -1,8 +1,10 @@
 // alcove-agent runs inside a guest and serves docs/agent-protocol.md on TCP 7645
-// to connections from 10.0.2.2 and from the ranges given with --allow-peer.
+// to connections from 10.0.2.2 and from the ranges given with --allow-peer,
+// once the host paired with it or proved the stored host key.
 //
 //	alcove-agent [--port 7645] [--allow-exec] [--allow-peer CIDR]... [--token T]
 //	alcove-agent --install   (Windows: scheduled task at logon + firewall rule)
+//	alcove-agent --forget-host-key   (removes the stored host key)
 package main
 
 import (
@@ -29,9 +31,19 @@ func main() {
 	tok := flag.String("token", "", "override the SMBIOS token")
 	install := flag.Bool("install", false, "install to start at logon (Windows) and exit")
 	logPath := flag.String("log", "", "log file (default: stderr)")
+	forget := flag.Bool("forget-host-key", false, "remove the stored host key, so the next host that connects pairs with this agent, and exit (as an administrator or root)")
 	var peers peerFlag
 	flag.Var(&peers, "allow-peer", "also serve connections from this address or CIDR range (repeatable; 10.0.2.2 is always served)")
 	flag.Parse()
+
+	if *forget {
+		path, err := forgetHostKeyPath()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(forgetHostKey(path, os.Stdout, os.Stderr))
+	}
 
 	if *install {
 		dir, err := lockDataFolder()
@@ -105,7 +117,8 @@ func main() {
 		helper.SetLogPath(filepath.Join(uiaDir, "helper.log"))
 		ui = helper
 	}
-	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui, AllowPeers: allowed})
+	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui, AllowPeers: allowed,
+		HostKey: newHostKeyStore(alcoveDir, dataErr, lockErr)})
 	err = s.Serve(l)
 	s.Close()
 	logger.Fatal(err)
