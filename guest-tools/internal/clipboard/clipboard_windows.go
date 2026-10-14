@@ -62,7 +62,11 @@ func open() error {
 	return errors.New("OpenClipboard failed")
 }
 
-func (windowsClipboard) Text() (string, error) {
+// Text reads the text through serial, so the thread that opens the clipboard
+// closes it.
+func (windowsClipboard) Text() (string, error) { return serial(text) }
+
+func text() (string, error) {
 	if r, _, _ := procIsClipboardFormatAvail.Call(cfUnicodeText); r == 0 {
 		return "", nil
 	}
@@ -89,7 +93,14 @@ func (windowsClipboard) Text() (string, error) {
 	return string(utf16.Decode(u[:end])), nil
 }
 
+// SetText writes the text through serial, so the thread that opens the
+// clipboard closes it.
 func (windowsClipboard) SetText(s string) error {
+	_, err := serial(func() (struct{}, error) { return struct{}{}, setText(s) })
+	return err
+}
+
+func setText(s string) error {
 	u := utf16.Encode([]rune(s))
 	u = append(u, 0)
 	size := uintptr(len(u) * 2)
