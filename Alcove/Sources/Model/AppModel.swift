@@ -177,6 +177,7 @@ final class AppModel {
         refreshCloneList(ofTemplate: config.cloneOf)
         session.invalidate()
         let replacement = makeSession(bundle: bundle, config: config, engine: engine)
+        AppControlServer.shared.vmRenamed(from: session.name, oldPath: session.id, to: replacement.name, newPath: replacement.id)
         sessions = sorted(sessions.filter { $0.id != session.id } + [replacement])
         return replacement
     }
