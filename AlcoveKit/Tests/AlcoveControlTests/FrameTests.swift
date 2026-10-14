@@ -135,6 +135,28 @@ final class FrameTests: XCTestCase {
         XCTAssertNil(FrameSource().frame(for: missing))
     }
 
+    func testFrameSourceReadsTheFileThatReplacedTheMappedOneAtItsPath() throws {
+        let path = try sharedFile([UInt8](repeating: 0x11, count: 4096))
+        defer { unlink(path) }
+        let surface = FromQEMU.SurfaceSwitch(con: 0, w: 8, h: 4, stride: 32, fmt: "bgra8", shm: path, size: 4096)
+        let source = FrameSource()
+        XCTAssertEqual(try XCTUnwrap(source.frame(for: surface)).pixels[0], 0x11)
+
+        let handle = try FileHandle(forUpdating: URL(fileURLWithPath: path))
+        try handle.write(contentsOf: Data([UInt8](repeating: 0x22, count: 4096)))
+        try handle.close()
+        XCTAssertEqual(try XCTUnwrap(source.frame(for: surface)).pixels[0], 0x22)
+
+        XCTAssertEqual(unlink(path), 0)
+        try Data([UInt8](repeating: 0x33, count: 4096)).write(to: URL(fileURLWithPath: path))
+        XCTAssertEqual(try XCTUnwrap(source.frame(for: surface)).pixels[0], 0x33)
+
+        XCTAssertEqual(unlink(path), 0)
+        XCTAssertNil(source.frame(for: surface))
+        try Data([UInt8](repeating: 0x44, count: 4096)).write(to: URL(fileURLWithPath: path))
+        XCTAssertEqual(try XCTUnwrap(source.frame(for: surface)).pixels[0], 0x44)
+    }
+
     func testFrameAfterSurfaceSwitch() throws {
         let big = try sharedFile([UInt8](repeating: 0x11, count: 8192))
         let small = try sharedFile([UInt8](repeating: 0x22, count: 4096))
