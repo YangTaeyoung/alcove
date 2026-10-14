@@ -531,6 +531,22 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.factory.latest.stopCount, 1)
     }
 
+    func testACancelledStartStillUndoesItsGuestSteps() async throws {
+        let c = try await capture()
+        c.held.value = ["recipe.setProxy(49152)"]
+        let h = c.h
+        let caller = Task { try await h.handle(op: "vm.http.start", params: ["name": "Win"]) }
+        let asked = await eventually("the start asks the guest to set its system proxy") { c.waiting.value.count == 1 }
+        XCTAssertTrue(asked)
+        caller.cancel()
+        _ = try? await caller.value
+        let ended = await c.factory.latest.stopped()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "push \(GuestRecipes.windowsProxyCAPath)", "recipe.installCA",
+                                       "recipe.setProxy(49152)", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
     func testACopyThatFailsIsUndoneAndNamed() async throws {
         let c = try await capture()
         let files = c.agentHandler
@@ -735,6 +751,42 @@ final class ControlHTTPTests: XCTestCase {
         let again = try await c.start()
         XCTAssertEqual(again["proxy"]?.stringValue, "10.0.2.2:49153")
         XCTAssertEqual(c.factory.made.count, 2)
+    }
+
+    func testACancelledStopStillRestoresTheGuestAndEndsTheCapture() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        c.held.value = ["recipe.clearProxy"]
+        c.log.clear()
+        let h = c.h
+        let caller = Task { try await h.handle(op: "vm.http.stop", params: ["name": "Win"]) }
+        let asked = await eventually("the stop asks the guest to restore its proxy settings") { c.waiting.value.count == 1 }
+        XCTAssertTrue(asked)
+        caller.cancel()
+        c.release("recipe.clearProxy", printing: restoredState(caThumbprint))
+        _ = try? await caller.value
+        let ended = await c.factory.latest.stopped()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(c.log.entries, ["proxy.list", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
+    func testACancelledStopThatWaitsForTheToolsStillRestoresTheGuest() async throws {
+        let c = try await capture(adjust: { $0.toolsWait = .seconds(5) })
+        _ = try await c.start()
+        await c.t.setAgentWait(.milliseconds(300))
+        c.log.clear()
+        let h = c.h
+        let caller = Task { try await h.handle(op: "vm.http.stop", params: ["name": "Win"]) }
+        let waiting = await eventually("the stop waits for the guest tools") { await c.t.agentWaits == 1 }
+        XCTAssertTrue(waiting)
+        caller.cancel()
+        let result = try await caller.value
+        XCTAssertNil(result["warning"])
+        let cancelled = await c.t.cancelledAgentWaits
+        XCTAssertEqual(cancelled, 0)
+        XCTAssertEqual(c.log.entries, ["proxy.list", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
     }
 
     func testStopRemovesTheCAOfTheStateFileToo() async throws {
@@ -1565,6 +1617,22 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertNil(c.journal.entry(for: "Win"))
     }
 
+    func testACancelledStopWithoutACaptureStillRestoresFromTheJournalEntry() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        let next = c.makeHandler()
+        c.held.value = ["recipe.clearProxy"]
+        c.log.clear()
+        let caller = Task { try await next.handle(op: "vm.http.stop", params: ["name": "Win"]) }
+        let asked = await eventually("the stop asks the guest to restore its proxy settings") { c.waiting.value.count == 1 }
+        XCTAssertTrue(asked)
+        caller.cancel()
+        c.release("recipe.clearProxy", printing: restoredState(caThumbprint))
+        _ = try? await caller.value
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
     func testASnapshotCreatedDuringACaptureIsCleanedAfterItsRestoreByAnotherHandler() async throws {
         let c = try await capture()
         _ = try await c.start()
@@ -2160,6 +2228,46 @@ final class ControlHTTPTests: XCTestCase {
         let unreachable = try await offline.h.handle(op: "vm.stop", params: ["name": "Win"])
         XCTAssertEqual(unreachable["warning"]?.stringValue, "the guest keeps the proxy settings and the CA certificate of the capture (its guest "
                        + "tools were not connected); Alcove restores them when its guest tools next connect")
+    }
+
+    func testACancelledVMStopStillRestoresTheGuest() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        c.held.value = ["recipe.clearProxy"]
+        c.log.clear()
+        let h = c.h
+        let caller = Task { try await h.handle(op: "vm.stop", params: ["name": "Win"]) }
+        let asked = await eventually("vm.stop asks the guest to restore its proxy settings") { c.waiting.value.count == 1 }
+        XCTAssertTrue(asked)
+        caller.cancel()
+        c.release("recipe.clearProxy", printing: restoredState(caThumbprint))
+        _ = try? await caller.value
+        let ended = await c.factory.latest.stopped()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
+    func testVMStopRestoresTheGuestUnderTheCaptureGate() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        c.held.value = ["recipe.clearProxy"]
+        c.log.clear()
+        let h = c.h
+        let httpStop = Task { try await h.handle(op: "vm.http.stop", params: ["name": "Win"]) }
+        let asked = await eventually("vm.http.stop asks the guest to restore its proxy settings") { c.waiting.value.count == 1 }
+        XCTAssertTrue(asked)
+        let vmStop = Task { try await h.handle(op: "vm.stop", params: ["name": "Win"]) }
+        let queued = await eventually("vm.stop waits for the capture gate") { await h.captureGate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(queued)
+        XCTAssertEqual(c.waiting.value.count, 1)
+        c.release("recipe.clearProxy", printing: restoredState(caThumbprint))
+        let stopped = try await vmStop.value
+        _ = try await httpStop.value
+        XCTAssertEqual(stopped["captureEnded"]?.boolValue, true)
+        XCTAssertNil(stopped["warning"])
+        XCTAssertEqual(c.log.entries, ["proxy.list", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
     }
 
     func testStopOfAPausedCapturingVMSaysTheVMWasPaused() async throws {

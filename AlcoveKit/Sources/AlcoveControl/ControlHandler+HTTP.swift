@@ -237,7 +237,8 @@ extension ControlHandler {
                     bundle = try await prepareGuest(&capture, &warnings, t, agent, hostCAPath: started.caPath, guestPath: guestPath,
                                                     systemProxy: request.systemProxy)
                 } catch {
-                    let undone = await restoreGuest(t, agent, os: os, thumbprint: thumbprint, op: "vm.http.start", limit: httpTiming.undo)
+                    let undo = httpTiming.undo
+                    let undone = await Task { await self.restoreGuest(t, agent, os: os, thumbprint: thumbprint, op: "vm.http.start", limit: undo) }.value
                     guard undone.failure != nil else {
                         try? captureJournal.remove(capture.journalEntry, now: wallClock())
                         throw error
@@ -387,19 +388,30 @@ extension ControlHandler {
         if let newest = try? await capture.proxy.call("list", ["limit": 1]) { exchanges = newest["next"]?.intValue ?? 0 }
         var warnings: [String] = []
         if capture.guestChanged {
-            let state = await t.state()
-            if state == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.toolsWait) {
-                let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
-                if let failure = restored.failure { warnings.append(failure) } else { try? captureJournal.remove(capture.journalEntry, now: wallClock()) }
-                if let warning = restored.warning { warnings.append(warning) }
-            } else {
-                warnings.append(ControlHandler.unreachableGuestWarning(state))
-            }
+            let entry = capture.journalEntry
+            let os = capture.os
+            let thumbprint = capture.thumbprint
+            warnings = await Task { await self.restoreStoppedGuest(t, entry: entry, os: os, thumbprint: thumbprint) }.value
         }
         await endCapture(vm, id: capture.id)
         var out: [String: JSON] = ["exchanges": .int(Int64(exchanges))]
         if !warnings.isEmpty { out["warning"] = .string(warnings.joined(separator: "; ")) }
         return .object(out)
+    }
+
+    /// Restores the guest of the capture with journal entry `entry` for `vm.http.stop`: waits up to
+    /// `HTTPTiming.toolsWait` for its guest tools, runs the restore recipes with `HTTPTiming.recipe` each and removes
+    /// the entry when they worked. Returns the warnings of the stop.
+    private func restoreStoppedGuest(_ t: VMTarget, entry: CaptureJournal.Entry, os: VMConfig.GuestOS, thumbprint: String) async -> [String] {
+        let state = await t.state()
+        guard state == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.toolsWait) else {
+            return [ControlHandler.unreachableGuestWarning(state)]
+        }
+        var warnings: [String] = []
+        let restored = await restoreGuest(t, agent, os: os, thumbprint: thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
+        if let failure = restored.failure { warnings.append(failure) } else { try? captureJournal.remove(entry, now: wallClock()) }
+        if let warning = restored.warning { warnings.append(warning) }
+        return warnings
     }
 
     /// The warning of a `vm.http.stop` that ended a capture without restoring its guest, whose VM is in `state`.
@@ -427,7 +439,9 @@ extension ControlHandler {
                 : "while the VM is not running; Alcove restores it when its guest tools next connect"
             throw ControlError.failed("'\(vm)' is not capturing, and what an earlier capture left in its guest cannot be restored \(why)")
         }
-        let stale = await restoreGuest(t, agent, os: await t.guestOS(), thumbprint: recorded?.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
+        let os = await t.guestOS()
+        let limit = httpTiming.recipe
+        let stale = await Task { await self.restoreGuest(t, agent, os: os, thumbprint: recorded?.thumbprint, op: "vm.http.stop", limit: limit) }.value
         if let failure = stale.failure { throw ControlError.failed(failure) }
         if let recorded { try? captureJournal.remove(recorded, now: wallClock()) }
         guard stale.cleared else { throw ControlError.failed(notCapturing) }
@@ -677,8 +691,13 @@ extension ControlHandler {
 
     /// Restores the guest of the capture of `t` on behalf of `op`, with `limit` for each recipe (by default
     /// `HTTPTiming.undo`), when its guest tools are connected right now. Returns nil when the guest holds nothing of
-    /// the capture afterwards, otherwise why it still does.
+    /// the capture afterwards, otherwise why it still does. The restore runs in a task of its own, which a cancelled
+    /// caller does not cancel.
     func restoreCaptureGuest(_ t: VMTarget, op: String = "vm.stop", limit: RecipeLimit? = nil) async -> String? {
+        await Task { await self.restoreCaptureGuestSteps(t, op: op, limit: limit) }.value
+    }
+
+    private func restoreCaptureGuestSteps(_ t: VMTarget, op: String, limit: RecipeLimit?) async -> String? {
         guard let capture = captures[t.name], capture.guestChanged else { return nil }
         let state = await t.state()
         guard state == .running, case .ready(let agent) = await guestAccess(t, wait: .zero) else {

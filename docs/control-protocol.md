@@ -1924,6 +1924,11 @@ vm.status shows tools`, `the VM is paused; call vm.resume, then vm.http.stop
 again` or `the VM is not running; Alcove restores them when its guest tools
 next connect`.
 
+A `vm.http.stop` whose client disconnects or whose request is cancelled still
+waits for the guest tools and restores the guest to its end, within the same
+limits; so does the undo of a cancelled `vm.http.start`, and the restore of a
+cancelled `vm.stop`.
+
 The restore puts back exactly the values the state file recorded, and only
 while `ProxyServer` is still `10.0.2.2:<port of the state file>` (the WinHTTP
 proxy: while it names that address). It writes `ProxyServer` last, so a
@@ -1962,7 +1967,8 @@ Alcove; if a capture left it, change it by hand)`.
 A capture also ends when:
 
 - `vm.stop` stops the VM: without `force` and with connected guest tools it
-  restores the guest first (12 s per recipe); the result carries
+  restores the guest first (12 s per recipe), after a `vm.http.start`,
+  `vm.http.stop` or cleanup of the same VM that is running has ended; the result carries
   `captureEnded: true`, and `warning` when the guest was not restored (`the
   guest keeps the proxy settings and the CA certificate of the capture
   (<reason>); Alcove restores them when its guest tools next connect`, the

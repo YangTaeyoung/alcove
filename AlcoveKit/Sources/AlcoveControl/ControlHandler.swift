@@ -318,7 +318,14 @@ public actor ControlHandler {
             let capturing = captures[t.name] != nil
             var unrestored = captures[t.name]?.guestChanged == true ? "the VM was not running" : nil
             if await t.state().isActive {
-                if capturing { unrestored = force ? (unrestored == nil ? nil : "the stop was forced") : await restoreCaptureGuest(t) }
+                if capturing {
+                    let changed = unrestored != nil
+                    unrestored = await captureGate.withLock(t.name) {
+                        let reason = force ? (changed ? "the stop was forced" : nil) : await self.restoreCaptureGuest(t)
+                        await self.endCapture(t.name)
+                        return reason
+                    }
+                }
                 await endCapture(t.name)
                 do {
                     try await t.stop(force: force)
