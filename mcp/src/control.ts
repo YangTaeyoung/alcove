@@ -15,16 +15,30 @@ export class ControlError extends Error {}
 
 export class ControlClient {
   private sock: net.Socket | null = null;
+  private dialing: net.Socket | null = null;
+  private connecting: Promise<void> | null = null;
   private buffer = "";
   private nextId = 1;
-  private pending = new Map<number, { resolve: (r: ControlReply) => void; reject: (e: Error) => void }>();
+  private pending = new Map<number, { op: string; resolve: (r: ControlReply) => void; reject: (e: Error) => void }>();
   private headless: ChildProcess | null = null;
 
   constructor(readonly socketPath = process.env.ALCOVE_CONTROL_SOCKET ?? DEFAULT_SOCKET) {}
 
-  /** Connect, starting `alcovectl serve` when nothing answers. */
-  async connect(): Promise<void> {
-    if (this.sock) return;
+  /** Whether the client holds a connection to the control server. */
+  get connected(): boolean {
+    return this.sock !== null;
+  }
+
+  /** Connect, starting `alcovectl serve` when nothing answers. Callers that arrive while a connection is being made wait for that one. */
+  connect(): Promise<void> {
+    if (this.sock) return Promise.resolve();
+    if (!this.connecting) {
+      this.connecting = this.open().finally(() => { this.connecting = null; });
+    }
+    return this.connecting;
+  }
+
+  private async open(): Promise<void> {
     try {
       await this.dial();
       return;
@@ -43,21 +57,38 @@ export class ControlClient {
         await new Promise((r) => setTimeout(r, 300));
       }
     }
-    throw new ControlError(`cannot reach the Alcove control socket at ${this.socketPath}: ${String(lastErr)}`);
+    throw new ControlError(
+      `cannot reach the Alcove control socket at ${this.socketPath}: ${String(lastErr)}; open Alcove.app, or set ALCOVE_CTL to an alcovectl binary that can run \`alcovectl serve\``,
+    );
   }
 
+  /** Opens one socket and makes it the connection; its data and close events count only while it is the connection. */
   private dial(): Promise<void> {
     return new Promise((resolve, reject) => {
       const s = net.createConnection(this.socketPath);
+      this.dialing = s;
       s.setEncoding("utf8");
       s.once("connect", () => {
+        if (this.dialing !== s) {
+          s.destroy();
+          reject(new ControlError("the control client was closed"));
+          return;
+        }
+        this.dialing = null;
         this.sock = s;
-        s.on("data", (chunk: string) => this.onData(chunk));
-        s.on("close", () => this.onClose(new ControlError("control connection closed")));
-        s.on("error", (e) => this.onClose(e));
+        this.buffer = "";
+        s.on("data", (chunk: string) => { if (this.sock === s) this.onData(chunk); });
+        s.on("close", () => { if (this.sock === s) this.onClose(); });
+        s.on("error", () => { if (this.sock === s) this.onClose(); });
         resolve();
       });
-      s.once("error", (e) => reject(e));
+      s.once("error", (e) => {
+        if (this.dialing === s) this.dialing = null;
+        reject(e);
+      });
+      s.once("close", () => {
+        if (this.sock !== s) reject(new ControlError("the control client was closed"));
+      });
     });
   }
 
@@ -82,27 +113,39 @@ export class ControlClient {
     }
   }
 
-  private onClose(err: Error) {
+  /** Drops the connection and fails every pending call with a sentence that names its op. */
+  private onClose() {
+    this.sock?.destroy();
     this.sock = null;
-    for (const [, p] of this.pending) p.reject(err);
+    this.buffer = "";
+    for (const [, p] of this.pending) {
+      p.reject(new ControlError(
+        `the connection to the Alcove control server closed before ${p.op} answered; check the VM with alcove_vm_status, then call the tool again`,
+      ));
+    }
     this.pending.clear();
   }
 
   /** Send one request and await its reply; throws ControlError on `ok: false`. The request's `id` and `op` are the envelope's, whatever `params` holds under those names. */
   async call(op: string, params: Record<string, unknown> = {}, timeoutMs = 600000): Promise<ControlReply> {
     await this.connect();
+    const sock = this.sock;
+    if (!sock) throw new ControlError(`the connection to the Alcove control server closed before ${op} was sent; call the tool again`);
     const id = this.nextId++;
     const line = JSON.stringify({ ...params, id, op }) + "\n";
     const reply = await new Promise<ControlReply>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new ControlError(`${op} timed out after ${timeoutMs / 1000}s`));
+        reject(new ControlError(
+          `${op} timed out after ${timeoutMs / 1000} s; the control server may still be running it: check alcove_vm_status before you call the tool again`,
+        ));
       }, timeoutMs);
       this.pending.set(id, {
+        op,
         resolve: (r) => { clearTimeout(timer); resolve(r); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      this.sock!.write(line);
+      sock.write(line);
     });
     if (!reply.ok) throw new ControlError(reply.error ?? `${op} failed`);
     return reply;
@@ -126,9 +169,11 @@ export class ControlClient {
     this.headless = child;
   }
 
+  /** Ends the connection, a connection being made, and the `alcovectl serve` this client started. */
   close() {
-    this.sock?.destroy();
-    this.sock = null;
+    this.dialing?.destroy();
+    this.dialing = null;
+    if (this.sock) this.onClose();
     if (this.headless) {
       this.headless.kill("SIGTERM");
       this.headless = null;
