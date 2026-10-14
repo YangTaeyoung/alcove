@@ -114,6 +114,23 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertEqual(try hostFiles(dest), ["inside.txt"])
     }
 
+    func testPullKeepsAFolderNamedLikeItsPartFile() async throws {
+        let fs = FakeFS()
+        fs["/data/out.bin"] = randomData(1000)
+        let (_, client) = try await connected(fs)
+        let dir = try tempDir()
+        let dest = dir.appendingPathComponent("out.bin")
+        let part = dir.appendingPathComponent("out.bin.alcove-part")
+        try FileManager.default.createDirectory(at: part, withIntermediateDirectories: true)
+        try Data("kept".utf8).write(to: part.appendingPathComponent("inside.txt"))
+        do { _ = try await client.pullFile(guestPath: "/data/out.bin", to: dest); XCTFail("expected a refusal") }
+        catch AgentClient.AgentError.remote(let text) {
+            XCTAssertEqual(text, "'\(part.path)' is a folder on the host, and the pull writes its partial copy there; move that folder away or pull to another path")
+        }
+        XCTAssertEqual(try Data(contentsOf: part.appendingPathComponent("inside.txt")), Data("kept".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dest.path))
+    }
+
     func testPullReplacesAnExistingFile() async throws {
         let fs = FakeFS()
         let payload = randomData(1000)
@@ -449,6 +466,33 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertEqual(fs["/data/blob.bin"], Data("original".utf8))
         XCTAssertNil(fs["/data/blob.bin.alcove-part"])
         XCTAssertEqual(fs.paths(), ["/data/blob.bin"])
+    }
+
+    func testACancelledPushRemovesItsPartFile() async throws {
+        let fs = FakeFS()
+        let (agent, client) = try await connected(fs)
+        let inner = agent.handler
+        let writes = LockedBox(0)
+        let kept = LockedBox<JSON?>(nil)
+        agent.handler = { m, a in
+            if m["op"]?.stringValue == "fs.write" {
+                writes.value += 1
+                if writes.value == 2 {
+                    kept.value = inner?(m, a).first
+                    return []
+                }
+            }
+            return inner?(m, a) ?? []
+        }
+        let local = try tempDir().appendingPathComponent("blob.bin")
+        try randomData(600_000).write(to: local)
+        let push = Task { try await client.pushFile(local, toGuestPath: "/data/blob.bin", overwrite: false) }
+        await waitFor { kept.value != nil }
+        push.cancel()
+        agent.sendLine(kept.value!)
+        do { _ = try await push.value; XCTFail("expected a cancelled push") } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        XCTAssertEqual(fs.paths(), [])
+        XCTAssertEqual(agent.received.last?["op"]?.stringValue, "fs.delete")
     }
 
     func testPushRemovesPartFileWhenAWriteFails() async throws {

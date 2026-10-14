@@ -118,7 +118,9 @@ extension AgentClient {
         _ = try syncSource(directory, toGuestPath: path, preserving: preserving)
     }
 
-    /// Upload a local file to `path` in the guest through `<path>.alcove-part`, verifying the SHA-256.
+    /// Upload a local file to `path` in the guest through `<path>.alcove-part`, verifying the SHA-256. A push that fails
+    /// or is cancelled before the rename deletes `<path>.alcove-part` in the guest while the connection lasts; a
+    /// cancellation does not stop that delete.
     public func pushFile(_ url: URL, toGuestPath path: String, overwrite: Bool, timeout: Duration = .seconds(1800)) async throws -> TransferResult {
         let existing = try await call("fs.stat", ["path": .string(path)], timeout: timeout)
         if existing["exists"]?.boolValue == true, !overwrite {
@@ -155,7 +157,7 @@ extension AgentClient {
             }
         } catch {
             if let agentError = error as? AgentError, agentError == .disconnected || agentError == .notConnected { throw error }
-            _ = try? await call("fs.delete", ["path": .string(part)], timeout: timeout)
+            _ = try? await Task { try await self.call("fs.delete", ["path": .string(part)], timeout: timeout) }.value
             throw error
         }
         return TransferResult(guestPath: renamed["path"]?.stringValue ?? path, bytes: offset, sha256: digest)
@@ -163,7 +165,7 @@ extension AgentClient {
 
     /// Download a guest file to `url` through `<url>.alcove-part`, verifying the SHA-256, and replace a file at `url` with
     /// it in one `rename(2)`. A folder at `url` is refused before any request and kept as it is, also when it appears
-    /// there during the pull.
+    /// there during the pull; a folder at `<url>.alcove-part` is refused and kept as it is.
     ///
     /// With `deadline`, each request waits `timeout` or the time left until `deadline`, whichever is shorter, and a request
     /// due after `deadline` throws `AgentError.timeout` without being sent. With `maxBytes`, a file that holds more bytes
@@ -194,7 +196,11 @@ extension AgentClient {
         let expected = info["sha256"]?.stringValue?.lowercased() ?? ""
         let part = URL(fileURLWithPath: url.path + ".alcove-part")
         let fm = FileManager.default
-        try? fm.removeItem(at: part)
+        var partIsFolder: ObjCBool = false
+        if fm.fileExists(atPath: part.path, isDirectory: &partIsFolder), partIsFolder.boolValue {
+            throw AgentError.remote("'\(part.path)' is a folder on the host, and the pull writes its partial copy there; move that folder away or pull to another path")
+        }
+        unlink(part.path)
         guard fm.createFile(atPath: part.path, contents: nil) else {
             throw AgentError.remote("cannot create '\(part.path)'; check the destination folder")
         }
@@ -202,7 +208,7 @@ extension AgentClient {
         do {
             handle = try FileHandle(forWritingTo: part)
         } catch {
-            try? fm.removeItem(at: part)
+            unlink(part.path)
             throw error
         }
         var hasher = SHA256()
@@ -224,17 +230,17 @@ extension AgentClient {
             try Task.checkCancellation()
         } catch {
             try? handle.close()
-            try? fm.removeItem(at: part)
+            unlink(part.path)
             throw error
         }
         let digest = hex(hasher.finalize())
         guard digest == expected else {
-            try? fm.removeItem(at: part)
+            unlink(part.path)
             throw AgentError.remote(AgentClient.downloadMismatch(guestPath))
         }
         guard rename(part.path, url.path) == 0 else {
             let reason = String(cString: strerror(errno))
-            try? fm.removeItem(at: part)
+            unlink(part.path)
             throw AgentError.remote("'\(url.path)' could not be replaced: \(reason); pass the path of a file that is not a folder")
         }
         return TransferResult(guestPath: info["path"]?.stringValue ?? guestPath, bytes: offset, sha256: digest)

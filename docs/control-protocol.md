@@ -2380,7 +2380,8 @@ FAILED: step 2 failed after 0.7 s
   every printed line.
 - On a failed step the failure screenshot is written next to the script as
   `FILE.failure.png` (full size). The file is removed when a run starts, so it
-  exists afterwards only when that run failed and produced a screenshot.
+  exists afterwards only when that run failed and produced a screenshot; a
+  folder of that name is never removed.
 - Exit status: 0 passed; 1 a step failed; 2 the script could not run (bad
   arguments, unreadable script, no VM, no server, a refusal before step 1, or
   an `--in-process` run that passed but whose VM could not be stopped; the
@@ -2472,7 +2473,9 @@ an agent operation such as `exec.list` (here `vm.exec.list`).
 
 - `vm.push_file` with `guestPath` writes the host file to that exact guest
   path, creating missing folders, through `<guestPath>.alcove-part`, and
-  compares SHA-256 digests before it renames. An existing file is refused
+  compares SHA-256 digests before it renames; a push that fails or is
+  cancelled before the rename deletes `<guestPath>.alcove-part` while the guest
+  tools stay connected. An existing file is refused
   (`'<path>' exists in the guest; pass overwrite`) unless `overwrite` is true.
   Without `guestPath` the file goes to the Desktop or Downloads folder under a
   name that does not clash, and the reply has only `guestPath`.
@@ -2484,7 +2487,10 @@ an agent operation such as `exec.list` (here `vm.exec.list`).
   read from the guest (`'<path>' is a folder on the host; pass the path of the
   file to create, such as <path>/<guest file name>`); a folder that appears
   there during the pull is kept and the pull fails (`'<path>' could not be
-  replaced: <reason>; pass the path of a file that is not a folder`). A file
+  replaced: <reason>; pass the path of a file that is not a folder`). A folder
+  at `<path>.alcove-part` is kept and the pull is refused (`'<path>.alcove-part'
+  is a folder on the host, and the pull writes its partial copy there; move
+  that folder away or pull to another path`). A file
   that changes in the guest during the pull answers `'<guestPath>' changed in
   the guest while it was pulled, so the copy does not match; pull the file
   again`. `vm.crash_dumps.pull` takes `path` by the same rules.
