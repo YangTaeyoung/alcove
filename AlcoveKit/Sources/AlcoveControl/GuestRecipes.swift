@@ -846,7 +846,7 @@ enum GuestRecipes {
                 if ($state.systemProxy) { $restored = AlcoveRestore $state $hkcu $hklm }
                 [System.IO.File]::Delete($statePath)
               }
-              [System.IO.File]::Delete($statePath + '.new')
+              if ([System.IO.File]::Exists($statePath + '.new')) { [System.IO.File]::Delete($statePath + '.new') }
               if ($restored) { $refreshed = AlcoveRefresh }
             } catch {
               [Console]::Error.WriteLine('could not restore the proxy settings of the guest: ' + ($_.Exception.GetBaseException().Message -replace '\s+', ' ') + '; check that alcove-agent runs elevated, then call vm.http.stop again')

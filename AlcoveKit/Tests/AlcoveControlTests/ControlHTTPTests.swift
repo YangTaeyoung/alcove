@@ -2213,7 +2213,7 @@ final class ControlHTTPTests: XCTestCase {
                 if ($state.systemProxy) { $restored = AlcoveRestore $state $hkcu $hklm }
                 [System.IO.File]::Delete($statePath)
               }
-              [System.IO.File]::Delete($statePath + '.new')
+              if ([System.IO.File]::Exists($statePath + '.new')) { [System.IO.File]::Delete($statePath + '.new') }
               if ($restored) { $refreshed = AlcoveRefresh }
 
             """)
