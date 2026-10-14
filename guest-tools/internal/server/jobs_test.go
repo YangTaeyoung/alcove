@@ -253,10 +253,70 @@ func TestJobWriteTimesOutWhenInputIsNotRead(t *testing.T) {
 	if time.Since(started) > 2*time.Second {
 		t.Fatalf("write took %v", time.Since(started))
 	}
-	if res["ok"] != false || res.String("error") != "job '"+job+"' is not reading its input; exec.kill it or retry later" {
+	if res["ok"] != false || res.String("error") != "job '"+job+"' is not reading its input; the data may still reach it later, so exec.kill it or wait before writing again" {
 		t.Fatalf("res %v", res)
 	}
 	if st := c.ok("exec.kill", proto.Message{"job": job}).String("state"); st != "exited" {
 		t.Fatalf("state %q", st)
+	}
+}
+
+func TestRingKeepsTheNewestBytesAcrossWrites(t *testing.T) {
+	r := newRing(8)
+	all := ""
+	for i, piece := range []string{"ab", "cdefg", "h", "ijk", "", "lmnopqrst", "u", "vwxyz0123456789", "!"} {
+		r.Write([]byte(piece))
+		all += piece
+		keep := all
+		if len(keep) > 8 {
+			keep = keep[len(keep)-8:]
+		}
+		got, cut := r.snapshot()
+		if string(got) != keep || cut != (len(all) > 8) || r.written() != len(all) {
+			t.Fatalf("after write %d: %q cut %v, expected %q", i, got, cut, keep)
+		}
+		for from := len(all) - len(keep); from <= len(all); from++ {
+			data, next, dropped := r.ReadFrom(from, 3)
+			want := all[from:min(from+3, len(all))]
+			if string(data) != want || next != from+len(want) || dropped {
+				t.Fatalf("after write %d, from %d: %q next %d dropped %v, expected %q", i, from, data, next, dropped, want)
+			}
+		}
+	}
+}
+
+func TestAReservedJobIsNotVisibleBeforeItStarted(t *testing.T) {
+	tab := newJobTable()
+	j := &job{out: newRing(4), err: newRing(4), done: make(chan struct{})}
+	if err := tab.reserve(j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tab.get(j.id); err == nil || err.Error() != "no job '"+j.id+"'; call exec.list" {
+		t.Fatalf("get of a reserved job: %v", err)
+	}
+	if got := tab.list(); len(got) != 0 {
+		t.Fatalf("list holds %d jobs", len(got))
+	}
+	j.markStarted(42)
+	if got, err := tab.get(j.id); err != nil || got != j || got.processID() != 42 {
+		t.Fatalf("get of a started job: %v %v", got, err)
+	}
+	if got := tab.list(); len(got) != 1 {
+		t.Fatalf("list holds %d jobs", len(got))
+	}
+}
+
+func TestExecReadWithASmallMaxAdvancesOverMultibyteCharacters(t *testing.T) {
+	c, _ := newRPCClient(t, Options{})
+	job := c.ok("exec.start", proto.Message{"cmd": "printf '\\303\\251\\342\\202\\254x'"}).String("job")
+	waitJobExited(t, c, job)
+	got, next := "", 0
+	for i := 0; i < 10 && next < 6; i++ {
+		res := c.ok("exec.read", proto.Message{"job": job, "out_offset": next, "max": 1})
+		got += res.String("out")
+		next = res.Int("out_next")
+	}
+	if got != "é€x" || next != 6 {
+		t.Fatalf("read %q up to %d", got, next)
 	}
 }

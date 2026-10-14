@@ -188,10 +188,12 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   retained window starts at the oldest retained byte and sets `dropped`. A
   piece does not end inside a UTF-8 sequence; the bytes of an unfinished
   sequence come with the next read. Only the read that reaches the end of an
-  exited job's output returns the bytes as they are.
+  exited job's output returns the bytes as they are. A `max` below 4 counts
+  as 4, so every read can carry a whole character.
 - The job's stdin stays open. `exec.write` writes `data` and, with `eof`,
   closes it; it fails for an exited job, for a closed stdin, and after 10 s
-  when the job does not read.
+  when the job does not read
+  (`job '<id>' is not reading its input; the data may still reach it later, so exec.kill it or wait before writing again`).
 - `exec.kill` kills the job's process tree, waits up to 5 s for the exit and
   answers the state; for an exited job it answers `exited` at once.
 - The table holds 64 jobs. Starting one more forgets the oldest exited job;
@@ -199,9 +201,12 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - `exec.list` reports each job's `cmd` text (for `argv`, the elements joined
   by spaces) cut to 4096 characters with a trailing `…` when longer, and
   `started` in the guest's local time with its offset.
+- A job is listed and found by its id once its process has started; a start
+  that fails leaves no job.
 - When a job's process exits the agent sends
   `{"t":"ev","name":"job.exited","job":"<id>","code":<int>}` to every open
-  connection.
+  connection. For a job that ends at once the event can arrive before the
+  `exec.start` reply; match it by `job` after the reply.
 
 ### Processes (`proc.list`, `proc.kill`)
 

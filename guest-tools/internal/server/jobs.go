@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
@@ -20,10 +21,12 @@ var (
 
 const maxReadBytes = 262144
 
-// ring keeps the newest max bytes and counts every byte written.
+// ring keeps the newest max bytes and counts every byte written. Once full,
+// buf holds max bytes and the oldest one is at head.
 type ring struct {
 	mu    sync.Mutex
 	buf   []byte
+	head  int
 	max   int
 	total int
 }
@@ -33,17 +36,37 @@ func newRing(max int) *ring { return &ring{max: max} }
 func (r *ring) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.total += len(p)
-	if len(p) >= r.max {
-		r.buf = append(r.buf[:0], p[len(p)-r.max:]...)
-		return len(p), nil
+	n := len(p)
+	r.total += n
+	if n >= r.max {
+		r.buf = append(r.buf[:0], p[n-r.max:]...)
+		r.head = 0
+		return n, nil
 	}
-	r.buf = append(r.buf, p...)
-	if len(r.buf) > r.max {
-		n := copy(r.buf, r.buf[len(r.buf)-r.max:])
-		r.buf = r.buf[:n]
+	if room := r.max - len(r.buf); room > 0 {
+		k := min(room, len(p))
+		r.buf = append(r.buf, p[:k]...)
+		p = p[k:]
 	}
-	return len(p), nil
+	for len(p) > 0 {
+		k := copy(r.buf[r.head:], p)
+		p = p[k:]
+		r.head = (r.head + k) % r.max
+	}
+	return n, nil
+}
+
+// slice returns a copy of the retained bytes from position a to b, counted
+// from the oldest retained byte.
+func (r *ring) slice(a, b int) []byte {
+	out := make([]byte, 0, b-a)
+	for a < b {
+		i := (r.head + a) % len(r.buf)
+		end := min(len(r.buf), i+b-a)
+		out = append(out, r.buf[i:end]...)
+		a += end - i
+	}
+	return out
 }
 
 // ReadFrom returns up to max bytes starting at the absolute offset. When the
@@ -63,15 +86,14 @@ func (r *ring) ReadFrom(offset, max int) (data []byte, next int, dropped bool) {
 	if max >= 0 && offset+max < end {
 		end = offset + max
 	}
-	data = append([]byte(nil), r.buf[offset-start:end-start]...)
-	return data, end, dropped
+	return r.slice(offset-start, end-start), end, dropped
 }
 
 // snapshot returns the retained bytes and whether older bytes were dropped.
 func (r *ring) snapshot() ([]byte, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]byte(nil), r.buf...), r.total > len(r.buf)
+	return r.slice(0, len(r.buf)), r.total > len(r.buf)
 }
 
 func (r *ring) written() int {
@@ -93,8 +115,23 @@ type job struct {
 	mu       sync.Mutex
 	stdin    io.WriteCloser
 	stdinOff bool
+	running  bool // the process was started
 	exited   bool
 	code     int
+}
+
+// markStarted records the pid of the started process; from then on the job
+// is listed and found by its id.
+func (j *job) markStarted(pid int) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.pid, j.running = pid, true
+}
+
+func (j *job) isStarted() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.running
 }
 
 func (j *job) processID() int {
@@ -131,14 +168,15 @@ func (t *jobTable) get(id string) (*job, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	j := t.jobs[id]
-	if j == nil {
+	if j == nil || !j.isStarted() {
 		return nil, fmt.Errorf("no job '%s'; call exec.list", id)
 	}
 	return j, nil
 }
 
 // reserve assigns the job an id and a table slot, forgetting the oldest
-// exited jobs to stay within maxJobs.
+// exited jobs to stay within maxJobs. The job is found and listed once
+// markStarted ran.
 func (t *jobTable) reserve(j *job) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -184,7 +222,9 @@ func (t *jobTable) list() []*job {
 	defer t.mu.Unlock()
 	out := make([]*job, 0, len(t.order))
 	for _, id := range t.order {
-		out = append(out, t.jobs[id])
+		if j := t.jobs[id]; j.isStarted() {
+			out = append(out, j)
+		}
 	}
 	return out
 }
@@ -210,19 +250,18 @@ func (s *Server) execStart(_ context.Context, req proto.Message) (proto.Message,
 		done:    make(chan struct{}),
 	}
 	c.Stdout, c.Stderr = j.out, j.err
-	if j.stdin, err = c.StdinPipe(); err != nil {
-		return nil, startError(err)
-	}
 	if err := s.jobs.reserve(j); err != nil {
 		return nil, err
+	}
+	if j.stdin, err = c.StdinPipe(); err != nil {
+		s.jobs.release(j)
+		return nil, startError(err)
 	}
 	if err := c.Start(); err != nil {
 		s.jobs.release(j)
 		return nil, startError(err)
 	}
-	j.mu.Lock()
-	j.pid = c.Process.Pid
-	j.mu.Unlock()
+	j.markStarted(c.Process.Pid)
 	go func() {
 		_ = c.Wait()
 		code := -1
@@ -246,6 +285,9 @@ func (s *Server) execRead(_ context.Context, req proto.Message) (proto.Message, 
 	limit := req.Int("max")
 	if limit <= 0 || limit > maxReadBytes {
 		limit = maxReadBytes
+	}
+	if limit < utf8.UTFMax {
+		limit = utf8.UTFMax
 	}
 	exited, code := j.state()
 	out, outNext, outDropped := j.out.ReadFrom(req.Int("out_offset"), limit)
@@ -312,7 +354,7 @@ func (s *Server) execWrite(_ context.Context, req proto.Message) (proto.Message,
 			return nil, err
 		}
 	case <-time.After(stdinWriteTimeout):
-		return nil, fmt.Errorf("job '%s' is not reading its input; exec.kill it or retry later", j.id)
+		return nil, fmt.Errorf("job '%s' is not reading its input; the data may still reach it later, so exec.kill it or wait before writing again", j.id)
 	}
 	return proto.Message{}, nil
 }
