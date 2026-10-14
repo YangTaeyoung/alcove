@@ -652,7 +652,7 @@ def _(run):
     enabled = run.enable(EXE)
     expect(enabled["folder"] == DUMPS and enabled["createdKey"] is True, f"vm.crash_dumps.enable answered {enabled!r}")
     key = run.local_dumps()
-    expect(key == {"": {"AlcoveCreated": "0x1"}, EXE: {"DumpFolder": DUMPS, "DumpCount": "0x5", "DumpType": "0x1"}},
+    expect(key == {"": {"AlcoveCreated": "0x1"}, EXE: {"AlcoveCreated": "0x1", "DumpFolder": DUMPS, "DumpCount": "0x5", "DumpType": "0x1"}},
            f"reg query of {LOCAL_DUMPS} shows {key!r}")
     pid, row, listed, clicked = run.crash()
     expect(row["bytes"] > 0 and re.fullmatch(re.escape(EXE) + r"(\(\d+\))?\." + str(pid) + r"\.dmp", row["file"]), f"the dump is listed as {row!r}")
@@ -786,8 +786,8 @@ def _(run):
         run.disable(exe)
     expect(run.local_dumps() is None, f"the key {LOCAL_DUMPS} is still there after every image of this run was disabled: {run.local_dumps()!r}")
     a, b, x = DISABLE_IMAGES
-    values = {"DumpFolder": DUMPS, "DumpCount": "0x5", "DumpType": "0x1"}
     marker = {"AlcoveCreated": "0x1"}
+    values = {**marker, "DumpFolder": DUMPS, "DumpCount": "0x5", "DumpType": "0x1"}
     run.touched_key = True
     seen = []
 
