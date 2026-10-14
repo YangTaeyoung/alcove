@@ -71,7 +71,10 @@ no `alcove` display backend
 `qemu-system-aarch64` on `$PATH` will not do. The real-engine tests in
 `AlcoveKit/Tests/AlcoveEngineTests/VMControllerTests.swift` skip themselves
 with `engine not built; run scripts/build-qemu.sh` when it is missing, and
-`scripts/test/all.sh` runs the build as its first step.
+`scripts/test/all.sh` runs the build as its first step. They use
+`$ALCOVE_QEMU_DIR` instead of `build/qemu-build` when it is set, so a second
+working tree (a `git worktree`) can run them against the engine of the main
+checkout: `ALCOVE_QEMU_DIR=<main checkout>/build/qemu-build swift test`.
 
 What the script does, in order:
 
@@ -134,7 +137,12 @@ and stops at the first failure:
    (`-ldflags "-H windowsgui"`, so it has no console window) and
    `build/alcove-agent-linux-arm64`.
 6. `xcodegen generate` and `xcodebuild -project Alcove.xcodeproj -scheme Alcove
-   -configuration Debug -derivedDataPath build/DerivedData build`.
+   -configuration Debug -derivedDataPath build/DerivedData build`. The app
+   carries the HTTP capture proxy in `Contents/MacOS`: its last build phase
+   copies `build/alcove-proxy`, which step 5 builds, and fails with a sentence
+   naming the command when the file is missing. To build the app on its own,
+   build the proxy first:
+   `cd guest-tools && GOOS=darwin GOARCH=arm64 go build -o ../build/alcove-proxy ./cmd/alcove-proxy`.
 
 The suites `all.sh` deliberately leaves out, because they need disk images or
 an installed guest:
