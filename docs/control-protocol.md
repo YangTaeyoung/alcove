@@ -2328,7 +2328,16 @@ an agent operation such as `exec.list` (here `vm.exec.list`).
   name that does not clash, and the reply has only `guestPath`.
 - `vm.pull_file` copies a guest file to the host `path` through
   `<path>.alcove-part` with the same digest check and replaces an existing
-  file. The host folder must exist.
+  file with one `rename(2)`. The host folder must exist. `path` must be
+  absolute (`path must be an absolute path on the host, such as
+  /Users/<you>/<name>`), and a folder at `path` is refused before anything is
+  read from the guest (`'<path>' is a folder on the host; pass the path of the
+  file to create, such as <path>/<guest file name>`); a folder that appears
+  there during the pull is kept and the pull fails (`'<path>' could not be
+  replaced: <reason>; pass the path of a file that is not a folder`). A file
+  that changes in the guest during the pull answers `'<guestPath>' changed in
+  the guest while it was pulled, so the copy does not match; pull the file
+  again`. `vm.crash_dumps.pull` takes `path` by the same rules.
 - `vm.sync_dir` uploads every regular file under the host directory whose
   size or SHA-256 differs from the guest copy. `sent` and `deleted` are
   relative paths with `/`; file names are sent in Unicode NFC; symbolic links

@@ -28,7 +28,7 @@ extension ControlHandler {
                 return ["guestPath": .string(r.guestPath), "bytes": .int(Int64(r.bytes)), "sha256": .string(r.sha256)]
             case "vm.pull_file":
                 let guestPath = try string(params, "guestPath")
-                let path = try string(params, "path")
+                let path = try hostTarget(params)
                 return try await pull(t, guestPath: guestPath, to: path)
             case "vm.crash_dumps.pull":
                 guard await t.guestOS() == .windows else { throw ControlError.failed(ControlHandler.windowsOnlyDumps) }
@@ -36,7 +36,7 @@ extension ControlHandler {
                 guard ControlHandler.isWindowsFileName(file, suffix: ".dmp") else {
                     throw ControlError.failed("file must be the name of a .dmp file listed by vm.crash_dumps.list, without a folder")
                 }
-                let path = try string(params, "path")
+                let path = try hostTarget(params)
                 return try await pullDump(t, file: file, to: path)
             case "vm.sync_dir":
                 let path = try string(params, "path")
@@ -134,13 +134,22 @@ extension ControlHandler {
                   maxBytes: Int? = nil) async throws -> JSON {
         do {
             return try await pull(t, guestPath: GuestRecipes.dumpFolder + "\\" + file, to: path, deadline: deadline, maxBytes: maxBytes)
-        } catch AgentClient.AgentError.remote("digest mismatch after download") {
+        } catch AgentClient.AgentError.remote(let text) where text == AgentClient.downloadMismatch(GuestRecipes.dumpFolder + "\\" + file) {
             throw ControlError.failed("the dump changed while it was pulled; retry in a few seconds")
         } catch AgentClient.AgentError.remote(let text) where text.contains("being used by another process") {
             throw ControlError.failed("the dump '\(file)' is still being written; retry in a few seconds")
         } catch AgentClient.AgentError.remote(let text) where text.hasSuffix("is not a file in the guest; check the path") {
             throw ControlError.failed("\(GuestRecipes.dumpFolder) holds no dump named '\(file)'; list the dumps with vm.crash_dumps.list")
         }
+    }
+
+    /// The `path` parameter of a pull: an absolute host path.
+    nonisolated func hostTarget(_ params: JSON) throws -> String {
+        let path = try string(params, "path")
+        guard path.hasPrefix("/") else {
+            throw ControlError.failed("path must be an absolute path on the host, such as /Users/<you>/\((path as NSString).lastPathComponent)")
+        }
+        return path
     }
 
     nonisolated func requireHostFile(_ path: String) throws {

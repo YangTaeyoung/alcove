@@ -298,6 +298,25 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertTrue(noPath.contains("'path'"), noPath)
     }
 
+    func testPullsRefuseARelativeHostPathAndAHostFolderWithoutARequest() async throws {
+        let fs = FakeFS()
+        fs["/data/out.bin"] = Data("x".utf8)
+        let (h, agent) = try await setup(fs: fs)
+        let folder = try tempDir()
+        try Data("keep".utf8).write(to: folder.appendingPathComponent("inside.txt"))
+        for op in ["vm.pull_file", "vm.crash_dumps.pull"] {
+            var params: JSON = op == "vm.pull_file" ? ["name": "Win", "guestPath": "/data/out.bin"] : ["name": "Win", "file": "app.dmp"]
+            if case .object(var fields) = params { fields["path"] = "out.bin"; params = .object(fields) }
+            let relative = await failure(h, op, params)
+            XCTAssertEqual(relative, "path must be an absolute path on the host, such as /Users/<you>/out.bin", op)
+            if case .object(var fields) = params { fields["path"] = .string(folder.path); params = .object(fields) }
+            let onFolder = await failure(h, op, params)
+            XCTAssertTrue(onFolder.hasPrefix("'\(folder.path)' is a folder on the host; pass the path of the file to create"), "\(op): \(onFolder)")
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["inside.txt"])
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "req" })
+    }
+
     func testSyncDir() async throws {
         let root = try tempDir()
         let a = Data("same".utf8), b = Data("new contents".utf8)

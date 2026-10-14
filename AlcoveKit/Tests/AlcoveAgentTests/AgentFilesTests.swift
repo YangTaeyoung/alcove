@@ -55,7 +55,7 @@ final class AgentFilesTests: XCTestCase {
         let local = try tempDir().appendingPathComponent("blob.bin")
         try randomData(5000).write(to: local)
         do { _ = try await client.pushFile(local, toGuestPath: "/data/blob.bin", overwrite: false); XCTFail("expected mismatch") }
-        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, "digest mismatch after upload") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, "the copy of '/data/blob.bin' in the guest does not match the host file after the upload; push the file again") }
         XCTAssertEqual(fs.paths(), [])
     }
 
@@ -70,6 +70,61 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertEqual(r.sha256, SHA256Digest.hex(of: payload))
         XCTAssertEqual(r.bytes, 700_000)
         XCTAssertFalse(FileManager.default.fileExists(atPath: dest.path + ".alcove-part"))
+    }
+
+    func testPullOntoAHostFolderIsRefusedBeforeAnyRequestAndKeepsTheFolder() async throws {
+        let fs = FakeFS()
+        fs["C:\\out\\log.txt"] = randomData(1000)
+        let (agent, client) = try await connected(fs)
+        let folder = try tempDir()
+        try Data("keep".utf8).write(to: folder.appendingPathComponent("inside.txt"))
+        do {
+            _ = try await client.pullFile(guestPath: "C:\\out\\log.txt", to: folder)
+            XCTFail("expected a refusal")
+        } catch AgentClient.AgentError.remote(let text) {
+            XCTAssertEqual(text, "'\(folder.path)' is a folder on the host; pass the path of the file to create, such as \(folder.path)/log.txt")
+        }
+        XCTAssertEqual(try hostFiles(folder), ["inside.txt"])
+        XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent("inside.txt")), Data("keep".utf8))
+        XCTAssertEqual(agent.received.filter { $0["t"]?.stringValue == "req" }.count, 0)
+    }
+
+    func testPullKeepsAFolderCreatedAtTheDestinationDuringThePull() async throws {
+        let fs = FakeFS()
+        fs["/data/out.bin"] = randomData(1000)
+        let (agent, client) = try await connected(fs)
+        let dir = try tempDir()
+        let dest = dir.appendingPathComponent("out.bin")
+        let inner = agent.handler
+        agent.handler = { m, a in
+            if m["op"]?.stringValue == "fs.read", !FileManager.default.fileExists(atPath: dest.path) {
+                try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: false)
+                try? Data("keep".utf8).write(to: dest.appendingPathComponent("inside.txt"))
+            }
+            return inner?(m, a) ?? []
+        }
+        do {
+            _ = try await client.pullFile(guestPath: "/data/out.bin", to: dest)
+            XCTFail("expected a failure")
+        } catch AgentClient.AgentError.remote(let text) {
+            XCTAssertTrue(text.hasPrefix("'\(dest.path)' could not be replaced: "), text)
+            XCTAssertTrue(text.hasSuffix("; pass the path of a file that is not a folder"), text)
+        }
+        XCTAssertEqual(try hostFiles(dir), ["out.bin"])
+        XCTAssertEqual(try hostFiles(dest), ["inside.txt"])
+    }
+
+    func testPullReplacesAnExistingFile() async throws {
+        let fs = FakeFS()
+        let payload = randomData(1000)
+        fs["/data/out.bin"] = payload
+        let (_, client) = try await connected(fs)
+        let dir = try tempDir()
+        let dest = dir.appendingPathComponent("out.bin")
+        try Data("earlier".utf8).write(to: dest)
+        _ = try await client.pullFile(guestPath: "/data/out.bin", to: dest)
+        XCTAssertEqual(try Data(contentsOf: dest), payload)
+        XCTAssertEqual(try hostFiles(dir), ["out.bin"])
     }
 
     /// A connected agent over `fs` that leaves the `held`-th `fs.read` request (counted from 1) unanswered and keeps its reply.

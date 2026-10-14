@@ -51,6 +51,11 @@ private func joinGuestPath(_ base: String, _ relative: String) -> String {
     return root + separator + tail
 }
 
+/// The last component of the guest path `path`, split at `/` and `\\`.
+private func guestFileName(_ path: String) -> String {
+    path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? "file"
+}
+
 private func foldedName(_ name: String) -> String { name.precomposedStringWithCanonicalMapping.lowercased() }
 
 func windowsCaseConflict(in names: [String]) -> (String, String)? {
@@ -100,6 +105,11 @@ private func syncSource(_ directory: URL, toGuestPath path: String, preserving: 
 }
 
 extension AgentClient {
+    /// The sentence of a pull of `guestPath` whose received bytes do not match the digest the guest reported.
+    public static func downloadMismatch(_ guestPath: String) -> String {
+        "'\(guestPath)' changed in the guest while it was pulled, so the copy does not match; pull the file again"
+    }
+
     /// Throws what `syncDirectory` with the same arguments refuses from the files of `directory` alone, without a
     /// request to the guest.
     public static func checkSyncSource(_ directory: URL, toGuestPath path: String, preserving: Set<String> = []) throws {
@@ -134,7 +144,7 @@ extension AgentClient {
             digest = hex(hasher.finalize())
             let uploaded = try await call("fs.stat", ["path": .string(part), "sha256": .bool(true)], timeout: timeout)
             guard uploaded["sha256"]?.stringValue?.lowercased() == digest else {
-                throw AgentError.remote("digest mismatch after upload")
+                throw AgentError.remote("the copy of '\(path)' in the guest does not match the host file after the upload; push the file again")
             }
             do {
                 renamed = try await call("fs.rename", ["from": .string(part), "to": .string(path), "overwrite": .bool(overwrite)], timeout: timeout)
@@ -149,7 +159,9 @@ extension AgentClient {
         return TransferResult(guestPath: renamed["path"]?.stringValue ?? path, bytes: offset, sha256: digest)
     }
 
-    /// Download a guest file to `url` through `<url>.alcove-part`, verifying the SHA-256.
+    /// Download a guest file to `url` through `<url>.alcove-part`, verifying the SHA-256, and replace a file at `url` with
+    /// it in one `rename(2)`. A folder at `url` is refused before any request and kept as it is, also when it appears
+    /// there during the pull.
     ///
     /// With `deadline`, each request waits `timeout` or the time left until `deadline`, whichever is shorter, and a request
     /// due after `deadline` throws `AgentError.timeout` without being sent. With `maxBytes`, a file that holds more bytes
@@ -164,6 +176,10 @@ extension AgentClient {
             let left = now().duration(to: deadline)
             guard left > .zero else { throw AgentError.timeout(op) }
             return min(timeout, left)
+        }
+        var isFolder: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isFolder), isFolder.boolValue {
+            throw AgentError.remote("'\(url.path)' is a folder on the host; pass the path of the file to create, such as \(url.path)/\(guestFileName(guestPath))")
         }
         let info = try await call("fs.stat", ["path": .string(guestPath), "sha256": .bool(true)], timeout: try wait(for: "fs.stat"))
         guard info["exists"]?.boolValue == true, info["dir"]?.boolValue != true else {
@@ -180,7 +196,13 @@ extension AgentClient {
         guard fm.createFile(atPath: part.path, contents: nil) else {
             throw AgentError.remote("cannot create '\(part.path)'; check the destination folder")
         }
-        let handle = try FileHandle(forWritingTo: part)
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forWritingTo: part)
+        } catch {
+            try? fm.removeItem(at: part)
+            throw error
+        }
         var hasher = SHA256()
         var offset = 0
         do {
@@ -206,10 +228,13 @@ extension AgentClient {
         let digest = hex(hasher.finalize())
         guard digest == expected else {
             try? fm.removeItem(at: part)
-            throw AgentError.remote("digest mismatch after download")
+            throw AgentError.remote(AgentClient.downloadMismatch(guestPath))
         }
-        try? fm.removeItem(at: url)
-        try fm.moveItem(at: part, to: url)
+        guard rename(part.path, url.path) == 0 else {
+            let reason = String(cString: strerror(errno))
+            try? fm.removeItem(at: part)
+            throw AgentError.remote("'\(url.path)' could not be replaced: \(reason); pass the path of a file that is not a folder")
+        }
         return TransferResult(guestPath: info["path"]?.stringValue ?? guestPath, bytes: offset, sha256: digest)
     }
 
