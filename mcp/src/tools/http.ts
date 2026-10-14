@@ -195,7 +195,7 @@ export function register(r: Registrar, client: ControlClient): void {
         body: z.string().optional().describe("Response body; content-type defaults to application/json when it parses as JSON, else text/plain"),
         delay_ms: z.number().int().min(0).max(600000).optional().describe("Wait this long before answering or forwarding"),
         drop: z.boolean().optional().describe("Close the connection without a response"),
-        times: z.number().int().min(1).optional().describe("Apply the rule this many times, then it disappears"),
+        times: z.number().int().min(1).optional().describe("Apply the rule this many times; after that it no longer applies and stays listed with 0 left until removed"),
       }).optional().describe("add: what to do with a matching request"),
       rule: z.number().int().min(0).optional().describe("remove: rule id from add or list"),
     },
