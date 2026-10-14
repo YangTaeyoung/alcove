@@ -10,7 +10,8 @@ Windows guest, launch and deploy apps, read guest events, wait for
 conditions, record what was done, read the guest's event log, collect crash
 dumps, write a diagnostics bundle, take and restore snapshots, forward ports,
 cut the guest's network link, lease a VM, change guest settings, diagnose a
-VM, and create linked clones and sessions that discard their changes.
+VM, create linked clones and sessions that discard their changes, and capture
+the guest's HTTP and HTTPS traffic with canned, delayed or dropped answers.
 
 The same server runs inside the Alcove app (which owns the VMs while it is
 running) and inside `alcovectl serve` (headless, when the app is not running).
@@ -54,7 +55,8 @@ Each connection has two lanes.
   `vm.set_resolution`, `vm.set_environment`, `vm.doctor`, `vm.clone`,
   `vm.delete`, `vm.window.action`, `vm.ui.click`, `vm.ui.type`,
   `vm.ui.action`, `vm.events`, `vm.record.*`, `vm.event_log`,
-  `vm.crash_dumps.enable`, `vm.crash_dumps.disable`, `vm.crash_dumps.list`). These run one after another in the order they arrived, and
+  `vm.crash_dumps.enable`, `vm.crash_dumps.disable`, `vm.crash_dumps.list`,
+  `vm.http.*`). These run one after another in the order they arrived, and
   their replies come in that order; a long `vm.wait_for` or `vm.batch` holds
   back the later requests of the serial lane of its connection.
 
@@ -78,7 +80,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.list` | — | `{vms: [{name, guestOS, state, suspended, width?, height?, error?, leasedBy?, cloneOf?, ephemeral?}]}` — see [VM rows](#vm-rows) |
 | `vm.status` | `name` | the VM's row plus, while it is running or paused, `tools: bool` and, with tools, `agentCaps: [...]` |
 | `vm.start` | `name`, `discardChanges?`, `waitTools?` | `{state, ephemeral}` after the guest is running; `{state, ephemeral, resumed, tools, clockSynced}` when it resumed a session saved to disk — see [Starting](#starting) |
-| `vm.stop` | `name`, `force?` | `{state}` after the engine exited (graceful ACPI first) |
+| `vm.stop` | `name`, `force?` | `{state, captureEnded?, warning?}` after the engine exited (graceful ACPI first); see [Stopping a capture](#stopping-a-capture) for the capture fields |
 | `vm.clone` | `name` (the template), `newName` | `{name}` — see [Linked clones](#linked-clones) |
 | `vm.delete` | `name` (a clone) | `{}` — see [Linked clones](#linked-clones) |
 | `vm.pause` / `vm.resume` | `name` | `{state}` |
@@ -113,7 +115,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.wait_idle` | `name`, `seconds?` (stable period, default 2), `timeout?` (default 30) | `{idle: bool}` — `true` when fewer than 0.5% of the frame's 32x32 tiles changed between samples 250 ms apart for the whole period, `false` at the timeout |
 | `vm.snapshot.list` | `name` | `{snapshots: [{name, date, vmStateBytes}]}` — see [Snapshots](#snapshots) |
 | `vm.snapshot.create` | `name`, `snapshot` | `{snapshot}` |
-| `vm.snapshot.restore` | `name`, `snapshot`, `waitTools?` s (default 30) | `{snapshot, tools: bool, clockSynced: bool}` |
+| `vm.snapshot.restore` | `name`, `snapshot`, `waitTools?` s (default 30) | `{snapshot, tools: bool, clockSynced: bool, captureEnded?, staleProxyCleared?}` |
 | `vm.snapshot.delete` | `name`, `snapshot` | `{}` |
 | `vm.forward.add` | `name`, `guestPort`, `hostPort?` | `{hostPort, guestPort}` — see [Port forwards](#port-forwards) |
 | `vm.forward.remove` | `name`, `hostPort` | `{}` |
@@ -144,6 +146,14 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.crash_dumps.list` | `name` | `{dumps: [{file, exe, bytes, time}]}` |
 | `vm.crash_dumps.pull` | `name`, `file`, `path` (host) | `{path, bytes, sha256}` |
 | `vm.collect_diagnostics` | `name`, `dir?` (host), `sinceMinutes?` (default 30), `logFiles?`, `processName?` | `{dir, files, summary}` — see [Diagnostics bundle](#diagnostics-bundle) |
+| `vm.http.start` | `name`, `hosts?`, `secrets?`, `bodies?`, `systemProxy?` (default true) | `{proxy, env, caInstalled, systemProxySet, guestCAPath?, warning?}` — see [HTTP capture](#http-capture) |
+| `vm.http.stop` | `name` | `{exchanges, warning?}`; without a capture `{exchanges: 0, staleCleared: true, warning?}` |
+| `vm.http.requests` | `name`, `since?`, `host?`, `path?`, `status?`, `limit?` (default 50, at most 500) | `{exchanges, next, pending}` |
+| `vm.http.request` | `name`, `exchange`, `part` (`request` or `response`), `offset?`, `length?` (default and at most 200000) | `{headers, body, total, bodyTruncated, base64?, encoding?, bodyDropped?, trailers?}` |
+| `vm.http.clear` | `name` | `{}` — discards the captured exchanges |
+| `vm.http.rule.add` | `name`, `match` (`host?`, `path?`, `method?`), `action` (`status?`, `headers?`, `body?`, `delayMs?`, `drop?`, `times?`) | `{rule}` |
+| `vm.http.rule.list` | `name` | `{rules: [{id, match, action, hits, remaining?}]}` |
+| `vm.http.rule.remove` / `vm.http.rule.clear` | `name`, `rule` / `name` | `{}` |
 | `script.run` | `path` (host), `name?`, `variables?`, `snapshot?`, `lease?`, `maxWidth?` | `{passed, stepsRun, steps, failedStep?, label?, error?, warning?, seconds, failure?}` — see [Scripts](#scripts) |
 | `script.save` | `dir` or `trace` (host), `path` (host, `.json`), `name?`, `from?`, `to?`, `overwrite?` | `{path, steps, skipped, warnings?}` — see [Saving a script from a recording](#saving-a-script-from-a-recording) |
 
@@ -743,6 +753,9 @@ waited for, either `window` (a window object) or `windowTimedOut: true`.
 
 - The program runs with the agent's elevated token and with the null device
   as standard input and output.
+- While the VM has an HTTP capture, the program's environment also holds the
+  capture's proxy variables (see [Starting a capture](#starting-a-capture)); the program of
+  `vm.deploy`'s `launch` gets them the same way, its installer does not.
 - `pid` is the process that was started. `window.pid` can be another process:
   Notepad and Edge hand over to a child or to a process that already runs
   (an Edge with a profile folder of its own is started by a launcher that
@@ -1144,7 +1157,8 @@ The read-only ops, which ignore leases, are `hello`, `vm.list`, `vm.status`,
 `vm.forward.list`, `vm.lease.acquire`, `vm.lease.release`, `vm.doctor`,
 `vm.record.status`, `vm.window.list`, `vm.ui.tree`, `vm.ui.find`,
 `vm.ui.text`, `vm.events`, `vm.event_log`, `vm.crash_dumps.list`,
-`vm.crash_dumps.pull`, `vm.collect_diagnostics` and `script.save`. Every other op is guarded, among them the power ops,
+`vm.crash_dumps.pull`, `vm.collect_diagnostics`, `vm.http.requests`,
+`vm.http.request`, `vm.http.rule.list` and `script.save`. Every other op is guarded, among them the power ops,
 `vm.window.action`, `vm.ui.click`, `vm.ui.type`, `vm.ui.action`,
 `vm.app.launch`, `vm.deploy`,
 `vm.clone` (through its template's lease) and `vm.delete`. The action ops and
@@ -1238,6 +1252,7 @@ that makes the later ones impossible:
 | `clock` | `skew <n> s` between guest and host | above 5 s (hint `vm.set_environment clock=host`), or no valid time reported | |
 | `network` | `example.com resolves` / `does not resolve` | the name does not resolve in the guest | |
 | `scale` | `<p> %` or `not checked on this guest` | never | |
+| `proxy` | the guest's system proxy held against the VM's HTTP capture, see [Doctor row](#doctor-row) | something of an earlier capture is left in the guest, the system proxy points at another port than the capture's, or the guest printed no proxy settings | |
 
 `session` is `locked` on Windows while a `LogonUI` process exists. `scale` is
 the system DPI a newly started DPI-aware process reads on Windows, as a
@@ -1527,6 +1542,382 @@ steps that failed: none
   follow for cut files (the trace's first lines, log tails, job streams,
   frames) and for skipped steps; the last lines list the failed steps with
   their sentences, or `steps that failed: none`.
+
+## HTTP capture
+
+A capture shows the HTTP and HTTPS requests the programs in a guest make and
+lets a caller answer, delay or drop chosen requests. For each capturing VM the
+control server runs `alcove-proxy`, an intercepting proxy, as its child
+process. The proxy listens on `127.0.0.1` on a port it picks, and the guest
+reaches it at `10.0.2.2:<port>`, the address of the Mac on the guest's
+user-mode network. HTTPS is intercepted with certificates the proxy signs with
+the Alcove CA; the guest trusts that CA while the capture runs.
+
+The server looks for `alcove-proxy` in this order: the file `$ALCOVE_PROXY`
+names (and only that file when the variable is set), `alcove-proxy` next to
+the running executable, `<repo>/build/alcove-proxy` (built by
+`scripts/test/all.sh`). Without it `vm.http.start` answers `alcove-proxy was
+not found; build it with scripts/test/all.sh or set ALCOVE_PROXY`.
+
+The CA lives in `~/Library/Application Support/Alcove/proxy-ca/` (`ca.pem`
+and `ca.key`, mode 0600, in a folder of mode 0700). The first capture creates
+it, valid for 5 years; every capture of the Mac user uses it. A new CA is made
+by deleting both files while no capture runs. Leaf certificates are valid for
+7 days and kept per host for the life of one proxy process.
+
+All `vm.http.*` ops run in the serial lane. `vm.http.requests`,
+`vm.http.request` and `vm.http.rule.list` are read-only; the others are
+guarded by a lease. One `vm.http.start`, `vm.http.stop` or cleanup of a VM
+runs at a time; the others wait for it.
+
+### Starting a capture
+
+`vm.http.start` takes `name` and:
+
+| Param | Default | Meaning |
+|---|---|---|
+| `hosts` | all hosts | array of host globs (`*` matches any run of characters), e.g. `["api.example.com", "*.corp.net"]`; other hosts are tunnelled and recorded as `tunnel` rows with byte counts only |
+| `secrets` | `false` | keep the values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `x-api-key` and `api-key`; without it they are stored as `<redacted n chars>` |
+| `bodies` | `true` | keep request and response bodies |
+| `systemProxy` | `true` | point the guest's system proxy at the capture (Windows) |
+
+The VM must be running (`VM '<vm>' is paused; call vm.resume first`), without
+a capture (`'<vm>' is already capturing on port <n>; call vm.http.stop
+first`). The guest tools get up to 25 s to connect. With `systemProxy` they
+must connect and run commands: `guest tools are not connected in '<vm>', and
+vm.http.start needs them to install the CA certificate and set the system
+proxy; install alcove-agent in the guest, or pass systemProxy: false` (and
+variants for tools that are too old or lack `--allow-exec`). With
+`systemProxy: false` and no usable tools the capture starts with
+`caInstalled: false` and a `warning` that names the host's `ca.pem`.
+
+On a Windows guest the start, in order:
+
+1. starts the proxy (15 s to report its port) and configures it;
+2. writes the capture's entry into the capture journal (see [Cleanup after an
+   earlier capture](#cleanup-after-an-earlier-capture));
+3. copies the CA to `C:\ProgramData\Alcove\proxy-ca.pem` (Administrators and
+   SYSTEM full control, Users read) and adds it to
+   `Cert:\LocalMachine\Root`, found by its SHA-1 thumbprint;
+4. with `systemProxy`, records the proxy settings it is about to change in
+   `C:\ProgramData\Alcove\proxy-previous.json`, then sets the WinINET proxy of
+   the agent's user (`ProxyServer` `10.0.2.2:<port>`, `ProxyOverride`
+   `<local>`, `ProxyEnable` 1, `AutoConfigURL` removed, under
+   `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`), tells
+   WinINET to reread its settings, and runs `netsh winhttp set proxy
+   proxy-server=10.0.2.2:<port> bypass-list=<local>` (64-bit WinHTTP). With
+   `systemProxy: false` it records the capture in the same file with
+   `systemProxy: false` and puts back what an earlier capture left set.
+
+On a Linux guest it copies the CA to
+`/usr/local/share/ca-certificates/alcove-proxy.crt` and runs
+`update-ca-certificates`; the system proxy is not changed, so only programs
+started with the returned `env` are captured. A guest without
+`update-ca-certificates` starts with `caInstalled: false` and a warning. Other
+guest OSes start with a warning that the CA is not installed.
+
+When a guest step fails, the start undoes the earlier ones and stops the
+proxy; the error is the step's sentence. When the undo fails too, the error
+adds `the guest keeps what this attempt changed, and Alcove restores it when
+its guest tools next connect; call vm.http.stop to restore it now`.
+
+The result:
+
+```json
+{"proxy": "10.0.2.2:58546", "caInstalled": true, "systemProxySet": true,
+ "guestCAPath": "C:\\ProgramData\\Alcove\\proxy-ca.pem",
+ "env": {"HTTP_PROXY": "http://10.0.2.2:58546", "HTTPS_PROXY": "…", "ALL_PROXY": "…",
+         "NO_PROXY": "localhost,127.0.0.1,::1", "NODE_EXTRA_CA_CERTS": "C:\\ProgramData\\Alcove\\proxy-ca.pem",
+         "SSL_CERT_FILE": "…", "REQUESTS_CA_BUNDLE": "…", "http_proxy": "…", "https_proxy": "…", "all_proxy": "…", "no_proxy": "…"},
+ "warning": "…"}
+```
+
+`env` holds each proxy variable in upper and lower case. `NODE_EXTRA_CA_CERTS`
+names the CA file. `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` name the CA bundle
+on Linux and the CA file on Windows; on Windows they are left out when `hosts`
+is set, because they replace a program's whole trust store (the `warning`
+says so). While the capture runs, `vm.app.launch` and `vm.deploy` add `env` to
+the environment of the programs they start; a variable the request names, in
+any letter case, keeps the request's value. `vm.exec` and `vm.exec.start` add
+nothing. Programs that were already running keep their proxy settings.
+
+`warning` also reports a `netsh` failure (`netsh could not set the WinHTTP
+proxy, so services and apps that use WinHTTP are not captured; run 'netsh
+winhttp show proxy' with vm.exec to see why`) and a refresh that did not
+happen (`the proxy settings were written, but Windows was not told to reread
+them; restart the app under test`).
+
+### Which programs are captured
+
+Measured in a Windows 11 ARM64 guest (see
+`docs/superpowers/plans/2026-10-13-at7-results.md`):
+
+| Program | Reaches the proxy through | Trusts the CA |
+|---|---|---|
+| A Go program (`net/http`) started by `vm.deploy` | `HTTPS_PROXY` from `env` | yes (Windows root store) |
+| PowerShell 5.1 `Invoke-WebRequest` (.NET Framework) | the WinINET system proxy | yes |
+| WinHTTP clients (`WinHttp.WinHttpRequest.5.1`) | the `netsh winhttp` proxy | yes |
+| Microsoft Edge, also one started before the capture | the WinINET system proxy | yes |
+| `curl.exe` (Schannel) | only `-x` or `HTTPS_PROXY`; it ignores the system proxy | only with `--ssl-no-revoke` or `--ssl-revoke-best-effort`: without them it fails with `CRYPT_E_NO_REVOCATION_CHECK`, because the proxy's certificates name no revocation list |
+
+Windows' own components (the connectivity probe, SmartScreen, telemetry) show
+up in the capture as well. A program that pins certificates or brings its own
+trust store (Firefox, Java, Python `requests` without `REQUESTS_CA_BUNDLE`)
+rejects the proxy's certificate; the proxy records a `tlsError` row naming the
+host and goes on serving the others.
+
+### Reading the capture
+
+**`vm.http.requests`** lists exchanges, oldest first: without `since` the
+newest `limit` (default 50, at most 500), with `since` the first `limit` after
+that exchange id. Filters: `host` and `path` (substrings of the URL), `status`
+(a number, or a class such as `"4xx"`). The result is `{exchanges, next,
+pending}`:
+
+- each exchange is `{id, time, kind, method, url, status, ms, reqBytes,
+  resBytes, rule?, error?, bodyDropped?}`; `kind` is `http`, `tunnel` (a host
+  outside `hosts`, a WebSocket, or a plain `http://` request to such a host)
+  or `tlsError` (the guest program refused the proxy's certificate); `rule` is
+  the id of the rule that answered it; `error` says why the proxy answered
+  502 itself, e.g. `the upstream request failed: dial tcp …: connect: no route
+  to host`;
+- `next` is the id to pass as `since` for the following page;
+- `pending` lists requests in flight and open tunnels (at most 200, oldest
+  first) without an id.
+
+**`vm.http.request`** reads one side of an exchange: `exchange` (the id),
+`part` (`request` or `response`, required), `offset` and `length` (default and
+at most 200,000 bytes of the body). The result is `{headers, body, total,
+bodyTruncated, base64?, encoding?, bodyDropped?, trailers?}`: `headers` and
+`trailers` as `[[name, value]]`; a `gzip` or `deflate` body is decoded; a
+body that is not UTF-8 text comes as base64 with `base64: true`, and a body
+with another content encoding comes as base64 with `encoding` naming it. A
+missing id answers `no exchange with id <n>; the store keeps the newest 2000
+exchanges and 'clear' removes them all`.
+
+**`vm.http.clear`** discards the captured exchanges; the capture goes on.
+
+The proxy keeps up to 2 MiB of each body (`bodyTruncated` beyond) and the
+newest 2000 exchanges. Bodies take at most 256 MiB together; beyond that the
+oldest exchanges lose their bodies and report `bodyDropped: true`. A streamed
+response (server-sent events, a chunked model reply) is passed to the guest
+as each piece arrives; the capture holds it once it has ended.
+
+A guest request to `10.0.2.2:<port>`, a server on the Mac, is captured: the
+proxy connects to the Mac's `127.0.0.1:<port>` and keeps the URL. The proxy
+checks upstream HTTPS certificates against the Mac's trust store, so a Mac
+server with a self-signed certificate answers 502 with the reason.
+
+In a recording's trace the six secret headers of `vm.http.request` results
+read `<masked>` (a `<redacted n chars>` value stays as it is), and bodies are
+cut at 2000 characters with `bodyCut: true`.
+
+### Rules
+
+**`vm.http.rule.add`** takes `match` (`host` glob, `path` glob, `method`; all
+optional, so `{}` matches every request) and `action`:
+
+- `status` (200 to 599), `headers` (object) and `body` (string) answer the
+  request without contacting the server; the status defaults to 200 and the
+  content type to `application/json` when the body parses as JSON, otherwise
+  `text/plain; charset=utf-8`;
+- `delayMs` (0 to 600,000) waits before answering, or before forwarding when
+  the rule has no `status` or `body`;
+- `drop: true` closes the connection without an answer;
+- `times` (at least 1) applies the rule that many times.
+
+The result is `{rule}`, the rule's id. The first matching rule in the order
+they were added applies; `times: 1` affects exactly one request also under
+concurrent requests. **`vm.http.rule.list`** returns `{rules: [{id, match,
+action, hits, remaining?}]}`; a rule whose `times` are used up stays listed
+with `remaining: 0` and no longer applies. **`vm.http.rule.remove`** deletes
+`rule` (`no rule with id <n>; run rule.list to see the ids`);
+**`vm.http.rule.clear`** deletes all. An action without any of `status`,
+`body`, `delayMs` or `drop` answers `the action needs at least one of status,
+body, delayMs or drop`.
+
+The ops other than `vm.http.start` and `vm.http.stop` answer `'<vm>' is not
+capturing; call vm.http.start first` on a VM without a capture.
+
+### Stopping a capture
+
+**`vm.http.stop`** restores the guest, removes the CA from it, stops the proxy
+and returns `{exchanges}`, the number of exchanges since the start. The
+captured exchanges and rules are discarded; read them first. When a guest step
+fails or the guest tools are not reachable, the capture still ends on the
+host and `warning` says what the guest keeps; a second `vm.http.stop` then
+clears it.
+
+The restore puts back exactly the values the state file recorded, and only
+while `ProxyServer` is still `10.0.2.2:<port of the state file>` (the WinHTTP
+proxy: while it names that address). It writes `ProxyServer` last, so a
+restore that was cut off can run again. A proxy the user set, also one at
+`10.0.2.2`, or a `ProxyServer` the user changed during the capture is left as
+it is (the `ProxyOverride` `<local>` of the capture then stays too). The CA is
+removed by thumbprint, the journal's and the state file's, never by name; a
+certificate the user had installed with the same thumbprint goes too. The
+state file and a leftover `proxy-previous.json.new` are deleted. WinINET
+itself stores `ProxyEnable` as `REG_DWORD` and `ProxyOverride` as `REG_SZ`
+whenever it rereads its settings, and it advances the change counter of the
+`DefaultConnectionSettings` blob; the values themselves are the recorded ones.
+
+On a VM without a capture, `vm.http.stop` clears what an earlier capture left
+in the guest (the state file, the journal's entry, the CA file) and answers
+`{exchanges: 0, staleCleared: true}`; when it finds nothing, `'<vm>' is not
+capturing; call vm.http.start first`. Its guest tools get 5 s to connect; with
+an entry in the journal and no tools it answers `'<vm>' is not capturing, and
+what an earlier capture left in its guest cannot be restored while its guest
+tools are not reachable; call vm.http.stop again once vm.status shows tools`.
+
+A state file that cannot be read (a read is tried three times, 200 ms apart)
+is never changed or deleted. Every step that needs it, `vm.http.start` among
+them, answers `the stored proxy settings in
+C:\ProgramData\Alcove\proxy-previous.json cannot be read; put the proxy
+settings right by hand, delete that file and call vm.http.stop again`. A start
+refused this way leaves no certificate in `Root`, and the journal keeps the
+entry until a later `vm.http.stop`. A state file deleted by hand during a
+capture leaves the capture's proxy settings in place: `vm.http.stop` removes
+the CA, and `vm.doctor` reads `system proxy 10.0.2.2:<port> (not set by
+Alcove; if a capture left it, change it by hand)`.
+
+A capture also ends when:
+
+- `vm.stop` stops the VM: without `force` and with connected guest tools it
+  restores the guest first (12 s per recipe); the result carries
+  `captureEnded: true`, and `warning` when the guest was not restored (`the
+  guest keeps the proxy settings and the CA certificate of the capture
+  (<reason>); Alcove restores them when its guest tools next connect`, the
+  reason being `the stop was forced`, `its guest tools were not connected`,
+  `the VM was paused`, `the VM was not running` or a recipe's sentence); a
+  stop that fails says `its HTTP capture was ended, call vm.http.start to
+  capture again`;
+- the VM stops by itself or runs in another engine process (checked every
+  2 s), or `vm.start` starts it again;
+- `vm.snapshot.restore` or a restore in the app window replaces the guest
+  (`captureEnded: true`); `vm.delete` deletes the VM;
+- `alcovectl serve` ends on SIGTERM or SIGINT, or the app quits: the guests
+  whose tools are connected are restored (the app waits at most 20 s);
+- the control server dies: the proxy exits when its input closes, and the
+  guest keeps the capture's settings until the cleanup below.
+
+### Cleanup after an earlier capture
+
+`captures.json` in the CA folder (mode 0600) records every capture whose guest
+was changed and not yet restored, and every snapshot taken while a VM had such
+a capture:
+
+```json
+{"version": 1,
+ "captures": [{"vm": "Win", "path": "/…/Win.alcovevm", "port": 49152, "thumbprint": "<40 hex>", "systemProxy": true, "since": "…"}],
+ "snapshots": [{"vm": "Win", "path": "/…/Win.alcovevm", "snapshot": "mid-capture", "port": 49152, "thumbprint": "…", "systemProxy": true, "since": "…"}]}
+```
+
+Changes hold an exclusive lock on `captures.json.lock`. A file that is not a
+readable version 1 counts as empty; the next change renames it to
+`captures.json.unreadable-<UTC time>`. A journal that cannot be written
+refuses `vm.http.start` before any guest step. An entry matches a VM by the
+standardized path of its bundle as the host spells it (an entry without
+`path` by name), so the app and `alcovectl serve --dir <other>` keep separate
+entries for equally named VMs; after a rename, a move or with a symbolic link
+in `--dir` the old entry no longer matches, and `vm.http.stop` still restores
+the guest from its state file.
+
+When the guest tools of a VM with an entry connect and no capture of it runs
+(after a crash of the host, a forced or paused stop, a stop without tools, a
+failed restore), the server restores the guest from the entry, once per
+connection, and removes the entry when every step worked. Each recipe gets
+25 s in the guest (30 s on the host), up to three recipes (90 s) while the
+VM's capture gate is held; `vm.http.start` and `vm.http.stop` wait for it. A
+cleanup that failed keeps the entry for the next connection and writes one
+line to the server's stderr (`alcovectl serve`) and the system log
+(subsystem `io.github.yangtaeyoung.Alcove`, category `control`): `the cleanup
+after an earlier HTTP capture of '<vm>' failed to <step> (<sentence>)[ and to
+<step> (<sentence>)]`, the steps being `restore the proxy settings`, `remove
+the proxy CA` and `run its recipes`. When a step failed because the guest gave
+no answer, the server drops that connection and asks for one more.
+
+In the app, a window connection on a boot or resume of a VM with an entry also
+makes the control target connect, and that connection runs the cleanup; a VM
+without an entry gets no extra connection. A snapshot taken during a capture,
+from the op or the window, is noted; restoring it (`vm.snapshot.restore` or
+the window) makes the note the VM's entry again and runs the cleanup, and
+`vm.snapshot.restore` answers `staleProxyCleared` (whether the cleanup removed
+anything). Deleting the snapshot removes its note; deleting the VM removes its
+entry and notes. The app calls these hooks only when it hosts the control
+server.
+
+### Doctor row
+
+The `proxy` row reads the guest's proxy settings: `capturing through
+10.0.2.2:<port>, system proxy set|not set` while a capture runs (not ok when
+the system proxy points at another port: hint `call vm.http.stop, then
+vm.http.start`); `no system proxy` or `system proxy <server>` when nothing of
+a capture is left, with ` (not set by Alcove; if a capture left it, change it
+by hand)` for a server at `10.0.2.2:<port>` without a state file. It is not ok
+with the hint `vm.http.stop clears stale proxy settings` when no capture runs
+but the system proxy still points at the port the state file records, the
+state file is still there, the CA is still installed, or the state file cannot
+be read.
+
+### Time limits
+
+Limits from the code, the longest each op can take: `vm.http.start` 160 s
+when it works and 211 s when its last step fails, 250 s and 301 s behind a
+running cleanup (Linux 130/151 s, 160/181 s); `vm.http.stop` 247 s; a
+cleanup 90 s; `vm.stop` of a capturing VM 51 s before the engine stop. Each
+proxy call has 30 s and an answer line at most 16 MiB (`alcove-proxy sent an
+answer larger than 16 MiB; ask for less with limit, offset or length`). One
+proxy of the server starts at a time. Measured in the guest: start about 2 to
+3 s, stop about 2 s, the cleanup after a cold boot within 5 s of the tools
+connecting.
+
+### Restoring a guest by hand
+
+Without Alcove, in an elevated PowerShell as the agent's user:
+
+1. `Get-Content C:\ProgramData\Alcove\proxy-previous.json`. A field decodes
+   with `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<value>'))`;
+   `null` means the value was absent. With `"systemProxy":false` go to step 4.
+2. `$k='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'`:
+   put back the recorded `ProxyServer`, `ProxyOverride` and `AutoConfigURL`
+   (`New-ItemProperty $k -Name ProxyServer -Value '<old>' -PropertyType String
+   -Force`, `ExpandString` where the recorded kind says so), remove the ones
+   recorded as `null` (`Remove-ItemProperty $k -Name ProxyServer -ErrorAction
+   SilentlyContinue`), and set `ProxyEnable` to the recorded number.
+3. WinHTTP: `netsh winhttp reset proxy`, or `netsh winhttp set proxy
+   proxy-server="<server>" bypass-list="<list>"` for a recorded proxy.
+4. The certificate, by the thumbprint of the state file or of `captures.json`
+   on the Mac: `Remove-Item Cert:\LocalMachine\Root\<THUMBPRINT>`.
+5. `Remove-Item C:\ProgramData\Alcove\proxy-ca.pem,
+   C:\ProgramData\Alcove\proxy-previous.json,
+   C:\ProgramData\Alcove\proxy-previous.json.new -ErrorAction
+   SilentlyContinue`.
+6. Linux: `rm -f /usr/local/share/ca-certificates/alcove-proxy.crt
+   /usr/local/share/alcove-proxy.crt.removing && update-ca-certificates
+   --fresh`.
+7. On the Mac, remove the VM's entry from `captures.json` (or the file, while
+   no capture runs).
+
+Programs that are running keep the old settings until they restart.
+
+On Linux the removal moves the CA file to
+`/usr/local/share/alcove-proxy.crt.removing` and deletes it after
+`update-ca-certificates --fresh` worked; a failed refresh answers
+`update-ca-certificates --fresh failed in the guest, so the guest still trusts
+the proxy CA; run it with vm.exec to see why, then call vm.http.stop again`,
+and the next stop refreshes again.
+
+### HTTP tools of the MCP server
+
+The `http` toolset has `alcove_http_capture_start` (`hosts`, `secrets`,
+`bodies`, `system_proxy`), `alcove_http_capture_stop`, `alcove_http_requests`
+(the list filters; with `id`, `part`, `offset` and `length` one exchange as
+headers, a blank line and the body clipped at 60,000 characters; `clear:
+true` alone empties the list) and `alcove_http_rule` (`action` `add`, `list`,
+`remove`, `clear`; `match`; `response` with `status`, `headers`, `body`,
+`delay_ms`, `drop`, `times`; `rule`). List lines read `#id time METHOD url ->
+status (ms, req/res bytes) [rule n]`. The client waits up to 316,000 ms for
+a start and 262,000 ms for a stop.
 
 ## Scripts
 
@@ -1930,6 +2321,9 @@ cannot start 'C:\apps\tool.exe': The system cannot find the file specified.; che
 the request line is not JSON that can be read (broken syntax, or a \u escape of half a surrogate pair); send one JSON object per line
 'Win' is already recording to /Users/me/rec; call vm.record.stop first
 the dump 'app.exe.4242.dmp' is still being written; retry in a few seconds
+'Win' is already capturing on port 58546; call vm.http.stop first
+'Win' is not capturing; call vm.http.start first
+alcove-proxy was not found; build it with scripts/test/all.sh or set ALCOVE_PROXY
 ```
 
 ## Limits
