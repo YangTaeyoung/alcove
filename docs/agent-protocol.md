@@ -164,7 +164,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - `exec.run` gives the child a pipe that carries the `stdin` text and then
   ends; without the field the child reads end-of-file at once. It waits for
   the child, at most `timeout_ms`. On timeout the process tree is killed,
-  `timed_out` is true and `code` is -1.
+  `timed_out` is true and `code` is -1. When the connection of the request
+  closes first, the process tree is killed too and no reply is sent.
 - `exec.run` keeps the last 200000 bytes of each stream; `truncated` is true
   when either stream lost earlier bytes. A character split by the cut is
   dropped, so a truncated stream starts on a character boundary. Other

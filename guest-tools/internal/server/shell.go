@@ -153,7 +153,9 @@ func (s *Server) registerShell() {
 	s.registerProcs()
 }
 
-func (s *Server) execRun(_ context.Context, req proto.Message) (proto.Message, error) {
+// execRun runs a command to its end. Its process tree is killed when the
+// timeout passes or the connection of the request closes.
+func (s *Server) execRun(ctx context.Context, req proto.Message) (proto.Message, error) {
 	c, err := s.newCommand(req)
 	if err != nil {
 		return nil, err
@@ -176,8 +178,10 @@ func (s *Server) execRun(_ context.Context, req proto.Message) (proto.Message, e
 		timedOut.Store(true)
 		_ = killTree(pid)
 	})
+	stopOnClose := context.AfterFunc(ctx, func() { _ = killTree(pid) })
 	_ = c.Wait()
 	timer.Stop()
+	stopOnClose()
 
 	code := -1
 	if c.ProcessState != nil && !timedOut.Load() {
