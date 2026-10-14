@@ -19,8 +19,8 @@ extension ControlHandler {
                 try await provisioning.cloneVM(named: name, as: newName)
                 return ["name": .string(newName)]
             }
-            await endCapture(name)
             try await provisioning.deleteVM(named: name)
+            await endCapture(name)
         } catch let error as ControlError {
             throw error
         } catch let error as VMBundle.CloneError {
@@ -91,10 +91,10 @@ extension ControlHandler {
                 throw ControlError.failed("a snapshot named '\(snapshot)' already exists in '\(t.name)'; call vm.snapshot.delete first or choose another name")
             }
             do { try await t.createSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot create failed: \(engineReason(error))") }
-            if captures[t.name] != nil {
-                captureSnapshots[t.name, default: []].insert(snapshot)
+            if let capture = captures[t.name], capture.guestChanged {
+                try? captureJournal.noteSnapshot(snapshot, during: capture.journalEntry(vm: t.name), now: wallClock())
             } else {
-                captureSnapshots[t.name]?.remove(snapshot)
+                try? captureJournal.forgetSnapshot(snapshot, vm: t.name, now: wallClock())
             }
             return ["snapshot": .string(snapshot)]
         case "vm.snapshot.restore":
@@ -110,21 +110,25 @@ extension ControlHandler {
             let restored = await passEvents(of: t)
             let capturing = captures[t.name] != nil
             await endCapture(t.name)
+            let duringCapture = captureJournal.snapshotEntry(snapshot, vm: t.name)
+            if let duringCapture { try? captureJournal.record(duringCapture, now: wallClock()) }
             let agent = await t.agent(timeout: .seconds(max(0, wait)))
             var clockSynced = false
             if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.snapshot.restore") }
             var out: [String: JSON] = ["snapshot": .string(snapshot), "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced),
                                        "eventSeq": .int(Int64(restored))]
             if capturing { out["captureEnded"] = true }
-            if captureSnapshots[t.name]?.contains(snapshot) == true {
-                out["staleProxyCleared"] = .bool(await clearStaleAfterRestore(t, agent))
+            if duringCapture != nil {
+                var cleared = false
+                if let agent { cleared = await staleCleanup(t, agent).value }
+                out["staleProxyCleared"] = .bool(cleared)
             }
             return .object(out)
         case "vm.snapshot.delete":
             let snapshot = try string(params, "snapshot")
             try await requireSnapshot(snapshot, in: t)
             do { try await t.deleteSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot delete failed: \(engineReason(error))") }
-            captureSnapshots[t.name]?.remove(snapshot)
+            try? captureJournal.forgetSnapshot(snapshot, vm: t.name, now: wallClock())
             return [:]
         case "vm.forward.add":
             let guestPort = try portParameter(params, "guestPort")

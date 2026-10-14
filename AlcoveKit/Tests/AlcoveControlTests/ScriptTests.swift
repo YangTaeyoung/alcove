@@ -73,7 +73,7 @@ final class ScriptTests: XCTestCase {
         let target = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         await target.setAgent(client)
         let clock = TestClock()
-        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", clock: { clock.now })
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", captureDirectory: scratchCaptureDirectory, clock: { clock.now })
         return Rig(handler: handler, target: target, agent: agent, fs: fs, clock: clock)
     }
 

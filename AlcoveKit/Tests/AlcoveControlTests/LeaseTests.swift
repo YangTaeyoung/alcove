@@ -17,7 +17,7 @@ final class LeaseTests: XCTestCase {
     private func setup() -> (ControlHandler, FakeTarget, TestClock) {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         let clock = TestClock()
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", clock: { clock.now })
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory, clock: { clock.now })
         return (h, t, clock)
     }
 

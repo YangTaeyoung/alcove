@@ -34,7 +34,7 @@ final class GuestRecipeTests: XCTestCase {
             await t.setAgent(client)
         }
         let now = hostNow
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", engineDescription: engine, now: { now })
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory, engineDescription: engine, now: { now })
         return (h, t, agent)
     }
 

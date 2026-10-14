@@ -6,7 +6,7 @@ public enum ToolLocator {
     /// `alcove-proxy` next to the running executable and `<repo>/build/alcove-proxy` that is an executable file.
     /// Nil when that file is missing or not executable.
     public static func proxy(environment: [String: String] = ProcessInfo.processInfo.environment,
-                             executableDirectory: String? = Bundle.main.executableURL?.deletingLastPathComponent().path,
+                             executableDirectory: String? = directory(ofExecutable: Bundle.main.executableURL),
                              developmentRoot: String = developmentBuildDirectory,
                              fileManager fm: FileManager = .default) -> String? {
         if let named = environment["ALCOVE_PROXY"], !named.isEmpty {
@@ -16,6 +16,11 @@ public enum ToolLocator {
         if let executableDirectory { candidates.append(executableDirectory + "/alcove-proxy") }
         candidates.append(developmentRoot + "/alcove-proxy")
         return candidates.first { isProgram($0, fm) }
+    }
+
+    /// The folder of the file `executable` is or, when it is a symbolic link, leads to.
+    public static func directory(ofExecutable executable: URL?) -> String? {
+        executable?.resolvingSymlinksInPath().deletingLastPathComponent().path
     }
 
     /// `<repo>/build`, derived from this source file's location.

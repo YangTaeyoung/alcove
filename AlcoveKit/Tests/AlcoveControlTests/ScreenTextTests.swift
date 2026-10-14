@@ -448,6 +448,6 @@ final class ScreenTextTests: XCTestCase {
 
     private func textHandler(_ frame: Frame) -> (ControlHandler, FakeTarget) {
         let t = FakeTarget(name: "Win", state: .running, png: frame.encoded(.png))
-        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"), t)
+        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory), t)
     }
 }

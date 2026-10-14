@@ -37,6 +37,9 @@ public protocol VMTarget: Sendable {
     /// connected. Without a connected agent one connection attempt is started in the background, as by
     /// `agent(timeout: .zero)`.
     func agentLink() async -> AgentLinkState
+    /// Makes `observer` the one receiver of every agent connection the target adopts from now on; nil removes it.
+    /// The observer is called with the target and the adopted connection, and the adoption does not wait for it.
+    func setAgentObserver(_ observer: (@Sendable (any VMTarget, AgentClient) async -> Void)?) async
     /// The guest events with a sequence number above `seq`, oldest first, the sequence
     /// number of the newest event and that of the oldest one still kept. The events
     /// outlive the agent connection.
@@ -106,6 +109,10 @@ actor AgentLink {
     private(set) var warmUpCount = 0
     /// The `ui.ping` sent after the latest adoption of a client with the `ui` capability.
     private(set) var helperStart: Task<Void, Never>?
+    /// Receives every client the link adopts.
+    private var observer: (@Sendable (AgentClient) async -> Void)?
+    /// The call of `observer` for the latest adoption.
+    private(set) var observerCall: Task<Void, Never>?
     /// Connection attempts that are running or about to start. An attempt is counted from the moment it is certain
     /// to be made until its client is adopted or given up, or it failed; the pause after a failed attempt counts
     /// only when the caller's deadline leaves room for another attempt.
@@ -218,14 +225,20 @@ actor AgentLink {
         return nil
     }
 
+    /// Makes `observer` the receiver of every client the link adopts from now on; nil removes it.
+    func setObserver(_ observer: (@Sendable (AgentClient) async -> Void)?) {
+        self.observer = observer
+    }
+
     /// Makes `candidate` the cached client and the one source of guest events. With `startsHelper` it gets one `ui.ping`
-    /// that nobody waits for, which starts the agent's UI helper.
+    /// that nobody waits for, which starts the agent's UI helper. The observer is called in a task of its own.
     private func adopt(_ candidate: AgentClient, startsHelper: Bool) {
         feed?.cancel()
         feed = events.follow(candidate)
         client = candidate
         lastAttemptFailed = false
         helperStart = startsHelper ? Task { _ = try? await candidate.call("ui.ping", [:], timeout: UITiming.callTimeout) } : nil
+        observerCall = observer.map { notify in Task { await notify(candidate) } }
     }
 
     /// Starts the warm-up unless one is running, and counts its attempt in `attempts`.
@@ -342,4 +355,14 @@ public actor ControllerTarget: VMTarget {
 
     public func agent(timeout: Duration) async -> AgentClient? { await link.agent(timeout: timeout) }
     public func agentLink() async -> AgentLinkState { await link.state() }
+    public func setAgentObserver(_ observer: (@Sendable (any VMTarget, AgentClient) async -> Void)?) async {
+        guard let observer else {
+            await link.setObserver(nil)
+            return
+        }
+        await link.setObserver { [weak self] agent in
+            guard let self else { return }
+            await observer(self, agent)
+        }
+    }
 }

@@ -77,7 +77,7 @@ final class WaitTests: XCTestCase {
     private func screenRig(frames: [Frame]) async -> (ControlHandler, FakeTarget) {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
         await t.setFrames(frames)
-        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"), t)
+        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory), t)
     }
 
     /// A running VM "Win" with guest tools served by `agent`.
@@ -1427,7 +1427,7 @@ final class WaitTests: XCTestCase {
 
     func testRefusedOnAStoppedVM() async throws {
         let t = FakeTarget(name: "Win", state: .stopped, png: makePNG(width: 8, height: 8))
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         let message = await failure(h, ["name": "Win", "conditions": [["type": "screen_idle"]]])
         XCTAssertTrue(message.contains("stopped"), message)
     }

@@ -177,7 +177,7 @@ final class DiagnosticsTests: XCTestCase {
         let target = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         await target.setAgent(client)
         await target.setOS(os)
-        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", now: { now?.value ?? Date() },
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", captureDirectory: scratchCaptureDirectory, now: { now?.value ?? Date() },
                                      recordingsDirectory: scratch.appendingPathComponent("recordings"),
                                      diagnosticsDirectory: scratch.appendingPathComponent("diagnostics"))
         return Rig(handler: handler, target: target, agent: agent, guest: guest)
@@ -731,7 +731,7 @@ final class DiagnosticsTests: XCTestCase {
 
     func testWorksWithoutGuestTools() async throws {
         let target = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test",
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", captureDirectory: scratchCaptureDirectory,
                                diagnosticsDirectory: scratch.appendingPathComponent("diagnostics"))
         DiagnosticsTiming.agentWait = .zero
         let result = try await collect(h)

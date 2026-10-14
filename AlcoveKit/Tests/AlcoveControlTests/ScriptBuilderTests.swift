@@ -113,7 +113,7 @@ final class ScriptBuilderTests: XCTestCase {
 
     private func handler() -> ControlHandler {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
-        return ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        return ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
     }
 
     /// An agent that offers `caps` and answers each op as `answers` says at that moment; an op without an entry gets
@@ -1554,7 +1554,7 @@ final class ScriptBuilderTests: XCTestCase {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         await t.setAgent(client)
         let registry = ParkingRegistry(t)
-        return (ControlHandler(registry: registry, hostKind: "test"), t, agent, registry)
+        return (ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory), t, agent, registry)
     }
 
     func testRecordingAddsTargetToClicks() async throws {
@@ -1935,7 +1935,7 @@ final class ScriptBuilderTests: XCTestCase {
     func testARecordedActionLooksItsVMUpOnce() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
         let registry = ParkingRegistry(t)
-        let h = ControlHandler(registry: registry, hostKind: "test")
+        let h = ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory)
         _ = try await startRecording(h)
         for (op, params) in [("vm.mouse.click", click(5, 5)), ("vm.type", ["name": "Win", "text": "a"]), ("vm.key.press", ["name": "Win", "keys": "a"])] {
             let before = await registry.lookups

@@ -43,7 +43,9 @@ actor FakeTarget: VMTarget {
     var os: VMConfig.GuestOS = .windows
     func guestOS() async -> VMConfig.GuestOS { os }
     func setOS(_ value: VMConfig.GuestOS) { os = value }
-    func state() async -> VMController.State { stateValue }
+    /// How many times `state()` was called.
+    var stateCalls = 0
+    func state() async -> VMController.State { stateCalls += 1; return stateValue }
     var suspended = false
     func isSuspended() async -> Bool { suspended }
     func setSuspended(_ value: Bool) { suspended = value }
@@ -163,6 +165,14 @@ actor FakeTarget: VMTarget {
         eventFeed?.cancel()
         eventFeed = a.map { guestEvents.follow($0) }
     }
+    /// The receiver of the agent connections that `connectAgent` announces.
+    var agentObserver: (@Sendable (any VMTarget, AgentClient) async -> Void)?
+    func setAgentObserver(_ observer: (@Sendable (any VMTarget, AgentClient) async -> Void)?) async { agentObserver = observer }
+    /// Sets `a` as the agent and calls the observer with it, as a target does for a connection it adopts.
+    func connectAgent(_ a: AgentClient) async {
+        setAgent(a)
+        await agentObserver?(self, a)
+    }
     func events(since seq: Int) async -> (events: [GuestEvent], next: Int, first: Int) { await guestEvents.since(seq) }
     func setAgentWait(_ d: Duration) { agentWait = d }
     func setPNG(_ d: Data) { png = d }
@@ -175,6 +185,11 @@ actor FakeTarget: VMTarget {
 struct FrameUnavailable: Error, CustomStringConvertible {
     var description: String { "no surface is mapped" }
 }
+
+/// The capture directory of handlers whose test does not look at the capture journal: a folder of this test process
+/// that no test creates.
+let scratchCaptureDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("alcove-test-captures-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)")
 
 struct FakeRegistry: VMRegistry {
     let targets: [String: FakeTarget]
@@ -199,7 +214,7 @@ func makePNG(width: Int, height: Int, gray: UInt8 = 0x80) -> Data {
 final class ControlHandlerTests: XCTestCase {
     private func setup(state: VMController.State = .running, size: (Int, Int) = (800, 600)) -> (ControlHandler, FakeTarget) {
         let t = FakeTarget(name: "Win", state: state, png: makePNG(width: size.0, height: size.1))
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         return (h, t)
     }
 

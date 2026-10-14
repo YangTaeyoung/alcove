@@ -1811,7 +1811,7 @@ final class ControlUITests: XCTestCase {
 
     func testObservationOfAVMWhoseToolsAreNotConnectedYet() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
         var calls = await t.agentCalls
         XCTAssertTrue(calls.isEmpty)
@@ -1870,7 +1870,7 @@ final class ControlUITests: XCTestCase {
     func testAnOpLooksItsVMUpOnce() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 64, height: 64))
         let registry = CountingRegistry(t)
-        let h = ControlHandler(registry: registry, hostKind: "test")
+        let h = ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory)
         _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
         var lookups = await registry.lookups
         XCTAssertEqual(lookups, 1)
@@ -2422,7 +2422,7 @@ final class ControlUITests: XCTestCase {
             holder.target = old
             registry = SwapRegistry(old)
         }
-        let h = ControlHandler(registry: registry, hostKind: "test")
+        let h = ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory)
         _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5, "observe": "summary", "settleMs": 20])
         XCTAssertNotNil(holder.target)
         await registry.swap(fresh)
@@ -2465,7 +2465,7 @@ final class ControlUITests: XCTestCase {
     func testEventPositionsStartOverForAVMWithANewEventSequence() async throws {
         let (old, oldAgent) = try await target(emitting: ["t": "ev", "name": "unused"])
         let registry = SwapRegistry(old)
-        let h = ControlHandler(registry: registry, hostKind: "test")
+        let h = ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory)
         for i in 1...3 { oldAgent.sendLine(["t": "ev", "name": "window.opened", "window": titled("old \(i)")]) }
         let arrived = await eventually { await old.events(since: 0).next == 3 }
         XCTAssertTrue(arrived)
@@ -3375,7 +3375,7 @@ final class ControlUITests: XCTestCase {
 
     func testUIOpsWithoutTools() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         let tree = await failure(h, "vm.ui.tree", ["name": "Win"])
         XCTAssertEqual(tree, "guest tools are not connected in 'Win'; install alcove-agent in the guest")
         await t.setState(.stopped)

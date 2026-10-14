@@ -32,7 +32,7 @@ final class ObservationTests: XCTestCase {
     private func setup(frames: [Frame]) async -> (ControlHandler, FakeTarget) {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
         await t.setFrames(frames)
-        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"), t)
+        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory), t)
     }
 
     private func failure(_ h: ControlHandler, _ op: String, _ params: JSON, file: StaticString = #filePath, line: UInt = #line) async -> String {

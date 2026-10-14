@@ -27,7 +27,7 @@ func handlerWithAgent(_ agent: FakeAgent, in test: XCTestCase) async throws -> (
     try await client.connect(port: agent.port, expectedToken: nil)
     let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
     await t.setAgent(client)
-    return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"), t)
+    return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory), t)
 }
 
 final class ControlShellFilesTests: XCTestCase {
@@ -557,7 +557,7 @@ final class ControlShellFilesTests: XCTestCase {
 
     func testShellAndFileOpsNeedARunningVMWithTools() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         let noTools = await failure(h, "vm.fs.list", ["name": "Win", "path": "/"])
         XCTAssertEqual(noTools, "guest tools are not connected in 'Win'; install alcove-agent in the guest")
         await t.setState(.stopped)
@@ -672,7 +672,7 @@ final class InputGateTests: XCTestCase {
 
     func testInputOpsOnOneVMDoNotInterleave() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         let click = Task { try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 0, "y": 0, "hold": 300]) }
         while await t.sent.count < 3 { try await Task.sleep(for: .milliseconds(5)) }
         _ = try await h.handle(op: "vm.key.press", params: ["name": "Win", "keys": "a"])

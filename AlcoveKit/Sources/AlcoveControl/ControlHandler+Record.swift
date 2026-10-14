@@ -192,7 +192,7 @@ extension ControlHandler {
         var aimed: VMTarget?
         var target: JSON?
         if let question = ControlHandler.targetQuestion(op: op, params: params) {
-            aimed = await registry.target(named: vm)
+            aimed = await lookUp(vm)
             if let aimed { target = await aimedElement(question, of: aimed) }
         }
         let framed = ControlHandler.capturesFrames(op: op)

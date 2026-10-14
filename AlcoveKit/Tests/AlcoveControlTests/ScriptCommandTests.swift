@@ -181,7 +181,7 @@ final class ScriptCommandTests: XCTestCase {
     func testClientReturnsTheReplyAndTheServersSentence() throws {
         let path = "/tmp/alcove-cmd-\(UUID().uuidString.prefix(8)).sock"
         let target = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let server = ControlServer(handler: ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test"), socketPath: path)
+        let server = ControlServer(handler: ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", captureDirectory: scratchCaptureDirectory), socketPath: path)
         try server.start()
         defer { server.stop() }
         let hello = try ControlSocketClient.call(op: "hello", params: [:], socketPath: path)

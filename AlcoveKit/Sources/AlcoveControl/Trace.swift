@@ -65,8 +65,8 @@ enum TraceSanitizer {
     }
 
     /// The sanitized result of `op`. In a `vm.http.request` result the values of the `ControlHandler.secretHeaders`
-    /// become `<masked>` unless the proxy stored them redacted, and a body longer than `maxStringLength` is cut and
-    /// marked with `bodyCut`.
+    /// become `<masked>` unless the proxy stored them as `<redacted n chars>`, and a body longer than `maxStringLength`
+    /// is cut and marked with `bodyCut`.
     static func sanitize(result: JSON, op: String) -> JSON {
         guard op == "vm.http.request", case .object(var fields) = result else { return sanitize(result) }
         for key in ["headers", "trailers"] {
@@ -84,11 +84,20 @@ enum TraceSanitizer {
         return .object(out)
     }
 
-    /// A `[name, value]` header pair with the value masked when the name is one of `ControlHandler.secretHeaders`.
+    /// A header pair whose first item is one of `ControlHandler.secretHeaders` as `[name, "<masked>"]`, whatever
+    /// follows the name; a pair whose value the proxy stored as `<redacted n chars>` stays as it is.
     private static func maskedHeader(_ pair: JSON) -> JSON {
-        guard let items = pair.arrayValue, items.count == 2, let name = items[0].stringValue, let value = items[1].stringValue,
-              ControlHandler.secretHeaders.contains(name.lowercased()), !value.hasPrefix("<redacted ") else { return pair }
+        guard let items = pair.arrayValue, let name = items.first?.stringValue,
+              ControlHandler.secretHeaders.contains(name.lowercased()) else { return pair }
+        if items.count == 2, let value = items[1].stringValue, isRedacted(value) { return pair }
         return [.string(name), "<masked>"]
+    }
+
+    /// Whether `value` is `<redacted n chars>` with a decimal number and nothing else.
+    private static func isRedacted(_ value: String) -> Bool {
+        guard value.hasPrefix("<redacted "), value.hasSuffix(" chars>") else { return false }
+        let digits = value.dropFirst("<redacted ".count).dropLast(" chars>".count)
+        return !digits.isEmpty && digits.unicodeScalars.allSatisfy { ("0"..."9").contains($0) }
     }
 
     private static func sanitize(_ value: JSON, inEnv: Bool) -> JSON {

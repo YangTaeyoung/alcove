@@ -18,7 +18,7 @@ final class TraceTests: XCTestCase {
     private func setup(state: VMController.State = .running) -> (ControlHandler, FakeTarget, TestClock) {
         let t = FakeTarget(name: "Win", state: state, png: makePNG(width: 800, height: 600))
         let clock = TestClock()
-        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", clock: { clock.now },
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory, clock: { clock.now },
                                recordingsDirectory: base)
         return (h, t, clock)
     }
@@ -745,7 +745,7 @@ final class TraceTests: XCTestCase {
 
     func testDeletingTheVMDropsItsLastRecording() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
-        let h = ControlHandler(registry: FakeProvisioningRegistry(targets: ["Win": t]), hostKind: "test", recordingsDirectory: base)
+        let h = ControlHandler(registry: FakeProvisioningRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory, recordingsDirectory: base)
         _ = try await start(h)
         _ = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
         let before = await h.lastRecording("Win")

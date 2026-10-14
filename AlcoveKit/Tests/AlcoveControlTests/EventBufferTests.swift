@@ -446,6 +446,38 @@ final class EventBufferTests: XCTestCase {
         XCTAssertTrue(agentRequests(plain, "ui.ping").isEmpty)
     }
 
+    func testLinkCallsItsObserverForEveryConnectionItAdopts() async throws {
+        let agents = [fakeAgent(caps: ["clipboard"]), fakeAgent(caps: ["clipboard"]), fakeAgent(caps: ["clipboard"])]
+        let port = LockedBox(agents[0].port)
+        let seen = LockedBox<[ObjectIdentifier]>([])
+        let link = AgentLink(events: EventBuffer(), isRunning: { true }, endpoint: { (port.value, nil) })
+        await link.setObserver { client in seen.value = seen.value + [ObjectIdentifier(client)] }
+
+        let connected = await link.agent(timeout: .seconds(60))
+        let first = try XCTUnwrap(connected)
+        await link.observerCall?.value
+        XCTAssertEqual(seen.value, [ObjectIdentifier(first)])
+        _ = await link.agent(timeout: .seconds(60))
+        await link.observerCall?.value
+        XCTAssertEqual(seen.value, [ObjectIdentifier(first)])
+
+        await link.drop()
+        port.value = agents[1].port
+        let reconnected = await link.agent(timeout: .seconds(60))
+        let second = try XCTUnwrap(reconnected)
+        await link.observerCall?.value
+        XCTAssertEqual(seen.value, [ObjectIdentifier(first), ObjectIdentifier(second)])
+
+        await link.setObserver(nil)
+        await link.drop()
+        port.value = agents[2].port
+        let third = await link.agent(timeout: .seconds(60))
+        XCTAssertNotNil(third)
+        let call = await link.observerCall
+        XCTAssertNil(call)
+        XCTAssertEqual(seen.value.count, 2)
+    }
+
     func testACancelledFeedStopsAppending() async throws {
         let agent = FakeAgent()
         agent.handler = { m, _ in m["op"]?.stringValue == "ping" ? [agentReply(m, ["pong": true])] : [] }

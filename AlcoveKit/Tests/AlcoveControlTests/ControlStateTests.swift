@@ -8,7 +8,7 @@ import AlcoveTestSupport
 final class ControlStateTests: XCTestCase {
     private func setup(state: VMController.State = .running) -> (ControlHandler, FakeTarget) {
         let t = FakeTarget(name: "Win", state: state, png: makePNG(width: 800, height: 600))
-        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"), t)
+        return (ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory), t)
     }
 
     private func failure(_ h: ControlHandler, _ op: String, _ params: JSON) async -> String {
@@ -117,7 +117,7 @@ final class ControlStateTests: XCTestCase {
     func testCloneAndDeleteFailuresAreSentences() async throws {
         let t = FakeTarget(name: "Win", state: .stopped, png: makePNG(width: 800, height: 600))
         let registry = FakeProvisioningRegistry(targets: ["Win": t])
-        let h = ControlHandler(registry: registry, hostKind: "test")
+        let h = ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory)
         await registry.setFailure(QMPClient.QMPError.notConnected)
         let clone = await failure(h, "vm.clone", ["name": "Win", "newName": "Copy"])
         XCTAssertEqual(clone, "clone failed: the connection to the engine is gone; check vm.status and restart the VM with vm.stop and vm.start")
@@ -412,7 +412,7 @@ final class ControlStateTests: XCTestCase {
     func testCloneAndDeleteGoThroughProvisioning() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         let registry = FakeProvisioningRegistry(targets: ["Win": t])
-        let h = ControlHandler(registry: registry, hostKind: "test")
+        let h = ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory)
 
         let cloned = try await h.handle(op: "vm.clone", params: ["name": "Win", "newName": "  Copy "])
         XCTAssertEqual(cloned, ["name": "Copy", "eventSeq": 0])
@@ -447,7 +447,7 @@ final class ControlStateTests: XCTestCase {
     func testProvisioningErrorsAreReported() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         let registry = FakeProvisioningRegistry(targets: ["Win": t])
-        let h = ControlHandler(registry: registry, hostKind: "test")
+        let h = ControlHandler(registry: registry, hostKind: "test", captureDirectory: scratchCaptureDirectory)
         _ = try await h.handle(op: "vm.screenshot", params: ["name": "Win"])
         await registry.setFailure(VMBundle.CloneError.sourceRunning("Win"))
         let clone = await failure(h, "vm.clone", ["name": "Win", "newName": "Copy"])
@@ -497,7 +497,7 @@ final class ControlStateTests: XCTestCase {
         }
         fm.createFile(atPath: root.appendingPathComponent("pc-bios/edk2-aarch64-code.fd").path, contents: Data(count: 16))
         let engine = try EngineLocator(roots: [root.path]).locate()
-        return (ControlHandler(registry: HeadlessRegistry(directory: vms, engine: engine), hostKind: "headless"), vms)
+        return (ControlHandler(registry: HeadlessRegistry(directory: vms, engine: engine), hostKind: "headless", captureDirectory: scratchCaptureDirectory), vms)
     }
 
     func testDeleteRefusesNonClone() async throws {

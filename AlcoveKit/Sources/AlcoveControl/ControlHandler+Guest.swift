@@ -146,28 +146,32 @@ extension ControlHandler {
         return agent
     }
 
-    /// The outcome of a recipe: `truncated` is the agent's flag that it kept only the tail of an output stream.
+    /// The outcome of a recipe: `answered` tells whether the agent answered the request at all, `hasText` whether the
+    /// script printed anything on the stream `detail` comes from, and `truncated` is the agent's flag that it kept only
+    /// the tail of an output stream.
     struct RecipeOutput {
         var ok: Bool
         var detail: String
         var stdout: String
         var timedOut = false
         var truncated = false
+        var answered = true
+        var hasText = true
     }
 
     /// Runs `script` in the guest. `ok` means exit code 0 without a timeout; `detail` is trimmed stderr on failure, trimmed stdout otherwise.
-    /// The guest gets `timeoutMilliseconds` for the script, 60 s when nil.
-    func runRecipe(_ agent: AgentClient, _ script: String, vm: String, op: String,
-                   timeoutMilliseconds: Int? = nil) async -> (ok: Bool, detail: String, stdout: String) {
-        let r = await runRecipeOutput(agent, script, vm: vm, op: op, timeoutMilliseconds: timeoutMilliseconds)
+    /// The guest gets 60 s for the script.
+    func runRecipe(_ agent: AgentClient, _ script: String, vm: String, op: String) async -> (ok: Bool, detail: String, stdout: String) {
+        let r = await runRecipeOutput(agent, script, vm: vm, op: op)
         return (r.ok, r.detail, r.stdout)
     }
 
-    func runRecipeOutput(_ agent: AgentClient, _ script: String, vm: String, op: String, timeoutMilliseconds: Int? = nil) async -> RecipeOutput {
-        let limit = timeoutMilliseconds ?? ControlHandler.recipeTimeoutMilliseconds
+    /// Runs `script` in the guest within `limit`; without one the guest gets 60 s and the host waits 15 s longer.
+    func runRecipeOutput(_ agent: AgentClient, _ script: String, vm: String, op: String, limit: RecipeLimit? = nil) async -> RecipeOutput {
+        let limit = limit ?? RecipeLimit(guestMilliseconds: ControlHandler.recipeTimeoutMilliseconds, marginSeconds: 15)
         do {
-            let r = try await agent.call("exec.run", ["cmd": .string(script), "timeout_ms": .int(Int64(limit))],
-                                         timeout: .seconds(limit / 1000 + 15))
+            let r = try await agent.call("exec.run", ["cmd": .string(script), "timeout_ms": .int(Int64(limit.guestMilliseconds))],
+                                         timeout: .seconds(limit.hostSeconds))
             let code = r["code"]?.intValue ?? -1
             let timedOut = r["timed_out"]?.boolValue ?? false
             let truncated = r["truncated"]?.boolValue ?? false
@@ -175,10 +179,10 @@ extension ControlHandler {
             let err = (r["stderr"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let ok = code == 0 && !timedOut
             if ok { return RecipeOutput(ok: true, detail: out, stdout: out, truncated: truncated) }
-            let detail = !err.isEmpty ? err : timedOut ? "timed out after \(limit / 1000) s" : out.isEmpty ? "exit code \(code)" : out
-            return RecipeOutput(ok: false, detail: detail, stdout: out, timedOut: timedOut, truncated: truncated)
+            let detail = !err.isEmpty ? err : timedOut ? "timed out after \(limit.guestMilliseconds / 1000) s" : out.isEmpty ? "exit code \(code)" : out
+            return RecipeOutput(ok: false, detail: detail, stdout: out, timedOut: timedOut, truncated: truncated, hasText: !err.isEmpty || !out.isEmpty)
         } catch {
-            return RecipeOutput(ok: false, detail: agentFailure(error, vm: vm, op: op).description, stdout: "")
+            return RecipeOutput(ok: false, detail: agentFailure(error, vm: vm, op: op).description, stdout: "", answered: false)
         }
     }
 

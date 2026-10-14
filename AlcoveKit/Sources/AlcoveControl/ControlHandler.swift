@@ -105,18 +105,31 @@ public actor ControlHandler {
     let makeProxy: @Sendable () -> ProxyControlling
     /// The HTTP captures by VM name.
     var captures: [String: HTTPCapture] = [:]
-    /// One `vm.http.start` or `vm.http.stop` per VM at a time.
+    /// One `vm.http.start`, `vm.http.stop` or cleanup after an earlier capture per VM at a time.
     let captureGate = InputGate()
-    /// Per VM: the snapshots created while it was capturing.
-    var captureSnapshots: [String: Set<String>] = [:]
+    /// One proxy is started at a time.
+    let proxyStartGate = InputGate()
+    let httpTiming: HTTPTiming
+    /// The captures whose guest is not restored, and the snapshots created during a capture.
+    let captureJournal: CaptureJournal
+    /// Per VM: the running cleanup after an earlier capture.
+    var staleCleanups: [String: (id: UUID, task: Task<Bool, Never>)] = [:]
+    /// Per VM: the target object this handler observes the agent connections of.
+    var observedTargets: [String: EventMark] = [:]
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
-    public init(registry: VMRegistry, hostKind: String, clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
+    /// `captureDirectory` is the folder of the proxy's CA certificate and of the capture journal; a handler that serves
+    /// a user's VMs gets `ProxyProcess.defaultCADirectory`. Without `makeProxy` a capture runs `alcove-proxy` as found
+    /// by `ToolLocator`, with `captureDirectory` as its CA directory.
+    public init(registry: VMRegistry, hostKind: String, captureDirectory: URL,
+                clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
                 engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() },
-                recordingsDirectory: URL? = nil, diagnosticsDirectory: URL? = nil,
-                makeProxy: @escaping @Sendable () -> ProxyControlling = { ProxyProcess(executable: ToolLocator.proxy()) }) {
-        self.makeProxy = makeProxy
+                recordingsDirectory: URL? = nil, diagnosticsDirectory: URL? = nil, httpTiming: HTTPTiming = HTTPTiming(),
+                makeProxy: (@Sendable () -> ProxyControlling)? = nil) {
+        self.makeProxy = makeProxy ?? { ProxyProcess(executable: ToolLocator.proxy(), caDirectory: captureDirectory) }
+        self.httpTiming = httpTiming
+        self.captureJournal = CaptureJournal(directory: captureDirectory)
         self.registry = registry
         self.hostKind = hostKind
         self.clock = clock
@@ -224,7 +237,7 @@ public actor ControlHandler {
         case "vm.list":
             var list: [JSON] = []
             for name in await registry.names() {
-                guard let t = await registry.target(named: name) else { continue }
+                guard let t = await lookUp(name) else { continue }
                 list.append(await status(of: t, quick: true))
             }
             return ["vms": .array(list)]
@@ -265,13 +278,15 @@ public actor ControlHandler {
             let t = try await target(params)
             let force = params["force"]?.boolValue ?? false
             let capturing = captures[t.name] != nil
+            var unrestored = captures[t.name]?.guestChanged == true ? "the VM was not running" : nil
             if await t.state().isActive {
-                if capturing, !force { await restoreCaptureGuest(t) }
+                if capturing { unrestored = force ? (unrestored == nil ? nil : "the stop was forced") : await restoreCaptureGuest(t) }
                 await endCapture(t.name)
                 do {
                     try await t.stop(force: force)
                 } catch {
-                    throw ControlError.failed("stop failed: \(ControlHandler.failureReason(error, fallback: "the VM did not stop; check vm.status, or call vm.stop with force"))")
+                    let reason = ControlHandler.failureReason(error, fallback: "the VM did not stop; check vm.status, or call vm.stop with force")
+                    throw ControlError.failed("stop failed: \(reason)" + (capturing ? "; its HTTP capture was ended, call vm.http.start to capture again" : ""))
                 }
             }
             await endCapture(t.name)
@@ -279,6 +294,7 @@ public actor ControlHandler {
             runtimeForwards[t.name] = nil
             var stopped: [String: JSON] = ["state": .string(describe(await t.state())), "eventSeq": .int(Int64(await passEvents(of: t)))]
             if capturing { stopped["captureEnded"] = true }
+            if let unrestored { stopped["warning"] = .string(ControlHandler.unrestoredWarning(unrestored)) }
             return .object(stopped)
         case "vm.pause":
             let t = try await running(params)
@@ -337,8 +353,7 @@ public actor ControlHandler {
             return try await ui(op: op, params: params)
         case "vm.deploy":
             return try await deploy(params)
-        case "vm.http.start", "vm.http.stop", "vm.http.requests", "vm.http.request", "vm.http.clear",
-             "vm.http.rule.add", "vm.http.rule.list", "vm.http.rule.remove", "vm.http.rule.clear":
+        case _ where ControlHandler.httpOps.contains(op):
             return try await http(op: op, params: params)
         case "vm.wait_idle":
             // "idle" tolerates small changes (clock, cursor blink, widgets): fewer
@@ -370,13 +385,26 @@ public actor ControlHandler {
     func target(_ params: JSON) async throws -> VMTarget {
         guard let name = params["name"]?.stringValue else { throw ControlError.missing("name") }
         if let resolved = ControlHandler.resolvedTarget, resolved.name == name { return resolved.target }
-        guard let t = await registry.target(named: name) else { throw ControlError.noSuchVM(name) }
+        guard let t = await lookUp(name) else { throw ControlError.noSuchVM(name) }
         return t
     }
 
-    /// Drops the lease, the runtime forwards, the cached frame size, the event positions, the agent mark and the capture snapshots of `vm`.
+    /// The VM `name` of the registry. The handler becomes the observer of the agent connections of a target object
+    /// it has not looked up before.
+    func lookUp(_ name: String) async -> VMTarget? {
+        guard let t = await registry.target(named: name) else { return nil }
+        if observedTargets[name]?.source !== (t as AnyObject) {
+            observedTargets[name] = EventMark(source: t as AnyObject, seq: 0)
+            await t.setAgentObserver { [weak self] target, agent in await self?.toolsConnected(target, agent) }
+        }
+        return t
+    }
+
+    /// Drops the lease, the runtime forwards, the cached frame size, the event positions, the agent mark and the
+    /// capture journal entries of `vm`.
     func forget(vm: String) {
-        captureSnapshots[vm] = nil
+        try? captureJournal.forget(vm: vm, now: wallClock())
+        observedTargets[vm] = nil
         leases.forget(vm: vm)
         runtimeForwards[vm] = nil
         forwardInstances[vm] = nil
@@ -393,7 +421,7 @@ public actor ControlHandler {
     private func performNotingEvents(op: String, params: JSON) async throws -> JSON {
         guard !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue else { return try await perform(op: op, params: params) }
         var found = ControlHandler.resolvedTarget.flatMap { $0.name == vm ? $0.target : nil }
-        if found == nil { found = await registry.target(named: vm) }
+        if found == nil { found = await lookUp(vm) }
         guard let t = found else { return try await perform(op: op, params: params) }
         let seq = await t.events(since: .max).next
         if ControlHandler.movesEventBaseline(op: op) { advanceEventBaseline(of: t, to: seq) }
@@ -440,7 +468,7 @@ public actor ControlHandler {
         guard st == .running || st == .paused else {
             runtimeForwards[t.name] = nil
             noteVMGone(t.name)
-            await endCapture(t.name)
+            if !ControlHandler.keepsCapture(st) { await endCapture(t.name) }
             throw ControlError.notRunning(t.name, st)
         }
         return t

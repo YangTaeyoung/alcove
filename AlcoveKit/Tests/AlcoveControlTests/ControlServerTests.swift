@@ -13,7 +13,7 @@ final class ControlServerTests: XCTestCase {
     func testRequestsOverTheSocket() async throws {
         let path = "/tmp/alcove-ctl-\(UUID().uuidString.prefix(8)).sock"
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let server = ControlServer(handler: ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"), socketPath: path)
+        let server = ControlServer(handler: ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory), socketPath: path)
         try server.start()
         defer { server.stop() }
         XCTAssertTrue(ControlServer.isAlive(at: path))
@@ -50,7 +50,7 @@ final class ControlServerTests: XCTestCase {
 
     func testALineThatCannotBeParsedIsAnsweredWithTheIDItHolds() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         func reply(_ line: String) async throws -> JSON {
             let data = await ControlServer.process(Data(line.utf8), handler: handler)
             XCTAssertEqual(data.last, 10)
@@ -121,7 +121,7 @@ final class ControlServerTests: XCTestCase {
     func testAServerStartedWithLoadingRecognizersReadsTheWarmUpFrameWithTheLanguagesOfFindText() async throws {
         let seen = recordingRecognizer()
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         _ = try startServer(handler, loadingRecognizers: true)
         await recognitionsEnded()
         let warmUp = seen.value
@@ -136,7 +136,7 @@ final class ControlServerTests: XCTestCase {
     func testCreatingAHandlerAndStartingAServerWithoutLoadingRecognizersReadsNothing() async throws {
         let seen = recordingRecognizer()
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         await recognitionsEnded()
         _ = try startServer(handler)
         let load = RecognitionQueue.shared.load
@@ -157,7 +157,7 @@ final class ControlServerTests: XCTestCase {
         }
         addTeardownBlock { WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) } }
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
         await recognitionsEnded()
         _ = try startServer(handler, loadingRecognizers: true)
         let find = Task { try await handler.handle(op: "vm.find_text", params: ["name": "Win", "languages": ["en-US"]]) }
@@ -246,7 +246,7 @@ final class ControlServerTests: XCTestCase {
 
     func testSerialLaneKeepsOrder() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let (_, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"))
+        let (_, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory))
         let fd = connectClient(path)
         defer { close(fd) }
 
@@ -261,7 +261,7 @@ final class ControlServerTests: XCTestCase {
     func testClosingTheConnectionCancelsConcurrentOps() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
         await t.setAgentWait(.seconds(20))
-        let (server, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"))
+        let (server, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory))
         let fd = connectClient(path)
 
         send("{\"id\":1,\"op\":\"vm.exec.list\",\"name\":\"Win\"}\n{\"id\":2,\"op\":\"vm.fs.list\",\"name\":\"Win\",\"path\":\"/\"}\n", on: fd)
@@ -327,7 +327,7 @@ final class ControlServerTests: XCTestCase {
 
     func testFinishedConcurrentOpsAreForgotten() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
-        let (server, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test"))
+        let (server, path) = try startServer(ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory))
         let fd = connectClient(path)
         defer { close(fd) }
 

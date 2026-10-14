@@ -181,7 +181,8 @@ case "serve":
         fail("a control server is already running at \(socketPath) (the Alcove app, or another alcovectl serve)")
     }
     let registry = HeadlessRegistry(directory: vmDir, engine: engine)
-    let handler = ControlHandler(registry: registry, hostKind: "headless", engineDescription: engine.qemuSystem)
+    let handler = ControlHandler(registry: registry, hostKind: "headless", captureDirectory: ProxyProcess.defaultCADirectory,
+                                 engineDescription: engine.qemuSystem)
     let server = ControlServer(handler: handler, socketPath: socketPath)
     do { try server.start(loadingRecognizers: true) } catch { fail("cannot start control server: \(error)") }
     print("alcove control server (headless) listening at \(socketPath); VMs in \(vmDir.path)")
