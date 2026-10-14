@@ -179,11 +179,21 @@ public final class ControlServer: @unchecked Sendable {
         queue.sync { discardedReplies }
     }
 
+    static let unreadableRequest = "the request line is not JSON that can be read (broken syntax, or a \\u escape of half a surrogate pair); send one JSON object per line"
+
+    /// The reply line to the request line `line`. A line that cannot be parsed is answered with `unreadableRequest`
+    /// and the `id` that `requestID` reads from it.
     static func process(_ line: Data, handler: ControlHandler) async -> Data {
         var id: JSON = .null
         var result: [String: JSON]
         do {
-            let req = try JSON.parse(line)
+            let req: JSON
+            do {
+                req = try JSON.parse(line)
+            } catch {
+                id = requestID(in: line) ?? .null
+                throw ControlHandler.ControlError.failed(unreadableRequest)
+            }
             id = req["id"] ?? .null
             guard let op = req["op"]?.stringValue else { throw ControlHandler.ControlError.missing("op") }
             let r = try await handler.handle(op: op, params: req)
@@ -198,6 +208,72 @@ public final class ControlServer: @unchecked Sendable {
         var data = (try? JSON.object(result).serialized()) ?? Data("{\"ok\":false,\"error\":\"encode failed\"}".utf8)
         data.append(10)
         return data
+    }
+
+    /// The value of the top-level `id` key of a request line that cannot be parsed as a whole: a number or a string.
+    /// The line is scanned from its start; nil when it does not begin as an object, when the scan meets broken syntax
+    /// before it reaches the key, and when the value of the key is anything else.
+    static func requestID(in line: Data) -> JSON? {
+        let bytes = [UInt8](line)
+        var at = 0
+        func skipSpace() { while at < bytes.count, [0x20, 0x09, 0x0D, 0x0A].contains(bytes[at]) { at += 1 } }
+        /// The bytes of the string that starts at `at`, quotes included; nil when it does not end.
+        func string() -> ArraySlice<UInt8>? {
+            guard at < bytes.count, bytes[at] == UInt8(ascii: "\"") else { return nil }
+            let start = at
+            at += 1
+            while at < bytes.count {
+                if bytes[at] == UInt8(ascii: "\\") { at += 2; continue }
+                if bytes[at] == UInt8(ascii: "\"") { at += 1; return bytes[start..<at] }
+                at += 1
+            }
+            return nil
+        }
+        /// Moves past the value that starts at `at`; false when it does not end.
+        func skipValue() -> Bool {
+            guard at < bytes.count else { return false }
+            if bytes[at] == UInt8(ascii: "\"") { return string() != nil }
+            guard bytes[at] == UInt8(ascii: "{") || bytes[at] == UInt8(ascii: "[") else {
+                let start = at
+                while at < bytes.count, ![UInt8(ascii: ","), UInt8(ascii: "}"), UInt8(ascii: "]")].contains(bytes[at]) { at += 1 }
+                return at > start
+            }
+            var depth = 0
+            while at < bytes.count {
+                switch bytes[at] {
+                case UInt8(ascii: "\""):
+                    guard string() != nil else { return false }
+                    continue
+                case UInt8(ascii: "{"), UInt8(ascii: "["): depth += 1
+                case UInt8(ascii: "}"), UInt8(ascii: "]"):
+                    depth -= 1
+                    if depth == 0 { at += 1; return true }
+                default: break
+                }
+                at += 1
+            }
+            return false
+        }
+        skipSpace()
+        guard at < bytes.count, bytes[at] == UInt8(ascii: "{") else { return nil }
+        at += 1
+        while true {
+            skipSpace()
+            guard let key = string() else { return nil }
+            skipSpace()
+            guard at < bytes.count, bytes[at] == UInt8(ascii: ":") else { return nil }
+            at += 1
+            skipSpace()
+            if Array(key) == Array("\"id\"".utf8) {
+                let start = at
+                guard at < bytes.count, skipValue(), let value = try? JSON.parse(Data(bytes[start..<at])) else { return nil }
+                return value.stringValue != nil || value.doubleValue != nil ? value : nil
+            }
+            guard skipValue() else { return nil }
+            skipSpace()
+            guard at < bytes.count, bytes[at] == UInt8(ascii: ",") else { return nil }
+            at += 1
+        }
     }
 
     /// Writes `data` to `fd` while connection `connection` still owns it; drops the reply otherwise.

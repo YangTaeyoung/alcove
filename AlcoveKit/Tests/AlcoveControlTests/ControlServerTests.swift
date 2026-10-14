@@ -48,6 +48,39 @@ final class ControlServerTests: XCTestCase {
         XCTAssertGreaterThan(shot["png"]!.stringValue!.count, 100)
     }
 
+    func testALineThatCannotBeParsedIsAnsweredWithTheIDItHolds() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 320, height: 200))
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test")
+        func reply(_ line: String) async throws -> JSON {
+            let data = await ControlServer.process(Data(line.utf8), handler: handler)
+            XCTAssertEqual(data.last, 10)
+            return try JSON.parse(data.dropLast())
+        }
+        let unreadable: JSON = .string(ControlServer.unreadableRequest)
+        let cases: [(String, JSON)] = [
+            (#"{"id": 7, "op": "vm.event_log", "name": "Win", "contains": "\ud83d"}"#, 7),
+            (#"{"op": "hello", "x": "\udc00 tail", "id": "abc"}"#, "abc"),
+            (#"{"nested": {"id": 1, "list": ["}", {"id": 2}]}, "text": "\"id\": 3", "id": 44, "x": }"#, 44),
+            (#"{"id": 9, "op": "hello", "x": }"#, 9),
+            (#" { "id" : 12.5 , "op": "hello" "#, 12.5),
+            (#"{"op": "hello", "x": "\ud83d"}"#, .null),
+            (#"{"x": }, "id": 5}"#, .null),
+            (#"{"id": [5], "x": "\ud83d"}"#, .null),
+            (#"{"id": true, "x": "\ud83d"}"#, .null),
+            (#"{"id": "\ud83d"}"#, .null),
+            ("not json at all", .null),
+            (#"[{"id": 5}"#, .null),
+        ]
+        for (line, id) in cases {
+            let r = try await reply(line)
+            XCTAssertEqual(r, ["ok": false, "id": id, "error": unreadable], line)
+        }
+        let whole = try await reply(#"{"id": 3, "op": "hello"}"#)
+        XCTAssertEqual(whole, ["ok": true, "id": 3, "version": 1, "host": "test"])
+        let noObject = try await reply("[1, 2, 3]")
+        XCTAssertEqual(noObject, ["ok": false, "id": .null, "error": "missing or invalid parameter 'op'"])
+    }
+
     private func startServer(_ handler: ControlHandler, loadingRecognizers: Bool = false) throws -> (ControlServer, String) {
         let path = "/tmp/alcove-ctl-\(UUID().uuidString.prefix(8)).sock"
         let server = ControlServer(handler: handler, socketPath: path)
