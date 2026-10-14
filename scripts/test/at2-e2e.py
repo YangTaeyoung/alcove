@@ -15,14 +15,18 @@ Each check prints `PASS <n> <title>`; the first failing check prints
 connection releases the lease, moves a hidden clone back and deletes the
 clones it created, starts the VM when it is stopped, deletes the snapshot, removes the
 forwards and the firewall rule, restores theme, time zone, clock, display
-scale and resolution, kills the jobs and deletes C:\\alcove-e2e.
+scale and resolution, kills the jobs and deletes C:\\alcove-e2e. The run refuses to start when that
+folder exists. SIGTERM, SIGHUP and SIGINT print `interrupted; restoring the
+guest...`, run the same cleanup and exit with 128 plus the signal's number
+(143, 129, 130); SIGHUP stays ignored when the script was started with it
+ignored (nohup).
 
 Usage: at2-e2e.py [--vm NAME] [--vm-dir DIR] [--only N[,N...]]
 """
 import argparse, base64, glob, json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time
 
 sys.dont_write_bytecode = True
-from alcove_ctl import Client, ControlError, ControlTimeout
+from alcove_ctl import Client, ControlError, ControlTimeout, ignore_stop_signals, stop_signal_handlers
 from mcp_stdio import MCP, MCPError
 
 GUEST = r"C:\alcove-e2e"
@@ -253,7 +257,7 @@ class Run:
         print(f"cleanup failed: {what}", flush=True)
 
     def cleanup(self):
-        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+        previous = ignore_stop_signals()
         try:
             self.cleanup_steps()
         finally:
@@ -271,18 +275,20 @@ class Run:
                 c.close()
             except Exception:
                 pass
+        moved_back = True
         if self.hidden and os.path.isdir(self.hidden[0]) and not os.path.exists(self.hidden[1]):
             try:
                 os.rename(self.hidden[0], self.hidden[1])
             except OSError as e:
+                moved_back = False
                 self.cleanup_error(f"could not move {self.hidden[0]} back to {self.hidden[1]} ({e}); move it by hand")
-        if self.hidden:
+        if self.hidden and moved_back:
             try:
                 shutil.rmtree(os.path.dirname(self.hidden[0]))
             except OSError as e:
                 print(f"cleanup warning: could not remove {os.path.dirname(self.hidden[0])} ({e}); remove it by hand")
         try:
-            with Client(self.c.socket_path) as c:
+            with Client(self.c.socket_path, spawn=False) as c:
                 self.restore(c)
         except ControlError as e:
             self.cleanup_error(f"the control server failed ({e}); check vm.list for the clones '{self.clone_names[0]}' and '{self.clone_names[1]}', "
@@ -903,10 +909,16 @@ def main():
         print(f"FAIL 0: no bundle of '{args.vm}' in {args.vm_dir}; pass --vm-dir")
         sys.exit(1)
 
-    def terminate(signum, frame):
-        raise SystemExit(128 + signum)
+    try:
+        existing = client.call("vm.exec", 90, name=args.vm, timeout=60, command=f"Test-Path -LiteralPath '{GUEST}'")["stdout"].strip()
+    except (ControlError, KeyError) as e:
+        print(f"FAIL 0: the guest could not be probed ({e}); check the guest shell with vm.doctor and run this script again")
+        sys.exit(1)
+    if existing == "True":
+        print(f"FAIL 0: the guest already holds the folder {GUEST}; remove it and run this script again")
+        sys.exit(1)
 
-    signal.signal(signal.SIGTERM, terminate)
+    stop_signal_handlers()
     failed = None
     interrupted = False
     try:
@@ -935,14 +947,15 @@ def main():
         interrupted = True
         raise
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        ignore_stop_signals()
         if interrupted:
             print("interrupted; restoring the guest...", flush=True)
         try:
             run.cleanup()
         except Exception as e:
             run.cleanup_error(f"{type(e).__name__}: {e}")
+        if interrupted and run.cleanup_failed:
+            sys.exit(1)
     if failed or run.cleanup_failed:
         sys.exit(1)
 

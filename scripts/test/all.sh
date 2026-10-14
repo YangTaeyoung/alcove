@@ -3,7 +3,7 @@
 # guest agent tests and cross-builds (agent, fixture app), MCP server build and
 # tests, app build. The Windows install and the VM runs are separate
 # (scripts/test/install-windows.py, install-agent.py, agent-*.py,
-# uia-helper-check.py, at1-e2e.py).
+# uia-helper-check.py, at1-e2e.py ... at7-e2e.py).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"

@@ -30,13 +30,16 @@ removes the LocalDumps key, the dump folder and the Windows Error Reporting
 reports of the fixture that appeared during the run, deletes the two folders
 and the host directory of the run. When a step of that cannot finish, the
 script prints `cleanup failed: ...` with what to do by hand and exits 1.
+SIGTERM, SIGHUP and SIGINT print `interrupted; restoring the guest...`, run the
+same cleanup and exit with 128 plus the signal's number (143, 129, 130); SIGHUP
+stays ignored when the script was started with it ignored (nohup).
 
 Usage: at5-e2e.py [--vm NAME] [--only N[,N...]]
 """
 import argparse, calendar, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time
 
 sys.dont_write_bytecode = True
-from alcove_ctl import Client, ControlError, ControlTimeout
+from alcove_ctl import Client, ControlError, ControlTimeout, ignore_stop_signals, stop_signal_handlers
 from mcp_stdio import MCP, MCPError
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -417,7 +420,7 @@ class Run:
         print(f"cleanup failed: {what}", flush=True)
 
     def cleanup(self):
-        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+        previous = ignore_stop_signals()
         try:
             self.cleanup_steps()
         finally:
@@ -439,7 +442,7 @@ class Run:
         by_hand = (f"end the processes that run from {APP_DIR} and {GUEST}, delete the key {LOCAL_DUMPS} (reg delete /reg:64), "
                    f"delete {DUMPS}, the WER reports of {EXE} in {', '.join(WER_FOLDERS)} and the two folders")
         try:
-            with Client(self.c.socket_path) as c:
+            with Client(self.c.socket_path, spawn=False) as c:
                 restored = self.restore(c, touched, by_hand)
         except ControlError as e:
             restored = False
@@ -980,11 +983,7 @@ def main():
         print(f"FAIL 0: the guest already holds what this run creates: {'; '.join(found)}; remove it and run this script again")
         sys.exit(1)
     run = Run(client, args.vm, apps_existed, wer_before)
-
-    def terminate(signum, frame):
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGTERM, terminate)
+    stop_signal_handlers()
     failed = None
     interrupted = False
     try:
@@ -1013,8 +1012,7 @@ def main():
         interrupted = True
         raise
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        ignore_stop_signals()
         if interrupted:
             print("interrupted; restoring the guest...", flush=True)
         try:

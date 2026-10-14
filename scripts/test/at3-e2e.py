@@ -16,14 +16,18 @@ whose path is printed. However the run ends, a second connection kills the
 jobs and the Notepad processes the run started, puts Notepad's saved tabs
 back once those processes are gone and deletes C:\\alcove-e2e. The host copy is
 deleted after the tabs were put back; when a step of that cannot finish, the
-script prints `cleanup failed: ...` with what to do by hand and exits 1.
+script prints `cleanup failed: ...` with what to do by hand and exits 1. The
+run refuses to start when C:\\alcove-e2e exists. SIGTERM, SIGHUP and SIGINT
+print `interrupted; restoring the guest...`, run the same cleanup and exit with
+128 plus the signal's number (143, 129, 130); SIGHUP stays ignored when the
+script was started with it ignored (nohup).
 
 Usage: at3-e2e.py [--vm NAME] [--only N[,N...]]
 """
 import argparse, base64, hashlib, os, re, shutil, signal, struct, sys, tempfile, time
 
 sys.dont_write_bytecode = True
-from alcove_ctl import Client, ControlError, ControlTimeout
+from alcove_ctl import Client, ControlError, ControlTimeout, ignore_stop_signals, stop_signal_handlers
 from mcp_stdio import MCP, MCPError
 
 GUEST = r"C:\alcove-e2e"
@@ -280,7 +284,7 @@ class Run:
         print(f"cleanup failed: {what}", flush=True)
 
     def cleanup(self):
-        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+        previous = ignore_stop_signals()
         try:
             self.cleanup_steps()
         finally:
@@ -302,7 +306,7 @@ class Run:
             by_hand = (f"; end the Notepad of this run in the guest, then make {NOTEPAD_STATE} equal to the copy in {self.notepad_copy} "
                        "(delete the files that are not in the copy" + ("" if self.notepad_names is not None else "; the folder did not exist before the run") + ")")
         try:
-            with Client(self.c.socket_path) as c:
+            with Client(self.c.socket_path, spawn=False) as c:
                 self.restore(c, by_hand)
         except ControlError as e:
             self.cleanup_error(f"the control server failed ({e}); check the guest for jobs of this run in vm.exec.list and for {GUEST}{by_hand}")
@@ -620,11 +624,16 @@ def main():
               "start it with scripts/test/ctl.py vm.start, wait for the guest tools (scripts/test/install-agent.py installs them) and run this script again")
         sys.exit(1)
     run = Run(client, args.vm)
+    try:
+        existing = client.call("vm.exec", 90, name=args.vm, timeout=60, command=f"Test-Path -LiteralPath '{GUEST}'")["stdout"].strip()
+    except (ControlError, KeyError) as e:
+        print(f"FAIL 0: the guest could not be probed ({e}); check the guest shell with vm.doctor and run this script again")
+        sys.exit(1)
+    if existing == "True":
+        print(f"FAIL 0: the guest already holds the folder {GUEST}; remove it and run this script again")
+        sys.exit(1)
 
-    def terminate(signum, frame):
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGTERM, terminate)
+    stop_signal_handlers()
     failed = None
     interrupted = False
     try:
@@ -653,8 +662,7 @@ def main():
         interrupted = True
         raise
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        ignore_stop_signals()
         if interrupted:
             print("interrupted; restoring the guest...", flush=True)
         try:

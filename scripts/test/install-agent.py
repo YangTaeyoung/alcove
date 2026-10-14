@@ -15,7 +15,7 @@ install.log during this run. The script then requires, in this order:
 3. hello on the forwarded agent port matches
    guest-tools/internal/server/server.go.
 
-Usage: install-agent.py [--vm NAME] [--ssh-port N] [--agent-port N]
+Usage: install-agent.py [--vm NAME] [--user NAME] [--ssh-port N] [--agent-port N]
 """
 import argparse, hashlib, json, os, re, socket, subprocess, sys, time
 
@@ -28,26 +28,35 @@ SERVER_GO = os.path.join(ROOT, "guest-tools", "internal", "server", "server.go")
 KEY = os.path.expanduser("~/Library/Application Support/Alcove/test_id_ed25519")
 SSH_OPTS = ["-i", KEY, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR"]
-GUEST_COPY = "C:/Users/alcove/alcove-agent.exe"
-GUEST_STDERR = r"C:\Users\alcove\alcove-agent-install.err"
+USER = "alcove"
 INSTALLED = r"C:\Program Files\Alcove\alcove-agent.exe"
 GUEST_AGENT_PORT = 7645
 REQUIRED_CAPS = ("rpc", "jobs", "proc", "fs")
 
 INSTALL_LOG = r"C:\ProgramData\Alcove\install.log"
-# Prints the installer's exit code, the first line it wrote to stderr, and the
-# last line of install.log when the installer wrote that file during this run.
-INSTALL_PS = (
-    '$before = (Get-Date).ToUniversalTime().Ticks; "before=$before"; '
-    r'$p = Start-Process -FilePath "C:\Users\alcove\alcove-agent.exe" -ArgumentList "--install","--allow-exec" -Wait -PassThru '
-    f'-RedirectStandardError "{GUEST_STDERR}"; '
-    '"exit=$($p.ExitCode)"; '
-    f'"stderr=$(Get-Content -LiteralPath "{GUEST_STDERR}" -ErrorAction SilentlyContinue | Select-Object -First 1)"; '
-    f'Remove-Item -LiteralPath "{GUEST_STDERR}" -Force -ErrorAction SilentlyContinue; '
-    f'"sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath "{INSTALLED}").Hash.ToLower())"; '
-    f'$log = Get-Item -LiteralPath "{INSTALL_LOG}" -ErrorAction SilentlyContinue; '
-    'if ($log -and $log.LastWriteTimeUtc.Ticks -ge $before) { "log=$(Get-Content -LiteralPath $log.FullName -Tail 1)" }'
-)
+
+
+def guest_copy():
+    return f"C:/Users/{USER}/alcove-agent.exe"
+
+
+def install_ps():
+    """The guest command that prints the installer's exit code, the first line it wrote to stderr, and the
+    last line of install.log when the installer wrote that file during this run."""
+    stderr = rf"C:\Users\{USER}\alcove-agent-install.err"
+    return (
+        '$before = (Get-Date).ToUniversalTime().Ticks; "before=$before"; '
+        rf'$p = Start-Process -FilePath "C:\Users\{USER}\alcove-agent.exe" -ArgumentList "--install","--allow-exec" -Wait -PassThru '
+        f'-RedirectStandardError "{stderr}"; '
+        '"exit=$($p.ExitCode)"; '
+        f'"stderr=$(Get-Content -LiteralPath "{stderr}" -ErrorAction SilentlyContinue | Select-Object -First 1)"; '
+        f'Remove-Item -LiteralPath "{stderr}" -Force -ErrorAction SilentlyContinue; '
+        f'"sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath "{INSTALLED}").Hash.ToLower())"; '
+        f'$log = Get-Item -LiteralPath "{INSTALL_LOG}" -ErrorAction SilentlyContinue; '
+        'if ($log -and $log.LastWriteTimeUtc.Ticks -ge $before) { "log=$(Get-Content -LiteralPath $log.FullName -Tail 1)" }'
+    )
+
+
 PROCESS_PS = (
     f'$p = Get-Process alcove-agent -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -eq "{INSTALLED}" }} '
     '| Sort-Object StartTime | Select-Object -Last 1; '
@@ -75,12 +84,12 @@ def run(what, argv, timeout):
 
 
 def ssh(port, what, cmd, timeout=120):
-    return run(what, ["ssh", *SSH_OPTS, "-p", str(port), "alcove@127.0.0.1", cmd], timeout)
+    return run(what, ["ssh", *SSH_OPTS, "-p", str(port), f"{USER}@127.0.0.1", cmd], timeout)
 
 
 def ssh_up(port):
     try:
-        r = subprocess.run(["ssh", *SSH_OPTS, "-p", str(port), "alcove@127.0.0.1", "hostname"],
+        r = subprocess.run(["ssh", *SSH_OPTS, "-p", str(port), f"{USER}@127.0.0.1", "hostname"],
                            capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
         return False
@@ -152,7 +161,7 @@ def install_failure(got):
 
 def install(ssh_port, digest):
     """Runs the installer in the guest and returns the guest time taken just before it."""
-    r = ssh(ssh_port, "the installer over ssh", INSTALL_PS)
+    r = ssh(ssh_port, "the installer over ssh", install_ps())
     got = fields(r.stdout)
     log("install:", ", ".join(f"{k}={got[k]}" for k in ("exit", "sha256", "stderr", "log") if got.get(k)) or (r.stdout + r.stderr).strip()[:300])
     if r.returncode != 0 or got.get("exit") != "0":
@@ -169,7 +178,10 @@ def wait_for_new_process(ssh_port, before):
     got = {}
     end = time.time() + 60
     while True:
-        got = fields(ssh(ssh_port, "the agent process query over ssh", PROCESS_PS, timeout=60).stdout)
+        query = ssh(ssh_port, "the agent process query over ssh", PROCESS_PS, timeout=60)
+        if query.returncode != 0:
+            fail(f"the agent process query over ssh exited with {query.returncode}: {query.stderr.strip() or 'no error text'}; check that ssh on port {ssh_port} still answers")
+        got = fields(query.stdout)
         started = got.get("start", "").isdigit() and int(got["start"]) > before
         if started and got.get("pid") and got.get("listener") == got["pid"]:
             log(f"agent process {got['pid']} started after the install and listens on guest port {GUEST_AGENT_PORT}")
@@ -203,9 +215,12 @@ def read_hello(port):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--vm", default="Windows 11")
+    ap.add_argument("--user", default="alcove", help="the guest account the ssh login uses")
     ap.add_argument("--ssh-port", type=int, default=2222)
     ap.add_argument("--agent-port", type=int, default=7646)
     args = ap.parse_args()
+    global USER
+    USER = args.user
 
     for p in (AGENT, KEY):
         if not os.path.exists(p):
@@ -215,7 +230,7 @@ def main():
     ensure_running(args.vm, args.ssh_port)
 
     log("copying", os.path.relpath(AGENT, ROOT), "sha256", digest)
-    scp = run("scp of the agent binary", ["scp", *SSH_OPTS, "-P", str(args.ssh_port), AGENT, f"alcove@127.0.0.1:{GUEST_COPY}"], 300)
+    scp = run("scp of the agent binary", ["scp", *SSH_OPTS, "-P", str(args.ssh_port), AGENT, f"{USER}@127.0.0.1:{guest_copy()}"], 300)
     if scp.returncode != 0:
         fail("scp: " + scp.stderr.strip())
 

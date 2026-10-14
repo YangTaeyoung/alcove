@@ -182,7 +182,7 @@ class Run:
         self.script = None
         self.started_utc = None
         self.clipboard = None
-        self.timer_pids = []
+        self.timer_jobs = []
 
     # calls
 
@@ -410,7 +410,7 @@ class Run:
         self.end_children()
         by_hand = f"end the processes that run from {APP_DIR} and {GUEST}, then delete the two folders"
         try:
-            with Client(self.c.socket_path) as c:
+            with Client(self.c.socket_path, spawn=False) as c:
                 restored = self.restore(c, by_hand)
         except (ControlError, Failure) as e:
             restored = False
@@ -466,11 +466,13 @@ class Run:
                     c.call("vm.snapshot.delete", 600, name=self.vm, snapshot=SNAPSHOT)
             except ControlError as e:
                 self.cleanup_error(f"vm.snapshot.delete of {SNAPSHOT} answered {e}; delete the snapshot with scripts/test/ctl.py vm.snapshot.delete")
-        try:
-            timers = {p["pid"] for p in self.processes(c) if "powershell" in (p["name"] or "").lower()} & set(self.timer_pids)
-        except ControlError:
-            timers = set()
-        self.kill(c, sorted(timers))
+        for job in self.timer_jobs:
+            try:
+                c.call("vm.exec.kill", 60, name=self.vm, job=job)
+            except ControlTimeout:
+                raise
+            except ControlError:
+                pass
         try:
             left = self.end(c, lambda: self.own_processes(c))
         except ControlError as e:
@@ -741,7 +743,7 @@ def signal_script(run, tag):
     return path, began, release, after
 
 
-@check("SIGINT, SIGTERM and SIGHUP during a step end run-script with 130, 143 and 129, the lease is released at once and no step runs after the signal")
+@check("SIGINT, SIGTERM and SIGHUP during a step end run-script with 130, 143 and 129, the lease is released within 5 s and no step runs after the signal")
 def _(run):
     run.fixture()
     run.prepare_guest()
@@ -752,7 +754,7 @@ def _(run):
         before = len(run.log())
         timer = run.call("vm.exec.start", command=f"Start-Sleep -Seconds {RELEASE_AFTER_S}; "
                                                   f"Set-Content -LiteralPath '{GUEST}\\{release}' -Value release")
-        run.timer_pids.append(timer["pid"])
+        run.timer_jobs.append(timer["job"])
         p = run.spawn(["run-script", "--socket", run.c.socket_path, script])
         end = time.time() + 60
         while began not in run.guest_names(GUEST):

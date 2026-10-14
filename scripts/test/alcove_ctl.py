@@ -9,9 +9,15 @@
 
 One reader thread files replies by id, so several requests can be in flight on
 the connection. Starts `alcovectl serve` when nothing answers on the socket
-(ALCOVE_CTL, or the development build in AlcoveKit/.build-ctl).
+(ALCOVE_CTL, or the development build in AlcoveKit/.build-ctl); Client(spawn=False)
+never starts one.
+
+stop_signal_handlers() and ignore_stop_signals() give the e2e scripts their
+SIGTERM, SIGHUP and SIGINT handling.
 """
-import json, os, socket, subprocess, threading, time
+import json, os, signal, socket, subprocess, threading, time
+
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 DEFAULT_SOCKET = os.path.expanduser("~/Library/Application Support/Alcove/control.sock")
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -25,9 +31,26 @@ class ControlTimeout(ControlError):
     """No reply arrived within the time given to wait()."""
 
 
+def stop_signal_handlers():
+    """Makes SIGTERM, SIGHUP and SIGINT raise SystemExit(128 + signal number); SIGHUP stays ignored when the process started with it ignored."""
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    for sig in STOP_SIGNALS:
+        if sig == signal.SIGHUP and signal.getsignal(sig) == signal.SIG_IGN:
+            continue
+        signal.signal(sig, terminate)
+
+
+def ignore_stop_signals():
+    """Ignores SIGTERM, SIGHUP and SIGINT and returns the handlers they had."""
+    return {sig: signal.signal(sig, signal.SIG_IGN) for sig in STOP_SIGNALS}
+
+
 class Client:
-    def __init__(self, socket_path=None):
+    def __init__(self, socket_path=None, spawn=True):
         self.socket_path = socket_path or os.environ.get("ALCOVE_CONTROL_SOCKET") or DEFAULT_SOCKET
+        self._spawn = spawn
         self._sock = self._connect()
         self._write_lock = threading.Lock()
         self._cond = threading.Condition()
@@ -47,6 +70,8 @@ class Client:
                 return s
             except OSError:
                 s.close()
+                if attempt == 0 and not self._spawn:
+                    raise ControlError(f"cannot connect to {self.socket_path}; nothing was started") from None
                 if attempt == 0:
                     ctl = os.environ.get("ALCOVE_CTL") or os.path.join(ROOT, "AlcoveKit", ".build-ctl", "debug", "alcovectl")
                     try:

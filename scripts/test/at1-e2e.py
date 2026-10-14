@@ -8,15 +8,19 @@ Needs the VM running with the agent installed with --allow-exec
 `npm run build` in mcp/. Each check prints `PASS <n> <title>`; the first
 failing check prints `FAIL <n>: <reason>` and the script exits 1. Guest files
 go under C:\\alcove-e2e (in, ctl, mcp), host files under a temporary directory.
-However the run ends, a second connection kills the jobs and ping processes the
-script started, deletes the guest directories, and the host directory is removed.
+The run refuses to start when C:\\alcove-e2e or a PING.EXE process exists in the guest.
+However the run ends, a second connection kills the jobs the script started,
+deletes the guest directories, and the host directory is removed. SIGTERM,
+SIGHUP and SIGINT print `interrupted; cleaning up...`, run the same cleanup and
+exit with 128 plus the signal's number (143, 129, 130); SIGHUP stays ignored
+when the script was started with it ignored (nohup).
 
 Usage: at1-e2e.py [--vm NAME] [--only N[,N...]]
 """
-import argparse, hashlib, os, re, shutil, sys, tempfile, time, unicodedata
+import argparse, hashlib, os, re, shutil, signal, sys, tempfile, time, unicodedata
 
 sys.dont_write_bytecode = True
-from alcove_ctl import Client, ControlError, ControlTimeout
+from alcove_ctl import Client, ControlError, ControlTimeout, ignore_stop_signals, stop_signal_handlers
 from mcp_stdio import MCP, MCPError
 
 GUEST = r"C:\alcove-e2e"
@@ -62,7 +66,9 @@ class Run:
         self.c = client
         self.vm = vm
         self.jobs = []
-        self.ping_started = False
+        self.hostname = ""
+        self.user = ""
+        self.cleanup_failed = False
         self.host = tempfile.mkdtemp(prefix="alcove-e2e-")
         self.mcps = []
 
@@ -91,9 +97,8 @@ class Run:
         return r["job"], r["pid"]
 
     def start_ping(self):
-        """Starts an endless ping as a job; cleanup kills every ping process."""
-        expect(self.pings() == [] or self.ping_started, "PING.EXE runs already in the guest; stop it before this check")
-        self.ping_started = True
+        """Starts an endless ping as a job; cleanup kills the job's process tree."""
+        expect(self.pings() == [], "PING.EXE runs already in the guest; stop it before this check")
         return self.start("ping -t 127.0.0.1")
 
     def pings(self):
@@ -132,6 +137,14 @@ class Run:
         return m
 
     def cleanup(self):
+        previous = ignore_stop_signals()
+        try:
+            self.cleanup_steps()
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def cleanup_steps(self):
         for m in self.mcps:
             try:
                 m.close()
@@ -142,10 +155,8 @@ class Run:
         except Exception:
             pass
         try:
-            with Client(self.c.socket_path) as c:
+            with Client(self.c.socket_path, spawn=False) as c:
                 steps = [("vm.exec.kill", {"job": j}) for j in self.jobs]
-                if self.ping_started:
-                    steps.append(("vm.process.kill", {"processName": "PING.EXE", "tree": True}))
                 steps += [("vm.fs.delete", {"path": p, "recursive": True}) for p in (G_IN, G_CTL, G_MCP)]
                 steps.append(("vm.fs.delete", {"path": GUEST}))
                 for op, params in steps:
@@ -154,7 +165,8 @@ class Run:
                     except ControlError:
                         pass
         except ControlError as e:
-            print(f"cleanup: cannot reach the control server ({e}); delete {GUEST} in the guest by hand")
+            self.cleanup_failed = True
+            print(f"cleanup failed: cannot reach the control server ({e}); kill the jobs {self.jobs!r} and delete {GUEST} in the guest by hand")
         shutil.rmtree(self.host, ignore_errors=True)
 
 
@@ -202,9 +214,8 @@ def _(run):
     r = run.exec("echo %CD%&echo %ALCOVE_E2E%", shell="cmd", cwd="C:\\Windows", env={"ALCOVE_E2E": "from-cmd"})
     expect(lines(r["stdout"]) == ["C:\\Windows", "from-cmd"], f"shell cmd: stdout {r['stdout']!r}, stderr {r['stderr']!r}")
     r = run.call("vm.exec", argv=["C:\\Windows\\System32\\whoami.exe"], shell="none", timeout=30)
-    expect(lines(r["stdout"]) == ["alcove-win\\alcove"] and r["code"] == 0, f"argv: code {r['code']!r}, stdout {r['stdout']!r}")
+    expect([l.lower() for l in lines(r["stdout"])] == [f"{run.hostname}\\{run.user}".lower()] and r["code"] == 0, f"argv: code {r['code']!r}, stdout {r['stdout']!r}")
     expect(run.pings() == [], "PING.EXE runs already in the guest; stop it before this check")
-    run.ping_started = True
     began = time.monotonic()
     r = run.call("vm.exec", 15, command="ping -n 60 127.0.0.1", timeout=3)
     took = time.monotonic() - began
@@ -236,7 +247,7 @@ def _(run):
             raise Failure(f"{what} did not answer within 4 s of a running vm.exec") from None
         expect(r.get("ok") is True, f"{what} failed: {r.get('error')}")
         if rid == host_id:
-            expect(lines(r["stdout"]) == ["alcove-win"], f"hostname printed {r['stdout']!r}")
+            expect(lines(r["stdout"]) == [run.hostname], f"hostname printed {r['stdout']!r}")
         else:
             expect(r.get("png"), "vm.screenshot returned no image")
     fast = max(c.arrival(shot_id)[1], c.arrival(host_id)[1]) - began
@@ -493,7 +504,6 @@ def _(run):
     mcp_read_until(run, m, filt, lambda seen, last: "exited with code 0" in last)
 
     expect(run.pings() == [], "PING.EXE runs already in the guest; stop it before this check")
-    run.ping_started = True
     ping = mcp_start(run, m, {"argv": ["C:\\Windows\\System32\\PING.EXE", "-t", "127.0.0.1"], "shell": "none"})
     mcp_read_until(run, m, ping, lambda seen, last: "Reply from 127.0.0.1" in seen)
     out = tool(m, "alcove_exec_list", {"name": vm})
@@ -611,7 +621,7 @@ def _(run):
     seen.append(message)
     began = time.monotonic()
     r = run.exec("hostname")
-    expect(lines(r["stdout"]) == ["alcove-win"] and time.monotonic() - began < 5,
+    expect(lines(r["stdout"]) == [run.hostname] and time.monotonic() - began < 5,
            f"after the refused request vm.exec printed {r['stdout']!r} in {time.monotonic() - began:.1f} s")
     return " | ".join(seen)
 
@@ -634,7 +644,22 @@ def main():
         sys.exit(1)
 
     run = Run(client, args.vm)
+    try:
+        probe = run.exec("hostname; $env:USERNAME; (Test-Path -LiteralPath '" + GUEST + "'); @(Get-Process -Name PING -ErrorAction SilentlyContinue).Count")
+        names = lines(probe["stdout"])
+        run.hostname, run.user, folder_exists, ping_count = (names + ["", "", "", ""])[:4]
+        found = ([f"the folder {GUEST}"] if folder_exists == "True" else []) + (["a PING.EXE process"] if ping_count not in ("", "0") else [])
+    except (ControlError, KeyError) as e:
+        print(f"FAIL 0: the guest could not be probed ({e}); check the guest shell with vm.doctor and run this script again")
+        shutil.rmtree(run.host, ignore_errors=True)
+        sys.exit(1)
+    if found:
+        print(f"FAIL 0: the guest already holds {' and '.join(found)}; remove it and run this script again")
+        shutil.rmtree(run.host, ignore_errors=True)
+        sys.exit(1)
+    stop_signal_handlers()
     failed = None
+    interrupted = False
     try:
         for n, title, fn in CHECKS:
             if only and n not in only:
@@ -649,15 +674,31 @@ def main():
                 failed = f"FAIL {n}: {e}"
             except MCPError as e:
                 failed = f"FAIL {n}: the MCP server failed ({e})"
-            except (KeyError, IndexError, TypeError) as e:
+            except (KeyError, IndexError, TypeError, ValueError, AttributeError) as e:
                 failed = f"FAIL {n}: a reply lacks an expected field ({type(e).__name__}: {e})"
+            except OSError as e:
+                failed = f"FAIL {n}: {e}"
             if failed:
                 break
             print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
+    except (KeyboardInterrupt, SystemExit):
+        interrupted = True
+        raise
     finally:
-        run.cleanup()
+        ignore_stop_signals()
+        if interrupted:
+            print("interrupted; cleaning up...", flush=True)
+        try:
+            run.cleanup()
+        except Exception as e:
+            run.cleanup_failed = True
+            print(f"cleanup failed: {type(e).__name__}: {e}")
+        if interrupted and run.cleanup_failed:
+            sys.exit(1)
     if failed:
         print(failed)
+        sys.exit(1)
+    if run.cleanup_failed:
         sys.exit(1)
 
 

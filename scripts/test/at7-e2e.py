@@ -292,7 +292,7 @@ class Run:
             self.stream.close()
             self.stream = None
         try:
-            with Client(self.c.socket_path) as c:
+            with Client(self.c.socket_path, spawn=False) as c:
                 self.restore(c)
         except (ControlError, Failure) as e:
             self.cleanup_error(f"the control server failed ({e}); call vm.http.stop for '{self.vm}', end the processes that run from "
@@ -478,18 +478,24 @@ def _(run):
     job = run.call("vm.exec.start", argv=["curl.exe", "-N", "-sS", "-x", f"http://10.0.2.2:{run.port}", target])["job"]
     seen, offset, text, code = {}, 0, "", None
     end = time.time() + 60
-    while True:
-        r = run.call("vm.exec.read", job=job, outOffset=offset)
-        text += r["out"]
-        offset = r["outNext"]
-        for n in range(1, EVENTS + 1):
-            if f"data: event {n}" in text and n not in seen:
-                seen[n] = time.monotonic()
-        if r["state"] != "running":
-            code = r.get("code")
-            break
-        expect(time.time() < end, f"curl.exe still runs 60 s after it started; it printed {text[-300:]!r}")
-        time.sleep(0.2)
+    try:
+        while True:
+            r = run.call("vm.exec.read", job=job, outOffset=offset)
+            text += r["out"]
+            offset = r["outNext"]
+            for n in range(1, EVENTS + 1):
+                if f"data: event {n}" in text and n not in seen:
+                    seen[n] = time.monotonic()
+            if r["state"] != "running":
+                code = r.get("code")
+                break
+            expect(time.time() < end, f"curl.exe still runs 60 s after it started; it printed {text[-300:]!r}")
+            time.sleep(0.2)
+    finally:
+        try:
+            run.call("vm.exec.kill", job=job)
+        except ControlError:
+            pass
     expect(code == 0, f"curl.exe exited with {code}: {r.get('err', '').strip()}")
     expect(sorted(seen) == list(range(1, EVENTS + 1)), f"curl.exe printed {text!r}")
     spread = seen[EVENTS] - seen[1]
@@ -506,8 +512,10 @@ def _(run):
 
 @check("vm.http.stop puts the guest's proxy settings back, removes the CA and leaves the direct path working")
 def _(run):
+    captured = len(run.exchanges())
+    expect(captured >= 6, f"vm.http.requests lists {captured} exchanges; checks 2 to 6 made at least 6")
     r = run.call("vm.http.stop", 400)
-    expect(r["exchanges"] >= 6 and not r.get("warning"), f"vm.http.stop answered {r!r}")
+    expect(r["exchanges"] >= captured and not r.get("warning"), f"vm.http.stop answered {r!r} after {captured} exchanges were listed")
     run.capture_may_run = False
     differences = proxy_differences(run.reading, run.proxy_reading())
     expect(not differences, f"after vm.http.stop: {'; '.join(differences)}")

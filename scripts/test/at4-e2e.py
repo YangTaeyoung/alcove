@@ -33,7 +33,8 @@ junctions with rmdir and deletes the two folders and the host directory of the
 run. When a step of that cannot finish, the script prints
 `cleanup failed: ...` with what to do by hand and exits 1. SIGTERM, SIGHUP
 and SIGINT print `interrupted; restoring the guest...`, run the same cleanup
-and exit with 128 plus the signal's number (143, 129, 130).
+and exit with 128 plus the signal's number (143, 129, 130); SIGHUP stays ignored
+when the script was started with it ignored (nohup).
 
 Usage: at4-e2e.py [--vm NAME] [--only N[,N...]]
 """
@@ -566,7 +567,7 @@ class Run:
             by_hand += (f"; end the Notepad of this run, then make {NOTEPAD_STATE} equal to the copy in {self.notepad_copy} "
                         "(delete the files that are not in the copy" + ("" if self.notepad_names is not None else "; the folder did not exist before the run") + ")")
         try:
-            with Client(self.c.socket_path) as c:
+            with Client(self.c.socket_path, spawn=False) as c:
                 restored = self.restore(c, touched, by_hand)
         except ControlError as e:
             restored = False
@@ -1363,6 +1364,8 @@ def main():
         raise SystemExit(128 + signum)
 
     for sig in STOP_SIGNALS:
+        if sig == signal.SIGHUP and signal.getsignal(sig) == signal.SIG_IGN:
+            continue
         signal.signal(sig, terminate)
 
     try:

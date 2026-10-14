@@ -7,7 +7,11 @@ Notepad, File Explorer and the fixture app (build/alcove-fixture-windows-arm64.e
 built by scripts/test/all.sh) in the guest. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py) and neither Notepad nor the
 fixture running. Each check prints `PASS <n> <title>` or `FAIL <n>: <reason>`;
-the script exits 1 when a check failed. Files go under C:\\alcove-e2e.
+the script exits 1 when a check failed. Files go under C:\\alcove-e2e; the run
+refuses to start when that folder exists. SIGTERM, SIGHUP and SIGINT print
+`interrupted; cleaning up...`, run the same cleanup and exit with 128 plus the
+signal's number (143, 129, 130), or 1 when the cleanup left something behind;
+SIGHUP stays ignored when the script was started with it ignored (nohup).
 
 Before Notepad starts, the files of its saved tabs are copied to a temporary
 directory on the host, whose path is printed. However the run ends, a second
@@ -26,6 +30,9 @@ that a ref of the first replacement is unknown to the second; the checks then
 run against the helper the agent started for the next operation.
 """
 import argparse, base64, hashlib, json, ntpath, os, re, select, shutil, signal, socket, statistics, sys, tempfile, time
+
+sys.dont_write_bytecode = True
+from alcove_ctl import ignore_stop_signals, stop_signal_handlers
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FIXTURE_BUILD = os.path.join(ROOT, "build", "alcove-fixture-windows-arm64.exe")
@@ -1151,8 +1158,7 @@ def cleanup(port, run):
     started, puts Notepad's saved tabs back, closes the File Explorer windows
     the run opened and deletes the files it wrote. Returns the sentences that
     say what could not be cleaned up."""
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ignore_stop_signals()
     problems = []
     try:
         a = Agent(port)
@@ -1275,12 +1281,19 @@ def main():
     print(f"helper pid {ping['pid']}" + (f" (started after pid {killed} was killed)" if killed is not None else "")
           + f", session {ping['session']}, {ping['integrity']} integrity, first answer after {took:.2f} s", flush=True)
 
+    try:
+        existing = a.call("fs.stat", path=E2E)["exists"]
+    except (Failure, OSError, ValueError, KeyError, TypeError) as e:
+        print(f"FAIL 0: the guest could not be probed ({e}); run scripts/test/install-agent.py and run this script again")
+        sys.exit(1)
+    if existing:
+        print(f"FAIL 0: the guest already holds the folder {E2E}; remove it and run this script again")
+        sys.exit(1)
+
     run = Run(a)
     failed = False
-
-    def terminate(*_):
-        raise SystemExit(1)
-    signal.signal(signal.SIGTERM, terminate)
+    interrupted = False
+    stop_signal_handlers()
     try:
         for n, title, fn in CHECKS:
             if only and n not in only:
@@ -1298,10 +1311,19 @@ def main():
                 continue
             failed = True
             print(f"FAIL {n}: {reason}", flush=True)
+    except (KeyboardInterrupt, SystemExit):
+        interrupted = True
+        raise
     finally:
-        for problem in cleanup(args.agent_port, run):
+        ignore_stop_signals()
+        if interrupted:
+            print("interrupted; cleaning up...", flush=True)
+        problems = cleanup(args.agent_port, run)
+        for problem in problems:
             failed = True
             print(f"FAIL cleanup: {problem}", flush=True)
+        if interrupted and problems:
+            sys.exit(1)
     sys.exit(1 if failed else 0)
 
 

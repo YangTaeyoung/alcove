@@ -7,14 +7,20 @@ sends welcome, then req/res with ids. Needs the agent installed with
 `PASS <n> <title>`; the first failing check prints `FAIL <n>: <reason>` and the
 script exits 1. Files go under C:\\alcove-e2e\\rpc. However the run ends, a
 second connection kills the jobs the script started, which include the
-Character Map windows it opened, and deletes that directory.
+Character Map windows it opened, and deletes that directory. The run refuses to
+start when C:\\alcove-e2e exists. SIGTERM, SIGHUP and SIGINT print
+`interrupted; cleaning up...`, run the same cleanup and exit with 128 plus the
+signal's number (143, 129, 130); SIGHUP stays ignored when the script was
+started with it ignored (nohup).
 
 Usage: agent-rpc-windows.py [--agent-port N] [--only N[,N...]]
 """
-import argparse, base64, hashlib, json, ntpath, os, select, socket, sys, time
+import argparse, base64, hashlib, json, ntpath, os, select, signal, socket, sys, time
+
+sys.dont_write_bytecode = True
+from alcove_ctl import ignore_stop_signals, stop_signal_handlers
 
 BASE = r"C:\alcove-e2e\rpc"
-HOME = r"C:\Users\alcove"
 CHUNK = 262144
 WINDOW_CHECK = (
     "Add-Type -Namespace AlcoveE2E -Name Win -MemberDefinition '"
@@ -115,6 +121,8 @@ class Agent:
 class Run:
     def __init__(self, agent):
         self.a = agent
+        self.home = ""
+        self.user = ""
         self.jobs = []
         self.markers = []
 
@@ -148,6 +156,14 @@ class Run:
         """On a new connection: kills the started jobs and the PowerShell
         processes whose command line holds a registered marker, then deletes
         BASE and its parent when that is empty."""
+        previous = ignore_stop_signals()
+        try:
+            self.cleanup_steps(port)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def cleanup_steps(self, port):
         try:
             a = Agent(port)
         except (Failure, OSError, ValueError) as e:
@@ -223,7 +239,7 @@ def _(a, run):
 def _(a, run):
     r = a.call("exec.run", shell="none", argv=["C:\\Windows\\System32\\whoami.exe"])
     out = lines(r["stdout"])
-    expect(len(out) == 1 and "alcove" in out[0] and r["code"] == 0, f"code {r['code']!r}, stdout {r['stdout']!r}, stderr {r['stderr']!r}")
+    expect(len(out) == 1 and run.user.lower() in out[0].lower() and r["code"] == 0, f"code {r['code']!r}, stdout {r['stdout']!r}, stderr {r['stderr']!r}")
 
 
 @check("exec.run timeout kills the process tree")
@@ -390,9 +406,9 @@ def _(a, run):
     expect(flat == ["한글 dir"], f"non-recursive fs.list names are {flat!r}")
 
     r = a.call("fs.stat", path="~")
-    expect(r["path"] == HOME and r["dir"] is True, f"'~' resolves to {r!r}")
+    expect(r["path"] == run.home and r["dir"] is True, f"'~' resolves to {r!r}")
     r = a.call("fs.stat", path="~/Desktop")
-    expect(r["path"] == HOME + "\\Desktop" and r["exists"] is True, f"'~/Desktop' resolves to {r!r}")
+    expect(r["path"] == run.home + "\\Desktop" and r["exists"] is True, f"'~/Desktop' resolves to {r!r}")
 
     text = "".join(f"line {i:04d}\r\n" for i in range(1, 1001)).encode()
     log = BASE + "\\tail.log"
@@ -505,7 +521,19 @@ def main():
         sys.exit(1)
 
     run = Run(a)
+    try:
+        run.home = a.call("fs.stat", path="~")["path"]
+        run.user = ntpath.basename(run.home)
+        existing = a.call("fs.stat", path=ntpath.dirname(BASE))["exists"]
+    except (Failure, OSError, ValueError, KeyError, TypeError) as e:
+        print(f"FAIL 0: the guest could not be probed ({e}); run scripts/test/install-agent.py and run this script again")
+        sys.exit(1)
+    if existing:
+        print(f"FAIL 0: the guest already holds the folder {ntpath.dirname(BASE)}; remove it and run this script again")
+        sys.exit(1)
+    stop_signal_handlers()
     failed = None
+    interrupted = False
     try:
         for n, title, fn in CHECKS:
             if only and n not in only:
@@ -522,7 +550,13 @@ def main():
                 failed = f"FAIL {n}: the connection to the agent broke ({type(e).__name__}: {e})"
                 break
             print(f"PASS {n} {title}" + (f" ({note})" if note else ""), flush=True)
+    except (KeyboardInterrupt, SystemExit):
+        interrupted = True
+        raise
     finally:
+        ignore_stop_signals()
+        if interrupted:
+            print("interrupted; cleaning up...", flush=True)
         run.cleanup(args.agent_port)
     if failed:
         print(failed)
