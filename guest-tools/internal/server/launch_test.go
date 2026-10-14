@@ -403,6 +403,21 @@ func TestClaimSetKeepsHeldIdsWhenItForgetsTheReleasedOnes(t *testing.T) {
 	}
 }
 
+func TestClaimSetForgetsTheOldestReleasedIdBeforeAHeldOne(t *testing.T) {
+	var c claimSet
+	for i := 0; i < maxClaims; i++ {
+		c.add(fmt.Sprintf("0x%x", i))
+	}
+	c.hold("0x0")
+	c.add("0xfffff")
+	if !c.ids["0x0"] || !c.held["0x0"] || c.ids["0x1"] || !c.ids["0xfffff"] || len(c.ids) != maxClaims || len(c.order) != maxClaims {
+		t.Fatalf("0x0 kept %v, 0x1 kept %v, %d ids in an order of %d", c.ids["0x0"], c.ids["0x1"], len(c.ids), len(c.order))
+	}
+	if c.order[0] != "0x0" || c.order[1] != "0x2" || c.order[len(c.order)-1] != "0xfffff" {
+		t.Fatalf("order begins %v and ends %v", c.order[:2], c.order[len(c.order)-1])
+	}
+}
+
 func TestAHelperStartReleasesTheClaimsOfLaunchesThatAnswered(t *testing.T) {
 	s := New(Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir(), UI: &fakeUI{}})
 	before := map[string]bool{}

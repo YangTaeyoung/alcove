@@ -354,6 +354,10 @@ file (`log: <path> is not opened because %ProgramData% is not set` on stderr),
 logs to stderr, starts no helper, and answers every `ui.*` and `win.*`
 operation with
 `the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task`.
+An `app.launch` that waits for a window (`wait_window_ms` above 0, the
+default) starts nothing and answers
+`'<path>' was not started because the windows could not be listed: the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task`;
+with `wait_window_ms: 0` it starts the program.
 
 Before a start the agent waits up to 10 s for the previous helper process to
 end (`the previous UI helper process has not ended after 10 s; retry`); once

@@ -43,7 +43,9 @@ type claimSet struct {
 	held  map[string]bool
 }
 
-// add records id; when that makes more than maxClaims ids, the oldest leave.
+// add records id; when that makes more than maxClaims ids, the oldest other
+// ids that are not held leave, and the oldest held ones when every other id
+// is held.
 func (c *claimSet) add(id string) {
 	if c.ids[id] {
 		return
@@ -54,9 +56,17 @@ func (c *claimSet) add(id string) {
 	c.ids[id] = true
 	c.order = append(c.order, id)
 	for len(c.order) > maxClaims {
-		delete(c.ids, c.order[0])
-		delete(c.held, c.order[0])
-		c.order = c.order[1:]
+		victim := 0
+		for i, other := range c.order[:len(c.order)-1] {
+			if !c.held[other] {
+				victim = i
+				break
+			}
+		}
+		gone := c.order[victim]
+		delete(c.ids, gone)
+		delete(c.held, gone)
+		c.order = append(c.order[:victim], c.order[victim+1:]...)
 	}
 }
 
@@ -71,7 +81,7 @@ func (c *claimSet) hold(id string) {
 	c.held[id] = true
 }
 
-// release ends the mark hold set; the id stays claimed.
+// release ends the hold on id; the id stays claimed.
 func (c *claimSet) release(id string) {
 	delete(c.held, id)
 }
