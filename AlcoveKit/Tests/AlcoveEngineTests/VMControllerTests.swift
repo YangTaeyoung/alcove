@@ -1,6 +1,7 @@
 import XCTest
 @testable import AlcoveEngine
 import AlcoveDisplayProtocol
+import CryptoKit
 
 /// End-to-end tests against the real engine in build/qemu-build (EDK2 only, no OS).
 /// Skipped when the engine has not been built. The state machine itself is
@@ -137,6 +138,8 @@ final class VMControllerTests: XCTestCase {
         let template = try makeVM()
         let bundle = try template.bundle.cloneLinked(named: "Clone", engine: engine)
         let clone = VMController(bundle: bundle, config: try bundle.loadConfig(), engine: engine)
+        let templateFiles = await template.config.disks.map { template.bundle.diskURL($0) } + [template.bundle.efiVarsURL]
+        let digests = try templateFiles.map(digest)
         await XCTAssertThrowsErrorAsync(try await template.start())
 
         try await clone.start(discardChanges: true)
@@ -154,6 +157,12 @@ final class VMControllerTests: XCTestCase {
         XCTAssertEqual(list.map(\.name), ["kept"])
         let base = try await template.snapshots()
         XCTAssertTrue(base.isEmpty)
+        XCTAssertEqual(try templateFiles.map(digest), digests, "the template's disk and UEFI variables are unchanged")
+    }
+
+    /// The SHA-256 of the file at `url`, in hex.
+    private func digest(_ url: URL) throws -> String {
+        SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
     }
 
     func testFirmwareVariableWritesReachTheFlashFileAfterASnapshot() async throws {
