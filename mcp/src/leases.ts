@@ -54,8 +54,12 @@ export class LeasedControlClient extends ControlClient {
     }
   }
 
-  /** Releases every held lease, ignoring failures. */
+  /** Releases every held lease over the open connection, ignoring failures; without a connection it only empties the book. */
   async releaseAll(timeoutMs = 5000): Promise<void> {
+    if (!this.connected) {
+      for (const [name] of this.leases.entries()) this.leases.clear(name);
+      return;
+    }
     await Promise.all(
       this.leases.entries().map(async ([name, lease]) => {
         try {

@@ -15,7 +15,9 @@ async function serve(answer: (request: Request) => Record<string, unknown>) {
   const socketPath = path.join(dir, "c.sock");
   const requests: Request[] = [];
   const sockets: net.Socket[] = [];
+  let connections = 0;
   const server = net.createServer((s) => {
+    connections++;
     sockets.push(s);
     let buffer = "";
     s.setEncoding("utf8");
@@ -36,6 +38,7 @@ async function serve(answer: (request: Request) => Record<string, unknown>) {
   return {
     client,
     requests,
+    connections: () => connections,
     sent: () => requests.map(({ id: _id, ...rest }) => rest),
     close: async () => {
       client.close();
@@ -136,10 +139,11 @@ test("call leaves the book untouched when a lease refusal names a VM without a s
 test("releaseAll releases every stored lease and empties the book", async () => {
   const s = await serve(() => ({ ok: true }));
   try {
+    await s.client.call("vm.list");
     s.client.leases.set("A", "tok-a");
     s.client.leases.set("B", "tok-b");
     await s.client.releaseAll();
-    const sent = s.sent().sort((x, y) => String(x.name).localeCompare(String(y.name)));
+    const sent = s.sent().filter((r) => r.op === "vm.lease.release").sort((x, y) => String(x.name).localeCompare(String(y.name)));
     assert.deepEqual(sent, [
       { op: "vm.lease.release", name: "A", lease: "tok-a" },
       { op: "vm.lease.release", name: "B", lease: "tok-b" },
@@ -153,10 +157,23 @@ test("releaseAll releases every stored lease and empties the book", async () => 
 test("releaseAll empties the book when a release fails", async () => {
   const s = await serve((r) => (r.name === "A" ? { ok: false, error: "no VM named 'A'; call vm.list" } : { ok: true }));
   try {
+    await s.client.call("vm.list");
     s.client.leases.set("A", "tok-a");
     s.client.leases.set("B", "tok-b");
     await s.client.releaseAll();
-    assert.equal(s.requests.length, 2);
+    assert.equal(s.requests.filter((r) => r.op === "vm.lease.release").length, 2);
+    assert.deepEqual(s.client.leases.entries(), []);
+  } finally {
+    await s.close();
+  }
+});
+
+test("releaseAll without a connection opens none, sends nothing and empties the book", async () => {
+  const s = await serve(() => ({ ok: true }));
+  try {
+    s.client.leases.set("A", "tok-a");
+    await s.client.releaseAll();
+    assert.equal(s.connections(), 0);
     assert.deepEqual(s.client.leases.entries(), []);
   } finally {
     await s.close();
