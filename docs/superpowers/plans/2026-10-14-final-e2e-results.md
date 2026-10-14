@@ -97,6 +97,7 @@ key, and deleted with its profile at the end.
 | D5 (N4) | install-agent.py reported the no-key `refused` as `no hello`; a malformed `agentKey` started the VM without `alcove-hostkey` and the agent's sentence named the wrong fix | | b095d1d: the scripts print the agent's sentence; e15a02c: `vm.start` refuses such a VM with `the agentKey in <path>/config.json is not 64 hexadecimal digits, …` | `testStartIsRefusedWhenTheAgentKeyIsNot64HexadecimalDigits`; `read_hello` returned a fake refusal line |
 | D6 (N5, N6) | listen retry up to 30 s; a test name about pairing | | d6e50c1 (5 s); bd51e5b (rename) | listen test; guest retry lines 1, 2, 4, 5, 5 s |
 | D7 | an interrupted `vm.http.start` left the guest's system proxy pointing at the stopped capture's port, with the CA removed, no journal entry and no capture; the doctor flagged it and only a `vm.http.stop` cleared it | the agent call of the cancelled start ended at once while its PowerShell recipe kept running in the guest; the undo ran first and the recipe then set the proxy | f0490bd: the guest steps of `vm.http.start` run in an unstructured task to their end, then a cancellation is checked and the undo runs | `testTheUndoOfACancelledStartWaitsForTheRecipeThatWasRunning` (failed before: `clearProxy` was sent while `setProxy` was still held); guest matrix above |
+| D8 | `app.launch` of a bare name expanded the `%VAR%` of the machine `Path` and of `HKLM\…\App Paths` with the agent's environment, which carries the user's `HKCU\Environment` | `ExpandEnvironmentStringsW` on the REG_EXPAND_SZ values in the agent process | dbc18c1: the new package `internal/sysfolder` expands only `%SystemDrive%`, `%SystemRoot%`, `%windir%` from `GetSystemWindowsDirectoryW` and the Program Files variables from their `…Dir` values under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion`; anything else is skipped | `TestABareNameResolvesInTheSystemFolderWhateverTheEnvironmentSays` (on the guest, 2a3506d with only this test resolved `notepad` to `…\Temp\TestABareNameResolves…\001\system32\notepad.exe`; passes at dbc18c1), `TestAnAppPathsProgramResolvesToAnExistingFile`, the four `internal/sysfolder` tests; over the wire the HKCU route did not reach a launch (see the section below) |
 | T1 | at5 check 3 expected the image key without `AlcoveCreated` | the protocol (`vm.crash_dumps.enable`) marks an image key it creates | 9b64f89 (script) | at5 11/11 |
 | T2 | at6 check 9 read the fixture log right after run-script exited | `vm.ui.click` answers once the input is sent; the send line, and the reply's `done` 2.4 s later, arrived after the read and the `done` fell into the SIGINT run | cb0a8f1 (script waits up to 10 s for both) | at6 13/13 |
 | T3 | at7 check 2 found an empty captured body | the fixture closed the response body unread; the proxy's write to the guest failed before it captured the chunk it had read | 25f58a2 (fixture reads the body) | at7 8/8 three times |
@@ -163,3 +164,40 @@ capture, journal entry, `C:\alcove-e2e`, `C:\alcove-dumps` or `LocalDumps` key;
 `HKCU\Environment` without the test overrides; the user `alcovetest` and its
 profile deleted. The guest keeps the new agent and the locked folders
 `C:\ProgramData\Alcove` and `C:\alcove-apps` (empty).
+
+## After the last review (2026-10-15)
+
+Same host, VM and `alcovectl serve` (built from 2a3506d; the host side did
+not change). Under test: dbc18c1 (app.launch resolution, D8), 9b998fa
+(handshake auth deadline before the queue) and 7f5b2e3 (UI answer of an
+agent without a ProgramData folder). The agent reports `0.2.0` before and
+after; the builds are told apart by `go version -m` (`vcs.revision`).
+
+| Check | Result | Evidence |
+|---|---|---|
+| Agent in the guest before | b095d1d build | `C:\Program Files\Alcove\alcove-agent.exe` SHA-256 `a04ff91b…e3b934`, equal to `build/alcove-agent-windows-arm64.exe` with `vcs.revision=b095d1d`; b095d1d..2a3506d changes only `cmd/alcove-fixture` in `guest-tools` |
+| Old agent, `HKCU\Environment` `SystemRoot=C:\Users\alcove\sr` (REG_EXPAND_SZ), `sr\System32\notepad.exe` = the fixture, task `AlcoveAgent` ended and run | override reaches the task's environment; the agent does not serve | a probe task with the same settings (`/RL HIGHEST /IT`, run in the session) wrote `SystemRoot=C:\Users\alcove\sr`, `windir=C:\WINDOWS`, `SystemDrive=C:`; agent.log every 5 s: `listen on 0.0.0.0:7645 failed (listen tcp 0.0.0.0:7645: socket: The requested service provider could not be loaded or initialized.); trying again in 5 s`; `vm.status` `tools: false`, so no `vm.app.launch` could be sent |
+| Old agent, `HKCU\Environment` `ProgramFiles=C:\Users\alcove\pf`, `pf\Windows Mail\wab.exe` = the fixture (App Paths `wab.exe` is `%ProgramFiles%\Windows Mail\wab.exe`) | override does not reach the agent | `vm.exec` `set ProgramFiles` in the restarted agent: `C:\Program Files`; `vm.app.launch path=wab waitWindow=0` → `process.exited` path `C:\Program Files\Windows Mail\wab.exe` (the real one; Contacts window closed) |
+| Install of the new agent (7f5b2e3) | PASS | `install-agent.py`: SHA-256 `6ce7e182…15bc264`, `vcs.revision=7f5b2e3`, hello `auth: "key"`, authenticated |
+| New agent, same `SystemRoot` override, task restarted | same as the old agent | the same `listen … failed (… service provider could not be loaded or initialized.)` lines; `tools: false` |
+| New agent, `vm.app.launch path=notepad waitWindow=0` | PASS | `process.exited` path `C:\WINDOWS\system32\notepad.exe`, its child `…\WindowsApps\Microsoft.WindowsNotepad_11.2607.14.0_arm64__8wekyb3d8bbwe\Notepad\Notepad.exe`; window closed |
+| New agent, `vm.app.launch path=msedge waitWindow=0` (App Paths, Edge already running) | PASS | `process.exited` path `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`, window `New tab - Profile 1 - Microsoft Edge` opened and closed |
+| Revert | PASS | `SystemRoot` and `ProgramFiles` values deleted from `HKCU\Environment` (left: `Path`, `TEMP`, `TMP`, `OneDrive`), `C:\Users\alcove\sr`, `pf` and the probe task deleted, task restarted; `vm.exec` `set SystemRoot` → `C:\WINDOWS` |
+| Go tests on the guest, `internal/sysfolder` | PASS | 4 of 4 |
+| Go tests on the guest, `internal/server` (`-test.run` the bare name, App Paths, replaced handshake, 16 idle handshakes, served connection tests) | PASS | 5 of 5 |
+| Go tests on the guest, `cmd/alcove-agent` | PASS | 15 pass, 1 skip (`TestInstallLogIsNotWrittenThroughALink`: symbolic links need a privilege); the two expansion tests now run in `internal/sysfolder` |
+| `TestABareNameResolvesInTheSystemFolderWhateverTheEnvironmentSays` on 2a3506d (the test file alone, `sysfolder.WindowsFolder` replaced by an inline `GetSystemWindowsDirectoryW`) | FAILS as expected | `notepad resolves to "C:\Users\alcove\AppData\Local\Temp\TestABareNameResolvesInTheSystemFolderWhateverTheEnvironmentSays978700886\001\system32\notepad.exe", <nil>; expected "C:\WINDOWS\System32\notepad.exe"` |
+| `agent-rpc-windows.py` | PASS | 17 of 17 |
+| `at4-e2e.py` | PASS | 16 of 16, 0 skipped (104 s) |
+| `mcp-smoke.py --vm "Windows 11"` | PASS | `PASS: MCP end to end` (27 s) |
+
+Concern: a `SystemRoot` in the user's `HKCU\Environment` keeps the agent from
+listening after its next start (the agent log names the Winsock error, not
+the variable); the same value made PowerShell over ssh fail
+(`Loading managed Windows PowerShell failed with error 8009001d`) and
+`MoNotificationUx.exe` and `OneDriveLauncher.exe` crash in the session. It
+was cleared from an elevated PowerShell opened through the guest display.
+
+End state: `Windows 11` stopped through `vm.stop` (`mcp-smoke.py` had stopped
+it); the `alcovectl serve` from 2a3506d still running; no `alcove-proxy`; no
+temporary worktree; the guest keeps the agent built from 7f5b2e3.
