@@ -8,33 +8,67 @@ import (
 	"unsafe"
 )
 
-var (
-	procSHGetKnownFolderPath = syscall.NewLazyDLL("shell32.dll").NewProc("SHGetKnownFolderPath")
-	procCoTaskMemFree        = syscall.NewLazyDLL("ole32.dll").NewProc("CoTaskMemFree")
-)
+var procGetSystemWindowsDirectory = syscall.NewLazyDLL("kernel32.dll").NewProc("GetSystemWindowsDirectoryW")
 
-// folderIDProgramData is FOLDERID_ProgramData, {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}.
-var folderIDProgramData = syscall.GUID{Data1: 0x62ab5d82, Data2: 0xfdc1, Data3: 0x4dc3,
-	Data4: [8]byte{0xa9, 0xdd, 0x07, 0x0d, 0x1d, 0x49, 0x5d, 0x97}}
+// profileListKey holds the ProgramData value of the machine.
+const profileListKey = `SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`
 
-// programDataFolder returns the folder Windows names as ProgramData
-// (SHGetKnownFolderPath with FOLDERID_ProgramData); the ProgramData
-// environment variable is not read.
+// programDataFolder returns the folder Windows names as ProgramData: the
+// ProgramData value of the ProfileList key of HKEY_LOCAL_MACHINE, expanded
+// by expandSystemFolder with the system's Windows folder. No environment
+// variable is read.
 func programDataFolder() (string, error) {
-	var p *uint16
-	r, _, _ := procSHGetKnownFolderPath.Call(uintptr(unsafe.Pointer(&folderIDProgramData)), 0, 0, uintptr(unsafe.Pointer(&p)))
-	if p != nil {
-		defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(p)))
+	raw, err := machineString(profileListKey, "ProgramData")
+	if err != nil {
+		return "", err
 	}
-	if r != 0 {
-		return "", fmt.Errorf("SHGetKnownFolderPath: HRESULT 0x%08x", uint32(r))
+	windows, err := systemWindowsFolder()
+	if err != nil {
+		return "", err
 	}
-	if p == nil {
-		return "", fmt.Errorf("SHGetKnownFolderPath returned no path")
+	return expandSystemFolder(raw, windows)
+}
+
+// machineString returns a REG_SZ or REG_EXPAND_SZ value of a key of
+// HKEY_LOCAL_MACHINE without expanding it.
+func machineString(key, name string) (string, error) {
+	k, err := syscall.UTF16PtrFromString(key)
+	if err != nil {
+		return "", err
 	}
-	n := 0
-	for *(*uint16)(unsafe.Add(unsafe.Pointer(p), 2*n)) != 0 {
-		n++
+	var h syscall.Handle
+	if err := syscall.RegOpenKeyEx(syscall.HKEY_LOCAL_MACHINE, k, 0, syscall.KEY_QUERY_VALUE, &h); err != nil {
+		return "", fmt.Errorf("HKLM\\%s: %v", key, err)
 	}
-	return syscall.UTF16ToString(unsafe.Slice(p, n)), nil
+	defer syscall.RegCloseKey(h)
+	n, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		return "", err
+	}
+	var typ, size uint32
+	if err := syscall.RegQueryValueEx(h, n, nil, &typ, nil, &size); err != nil {
+		return "", fmt.Errorf("HKLM\\%s\\%s: %v", key, name, err)
+	}
+	if typ != syscall.REG_SZ && typ != syscall.REG_EXPAND_SZ {
+		return "", fmt.Errorf("HKLM\\%s\\%s is not a string", key, name)
+	}
+	if size < 2 {
+		return "", nil
+	}
+	buf := make([]uint16, size/2)
+	if err := syscall.RegQueryValueEx(h, n, nil, &typ, (*byte)(unsafe.Pointer(&buf[0])), &size); err != nil {
+		return "", fmt.Errorf("HKLM\\%s\\%s: %v", key, name, err)
+	}
+	return syscall.UTF16ToString(buf), nil
+}
+
+// systemWindowsFolder returns the system's Windows folder, the same for
+// every user and session.
+func systemWindowsFolder() (string, error) {
+	buf := make([]uint16, syscall.MAX_PATH)
+	n, _, e := procGetSystemWindowsDirectory.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if n == 0 || int(n) >= len(buf) {
+		return "", fmt.Errorf("GetSystemWindowsDirectoryW: %v", e)
+	}
+	return syscall.UTF16ToString(buf[:n]), nil
 }

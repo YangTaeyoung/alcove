@@ -460,9 +460,14 @@ helper runs in the agent's logon session. Its files are in
 `C:\ProgramData\Alcove\uia`: `bootstrap.ps1`, `helper.cs`, `helper.log` and
 `helper.log.1` (1 MiB each), and a `tmp` folder the compile uses. Every start
 compiles `helper.cs` in memory; no compiled helper is stored.
-`C:\ProgramData` stands for the folder Windows names as ProgramData
-(`SHGetKnownFolderPath(FOLDERID_ProgramData)`); the agent and `--install` do
-not read the `ProgramData` environment variable. That
+`C:\ProgramData` stands for the folder Windows names as ProgramData: the
+`ProgramData` value of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`
+(normally `%SystemDrive%\ProgramData`), in which the agent and `--install`
+replace `%SystemDrive%` with the drive of the system's Windows folder
+(`GetSystemWindowsDirectoryW`) and `%SystemRoot%` and `%windir%` with that
+folder; a value with any other variable is refused. No environment variable is
+read, so a `ProgramData` or `SystemDrive` set in a user's
+`HKCU\Environment` does not move the folder. That
 folder and its parent `C:\ProgramData\Alcove` are given the owner
 Administrators and the access list "Administrators and SYSTEM: full control"
 with inheritance removed (`icacls` reads it back as
