@@ -221,7 +221,7 @@ struct ScriptRunner: Sendable {
             case .success: entry["ok"] = true
             case .failure(let error):
                 entry["ok"] = false
-                entry["error"] = .string("\(error)")
+                entry["error"] = .string(Task.isCancelled || error is CancellationError ? ScriptRunner.cancelledDuring(number) : "\(error)")
             }
             if case .success(let value) = outcome, stepsBytes <= ScriptLimits.stepsBytes {
                 var withResult = entry
@@ -237,7 +237,7 @@ struct ScriptRunner: Sendable {
             result.stepResults.append(.object(entry))
             progress?(number, step, outcome)
             if case .failure(let error) = outcome {
-                if Task.isCancelled || error is CancellationError { return "the run was cancelled during step \(number); start it again" }
+                if Task.isCancelled || error is CancellationError { return ScriptRunner.cancelledDuring(number) }
                 result.failedStep = number
                 let title = step.label.map { "step \(number) (\($0))" } ?? "step \(number)"
                 return "\(title) failed: \(error)"
@@ -245,6 +245,9 @@ struct ScriptRunner: Sendable {
         }
         return nil
     }
+
+    /// The sentence of a run cancelled while step `number` ran.
+    static func cancelledDuring(_ number: Int) -> String { "the run was cancelled during step \(number); start it again" }
 
     /// A copy of `value` with every `png` string replaced by its size and every other long string shortened.
     static func bounded(_ value: JSON, key: String? = nil) -> JSON {

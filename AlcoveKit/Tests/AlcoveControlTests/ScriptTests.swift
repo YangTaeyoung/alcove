@@ -954,6 +954,22 @@ final class ScriptTests: XCTestCase {
         XCTAssertNil(after)
     }
 
+    func testStepCancelledWhileItWaitsCarriesTheCancelSentence() async throws {
+        let rig = try await rig()
+        let wait = "{\"label\": \"wait\", \"op\": \"vm.wait_for\", \"params\": {\"conditions\": [{\"type\": \"file_exists\", \"path\": \"C:\\\\never\"}], \"timeout\": 60}}"
+        let parsed = try script(steps([wait, exec("after")]))
+        let handler = rig.handler
+        let task = Task { await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", progress: nil) }
+        while !rig.agent.received.contains(where: { $0["t"]?.stringValue == "req" }) { try await Task.sleep(for: .milliseconds(10)) }
+        try await Task.sleep(for: .milliseconds(200))
+        task.cancel()
+        let result = await task.value
+        XCTAssertFalse(result.passed)
+        XCTAssertEqual(result.error, "the run was cancelled during step 1; start it again")
+        XCTAssertEqual(result.stepResults.count, 1)
+        XCTAssertEqual(result.stepResults.first?["error"]?.stringValue, "the run was cancelled during step 1; start it again")
+    }
+
     func testCancelledSnapshotRestoreIsReportedAsCancelled() async throws {
         let rig = try await rig()
         let handler = rig.handler
