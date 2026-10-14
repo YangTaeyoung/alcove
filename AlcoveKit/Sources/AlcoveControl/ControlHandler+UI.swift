@@ -334,7 +334,8 @@ extension ControlHandler {
         do {
             await sent?()
             try Task.checkCancellation()
-            result = .success(try await agent.call(agentOp, fields, timeout: UITiming.callTimeout))
+            let call = Task { try await agent.call(agentOp, fields, timeout: UITiming.callTimeout) }
+            result = .success(try await call.value)
         } catch {
             result = .failure(error)
         }
