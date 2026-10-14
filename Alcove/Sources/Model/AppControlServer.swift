@@ -90,6 +90,21 @@ final class AppControlServer {
         guard let handler else { return }
         Task { await handler.vmDeleted(vm: vm, path: path) }
     }
+
+    /// Tells the control handler that the app renamed the VM `oldName` whose bundle was at `oldPath` to `newName` at
+    /// `newPath`, so that the record of HTTP captures follows the VM; without a handler the record in
+    /// `ProxyProcess.defaultCADirectory` is changed directly.
+    func vmRenamed(from oldName: String, oldPath: String, to newName: String, newPath: String) {
+        let handler = self.handler
+        Task {
+            if let handler {
+                await handler.vmRenamed(from: oldName, oldPath: oldPath, to: newName, newPath: newPath)
+            } else {
+                try? ControlHandler.vmRenamed(from: oldName, oldPath: oldPath, to: newName, newPath: newPath,
+                                              captureDirectory: ProxyProcess.defaultCADirectory)
+            }
+        }
+    }
 }
 
 /// `VMRegistry` over `AppModel.shared.sessions`; targets are cached per session
