@@ -127,6 +127,9 @@ public actor ControlHandler {
     let httpTiming: HTTPTiming
     /// The captures whose guest is not restored, and the snapshots created during a capture.
     let captureJournal: CaptureJournal
+    /// Per VM: what ended its last capture when its proxy ended on its own; the next `vm.http.start` or `vm.http.stop`
+    /// of the VM removes it.
+    var lostCaptures: [String: String] = [:]
     /// Per VM: the running cleanup after an earlier capture.
     var staleCleanups: [String: (id: UUID, task: Task<Bool, Never>)] = [:]
     /// Per VM: the latest cleanup after an earlier capture that ended, and whether it removed anything from the guest.
