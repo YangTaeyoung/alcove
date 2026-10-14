@@ -2164,9 +2164,10 @@ cancelled during the restore of `snapshot` ends when the restore has ended
 until then. Otherwise the
 op answers with `{passed, stepsRun, steps, failedStep?, label?, error?, warning?,
 seconds, failure?: {png, width, height}}`; `passed: false` means a step ran and
-failed (or the run was cancelled or lost its lease before its last step
-finished); `error` is present only then. A cancellation after every step
-passed leaves `passed: true`. `warning` is present only when there is
+failed, a step ended with the run's cancellation, or the run was cancelled or
+lost its lease before a later step began; `error` is present only then. A
+step whose op finished despite a cancellation counts as passed, so a
+cancellation during or after the last step can leave `passed: true`. `warning` is present only when there is
 something to report that did not change the outcome. Step numbers, condition
 numbers and expectation numbers start at 1. `stepsRun` counts the steps that started, including the failed one.
 `failure` is a screenshot taken after the failing step and is complete.
