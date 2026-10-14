@@ -400,10 +400,8 @@ public actor ControlHandler {
         return t
     }
 
-    /// Drops the lease, the runtime forwards, the cached frame size, the event positions, the agent mark and the
-    /// capture journal entries of `vm`.
+    /// Drops the lease, the runtime forwards, the cached frame size, the event positions and the agent mark of `vm`.
     func forget(vm: String) {
-        try? captureJournal.forget(vm: vm, now: wallClock())
         observedTargets[vm] = nil
         leases.forget(vm: vm)
         runtimeForwards[vm] = nil

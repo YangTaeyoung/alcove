@@ -57,6 +57,8 @@ public protocol VMTarget: Sendable {
     func engineInstance() async -> Int
     /// The host port forwarded to the guest agent.
     func agentHostPort() async -> Int
+    /// The standardized file path of the VM's bundle; nil when the target has no bundle.
+    func bundlePath() async -> String?
 }
 
 /// What a VM's agent connection is at one moment.
@@ -345,6 +347,7 @@ public actor ControllerTarget: VMTarget {
 
     public func engineInstance() async -> Int { await controller.engineInstance }
     public func agentHostPort() async -> Int { await controller.config.agentHostPort }
+    public func bundlePath() async -> String? { controller.bundle.url.standardizedFileURL.path }
     public func deleteSnapshot(named name: String) async throws { try await controller.deleteSnapshot(named: name) }
     public func monitorCommand(_ line: String) async throws -> String { try await controller.monitorCommand(line) }
     public func setNetworkLink(up: Bool) async throws { try await controller.setNetworkLink(up: up) }

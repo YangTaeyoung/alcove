@@ -12,7 +12,7 @@ extension ControlHandler {
         guard let provisioning = registry as? VMProvisioning else {
             throw ControlError.failed("this control host cannot clone or delete VMs")
         }
-        _ = try await target(params)
+        let owner = try await journalVM(target(params))
         do {
             if op == "vm.clone" {
                 let newName = try string(params, "newName").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -29,6 +29,7 @@ extension ControlHandler {
             let what = op == "vm.clone" ? "clone" : "delete"
             throw ControlError.failed("\(what) failed: \(ControlHandler.failureReason(error, fallback: "the operation could not finish; check vm.list"))")
         }
+        try? captureJournal.forget(vm: owner, now: wallClock())
         forget(vm: name)
         if op == "vm.delete" { recordings.latest[name] = nil }
         return [:]
@@ -92,9 +93,9 @@ extension ControlHandler {
             }
             do { try await t.createSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot create failed: \(engineReason(error))") }
             if let capture = captures[t.name], capture.guestChanged {
-                try? captureJournal.noteSnapshot(snapshot, during: capture.journalEntry(vm: t.name), now: wallClock())
+                try? captureJournal.noteSnapshot(snapshot, during: capture.journalEntry, now: wallClock())
             } else {
-                try? captureJournal.forgetSnapshot(snapshot, vm: t.name, now: wallClock())
+                try? captureJournal.forgetSnapshot(snapshot, vm: await journalVM(t), now: wallClock())
             }
             return ["snapshot": .string(snapshot)]
         case "vm.snapshot.restore":
@@ -110,7 +111,7 @@ extension ControlHandler {
             let restored = await passEvents(of: t)
             let capturing = captures[t.name] != nil
             await endCapture(t.name)
-            let duringCapture = captureJournal.snapshotEntry(snapshot, vm: t.name)
+            let duringCapture = captureJournal.snapshotEntry(snapshot, vm: await journalVM(t))
             if let duringCapture { try? captureJournal.record(duringCapture, now: wallClock()) }
             let agent = await t.agent(timeout: .seconds(max(0, wait)))
             var clockSynced = false
@@ -128,7 +129,7 @@ extension ControlHandler {
             let snapshot = try string(params, "snapshot")
             try await requireSnapshot(snapshot, in: t)
             do { try await t.deleteSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot delete failed: \(engineReason(error))") }
-            try? captureJournal.forgetSnapshot(snapshot, vm: t.name, now: wallClock())
+            try? captureJournal.forgetSnapshot(snapshot, vm: await journalVM(t), now: wallClock())
             return [:]
         case "vm.forward.add":
             let guestPort = try portParameter(params, "guestPort")

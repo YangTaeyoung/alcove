@@ -1,7 +1,7 @@
 import XCTest
 import CryptoKit
 @testable import AlcoveControl
-import AlcoveEngine
+@testable import AlcoveEngine
 import AlcoveAgent
 import AlcoveQMP
 import AlcoveTestSupport
@@ -130,6 +130,15 @@ private func guestProxy(previous: Bool = false, unreadable: Bool = false, port: 
 /// What `clearSystemProxy` prints after it restored the settings a state file with `thumbprint` remembered.
 private func restoredState(_ thumbprint: String, refreshed: Bool = true) -> String {
     "{\"state\":true,\"restored\":true,\"thumbprint\":\"\(thumbprint)\",\"refreshed\":\(refreshed)}"
+}
+
+/// The journal calls of the tests, by VM name alone: they find the entries of every bundle of that name.
+extension CaptureJournal {
+    func entry(for name: String) -> Entry? { entry(for: VM(name: name, path: nil)) }
+    func snapshotEntry(_ snapshot: String, vm name: String) -> Entry? { snapshotEntry(snapshot, vm: VM(name: name, path: nil)) }
+    func remove(vm name: String, now: Date) throws { try remove(vm: VM(name: name, path: nil), now: now) }
+    func forgetSnapshot(_ snapshot: String, vm name: String, now: Date) throws { try forgetSnapshot(snapshot, vm: VM(name: name, path: nil), now: now) }
+    func forget(vm name: String, now: Date) throws { try forget(vm: VM(name: name, path: nil), now: now) }
 }
 
 /// A handler over the running VM "Win", its fake agent and the proxies the handler makes.
@@ -1067,6 +1076,72 @@ final class ControlHTTPTests: XCTestCase {
 
         _ = try await next.handle(op: "vm.snapshot.delete", params: ["name": "Win", "snapshot": "mid-capture"])
         XCTAssertNil(c.journal.snapshotEntry("mid-capture", vm: "Win"))
+    }
+
+    func testHostsWithEquallyNamedVMsKeepTheirOwnEntries() async throws {
+        let dir = try tempDir()
+        let here = CaptureJournal.VM(name: "Win", path: "/Users/someone/Library/Application Support/Alcove/VMs/Win.alcove")
+        let there = CaptureJournal.VM(name: "Win", path: "/Volumes/Other/VMs/Win.alcove")
+        let a = try await capture(directory: dir, bundle: here.path)
+        let b = try await capture(directory: dir, bundle: there.path)
+        _ = try await a.start()
+        XCTAssertEqual(a.journal.entry(for: here)?.path, here.path)
+        XCTAssertNil(a.journal.entry(for: there))
+
+        _ = try await b.h.handle(op: "vm.status", params: ["name": "Win"])
+        b.log.clear()
+        await b.t.connectAgent(try await newConnection(b))
+        let cleanup = await b.h.runningCleanup(of: "Win")
+        XCTAssertNil(cleanup)
+        XCTAssertEqual(b.log.entries, [])
+
+        _ = try await b.start()
+        XCTAssertEqual(a.journal.entry(for: here)?.path, here.path)
+        XCTAssertEqual(a.journal.entry(for: there)?.path, there.path)
+        _ = try await b.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "s"])
+        _ = try await b.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertNil(a.journal.entry(for: there))
+        XCTAssertEqual(a.journal.entry(for: here)?.path, here.path)
+        XCTAssertNil(a.journal.snapshotEntry("s", vm: here))
+        XCTAssertEqual(a.journal.snapshotEntry("s", vm: there)?.path, there.path)
+
+        let text = await b.failure("vm.http.stop")
+        XCTAssertEqual(text, "'Win' is not capturing; call vm.http.start first")
+        XCTAssertEqual(a.journal.entry(for: here)?.path, here.path)
+    }
+
+    func testAJournalEntryWithoutAPathBelongsToEveryVMOfItsName() throws {
+        let dir = try tempDir()
+        let journal = CaptureJournal(directory: dir)
+        try Data(("{\"version\":1,\"captures\":[{\"vm\":\"Win\",\"port\":49152,\"thumbprint\":\"\(caThumbprint)\",\"systemProxy\":true,"
+                  + "\"since\":\"2027-01-15T08:00:00Z\"}],\"snapshots\":[]}").utf8).write(to: journal.url)
+        let here = CaptureJournal.VM(name: "Win", path: "/VMs/Win.alcove")
+        XCTAssertEqual(journal.entry(for: here)?.port, 49152)
+        XCTAssertNil(journal.entry(for: here)?.path)
+        XCTAssertEqual(journal.entry(for: CaptureJournal.VM(name: "Win", path: "/Other/Win.alcove"))?.port, 49152)
+        XCTAssertNil(journal.entry(for: CaptureJournal.VM(name: "Lin", path: "/VMs/Win.alcove")))
+
+        let now = Date()
+        let recorded = CaptureJournal.Entry(vm: "Win", port: 49153, thumbprint: caThumbprint, systemProxy: true, since: "later", path: here.path)
+        try journal.record(recorded, now: now)
+        XCTAssertEqual(journal.entry(for: here), recorded)
+        XCTAssertNil(journal.entry(for: CaptureJournal.VM(name: "Win", path: "/Other/Win.alcove")))
+        XCTAssertEqual(journal.entry(for: CaptureJournal.VM(name: "Renamed", path: here.path)), recorded)
+        let text = try String(contentsOf: journal.url, encoding: .utf8)
+        XCTAssertEqual(try JSON.parse(Data(text.utf8))["captures"], [["vm": "Win", "path": "/VMs/Win.alcove", "port": 49153,
+                                                                     "thumbprint": .string(caThumbprint), "systemProxy": true, "since": "later"]])
+        try journal.remove(vm: CaptureJournal.VM(name: "Win", path: "/Other/Win.alcove"), now: now)
+        XCTAssertEqual(journal.entry(for: here), recorded)
+        try journal.remove(vm: here, now: now)
+        XCTAssertNil(journal.entry(for: here))
+    }
+
+    func testAControllerTargetNamesItsBundleByItsStandardizedPath() async {
+        let bundle = VMBundle(url: URL(fileURLWithPath: "/Users/someone/VMs/../VMs/./Win.alcove"))
+        let engine = EngineLocator.Engine(qemuSystem: "/e/qemu-system-aarch64", qemuImg: "/e/qemu-img", firmwareDir: "/e", swtpm: nil)
+        let controller = VMController(bundle: bundle, config: VMConfig.defaults(name: "Win", guestOS: .windows), engine: engine)
+        let path = await ControllerTarget(name: "Win", controller: controller).bundlePath()
+        XCTAssertEqual(path, "/Users/someone/VMs/Win.alcove")
     }
 
     func testDeleteRemovesTheJournalEntriesOfTheVM() async throws {

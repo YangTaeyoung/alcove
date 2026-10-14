@@ -42,6 +42,8 @@ public struct HTTPTiming: Sendable {
 /// The HTTP capture of one VM.
 struct HTTPCapture {
     let id = UUID()
+    /// The VM as the capture journal knows it.
+    let owner: CaptureJournal.VM
     let proxy: ProxyControlling
     let port: Int
     /// The SHA-1 of the proxy's CA certificate as 40 upper-case hexadecimal digits.
@@ -63,8 +65,8 @@ struct HTTPCapture {
     var watcher: Task<Void, Never>?
 
     /// The capture's entry in the capture journal.
-    func journalEntry(vm: String) -> CaptureJournal.Entry {
-        CaptureJournal.Entry(vm: vm, port: port, thumbprint: thumbprint, systemProxy: systemProxySet, since: since)
+    var journalEntry: CaptureJournal.Entry {
+        CaptureJournal.Entry(vm: owner.name, port: port, thumbprint: thumbprint, systemProxy: systemProxySet, since: since, path: owner.path)
     }
 }
 
@@ -208,15 +210,15 @@ extension ControlHandler {
                   let thumbprint = ControlHandler.certificateThumbprint(pem: pem) else {
                 throw ControlError.failed("the proxy's CA certificate at \(started.caPath) cannot be read; delete ca.pem and ca.key in its folder and call vm.http.start again")
             }
-            var capture = HTTPCapture(proxy: proxy, port: started.port, thumbprint: thumbprint, os: os, instance: await t.engineInstance(),
-                                      since: ISO8601DateFormatter().string(from: wallClock()))
+            var capture = HTTPCapture(owner: await journalVM(t), proxy: proxy, port: started.port, thumbprint: thumbprint, os: os,
+                                      instance: await t.engineInstance(), since: ISO8601DateFormatter().string(from: wallClock()))
             var warnings: [String] = []
             var bundle: String?
             switch (access, GuestRecipes.proxyCAPath(os: os)) {
             case (.ready(let agent), let guestPath?):
                 capture.systemProxySet = request.systemProxy && os == .windows
                 do {
-                    try captureJournal.record(capture.journalEntry(vm: vm), now: wallClock())
+                    try captureJournal.record(capture.journalEntry, now: wallClock())
                 } catch {
                     throw ControlError.failed(ControlHandler.failureReason(error, fallback: "the record of captures to restore could not be written; "
                         + "make \(captureJournal.url.deletingLastPathComponent().path) writable and call vm.http.start again"))
@@ -228,7 +230,7 @@ extension ControlHandler {
                 } catch {
                     let undone = await restoreGuest(t, agent, os: os, thumbprint: thumbprint, op: "vm.http.start", limit: httpTiming.undo)
                     guard undone.failure != nil else {
-                        try? captureJournal.remove(vm: vm, now: wallClock())
+                        try? captureJournal.remove(vm: capture.owner, now: wallClock())
                         throw error
                     }
                     if ControlHandler.failureReason(error, fallback: "") == GuestRecipes.unreadableProxyState { throw error }
@@ -374,7 +376,7 @@ extension ControlHandler {
         if capture.guestChanged {
             if await t.state() == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.toolsWait) {
                 let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
-                if let failure = restored.failure { warnings.append(failure) } else { try? captureJournal.remove(vm: vm, now: wallClock()) }
+                if let failure = restored.failure { warnings.append(failure) } else { try? captureJournal.remove(vm: capture.owner, now: wallClock()) }
                 if let warning = restored.warning { warnings.append(warning) }
             } else {
                 warnings.append("the guest keeps the capture's proxy settings and CA certificate because its guest tools are not reachable; "
@@ -390,7 +392,8 @@ extension ControlHandler {
     /// `vm.http.stop` for a VM without a capture: clears what an earlier capture left in the guest.
     private func stopStaleCapture(_ t: VMTarget) async throws -> JSON {
         let vm = t.name
-        let recorded = captureJournal.entry(for: vm)
+        let owner = await journalVM(t)
+        let recorded = captureJournal.entry(for: owner)
         guard await t.state() == .running, case .ready(let agent) = await guestAccess(t, wait: httpTiming.staleToolsWait) else {
             guard recorded != nil else { throw ControlError.failed("'\(vm)' is not capturing; call vm.http.start first") }
             throw ControlError.failed("'\(vm)' is not capturing, and what an earlier capture left in its guest cannot be restored while its guest "
@@ -398,7 +401,7 @@ extension ControlHandler {
         }
         let stale = await restoreGuest(t, agent, os: await t.guestOS(), thumbprint: recorded?.thumbprint, op: "vm.http.stop", limit: httpTiming.recipe)
         if let failure = stale.failure { throw ControlError.failed(failure) }
-        try? captureJournal.remove(vm: vm, now: wallClock())
+        try? captureJournal.remove(vm: owner, now: wallClock())
         guard stale.cleared else { throw ControlError.failed("'\(vm)' is not capturing; call vm.http.start first") }
         var out: [String: JSON] = ["exchanges": 0, "staleCleared": true]
         if let warning = stale.warning { out["warning"] = .string(warning) }
@@ -448,10 +451,16 @@ extension ControlHandler {
 
     // MARK: - what an earlier capture left
 
+    /// The VM `t` as the capture journal knows it.
+    func journalVM(_ t: VMTarget) async -> CaptureJournal.VM {
+        CaptureJournal.VM(name: t.name, path: await t.bundlePath())
+    }
+
     /// Called for every agent connection a VM adopts: starts the cleanup of `t` when the capture journal holds an
     /// entry for it and no capture of it is live.
-    func toolsConnected(_ t: VMTarget, _ agent: AgentClient) {
-        guard captures[t.name] == nil, captureJournal.entry(for: t.name) != nil else { return }
+    func toolsConnected(_ t: VMTarget, _ agent: AgentClient) async {
+        let owner = await journalVM(t)
+        guard captures[t.name] == nil, captureJournal.entry(for: owner) != nil else { return }
         _ = staleCleanup(t, agent)
     }
 
@@ -482,11 +491,12 @@ extension ControlHandler {
 
     private func cleanStale(_ t: VMTarget, _ agent: AgentClient) async -> Bool {
         let vm = t.name
-        guard captures[vm] == nil, let entry = captureJournal.entry(for: vm), await t.state() == .running,
+        let owner = await journalVM(t)
+        guard captures[vm] == nil, let entry = captureJournal.entry(for: owner), await t.state() == .running,
               case .ready(let ready) = await guestAccess(agent, vm: vm) else { return false }
         let restored = await restoreGuest(t, ready, os: await t.guestOS(), thumbprint: entry.thumbprint, op: "vm.http.stop", limit: httpTiming.undo)
         guard restored.failure == nil else { return false }
-        try? captureJournal.remove(vm: vm, now: wallClock())
+        try? captureJournal.remove(vm: owner, now: wallClock())
         return restored.cleared
     }
 
@@ -510,7 +520,7 @@ extension ControlHandler {
         }
         let restored = await restoreGuest(t, agent, os: capture.os, thumbprint: capture.thumbprint, op: "vm.stop", limit: httpTiming.undo)
         if let failure = restored.failure { return failure }
-        try? captureJournal.remove(vm: t.name, now: wallClock())
+        try? captureJournal.remove(vm: capture.owner, now: wallClock())
         return nil
     }
 

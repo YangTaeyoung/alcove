@@ -3,14 +3,24 @@ import AlcoveQMP
 
 /// The record of HTTP captures whose guest is not restored: `captures.json` in the proxy's CA directory. It holds one
 /// entry per VM whose guest a `vm.http.start` changed, and one note per snapshot created during such a capture.
+/// A VM is known by the standardized path of its bundle; an entry without a path belongs to every VM of its name.
 ///
 /// Every control handler of this user shares the file. A change reads the file, edits it and replaces it in one step
 /// while it holds an exclusive lock on `captures.json.lock`. A file that cannot be read as version 1 counts as
 /// empty; the next change renames it to `captures.json.unreadable-<UTC time>` and writes a new one.
 struct CaptureJournal: Sendable {
+    /// A VM as the journal knows it: its name and the standardized file path of its bundle, when the host has one.
+    struct VM: Equatable, Sendable {
+        var name: String
+        var path: String?
+    }
+
     /// What a capture changed in the guest of one VM.
     struct Entry: Equatable, Sendable {
+        /// The name of the VM.
         var vm: String
+        /// The standardized file path of the VM's bundle; nil in an entry written without one.
+        var path: String?
         /// The loopback port the capture's proxy listens on.
         var port: Int
         /// The SHA-1 of the CA certificate the capture installed, as 40 upper-case hexadecimal digits.
@@ -20,20 +30,37 @@ struct CaptureJournal: Sendable {
         /// When the capture started, as ISO 8601 text.
         var since: String
 
+        /// The VM the entry was written for.
+        var owner: VM { VM(name: vm, path: path) }
+
+        /// Whether the entry belongs to `other`: the same bundle path when both have one, otherwise the same name.
+        func belongs(to other: VM) -> Bool {
+            if let path, let otherPath = other.path { return path == otherPath }
+            return vm == other.name
+        }
+
         fileprivate var json: [String: JSON] {
-            ["vm": .string(vm), "port": .int(Int64(port)), "thumbprint": .string(thumbprint), "systemProxy": .bool(systemProxy),
-             "since": .string(since)]
+            var fields: [String: JSON] = ["vm": .string(vm), "port": .int(Int64(port)), "thumbprint": .string(thumbprint),
+                                          "systemProxy": .bool(systemProxy), "since": .string(since)]
+            if let path { fields["path"] = .string(path) }
+            return fields
         }
 
         fileprivate init?(_ json: JSON) {
             guard let vm = json["vm"]?.stringValue, let port = json["port"]?.intValue, (1...65_535).contains(port),
                   let thumbprint = json["thumbprint"]?.stringValue, ControlHandler.isThumbprint(thumbprint),
                   let systemProxy = json["systemProxy"]?.boolValue, let since = json["since"]?.stringValue else { return nil }
-            self.init(vm: vm, port: port, thumbprint: thumbprint.uppercased(), systemProxy: systemProxy, since: since)
+            var path: String?
+            if let value = json["path"], value != .null {
+                guard let text = value.stringValue, !text.isEmpty else { return nil }
+                path = text
+            }
+            self.init(vm: vm, port: port, thumbprint: thumbprint.uppercased(), systemProxy: systemProxy, since: since, path: path)
         }
 
-        init(vm: String, port: Int, thumbprint: String, systemProxy: Bool, since: String) {
+        init(vm: String, port: Int, thumbprint: String, systemProxy: Bool, since: String, path: String? = nil) {
             self.vm = vm
+            self.path = path
             self.port = port
             self.thumbprint = thumbprint
             self.systemProxy = systemProxy
@@ -66,51 +93,51 @@ struct CaptureJournal: Sendable {
     }
 
     /// The entry of `vm`; nil when the file holds none, is missing or cannot be read.
-    func entry(for vm: String) -> Entry? {
-        read()?.captures.first { $0.vm == vm }
+    func entry(for vm: VM) -> Entry? {
+        read()?.captures.first { $0.belongs(to: vm) }
     }
 
     /// The capture during which `snapshot` of `vm` was created; nil when none is noted.
-    func snapshotEntry(_ snapshot: String, vm: String) -> Entry? {
-        read()?.snapshots.first { $0.snapshot == snapshot && $0.entry.vm == vm }?.entry
+    func snapshotEntry(_ snapshot: String, vm: VM) -> Entry? {
+        read()?.snapshots.first { $0.snapshot == snapshot && $0.entry.belongs(to: vm) }?.entry
     }
 
-    /// Stores `entry` in place of the entry of its VM.
+    /// Stores `entry` in place of the entries of its VM.
     func record(_ entry: Entry, now: Date) throws {
         try change(now: now) { contents in
-            contents.captures.removeAll { $0.vm == entry.vm }
+            contents.captures.removeAll { $0.belongs(to: entry.owner) }
             contents.captures.append(entry)
         }
     }
 
-    /// Removes the entry of `vm`.
-    func remove(vm: String, now: Date) throws {
+    /// Removes the entries of `vm`.
+    func remove(vm: VM, now: Date) throws {
         guard entry(for: vm) != nil else { return }
-        try change(now: now) { $0.captures.removeAll { $0.vm == vm } }
+        try change(now: now) { $0.captures.removeAll { $0.belongs(to: vm) } }
     }
 
     /// Notes that `snapshot` was created during the capture `entry` describes, in place of an earlier note for that
-    /// snapshot name.
+    /// snapshot name of its VM.
     func noteSnapshot(_ snapshot: String, during entry: Entry, now: Date) throws {
         try change(now: now) { contents in
-            contents.snapshots.removeAll { $0.snapshot == snapshot && $0.entry.vm == entry.vm }
+            contents.snapshots.removeAll { $0.snapshot == snapshot && $0.entry.belongs(to: entry.owner) }
             contents.snapshots.append((snapshot, entry))
         }
     }
 
     /// Removes the note of `snapshot` of `vm`.
-    func forgetSnapshot(_ snapshot: String, vm: String, now: Date) throws {
+    func forgetSnapshot(_ snapshot: String, vm: VM, now: Date) throws {
         guard snapshotEntry(snapshot, vm: vm) != nil else { return }
-        try change(now: now) { $0.snapshots.removeAll { $0.snapshot == snapshot && $0.entry.vm == vm } }
+        try change(now: now) { $0.snapshots.removeAll { $0.snapshot == snapshot && $0.entry.belongs(to: vm) } }
     }
 
-    /// Removes the entry and every snapshot note of `vm`.
-    func forget(vm: String, now: Date) throws {
-        guard let contents = read(), contents.captures.contains(where: { $0.vm == vm })
-                || contents.snapshots.contains(where: { $0.entry.vm == vm }) else { return }
+    /// Removes the entries and every snapshot note of `vm`.
+    func forget(vm: VM, now: Date) throws {
+        guard let contents = read(), contents.captures.contains(where: { $0.belongs(to: vm) })
+                || contents.snapshots.contains(where: { $0.entry.belongs(to: vm) }) else { return }
         try change(now: now) { contents in
-            contents.captures.removeAll { $0.vm == vm }
-            contents.snapshots.removeAll { $0.entry.vm == vm }
+            contents.captures.removeAll { $0.belongs(to: vm) }
+            contents.snapshots.removeAll { $0.entry.belongs(to: vm) }
         }
     }
 
