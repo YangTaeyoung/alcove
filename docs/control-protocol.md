@@ -1044,6 +1044,7 @@ server checks before it launches the engine:
 | reason | when |
 |---|---|
 | `the configuration of '<vm>' at <path>/config.json cannot be read; restore or repair config.json before starting` | the bundle's `config.json` is missing or does not decode |
+| `the agentKey in <path>/config.json is not 64 hexadecimal digits, so the guest tools could not check the host; restore config.json from a backup` | the VM's `agentKey` gives no public key for the SMBIOS string `alcove-hostkey` |
 | `'<vm>' is a template with clones (<a>, <b>); delete the clones first or start a clone` | a linked clone of the VM exists (see [Linked clones](#linked-clones)) |
 | `'<vm>' has a suspended session; resume it or discard the suspended state before starting a session that discards changes` | `discardChanges` on a VM with a session saved to disk |
 | `the template of '<clone>' was not found at <path>; the clone cannot run without it` | a clone whose template bundle is gone or unreadable |

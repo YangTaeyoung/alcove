@@ -151,7 +151,8 @@ public actor VMController {
     /// (`VMBundle.advanceDiskEpoch`) and carries the new value in `config` and `runningConfig`;
     /// when that cannot be saved the start is refused.
     /// A VM whose `config.json` is missing or does not decode is refused, whatever kind of start is asked for.
-    /// A VM whose engine runs under another live host is refused (`engineOfAnotherHost()`).
+    /// A VM whose engine runs under another live host is refused (`engineOfAnotherHost()`), and so is a VM whose
+    /// `agentKey` gives no public key for the SMBIOS string `alcove-hostkey`.
     public func start(bootFromCDROM: Bool = false, discardChanges: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
         guard bundle.storedConfig() != nil else {
@@ -172,6 +173,11 @@ public actor VMController {
             throw ControllerError.engineDidNotStart(mismatch)
         }
         if let refusal = engineOfAnotherHost() { throw ControllerError.engineDidNotStart(refusal) }
+        guard config.agentPublicKey != nil else {
+            throw ControllerError.engineDidNotStart(
+                "the agentKey in \(bundle.configURL.path) is not 64 hexadecimal digits, so the guest tools could not check the host; "
+                + "restore config.json from a backup")
+        }
         if !discardChanges, !resuming {
             do {
                 if let epoch = try bundle.advanceDiskEpoch() { config.diskEpoch = epoch }

@@ -993,6 +993,16 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertEqual(try fileNumber(url), file)
     }
 
+    func testStartIsRefusedWhenTheAgentKeyIsNot64HexadecimalDigits() async throws {
+        for key in ["", "xyz", String(repeating: "zz", count: 32), String(repeating: "ab", count: 31)] {
+            let vm = try makeVM { $0.agentKey = key }
+            let refusal = "the agentKey in \(vm.bundle.configURL.path) is not 64 hexadecimal digits, so the guest tools "
+                + "could not check the host; restore config.json from a backup"
+            await assertStartRefused(vm, refusal)
+            await assertStartRefused(vm, refusal, discardChanges: true)
+        }
+    }
+
     func testEphemeralOverlayRemovedOnStop() async throws {
         let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
         let run = vm.bundle.runURL
