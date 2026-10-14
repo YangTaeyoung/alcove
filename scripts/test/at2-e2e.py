@@ -385,7 +385,7 @@ def check(title):
 def _(run):
     rows = run.call("vm.doctor")["checks"]
     ids = [r["id"] for r in rows]
-    expected = ["engine", "host", "state", "display", "tools", "rpc", "exec", "session", "disk", "clock", "network", "scale"]
+    expected = ["engine", "host", "state", "display", "tools", "rpc", "exec", "session", "disk", "clock", "network", "scale", "proxy"]
     expect(ids == expected, f"vm.doctor rows are {ids}, expected {expected}")
     bad = [f"{r['id']}: {r['detail']} ({r.get('hint', 'no hint')})" for r in rows if r["ok"] is not True]
     expect(not bad, "vm.doctor rows that are not ok: " + "; ".join(bad))
@@ -828,7 +828,7 @@ def _(run):
     b = run.client()
     err, out, _ = m.call("alcove_doctor", {"name": run.vm})
     rows = lines(out)
-    expect(not err and len(rows) == 12 and all(r.startswith("ok      ") for r in rows) and rows[0].startswith("ok      engine: "),
+    expect(not err and len(rows) == 13 and all(r.startswith("ok      ") for r in rows) and rows[0].startswith("ok      engine: "),
            f"alcove_doctor answered error={err} {out!r}")
     err, out, _ = m.call("alcove_snapshot_list", {"name": run.vm})
     expect(not err and out == "no snapshots", f"alcove_snapshot_list answered error={err} {out!r}")
@@ -871,7 +871,7 @@ def _(run):
         expect(time.time() < end, "the lease of the closed MCP server is still held after 10 s")
         time.sleep(0.5)
     b.call("vm.mouse.move", 60, name=run.vm, x=640, y=400)
-    return "doctor 12 rows ok; a lost lease is dropped; closing the server releases its lease"
+    return "doctor 13 rows ok; a lost lease is dropped; closing the server releases its lease"
 
 
 def main():
