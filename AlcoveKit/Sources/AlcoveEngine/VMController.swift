@@ -72,6 +72,8 @@ public actor VMController {
     /// for as long as the connection lives (hosts without an app that reads it).
     public private(set) var drainsDisplayMessages = false
     public func setDrainsDisplayMessages(_ on: Bool) { drainsDisplayMessages = on }
+    /// The drain of the live display connection; nil when the connection has none or no engine runs.
+    private(set) var displayDrain: Task<Void, Never>?
 
     /// Consumes and discards the messages of `connection` until its stream ends.
     @discardableResult
@@ -209,7 +211,7 @@ public actor VMController {
             }
             let display = try DisplayConnection(socketPath: bundle.displaySocketPath)
             self.display = display
-            if drainsDisplayMessages { VMController.drain(display) }
+            if drainsDisplayMessages { displayDrain = VMController.drain(display) }
             var options = QEMUCommandBuilder.Options(incomingStatePath: resuming ? bundle.suspendStateURL.path : nil,
                                                      bootFromCDROM: resuming ? false : bootFromCDROM)
             if discardChanges {
@@ -667,6 +669,7 @@ public actor VMController {
         eventTask?.cancel(); eventTask = nil
         await qmp?.disconnect(); qmp = nil
         display?.close(); display = nil
+        displayDrain?.cancel(); displayDrain = nil
         if let q = qemu, q.isRunning { q.kill() }
         qemu = nil
         runningConfig = nil

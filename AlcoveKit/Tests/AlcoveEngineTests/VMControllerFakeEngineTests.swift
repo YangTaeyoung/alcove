@@ -492,6 +492,23 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try await vm.shutdown(force: true)
     }
 
+    func testTheDrainFlagGivesEachStartsDisplayConnectionADrainThatEndsWithTheEngine() async throws {
+        let vm = try makeVM()
+        try await vm.start()
+        var drain = await vm.displayDrain
+        XCTAssertNil(drain, "a drain without the flag")
+        try await vm.shutdown(force: true)
+
+        await vm.setDrainsDisplayMessages(true)
+        try await vm.start()
+        drain = await vm.displayDrain
+        let running = try XCTUnwrap(drain, "no drain with the flag")
+        try await vm.shutdown(force: true)
+        drain = await vm.displayDrain
+        XCTAssertNil(drain, "the drain outlived the engine")
+        await running.value
+    }
+
     func testUSBAttachIDsAreUniquePerAttachment() async throws {
         let vm = try makeVM()
         try await vm.start()
