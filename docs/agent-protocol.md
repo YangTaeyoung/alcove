@@ -376,7 +376,13 @@ ref is forgotten. A request that was inside a helper that ended answers
   `<title> (Not Responding)`) the process of the hung window. The hung window
   itself stays listed.
 - `win.list` lists, top-most first, the top-level windows that are visible,
-  not cloaked and titled, and the foreground window even without a title.
+  not cloaked and titled, and the foreground window even without a title. A
+  notification toast that has the foreground (`New notification`, class
+  `Windows.UI.Core.CoreWindow` of `ShellExperienceHost.exe`, seen with the
+  OneDrive backup toast) is not listed, so no listed window has `foreground:
+  true` then; `ui.tree` with `window: foreground` reads it, and while it is in
+  front `win.action focus` on another window answers the `did not come to the
+  foreground` sentence.
 
 **Window argument.** `window` is an id from `win.list`, `foreground`, or a
 part of a title (case-insensitive; the top-most match). Errors:

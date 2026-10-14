@@ -5,9 +5,11 @@ Code and other agents, `alcovectl`, scripts — drive VMs: list and start them,
 take screenshots, move the mouse, click, type, press keys, run shell commands
 and background jobs in the guest, list and kill guest processes, exchange
 clipboard text, copy, sync, read and write guest files, read the text on the
-screen, wait for conditions, take and restore snapshots, forward ports, cut
-the guest's network link, lease a VM, change guest settings, diagnose a VM,
-and create linked clones and sessions that discard their changes.
+screen, list and act on windows, read and operate the UI elements of a
+Windows guest, launch and deploy apps, read guest events, wait for
+conditions, take and restore snapshots, forward ports, cut the guest's
+network link, lease a VM, change guest settings, diagnose a VM, and create
+linked clones and sessions that discard their changes.
 
 The same server runs inside the Alcove app (which owns the VMs while it is
 running) and inside `alcovectl serve` (headless, when the app is not running).
@@ -17,9 +19,16 @@ connect may start `alcovectl serve` itself.
 
 Transport: newline-delimited JSON. Request `{"id": n, "op": "...", ...params}`;
 response `{"id": n, "ok": true, ...result}` or `{"id": n, "ok": false, "error": "message"}`.
-A request line is at most 8 MiB; a longer one closes the connection.
-Coordinates are guest pixels at the resolution of the last screenshot /
-`vm.status`.
+A request line is at most 8 MiB; a longer one closes the connection. A line
+that cannot be read as JSON (broken syntax, or a `\u` escape of half a
+surrogate pair) is answered with `the request line is not JSON that can be
+read (broken syntax, or a \u escape of half a surrogate pair); send one JSON
+object per line`. That reply carries the request's `id` when the line begins
+as an object whose top-level `id`, a number or a string, comes before the
+broken part; otherwise its `id` is `null`.
+Coordinates are guest pixels of the guest frame as it is when the op runs:
+the pointer ops read the frame size for every move, so they follow a guest
+that changed its resolution.
 
 ## Lanes
 
@@ -27,7 +36,8 @@ Each connection has two lanes.
 
 - **Concurrent lane**: every op whose name starts with `vm.exec`,
   `vm.process.` or `vm.fs.`, and `vm.push_file`, `vm.pull_file`,
-  `vm.sync_dir`, `vm.find_text`. Such a request starts as soon as it arrives and answers when
+  `vm.sync_dir`, `vm.find_text`, `vm.window.list`, `vm.ui.tree`,
+  `vm.ui.find`, `vm.ui.text`, `vm.app.launch`, `vm.deploy`. Such a request starts as soon as it arrives and answers when
   it finishes, so several can be in flight and their replies arrive in any
   order. Match replies by `id`. Pipelined requests of this lane are unordered
   among themselves: two `vm.fs.write` requests to one file sent back to back
@@ -37,19 +47,22 @@ Each connection has two lanes.
   screenshot, mouse, keyboard, clipboard, `vm.batch`, `vm.wait_idle`,
   `vm.wait_for`, snapshots, forwards, `vm.set_network`, leases,
   `vm.set_resolution`, `vm.set_environment`, `vm.doctor`, `vm.clone`,
-  `vm.delete`). These run one after another in the order they arrived, and
+  `vm.delete`, `vm.window.action`, `vm.ui.click`, `vm.ui.type`,
+  `vm.ui.action`, `vm.events`). These run one after another in the order they arrived, and
   their replies come in that order; a long `vm.wait_for` or `vm.batch` holds
   back the later requests of the serial lane of its connection.
 
 The lanes do not wait for each other: a screenshot or a click is answered
 while a `vm.exec` of the same connection is still running. Mouse and keyboard
-ops (and `vm.batch`) for one VM run one at a time across all connections.
+ops, `vm.batch`, `vm.window.action`, `vm.ui.click`, `vm.ui.type` and
+`vm.ui.action` for one VM run one at a time across all connections.
 
 Closing a connection discards the replies to its unfinished requests. A
 command that `vm.exec` already started in the guest keeps running until it
 ends or reaches its `timeout`; jobs started with `vm.exec.start` are not
-affected. The control socket carries no events: a job's exit is seen through
-`vm.exec.read` or `vm.exec.list`.
+affected. The control socket pushes nothing to a client: a job's exit is seen
+through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
+`vm.events` (see [Guest events](#guest-events)).
 
 ## Operations
 
@@ -63,7 +76,7 @@ affected. The control socket carries no events: a job's exit is seen through
 | `vm.clone` | `name` (the template), `newName` | `{name}` — see [Linked clones](#linked-clones) |
 | `vm.delete` | `name` (a clone) | `{}` — see [Linked clones](#linked-clones) |
 | `vm.pause` / `vm.resume` | `name` | `{state}` |
-| `vm.screenshot` | `name`, `region?`, `scale?`, `format?`, `quality?`, `maxWidth?` | `{png | jpeg, mime, width, height, sentWidth, sentHeight, x, y, areaWidth, areaHeight, scale}` — see [Screenshots](#screenshots) |
+| `vm.screenshot` | `name`, `region?`, `scale?`, `format?`, `quality?`, `maxWidth?`, `window?`, `marks?` | `{png | jpeg, mime, width, height, sentWidth, sentHeight, x, y, areaWidth, areaHeight, scale, window?, marks?, marksTruncated?}` — see [Screenshots](#screenshots) |
 | `vm.mouse.move` | `name`, `x`, `y`, observe params | `{}` or `{observation}` |
 | `vm.mouse.click` | `name`, `x`, `y`, `button?` ("left"/"right"/"middle"), `count?` (1 to 3), `hold?` ms (default 60), observe params | `{}` or `{observation}` — moves, presses, releases |
 | `vm.mouse.drag` | `name`, `fromX`, `fromY`, `toX`, `toY`, `button?`, observe params | `{}` or `{observation}` |
@@ -71,7 +84,7 @@ affected. The control socket carries no events: a job's exit is seen through
 | `vm.mouse.down` / `vm.mouse.up` | `name`, `button?` ("left" default), `x?` and `y?` together, observe params | `{}` or `{observation}` — presses or releases the button and leaves it so; with `x`/`y` the pointer moves there first |
 | `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms, observe params | `{}` or `{observation}` — presses modifiers then the key, releases in reverse |
 | `vm.key.down` / `vm.key.up` | `name`, `key`, observe params | `{}` or `{observation}` |
-| `vm.type` | `name`, `text`, `delay?` ms per key (default 12), observe params | `{}` or `{observation}` — US-layout text typing; characters outside the layout use the guest clipboard + paste when tools are connected |
+| `vm.type` | `name`, `text`, `delay?` ms per key (default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content, otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again`. The guest clipboard holds the text afterwards |
 | `vm.batch` | `name`, `steps`, observe params | `{completed, results, failedStep?, error?, observation?}` — see [Batches](#batches) |
 | `vm.find_text` | `name`, `query?`, `regex?`, `region?`, `languages?` | `{matches, lines}` — see [Finding text](#finding-text) |
 | `vm.wait_for` | `name`, `conditions`, `timeout?`, observe params | `{matched, waited, type?, detail?, problems?, observation?}` — see [Waiting for conditions](#waiting-for-conditions) |
@@ -105,6 +118,20 @@ affected. The control socket carries no events: a job's exit is seen through
 | `vm.set_resolution` | `name`, `width`, `height` | `{width, height}` — see [Resolution](#resolution) |
 | `vm.set_environment` | `name`, any of `theme`, `timeZone`, `clock`, `locale`, `keyboardLayouts`, `dpiScale` | `{applied: [{setting, ok, detail, takesEffect}]}` — see [Guest environment](#guest-environment) |
 | `vm.doctor` | `name` | `{checks: [{id, ok, detail, hint?}]}` — see [Doctor](#doctor) |
+| `vm.window.list` | `name` | `{windows: [window]}` — see [Windows and UI elements](#windows-and-ui-elements) |
+| `vm.window.action` | `name`, `window`, `action`, `x?`, `y?`, `width?`, `height?`, observe params | `{window, closed?, observation?}` |
+| `vm.ui.tree` | `name`, `window?`, `root?`, `depth?`, `max?`, `filter?` | `{tree, count, truncated, window}` |
+| `vm.ui.find` | `name`, `ref` or `selector`, `limit?` | `{nodes, text, truncated?}` |
+| `vm.ui.text` | `name`, `ref` or `selector`, `mode?`, `offset?`, `length?` | `{text, total, source}` |
+| `vm.ui.click` | `name`, `ref` or `selector`, `button?`, `count?`, observe params | `{x, y, node, observation?}` — a mouse click on the element |
+| `vm.ui.type` | `name`, `ref` or `selector`, `text`, `clear?`, `submit?`, observe params | `{node, observation?}` — a click on the element, then keys |
+| `vm.ui.action` | `name`, `ref` or `selector`, `action`, `value?`, observe params | `{node, pending?, unresponsive?, gone?, observation?}` — a UI Automation pattern call |
+| `vm.app.launch` | `name`, `path`, `args?`, `cwd?`, `env?`, `waitWindow?` s (default 15) | `{pid, window?, windowTimedOut?}` — see [Launching and deploying apps](#launching-and-deploying-apps) |
+| `vm.deploy` | `name`, `path` (host), `guestDir?`, `install?`, `launch?`, `killRunning?`, `waitWindow?` s (default 20) | `{guestDir, sent, skipped, bytes, installCode?, pid?, window?, windowTimedOut?}` |
+| `vm.events` | `name`, `since?` | `{events, next, first}` — see [Guest events](#guest-events) |
+
+The reply to an op that is not read-only and names a VM also carries
+`eventSeq` (see [Guest events](#guest-events)).
 
 Key names: letters, digits, `enter return tab space esc escape backspace delete
 insert home end pageup pagedown up down left right f1..f20 capslock
@@ -139,15 +166,46 @@ makes it use the `screendump` always.
   frame), and `scale`, the image
   pixels per guest pixel (`sentWidth` divided by the width of the area).
   A guest pixel is `x + image_x / scale`, `y + image_y / scale`.
+- `window` (Windows guests with the `ui` capability) crops to the rectangle
+  of one window: a window id, `foreground`, or a part of a title (ids and
+  titles compare without regard to case; of several windows with that title
+  part, the one in the foreground, else the top-most). The result has
+  `window`, the window object, and `x`, `y`, `areaWidth`, `areaHeight` are the
+  window's rectangle cut to the frame. `window` together with `region`
+  answers `pass region or window, not both; region is a rectangle of the
+  frame, window crops to a window's rectangle`; no match answers `no window
+  matches '<text>'; call vm.window.list`; a minimized window, or one outside
+  the frame, answers `window '<title>' is minimized or has no area on the
+  <W>x<H> frame; call vm.window.action restore first`. The image shows what
+  the screen shows in that rectangle, including a window that covers it.
+- `marks: true` draws a numbered outline on the elements of the window (of
+  `window`, else of the foreground window) that a user acts on, and returns
+  them as `marks`: `[{n, ref, role, name, x, y, w, h}]` with the rectangle in
+  guest pixels of the frame and `ref` usable with the `vm.ui.*` ops. Marked
+  are the elements of the `interactive` tree (at most 300 are read) with the
+  role `Button`, `CheckBox`, `ComboBox`, `Edit`, `HeaderItem`, `Hyperlink`,
+  `ListItem`, `MenuItem`, `RadioButton`, `Slider`, `Spinner`, `SplitButton`,
+  `TabItem`, `TreeItem`, `DataItem` or `Document`, a rectangle that is not
+  empty and reaches into the image's area, and no `offscreen` flag; the first
+  100 in tree order, numbered from 1. `marksTruncated: true` says that more
+  such elements exist. An outline is 2 pixels wide and the number sits in a
+  filled tag above the rectangle's top-left corner (inside it when there is
+  no room above); with `scale` or `maxWidth` both are drawn larger so that
+  they keep their size in the sent image, the outline between 1 and 8 pixels
+  and the digits between 9 and 32 pixels of the frame. The six outline
+  colours repeat with the number. A screenshot with `window` and `marks`
+  makes two helper requests, one with either makes one (see [Windows and UI
+  elements](#windows-and-ui-elements)).
 
 ## Observing the screen after input
 
 Every action op (`vm.mouse.move`, `.click`, `.drag`, `.scroll`, `.down`, `.up`,
-`vm.key.press`, `.down`, `.up`, `vm.type`), `vm.batch` and `vm.wait_for` accept
+`vm.key.press`, `.down`, `.up`, `vm.type`), `vm.batch`, `vm.wait_for`,
+`vm.window.action`, `vm.ui.click`, `vm.ui.type` and `vm.ui.action` accept
 three parameters:
 
-- `observe`: `none` (default), `summary`, `diff` or `image`. Any other value
-  answers `observe must be one of none, summary, diff, image`.
+- `observe`: `none` (default), `summary`, `diff`, `image` or `ui`. Any other
+  value answers `observe must be one of none, summary, diff, image, ui`.
 - `settleMs`: whole milliseconds from 0 to 10000 (default 300).
 - `settleTimeoutMs`: whole milliseconds from 100 to 30000 (default 2000).
   `settleMs` above `settleTimeoutMs` answers
@@ -169,6 +227,45 @@ carries `observation`:
 | `changedFraction` | share of the frame's tiles that differ, 0 to 1 |
 | `width`, `height` | size of the settled frame |
 | `png`, `imageRect`, `imageScale` | with `diff` (only when something changed) or `image`: the PNG, the guest rectangle it shows, and image pixels per guest pixel. `diff` shows the changed box plus 16 pixels on every side, cut to the frame; `image` shows the whole frame. An image wider than 1280 pixels is shrunk to 1280 |
+| `foreground` | on a guest with the `ui` capability: the title of the window in the foreground; absent when there is none |
+| `focused` | the element with the keyboard focus as `Role "name"`; `Pane ""`, the desktop, when no element of a window has it (a button that disabled itself after a click, for example) |
+| `events` | the guest events since the VM's previous observation, oldest first, as lines (see below) |
+| `tree` | with `ui`: the tree text of the foreground window as `vm.ui.tree` returns it, at most 150 elements, followed by the line `… more elements; call vm.ui.tree to read the whole window` when elements were left out |
+| `uiError` | why `foreground`, `focused` or `tree` are missing |
+
+The last five fields are the UI facts of a Windows guest whose connected
+guest tools have the `ui` capability; every level except `none` carries
+them, and no image is sent with `ui`. An observation at another guest has
+none of them and no `uiError`, except at level `ui`, where `uiError` says why:
+`UI Automation is only available on Windows guests with current guest tools;
+update alcove-agent in '<vm>'`, `the guest tools are not connected yet; the
+next observation will carry the UI facts` (a connection is being made) or
+`the guest tools are not connected; UI facts need alcove-agent running in the
+guest`.
+
+- `foreground` and `focused` come from one helper request; when the focused
+  element lies outside the window in the foreground, a second one reads the
+  window list for the title. `tree` is one more request.
+- The requests take their turn at the helper like any other (see [Windows and
+  UI elements](#windows-and-ui-elements)) and share one budget counted from
+  the end of the settling: 3 s, or 20 s at level `ui`. What has not arrived by
+  then is left out and `uiError` is `the UI helper is busy with another
+  request; call vm.ui.tree when you need the tree`. An action's reply is
+  therefore delayed by a busy helper for at most that budget, and the input
+  is sent in any case: with a search of 7 s running in the helper, a
+  `vm.mouse.click` with `observe: summary` returned after 3.8 s to 4.2 s with
+  this `uiError` and the click had reached the app.
+- A failed request gives `uiError` `the foreground window and focused element
+  could not be read: <reason>`, `the foreground window could not be read:
+  <reason>` or `the UI tree could not be read: <reason>`; the screen fields
+  stay.
+- `events` lists the newest 20 events as `<name> "<window title>"` (the
+  process name for a window without a title), `process.exited <file> code
+  <n>`, `job.exited <job> code <n>` or `events.dropped (<count>)`, preceded
+  by `<n> earlier events; call vm.events` when there were more. The first
+  observation of a VM starts at the event baseline (see [Guest
+  events](#guest-events)); `vm.start`, `vm.stop` and `vm.snapshot.restore`
+  move the position past the events received by then.
 
 When the screen cannot be read after the input was sent, the input stands and
 the result carries `observationError` (a sentence of the form `the screen could
@@ -293,6 +390,50 @@ lane that takes no input gate. Conditions are numbered from 0.
 | `port_listening` | `port` (1 to 65535) | a TCP port listens in the guest | none |
 | `log_matches` | `path`, `pattern` | one of the last 400 lines of the guest file matches the regular expression | the line, cut to 500 characters |
 | `job_output_matches` | `job`, `pattern` | the stdout or stderr of the job (last 64 KiB of each, read from the start) matches the regular expression, with `^` and `$` matching at line breaks | none |
+| `ui_exists` | `ref`, or selector fields | the element exists | the node |
+| `ui_gone` | `ref`, or selector fields | no such element exists | none |
+| `ui_enabled` | `ref`, or selector fields | the element exists and has no `disabled` flag | the node |
+| `ui_text_stable` | `ref`, or selector fields; `quietMs?` (0 to 600000, default 1500) | the element's text and its full length stayed the same for `quietMs` | the full length of the text |
+| `window_title` | exactly one of `contains` and `regex` | a top-level window has a title that contains `contains` (case-insensitive) or matches the regular expression | `{id, title, foreground}` |
+| `event` | `event`, `titleContains?`, `since?` | a guest event named `event` arrived, of a window whose title contains `titleContains` (case-insensitive) when given | the event as `vm.events` returns it |
+
+The six conditions of the last block need a Windows guest with the `ui`
+capability (`event` needs connected guest tools only). The selector fields
+are those of [Windows and UI elements](#windows-and-ui-elements) and stand in
+the condition itself: `{"type": "ui_exists", "window": "Save As", "role":
+"Button", "name": "Save"}`. Refusals before the wait starts: `condition <i>:
+<type> needs 'ref' or at least one of role, name, nameContains,
+automationId`, `condition <i>: <type> takes 'ref' or selector fields, not
+both`, `condition <i>: 'quietMs' must be an integer between 0 and 600000`,
+`condition <i>: window_title needs exactly one of 'contains' and 'regex'`,
+`condition <i>: event needs a non-empty string 'event'`, `condition <i>:
+'since' must be an integer of 0 or more; pass the eventSeq of an earlier
+reply`.
+
+- An element condition asks the helper once per evaluation (`ui.find` with a
+  limit of 1, `ui.rect` for a ref, `ui.text`, `win.list`); the next request of
+  a condition is made 500 ms after the answer to the previous one arrived,
+  and a condition has one request in flight at most.
+- `ui_gone` holds on an empty search result, on the guest's `element <ref> no
+  longer exists` for that ref, and when the selector's window does not exist.
+  `ui_exists` and `ui_enabled` in a window that does not exist keep waiting
+  and are no problem.
+- `ui_text_stable` ends the wait, like `job exited`, with `matched: -1`,
+  `type: "ui_text_stable"` and the guest's sentence as `detail` when the
+  element disappears: for a `ref` as soon as the ref no longer exists, for
+  selector fields after the element was read once in this wait. Before that
+  first read a selector that matches nothing, or whose window does not exist,
+  is a failed evaluation (the page may still be loading) and is listed in
+  `problems`. A password field ends the wait with the password sentence as an
+  error.
+- `window_title` looks at every listed window, not only the one in front.
+- `event` without `since` looks at the events after the VM's event baseline,
+  with `since` at the events with a higher `seq`; a `since` above the newest
+  `seq` counts as 0. See [Guest events](#guest-events). A window event of a
+  hung app's `(Not Responding)` twin also matches a `titleContains` of the
+  app's title.
+- A helper that cannot start, or is shut down, ends the wait with the guest's
+  sentence as an error.
 
 `languages` of `text_visible` and `text_gone` is as for `vm.find_text`; an
 unsupported language is refused before the wait starts
@@ -307,7 +448,7 @@ screen take the screen at the start of the wait as their reference
 Conditions are evaluated in a loop with a 250 ms tick; each condition has its
 own period: 250 ms for `screen_idle` and `region_changed`, 700 ms for
 `text_visible` and `text_gone`, 500 ms for the conditions that call the guest
-tools. Conditions that read the screen share one frame per tick. A text
+tools, one tick for `event`. Conditions that read the screen share one frame per tick. A text
 condition does not hold the other conditions: its recognition runs beside the
 loop and is looked at on every tick, like a guest call, and the other
 conditions are judged on every tick meanwhile. Text conditions with the same
@@ -327,7 +468,9 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   as in the table. Running out of time is a success with `matched: -1`.
   `waited` can exceed `timeout` by up to one second plus one tick: at the
   timeout the wait gives the text recognitions that have not finished one
-  second, all of them together, whatever their number.
+  second, all of them together, whatever their number. Without a text
+  condition the bound is `timeout` plus one tick: an element condition that
+  never held returned after 3.0 s with `timeout: 3`.
 - `job exited`: when a `job_output_matches` condition sees the job exited and
   all its output read without a match, it can no longer become true and the wait
   ends at once with `matched: -1`, `type: "job_output_matches"` and
@@ -351,14 +494,391 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   line is `ss is not installed in the guest; install the iproute2 package`.
   When both are empty the sentence is `the port check failed: the guest
   command exited with code <n> and printed nothing; run vm.doctor to check the
-  guest shell`. Errors that make the
+  guest shell`. A condition whose request the guest has left unanswered for
+  500 ms or longer when the wait ends is listed, without `failures`, with
+  `the UI helper has not answered <op> for <n> s` (`<op>` is the agent op,
+  such as `ui.find`), `the UI helper was busy with other requests` (the
+  request did not get its turn), or, for the conditions that call the guest
+  tools without the helper, `the guest agent has not answered <op> for <n>
+  s`. Errors that make the
   condition meaningless end the wait with an error instead: a guest-tools
   connection that is lost or too old, a `region` outside the frame
   (`condition <i>: region is outside the <W>x<H> frame`), an unknown job, a
   `port_listening` on a guest OS that is not supported.
 - `observe` at a level above `none` adds `observation` or `observationError`
   as for an action op, comparing the final screen with the screen at the start
-  of the wait.
+  of the wait. When the wait ends while one of its own helper requests has
+  been unanswered for 500 ms or longer, the observation asks the helper
+  nothing and carries the busy `uiError` at once.
+
+## Windows and UI elements
+
+`vm.window.*` and `vm.ui.*` read and operate the windows of a Windows guest
+through UI Automation. They need connected guest tools with the `ui`
+capability (`vm.status` → `agentCaps` contains `ui`). Without it they answer
+`UI Automation is only available on Windows guests with current guest tools;
+update alcove-agent in '<vm>'`; guest tools older than the request/response
+layer answer `guest tools in '<vm>' are too old for <op>; update alcove-agent
+in the guest`. The ops map onto the agent's `win.*` and `ui.*` operations in
+[`agent-protocol.md`](agent-protocol.md), which has the exact rules for
+windows, nodes, roles and every action. A sentence of the agent is passed on
+unchanged, so it can name an agent operation: `ui.tree`, `ui.find`,
+`win.list`, `win.action` and `proc.kill` are `vm.ui.tree`, `vm.ui.find`,
+`vm.window.list`, `vm.window.action` and `vm.process.kill` here.
+
+**One request at a time.** One helper process in the guest serves every
+window and element request, one after another. The server therefore sends one
+such request per VM at a time, in the order they were asked for, across all
+connections. The requests of observations, of `vm.wait_for`, of a screenshot
+with `window` or `marks` and of a recording take their turn in the same line.
+
+- A `vm.window.*` or `vm.ui.*` op waits up to 60 s for its turn and then
+  answers `the UI helper is busy with other requests; retry`.
+- A request that was sent is waited for until the agent answers, for at most
+  215 s (the agent may spend 60 s in its own queue, 120 s on a helper start
+  and 30 s on the request); then the op answers `guest tools in '<vm>' did
+  not answer <op> in time; check vm.status and retry`.
+- The turn ends when the agent answered, also when the caller has stopped
+  waiting before (an observation whose budget ran out, a wait that ended, a
+  closed connection). A slow request therefore holds up the others: a
+  `vm.ui.find` without a match in the Services console (about 1,650 elements)
+  takes 7 s to 8 s on the test guest.
+- A request of a closed connection that still waits for its turn is not sent.
+- The agent's own sentences about the helper reach the caller unchanged, among
+  them `UI helper did not answer '<op>' within <n> s; it was restarted` (every
+  ref is forgotten), `UI helper exited; retry` and the start failures listed
+  in `agent-protocol.md`.
+
+**Windows.** `vm.window.list` returns the top-level windows, top-most first,
+as window objects:
+
+```
+{"id":"0x501fa","title":"Alcove Fixture","pid":9520,"process":"alcove-fixture.exe","class":"AlcoveFixtureWindow",
+ "x":85,"y":78,"w":706,"h":513,"state":"normal","foreground":true,"responding":true,"modal":false}
+```
+
+`x`, `y`, `w`, `h` are guest pixels of the visible frame; `state` is `normal`,
+`minimized` (then `0,0 0x0`) or `maximized`; `responding` turns false about
+5 s after a window stopped handling messages. A window is named by its `id`,
+by `foreground`, or by a part of its title (case-insensitive, the top-most
+match). While a notification toast has the foreground no listed window has
+`foreground: true`, because the toast is not listed (seen with the OneDrive
+backup toast after a boot); `vm.ui.tree` without `window` reads it.
+
+`vm.window.action` takes `window` and `action`: `focus`, `minimize`,
+`maximize`, `restore`, `close`, `move` (`x`, `y`) or `resize` (`width`,
+`height`, both above 0). The result is `{window}`, the window after the action
+(`null` when it is gone), and for `close` also `closed`. Refusals before the
+guest is asked: `action must be one of focus, minimize, maximize, restore,
+close, move, resize`, `move needs integer 'x' and 'y' in guest pixels`,
+`resize needs integer 'width' and 'height' above 0 in guest pixels`. Windows
+decides whether a window may come to the foreground: `focus` can answer
+`window <id> "<title>" did not come to the foreground; click its title bar
+through the display` (seen while the toast above had the foreground); a
+click on the title bar with `vm.mouse.click` brings it forward when the
+title bar is not covered.
+
+**Selecting an element.** An element op takes exactly one of
+
+- `ref`: a ref such as `e12` from `vm.ui.tree` or `vm.ui.find`. It names the
+  element while it exists and the helper process lives; afterwards the guest
+  answers `element <ref> no longer exists; call ui.tree again`. A new helper
+  process (after an agent restart, or after the agent replaced a helper that
+  did not answer) knows none of the earlier refs.
+- `selector`: an object with `window` (default `foreground`), `role`
+  (case-insensitive, e.g. `Button`, `Edit`, `Document`), `name` (exact),
+  `nameContains` (case-insensitive), `automationId` (exact) and `index`
+  (0-based among the matches in tree order; without it the first match). At
+  least one of `role`, `name`, `nameContains`, `automationId` is required.
+
+A field given as `null` counts as absent. Refusals: `pass ref or selector`,
+`pass ref or selector, not both`, `ref must be an element ref such as e12;
+take one from vm.ui.tree or vm.ui.find`, `selector must be an object with
+window, role, name, nameContains, automationId or index`, `selector has no
+field '<k>'; valid fields: window, role, name, nameContains, automationId,
+index`, `selector field '<k>' must be a string`, `selector field 'index' must
+be an integer of 0 or more`, `selector needs at least one of role, name,
+nameContains, automationId`. A selector that matches nothing answers `no
+element matches {"window":"0xd0368","role":"Button","name":"Nope"}; call
+ui.tree to see what exists` (`vm.ui.find` returns an empty list instead); a
+`window` that does not exist answers `no window has "<text>" in its title;
+call win.list to see the open windows` or `window <id> no longer exists; call
+win.list again`.
+
+**`vm.ui.tree`** reads the elements of `window` (default `foreground`) or
+below the element `root` (a ref). `depth` is the number of levels (0 or more,
+default 12), `max` the most elements (1 to 2000, default 300) and `filter`
+`interactive` (default: elements with a name, a value, keyboard focus or an
+action, and the control types people act on) or `all`. Refusals: `depth must
+be 0 or more`, `max must be between 1 and 2000`, `filter must be
+'interactive' or 'all'`. The result is `{tree, count, truncated, window}`:
+`window` is the window object, `count` the number of lines, `truncated` says
+that elements were left out, and `tree` is text with one line per element,
+indented by two spaces per level:
+
+```
+[e11] Window "Alcove Fixture" (78,78 720x520)
+  [e13] Edit "Message" (186,125 484x26) focused value="안녕 \"fixture\""
+  [e14] Button "Send" (678,124 96x28) disabled
+  [e16] Edit "" (186,159 484x26) password
+```
+
+A line is `[ref] Role "name" (x,y WxH)`, then the flags (`focused`,
+`disabled`, `offscreen`, `selected`, `checked`, `expanded`, `collapsed`,
+`password`), then `value="..."` when the element has a value. The rectangle
+is in guest pixels of the frame; an element without one has no `(x,y WxH)`
+part. Names and values are cut at 200 characters and end with `…` then;
+`\`, `"`, line break, carriage return and tab are written as `\\`, `\"`,
+`\n`, `\r`, `\t` and other control characters as `\u{hex}`, so one element is
+always one line. The automation id is not in the text; `vm.ui.find` returns
+it. The fixture window has 25 lines, the Notepad window 36, an Edge window
+with a small page 27.
+
+**`vm.ui.find`** returns the elements a selector matches: `{nodes, text}`,
+`nodes` being the node objects (`ref`, `role`, `name`, `aid` when the element
+has an automation id, `value` when it has one, `x`, `y`, `w`, `h`, `flags`,
+`depth` 0) and `text` the same elements as tree lines. `limit` is the most
+matches (1 or more, default 20; otherwise `limit must be 1 or more`). With
+`ref` it returns that one element as it is now. When the search ran out of
+time after some matches, the result has `truncated: true` and `text` ends
+with a line that says so.
+
+**`vm.ui.text`** returns `{text, total, source}` for one element: `mode`
+`auto` (default) reads the text pattern, then the value, then the names of
+the elements below, then the name; `pattern` and `descendants` read one
+source. `offset` (0 or more) and `length` (1 to 200000, the default) select a
+part; `total` is the whole length and `source` where the text came from
+(`text`, `value`, `descendants`, `name`). Line ends are `\n`. Refusals: `mode
+must be one of auto, pattern, descendants`, `offset must be 0 or more`,
+`length must be between 1 and 200000`.
+
+**`vm.ui.click`** asks the guest for the element's clickable point (the
+element is scrolled into view first when it can be) and sends a real mouse
+click there, like `vm.mouse.click` with the same `button` and `count`. The
+result is `{x, y, node}`: the point and the element. An element whose centre
+cannot be clicked answers `element <ref> has no clickable point: <reason>; or
+act on it with vm.ui.action`, with the guest's reason, such as `window
+0x501fa "Alcove Fixture" covers the centre of the element; focus the
+element's window with win.action`. A window that an app or `vm.app.launch`
+just opened is often behind another one; `vm.window.action` with `focus`
+comes first then. Two clicks on one point within the guest's double-click
+time (500 ms by default) are a double click to the guest.
+
+**`vm.ui.type`** clicks the element in the same way, waits 120 ms and types
+`text` with real keys as `vm.type` does (text outside the US layout goes
+through the guest clipboard and `ctrl+v`, and replaces what the clipboard
+held). With `clear: true` it first
+presses `ctrl+a`, `ctrl+home` and `ctrl+shift+end`, so the typed text
+replaces what the field holds, also in controls that ignore `ctrl+a` (a
+classic Win32 edit control does); with `clear` and an empty `text` it presses
+`backspace` after them. `submit: true` presses `enter` at the end. `text` is
+required and may be empty. The result is `{node}`, the element as it was
+before the typing.
+
+**`vm.ui.action`** acts on the element through a UI Automation pattern
+without the mouse: `action` is `invoke`, `toggle`, `expand`, `collapse`,
+`select`, `set_value` (with a string `value`), `focus` or `scroll_into_view`;
+it also works on elements that are covered or off screen. The result is
+`{node}` plus one of `pending: true` (the action is still running in the app,
+for example because it opened a modal dialog), `unresponsive: true` (the
+window stopped handling messages) or `gone: true` (the element no longer
+exists) when the guest reports it; `node` is then the element as it was
+before. Refusals: `action must be one of invoke, toggle, expand, collapse,
+select, set_value, focus, scroll_into_view`, `set_value needs a string
+'value'; pass the new text`.
+
+`vm.window.action`, `vm.ui.click`, `vm.ui.type` and `vm.ui.action` take the
+VM's input gate like the mouse and keyboard ops, and accept the observe
+parameters.
+
+**Password fields.** An element with the `password` flag has an empty `name`
+and no `value` in every result, and `vm.ui.text` answers `the element is a
+password field; its text is not read; it cannot be read through UI
+Automation`. A selector still finds a labelled password field by `name`.
+Text typed into such a field is in no result of these ops.
+
+**Elevated and hung windows.** The helper runs with the agent's elevated
+token (high integrity) and reads windows of elevated processes: an app the
+agent started is elevated itself. A window of a higher integrity level than
+the agent's was not present on the test guest. The ops addressed to a window
+that does not handle messages answer `window <id> "<title>" is not
+responding; wait and retry, or end its process with proc.kill when win.list
+still shows responding false after 10 s`.
+
+## Launching and deploying apps
+
+**`vm.app.launch`** starts the program `path` in the guest (a full path, or a
+name on the search path or registered under `App Paths`, such as
+`msedge.exe`) with `args` (array of strings), `cwd` and `env` (object of
+strings), and waits up to `waitWindow` seconds (0 to 300, default 15; 0 does
+not wait) for the window it opens. It needs guest tools that run commands and
+runs in the concurrent lane. The result is `{pid}` and, when a window was
+waited for, either `window` (a window object) or `windowTimedOut: true`.
+
+- The program runs with the agent's elevated token and with the null device
+  as standard input and output.
+- `pid` is the process that was started. `window.pid` can be another process:
+  Notepad and Edge hand over to a child or to a process that already runs
+  (an Edge with a profile folder of its own is started by a launcher that
+  exits with code 0 at once).
+- `window.title` is the title at the moment the window was found. Edge first
+  shows `Untitled - …` and Notepad `Notepad` before the document's name
+  appears; wait for the title with a `window_title` condition.
+- A window with an empty rectangle that is not minimized is not taken (the
+  hidden `OLEChannelWnd` of `mmc.exe`); without the `ui` capability no window
+  is waited for.
+- The new window is not brought to the foreground.
+- Refusals: `missing or invalid parameter 'path'` (also for `args`, `cwd`,
+  `env` of the wrong shape), `waitWindow must be between 0 and 300 seconds`,
+  `cannot start '<path>': <system error>; check the path with vm.fs.list`.
+
+**`vm.deploy`** copies the host file or directory `path` into the guest
+folder `guestDir`, optionally runs an installer, and starts a program. It
+runs in the concurrent lane; a second `vm.deploy` to the same VM waits until
+the first has finished. The steps, in order:
+
+1. Parameters and host files are checked without asking the guest. `path` is
+   absolute (`pass an absolute host path`) and exists (`'<path>' does not
+   exist on the host; check the path`). `killRunning` is a boolean (default
+   `true`), `waitWindow` as for `vm.app.launch` with a default of 20.
+   `install` is `{kind: "msi" | "exe", file, args?}` and `launch` is `{exe,
+   args?, env?, cwd?}`; `install.file` and `launch.exe` are paths inside
+   `guestDir` (no `.` or `..` segment: `launch.exe must stay inside guestDir;
+   pass an absolute path to start something else`) or absolute guest paths.
+   A host directory that cannot be read, and on a Windows guest two host
+   files that differ only by case (`'<a>' and '<b>' differ only by case and
+   cannot both exist in a Windows guest folder`), are refused here.
+2. The guest folder. Without `guestDir` a Windows guest gets
+   `C:\alcove-apps\<name>`, `<name>` being the directory's name or the file's
+   name without its extension; other guests need `guestDir` (`pass guestDir;
+   the default C:\alcove-apps\<name> only fits Windows guests`). See the
+   rules below.
+3. With `killRunning`, every guest process whose executable lies below
+   `guestDir` is killed with its child processes, and the op waits up to 5 s
+   until none is left (`<name> (pid <n>) under '<dir>' is still running after
+   vm.deploy tried to stop it; stop it with vm.process.kill or pass another
+   guestDir`). Processes elsewhere are left alone. The guest agent and the
+   processes that started it are never killed; when one of them runs from
+   `guestDir` nothing is killed and the op answers `the guest agent or a
+   process that started it (<name>, pid <n>) runs from '<dir>'; pass another
+   guestDir`.
+4. The marker file `.alcove-deploy` is written into `guestDir` when it is not
+   there. It holds one line of text and is never deleted or replaced by a
+   deploy.
+5. The copy. A directory is copied like `vm.sync_dir` with `delete: true`:
+   files whose size or SHA-256 differs are sent, guest files without a host
+   counterpart are deleted, the marker stays. A file is written to
+   `guestDir\<file name>`. `sent` lists what was sent as relative paths with
+   `/`, `skipped` counts the unchanged files, `bytes` the bytes sent.
+6. `install`: `msiexec.exe /i <file> /qn /norestart` followed by `args` for
+   `msi`, the file followed by `args` for `exe`, with `guestDir` as working
+   directory and 900 s to finish. Exit codes 0 and 3010 are a success and are
+   returned as `installCode`; anything else answers `installer '<file>'
+   exited with code <n>: <output>; fix the installer or its arguments and
+   call vm.deploy again`, a timeout `installer '<file>' did not finish within
+   900 s and was stopped; run it with vm.exec.start to see where it waits`.
+7. `launch`: as `vm.app.launch` with `guestDir` as the default `cwd`; the
+   result gains `pid` and `window` or `windowTimedOut`. A failure here
+   answers `the files were copied to <guestDir>, but starting <exe> failed:
+   <reason>`.
+
+The result is `{guestDir, sent, skipped, bytes, installCode?, pid?, window?,
+windowTimedOut?}`. A second deploy of an unchanged directory has `sent: []`
+and still stops and starts the app.
+
+Rules for `guestDir`, checked before any file is written:
+
+| refused | sentence |
+|---|---|
+| a path that is not absolute, has a `.` or `..` segment, or is a filesystem root | `guestDir '<dir>' is not an absolute path; pass a full path such as <example>`, `… has a '.' or '..' segment; pass the folder's full path such as <example>`, `… is a filesystem root; pass a folder below it such as <example>` |
+| Windows: `C:\Windows` and everything below, a `Program Files` folder itself, `C:\ProgramData` itself, `C:\ProgramData\Alcove` and everything below it, `C:\Users`, a profile folder, a profile's `Desktop`, `Documents`, `Downloads` and anything in its `AppData`. Other guests: `/usr`, `/etc`, `/bin`, `/sbin`, `/lib*`, `/var`, `/boot`, `/home`, `/home/<user>`, `/root`, `/opt` themselves | `guestDir '<dir>' is a system or profile folder; pass a folder of its own such as <example>` (`… a system or home folder …` on other guests) |
+| `C:\alcove-apps` itself, in any spelling | `guestDir '<dir>' holds every deployed app; pass a folder below it such as <example>` |
+| Windows: a device path (`\\?\`, `\\.\`) | `device paths such as \\?\ cannot be used; pass a drive or share path` |
+| Windows: the administrative share of a drive on any server (`\\host\C$\…`) | `administrative shares such as \\host\C$ cannot be used; pass the drive path` |
+| Windows: a segment Windows cannot use as a folder name (`<>:"|?*`, a control character, a trailing dot or space, a device name such as `NUL` or `COM1`) | `guestDir '<dir>' has the segment '<s>', which Windows cannot use as a folder name; pass a plain folder path such as <example>` |
+| Windows: a segment with `~` followed by a digit | `guestDir '<dir>' has the short name '<s>'; pass the long path` |
+| a guest folder that is a link (a junction or a symbolic link) | `'<dir>' is a link in the guest; pass the folder it points to` |
+| a guest path that is a file | `'<dir>' is a file in the guest; pass a folder as guestDir` |
+| a folder that holds entries, lies outside `C:\alcove-apps` and has no marker | `'<dir>' already holds files that Alcove did not deploy; choose an empty or new folder, or one under C:\alcove-apps` |
+| a marker path that is a folder or a link | `'<dir>\.alcove-deploy' is not a plain file; remove it or deploy to another folder` |
+| a link, or a file, in the guest where the host directory has a folder | `'<path>' in the guest is a link; remove it or deploy to another folder` (`… is not a folder; …` for a file) |
+
+`<example>` is `C:\alcove-apps\<name>` on a Windows guest and `/opt/<name>`
+on others. A folder that does
+not exist, an empty folder, a folder below `C:\alcove-apps` and a folder with
+the marker are accepted. A link in a parent of `guestDir` is not looked for.
+The refusal for a link below the folder comes after the processes were
+stopped and the marker was written; nothing is written through the link.
+Further refusals: a host file or folder named `.alcove-deploy` (`a file named
+.alcove-deploy cannot be deployed, vm.deploy keeps its own file under that
+name; rename the file`), a host name that cannot be the default folder name
+(`pass guestDir; '<name>' cannot be used as a folder name`, or `… has the form
+of a Windows short name and cannot be used as a folder name`), and on a
+Windows guest a segment of `install.file` or `launch.exe` that Windows cannot
+use (`'<s>' in launch.exe cannot be used as a file or folder name on
+Windows`).
+
+## Guest events
+
+The guest tools report what happens in the guest, and the server keeps the
+newest 500 events of each VM, numbered from 1 in the order they arrived
+(`seq`). The numbers keep counting when old events are dropped, and the
+events stay when the VM stops or the tools reconnect; a new server process
+starts at 1 again.
+
+| `name` | fields | sent when |
+|---|---|---|
+| `window.opened` | `window` | a titled window appeared |
+| `dialog.opened` | `window` | in addition to `window.opened`, for a modal window or a dialog |
+| `window.closed` | `window` (as last seen) | a listed window is gone |
+| `window.title` | `window` | a window's title changed (at most one per window per second) |
+| `window.foreground` | `window` | another window came to the foreground |
+| `process.exited` | `pid`, `code`, `path` | a process started by `vm.app.launch` or the `launch` of `vm.deploy` ended; a process killed by `vm.process.kill` has code 1 |
+| `job.exited` | `job`, `code` | a job of `vm.exec.start` ended |
+| `events.dropped` | `count` | the agent could not deliver `count` events on its connection |
+
+**`vm.events`** returns `{events, next, first}`: the kept events with `seq`
+above `since` (default 0), oldest first, each as `{seq, time, name, ...}` with
+`time` the host's arrival time (ISO 8601 with milliseconds); `next`, the
+`seq` of the newest event (0 when there is none), to pass as the next
+`since`; and `first`, the `seq` of the oldest event still kept. When `first`
+is above `since + 1`, the events in between are gone. A `since` above `next`
+(a number from an earlier server process) counts as 0. `since` is an integer
+of 0 or more (`since must be an integer of 0 or more; pass the next value of
+an earlier vm.events reply`). The op is read-only, works in any state of the
+VM and reads without consuming: two clients that pass the same `since` get
+the same events.
+
+Window events come from the helper of [Windows and UI
+elements](#windows-and-ui-elements), which compares the windows every 300 ms
+while it runs. The server starts it when it connects to guest tools with the
+`ui` capability, so a client gets window events without calling a window or
+element op first: after a restart of the agent, a `vm.app.launch` with
+`waitWindow: 0` was followed by its `window.opened`. The windows that are
+open when a helper starts are not announced, and what happens while no
+helper runs is not reported.
+
+**`eventSeq`.** The reply to every op that is not read-only and names a VM
+(all except `script.run` and `script.save`) carries `eventSeq`, the `seq` of
+the newest event when the op began; `vm.stop` and `vm.snapshot.restore`
+report the newest `seq` after the stop or the restore instead. An event
+caused by the op has a higher `seq`. Pass it as `since` to `vm.events` or to
+an `event` condition of `vm.wait_for` to look at exactly the events after
+that op.
+
+**The baseline.** An `event` condition without `since` looks at the events
+after the VM's baseline: the newest `seq` when the latest op began that can
+cause window or process events. These ops are the mouse and keyboard ops,
+`vm.batch` and each of its input steps, `vm.window.action`, `vm.ui.click`,
+`vm.ui.type`, `vm.ui.action`, `vm.app.launch`, `vm.deploy`, `vm.exec`,
+`vm.exec.start`, `vm.exec.write`, `vm.exec.kill`, `vm.process.kill`,
+`vm.start`, `vm.stop` and `vm.snapshot.restore`. Other ops, such as
+`vm.fs.write`, leave it where it is. The baseline is one per VM for all
+connections, so with several clients, or with an op between the action and
+the wait, pass `since`. Without any such op since the server started, only
+events that arrive during the wait count. `vm.start`, `vm.stop` and
+`vm.snapshot.restore` also move the position from which observations list
+events: events of an earlier session are in `vm.events` only.
 
 ## VM rows
 
@@ -369,7 +889,7 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
 | `name`, `guestOS` | the VM's name and `windows`, `linux` or `other` |
 | `state` | `stopped`, `starting`, `running`, `paused`, `suspending`, `stopping` or `failed` |
 | `suspended` | a session saved to disk exists; the next `vm.start` resumes it |
-| `width`, `height` | the size of the latest frame read through this server; `vm.status` reads a frame of a running VM when none is known |
+| `width`, `height` | `vm.status` of a running or paused VM: the size of the guest frame at this moment. `vm.list`: the size this server read last, absent when it has read none since the VM stopped |
 | `error` | with `failed`: the engine's message |
 | `leasedBy` | the owner of the lease, while one is active |
 | `cloneOf` | on a linked clone: the name of its template |
@@ -591,8 +1111,11 @@ The read-only ops, which ignore leases, are `hello`, `vm.list`, `vm.status`,
 `vm.screenshot`, `vm.wait_idle`, `vm.wait_for`, `vm.find_text`,
 `vm.clipboard.get`, `vm.exec.read`, `vm.exec.list`, `vm.process.list`,
 `vm.fs.list`, `vm.fs.read`, `vm.pull_file`, `vm.snapshot.list`,
-`vm.forward.list`, `vm.lease.acquire`, `vm.lease.release`, `vm.doctor` and
-`vm.record.status`. Every other op is guarded, among them the power ops,
+`vm.forward.list`, `vm.lease.acquire`, `vm.lease.release`, `vm.doctor`,
+`vm.record.status`, `vm.window.list`, `vm.ui.tree`, `vm.ui.find`,
+`vm.ui.text` and `vm.events`. Every other op is guarded, among them the power ops,
+`vm.window.action`, `vm.ui.click`, `vm.ui.type`, `vm.ui.action`,
+`vm.app.launch`, `vm.deploy`,
 `vm.clone` (through its template's lease) and `vm.delete`. The action ops and
 `vm.batch` are not read-only; a batch checks the lease once, for the whole
 batch.
@@ -853,6 +1376,13 @@ VM 'Win' is leased by ci-agent for another 240 s; pass its lease token, wait, or
 no snapshot 'clean' in 'Win'; call vm.snapshot.list
 host port 8080 is taken; pass hostPort: 0 to let Alcove choose
 start failed: 'Win' is a template with clones (Win clone); delete the clones first or start a clone
+the UI helper is busy with other requests; retry
+pass ref or selector
+element e12 no longer exists; call ui.tree again
+element e14 has no clickable point: window 0x501fa "Alcove Fixture" covers the centre of the element; focus the element's window with win.action; or act on it with vm.ui.action
+cannot start 'C:\apps\tool.exe': The system cannot find the file specified.; check the path with vm.fs.list
+'C:\alcove-e2e\junction' is a link in the guest; pass the folder it points to
+the request line is not JSON that can be read (broken syntax, or a \u escape of half a surrogate pair); send one JSON object per line
 ```
 
 ## Limits
@@ -867,3 +1397,9 @@ start failed: 'Win' is a template with clones (Win clone); delete the clones fir
 - A linked clone references its template's disk files by absolute path: a
   template bundle that is moved or renamed on disk leaves its clones without
   their backing files.
+- The window, element and event ops exist for Windows guests only.
+- Window events are reported only while the guest's UI helper runs. After the
+  agent replaced a helper that did not answer, they resume with the next
+  window or element request, and what happened in between is not reported.
+- A second host that starts a VM this server runs stops this server's engine
+  (see the first limit); the guest then loses its unsaved state.

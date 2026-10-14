@@ -9,7 +9,7 @@
   <a href="#quick-start"><img alt="platform" src="https://img.shields.io/badge/platform-macOS%2015%2B%20·%20Apple%20silicon-0B84FF?style=flat-square"></a>
   <a href="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/YangTaeyoung/alcove/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-MIT%20·%20GPL--2.0%20patches-6E7681?style=flat-square"></a>
-  <a href="#automate-it-from-claude-code"><img alt="MCP" src="https://img.shields.io/badge/MCP-53%20tools-E8952E?style=flat-square"></a>
+  <a href="#automate-it-from-claude-code"><img alt="MCP" src="https://img.shields.io/badge/MCP-76%20tools-E8952E?style=flat-square"></a>
 </p>
 
 <p><b>A virtual machine app for the Mac, written from scratch on top of QEMU and Apple's Hypervisor framework —<br>and the first one your coding agent can drive by itself.</b></p>
@@ -101,14 +101,14 @@ headless engine when it is not.
 ```
 
 <details>
-<summary><b>All 53 tools</b></summary>
+<summary><b>All 76 tools</b></summary>
 
 | Toolset | Tool | What it does |
 |---|---|---|
 | `core` | `alcove_list_vms` | Every VM with state and screen size |
 | `core` | `alcove_vm_status` | One VM, including whether the guest tools are connected |
 | `core` | `alcove_start_vm` / `alcove_stop_vm` | Boot (waiting for the tools) or shut down |
-| `core` | `alcove_screenshot` | The guest screen as an image, downscaled to save tokens |
+| `core` | `alcove_screenshot` | The guest screen, a region or one window as an image, downscaled to save tokens, optionally with numbered marks on the elements to act on |
 | `core` | `alcove_click` / `alcove_move_mouse` / `alcove_drag` / `alcove_scroll` | Pointer, in guest pixels |
 | `core` | `alcove_type` / `alcove_press_keys` | Text and combos like `ctrl+alt+delete`, `win+r` |
 | `core` | `alcove_exec` | A command in PowerShell, `cmd` or `sh`, or a program by `argv`, with working directory, environment, stdin and timeout; returns exit code, stdout and stderr |
@@ -116,7 +116,7 @@ headless engine when it is not.
 | `core` | `alcove_push_file` | Copy a file from the Mac into the guest, to the Desktop or to an exact path |
 | `core` | `alcove_wait_idle` | Wait until the screen stops changing |
 | `core` | `alcove_find_text` | Read the screen with OCR: lines of text with the point to click |
-| `core` | `alcove_wait_for` | Wait for text on screen, a process, a file, a listening port, a log line or job output |
+| `core` | `alcove_wait_for` | Wait for text on screen, a process, a file, a listening port, a log line or job output; on Windows guests also for a UI element, a window title or a guest event |
 | `core` | `alcove_batch` | A sequence of input steps without interruption from other callers, with one screen report |
 | `core` | `alcove_mouse_down` / `alcove_mouse_up` / `alcove_key_down` / `alcove_key_up` | Hold and release a mouse button or a key |
 | `shell` | `alcove_exec_start` | Start a build, test run or server as a background job |
@@ -133,12 +133,23 @@ headless engine when it is not.
 | `state` | `alcove_port_forward_add` / `alcove_port_forward_remove` / `alcove_port_forward_list` | Forward a host port on 127.0.0.1 to a guest port |
 | `state` | `alcove_set_network` / `alcove_set_resolution` / `alcove_set_environment` | Guest network link, screen resolution; theme, time zone, clock, locale, keyboard layouts and display scale |
 | `state` | `alcove_doctor` | Check why a VM may not be automatable, line by line with the next step |
+| `ui` | `alcove_list_windows` / `alcove_window_action` | The windows of a Windows guest with title, process and rectangle; focus, minimize, maximize, restore, close, move or resize one |
+| `ui` | `alcove_ui_tree` / `alcove_ui_find` / `alcove_ui_get_text` | The UI Automation tree of a window as text with element refs; elements by role, name or automation id; the text of one element |
+| `ui` | `alcove_ui_click` / `alcove_ui_type` / `alcove_ui_action` | Click an element or type into it with real input; invoke, toggle, expand, select or set a value through UI Automation |
+| `ui` | `alcove_launch_app` / `alcove_deploy` | Start a program and wait for its window; copy a Mac build into the guest, run its installer and start it |
+| `ui` | `alcove_events` | Window, dialog and process events of the guest in order, from a sequence number on |
+| `evidence` | `alcove_record_start` / `alcove_record_stop` / `alcove_record_status` | Record every operation on a VM as a trace with frames and a video |
+| `evidence` | `alcove_event_log` / `alcove_crash_dumps` | Entries of the guest's event log; crash dumps of a Windows program, copied to the Mac |
+| `evidence` | `alcove_collect_diagnostics` | Screenshot, windows, UI tree, processes, logs and dumps of a VM in one directory |
+| `replay` | `alcove_script_save` / `alcove_script_run` | Turn a recording into a script; replay it without a model |
+| `http` | `alcove_http_capture_start` / `alcove_http_capture_stop` | Capture the HTTP and HTTPS traffic of a VM through a proxy on the Mac |
+| `http` | `alcove_http_requests` / `alcove_http_rule` | List and read captured exchanges; answer, delay or drop matching requests |
 
 </details>
 
 The server lists every toolset by default. `ALCOVE_MCP_TOOLSETS` selects some
-of `core`, `shell`, `files` and `state` (the names `ui`, `evidence`, `replay` and
-`http` are accepted and hold no tools yet). `core` has 23 tools: VM lifecycle,
+of `core`, `shell`, `files`, `state`, `ui`, `evidence`, `replay` and `http`.
+`core` has 23 tools: VM lifecycle,
 screenshot, pointer, keyboard, held buttons and keys, `alcove_batch`,
 `alcove_exec`, the clipboard, `alcove_push_file`, `alcove_wait_idle`,
 `alcove_wait_for` and `alcove_find_text`. For example, `core` and `files`:
