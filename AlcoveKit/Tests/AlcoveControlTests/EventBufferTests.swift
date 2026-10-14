@@ -437,6 +437,27 @@ final class EventBufferTests: XCTestCase {
         XCTAssertFalse(settled)
     }
 
+    func testLinkStopsConnectingWhenItsCallerIsCancelled() async throws {
+        let unreachable = FakeAgent()
+        unreachable.stop()
+        let latch = Latch()
+        let link = AgentLink(events: EventBuffer(), retryDelay: .seconds(1), isRunning: { true }, endpoint: {
+            await latch.pass()
+            return (unreachable.port, nil)
+        })
+        let pending = Task { await link.agent(timeout: .seconds(5)) }
+        let held = await eventually { await latch.arrivals == 1 }
+        XCTAssertTrue(held)
+        pending.cancel()
+        await latch.open()
+        let client = await pending.value
+        XCTAssertNil(client)
+        let arrivals = await latch.arrivals
+        XCTAssertEqual(arrivals, 1, "connection attempts made for the cancelled caller")
+        let connecting = await link.isConnecting
+        XCTAssertFalse(connecting)
+    }
+
     func testLinkPingsTheUIHelperOfAnAgentThatHasOne() async throws {
         let withUI = fakeAgent(caps: ["clipboard", "ui"])
         let link = AgentLink(events: EventBuffer(), isRunning: { true }, endpoint: { (withUI.port, nil) })

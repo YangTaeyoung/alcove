@@ -167,7 +167,8 @@ actor AgentLink {
     }
 
     /// Makes connection attempts until one is adopted, another caller's client is connected, or an attempt ended
-    /// with no room for a further one before `deadline`. A failed attempt is followed by a pause of `retryDelay`.
+    /// with no room for a further one before `deadline`. A failed attempt is followed by a pause of `retryDelay`;
+    /// a caller cancelled before or during that pause gets nil at once.
     /// The caller has counted the first attempt in `attempts`; the count is kept while a further attempt follows
     /// and is given back when none does, in the same step that adopts a client.
     private func connect(until deadline: ContinuousClock.Instant) async -> AgentClient? {
@@ -181,7 +182,12 @@ actor AgentLink {
                 if begun == generation { lastAttemptFailed = true }
                 let again = ContinuousClock.now + retryDelay < deadline
                 if !again { attempts -= 1 }
-                try? await Task.sleep(for: retryDelay)
+                do {
+                    try await Task.sleep(for: retryDelay)
+                } catch {
+                    if again { attempts -= 1 }
+                    return nil
+                }
                 if again { continue }
                 return nil
             }
