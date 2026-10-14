@@ -1074,10 +1074,13 @@ image for later writes, and the image file keeps its size.
   `vm.status` shows the tools. Runtime port forwards stay in place.
   Once the guest is stopped for the load, a restore whose client disconnects
   or whose request is cancelled still runs to its end, up to the 600 s limit
-  of the load, and a guest that was running runs again. A second restore of
-  the same VM waits until the first has ended. A `vm.stop` during the load
-  stops the VM, and the restore then answers `snapshot restore failed: the VM
-  is not running; check vm.status`.
+  of the load, and a guest that was running runs again. A second restore, a
+  `vm.snapshot.create` or a `vm.snapshot.delete` of the same VM waits until
+  the restore has ended. A `vm.stop` during the load stops the VM, and the
+  restore fails: it answers `snapshot restore failed: the VM is not running;
+  check vm.status`, or `snapshot restore failed: the engine closed the
+  connection (<reason>); check vm.status` when the engine quits before the
+  load ends (a forced stop, or a graceful stop whose grace period ends first).
 - `vm.snapshot.delete` deletes `snapshot`.
 - `vm.snapshot.restore` and `vm.snapshot.delete` of a name that is not listed
   answer `no snapshot '<s>' in '<vm>'; call vm.snapshot.list`.
