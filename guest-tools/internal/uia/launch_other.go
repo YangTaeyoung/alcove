@@ -18,7 +18,7 @@ func LockDeployRoot(dir string) (string, error) { return "", nil }
 
 // DefaultLauncher returns a launcher that always fails on this system.
 func DefaultLauncher(dir string, logf func(format string, args ...any)) Launcher {
-	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
+	return func(<-chan struct{}) (io.WriteCloser, io.ReadCloser, func(), error) {
 		return nil, nil, nil, errors.New("UI Automation is only available on Windows guests")
 	}
 }

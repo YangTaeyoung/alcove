@@ -172,7 +172,10 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   invalid UTF-8 becomes U+FFFD.
 - Killing a tree (timeout, `exec.kill`, `proc.kill` with `tree`) runs
   `taskkill /F /T /PID <pid>` on Windows; elsewhere each child leads its own
-  process group and the group receives SIGKILL.
+  process group and the group receives SIGKILL. `taskkill` follows parent
+  process ids, so on Windows a process whose parent had already exited (for
+  example a server started by `cmd /c start /b`) is not part of the tree and
+  keeps running; stop it with `proc.kill` by `pid` or `name`.
 
 ### Jobs (`exec.start`, `exec.read`, `exec.write`, `exec.kill`, `exec.list`)
 
@@ -353,9 +356,14 @@ operation with
 `the UI helper cannot start because %ProgramData% is not set; start alcove-agent through its scheduled task`.
 
 Before a start the agent waits up to 10 s for the previous helper process to
-end (`the previous UI helper process has not ended after 10 s; retry`); the
-wait and the start do not hold up `Close` or the queue of other requests. The
-start failures:
+end (`the previous UI helper process has not ended after 10 s; retry`); once
+such a wait ran out, later starts answer that sentence at once until that
+process has ended, without waiting again. The wait and the start run in the
+turn of the request that needs the helper, so the requests behind it wait for
+them (within their 60 s turn limit); they do not hold up `Close`. After
+`Close` a start that is waiting or preparing stops before the next step and
+answers `the UI helper is shut down; restart alcove-agent`. The start
+failures:
 
 - `the UI helper could not be prepared in <dir>: <reason>; check free space and the folder's access list`
   (the helper files could not be written or read),

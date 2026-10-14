@@ -1,6 +1,7 @@
 package uia
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -53,12 +54,15 @@ func notStarted(reason error) error {
 // goroutine at a time.
 type exitGate struct {
 	exited chan struct{} // closed when that process has ended; nil before the first start
-	onWait func()        // runs when waitPrevious finds that process still running; may be nil
+	stuck  bool          // a wait for that process ran out while it still ran
+	onWait func()        // runs when waitPrevious waits for that process; may be nil
 }
 
 // waitPrevious returns true when no process was started before or the latest
-// one has ended, and false when it still runs after limit.
-func (g *exitGate) waitPrevious(limit time.Duration) bool {
+// one has ended, and false when it still runs after limit or stop closed
+// first. Once a wait for a process ran out, later calls do not wait for that
+// process again and return false while it runs.
+func (g *exitGate) waitPrevious(limit time.Duration, stop <-chan struct{}) bool {
 	if g.exited == nil {
 		return true
 	}
@@ -66,6 +70,9 @@ func (g *exitGate) waitPrevious(limit time.Duration) bool {
 	case <-g.exited:
 		return true
 	default:
+	}
+	if g.stuck {
+		return false
 	}
 	if g.onWait != nil {
 		g.onWait()
@@ -76,6 +83,9 @@ func (g *exitGate) waitPrevious(limit time.Duration) bool {
 	case <-g.exited:
 		return true
 	case <-timer.C:
+		g.stuck = true
+		return false
+	case <-stop:
 		return false
 	}
 }
@@ -85,6 +95,7 @@ func (g *exitGate) waitPrevious(limit time.Duration) bool {
 func (g *exitGate) started() (ended func()) {
 	exited := make(chan struct{})
 	g.exited = exited
+	g.stuck = false
 	return func() { close(exited) }
 }
 
@@ -107,15 +118,25 @@ type launchSteps struct {
 // newLauncher returns a launcher that waits up to previousExitWait for the
 // process of its previous start to end, then runs prepare, then start. It
 // runs neither when the previous process still runs after the wait, and does
-// not run start when prepare failed.
+// not run start when prepare failed. A launcher whose stop channel is closed
+// before a step runs that step no more and answers errClosed.
 func newLauncher(steps launchSteps, gate *exitGate) Launcher {
 	starts := 0
-	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
-		if !gate.waitPrevious(previousExitWait) {
+	return func(stop <-chan struct{}) (io.WriteCloser, io.ReadCloser, func(), error) {
+		if stopped(stop) {
+			return nil, nil, nil, errors.New(errClosed)
+		}
+		if !gate.waitPrevious(previousExitWait, stop) {
+			if stopped(stop) {
+				return nil, nil, nil, errors.New(errClosed)
+			}
 			return nil, nil, nil, fmt.Errorf("the previous UI helper process has not ended after %d s; retry", int(previousExitWait.Seconds()))
 		}
 		if err := steps.prepare(); err != nil {
 			return nil, nil, nil, err
+		}
+		if stopped(stop) {
+			return nil, nil, nil, errors.New(errClosed)
 		}
 		p, err := steps.start(starts)
 		if err != nil {
@@ -128,5 +149,15 @@ func newLauncher(steps launchSteps, gate *exitGate) Launcher {
 			ended()
 		}()
 		return p.stdin, p.stdout, p.kill, nil
+	}
+}
+
+// stopped reports whether stop is closed; a nil stop never is.
+func stopped(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
 	}
 }

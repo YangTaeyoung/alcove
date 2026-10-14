@@ -28,8 +28,9 @@ const (
 	defaultQueueWait    = 60 * time.Second
 )
 
-// Launcher starts the helper child and returns its pipes.
-type Launcher func() (stdin io.WriteCloser, stdout io.ReadCloser, kill func(), err error)
+// Launcher starts the helper child and returns its pipes. stop is closed when
+// the Helper is closed; a launcher that sees it closed starts nothing.
+type Launcher func(stop <-chan struct{}) (stdin io.WriteCloser, stdout io.ReadCloser, kill func(), err error)
 
 type result struct {
 	fields map[string]any
@@ -80,15 +81,16 @@ type Helper struct {
 	cur     *child
 	nextID  int64
 	closed  bool
-	busy    bool   // a call holds the helper
-	busyOp  string // the op of that call
+	stop    chan struct{} // closed by Close
+	busy    bool          // a call holds the helper
+	busyOp  string        // the op of that call
 	waiters []*waiter
 }
 
 // New returns a Helper that starts the child through launch on the first Call.
 // onEvent receives helper events with the "ev" key removed; it may be nil.
 func New(launch Launcher, onEvent func(name string, fields map[string]any)) *Helper {
-	return &Helper{launch: launch, onEvent: onEvent, logger: log.Default(),
+	return &Helper{launch: launch, onEvent: onEvent, logger: log.Default(), stop: make(chan struct{}),
 		startTimeout: defaultStartTimeout, queueWait: defaultQueueWait}
 }
 
@@ -217,7 +219,7 @@ func (h *Helper) CallContext(ctx context.Context, op string, params map[string]a
 	c := h.cur
 	h.mu.Unlock()
 	if c == nil {
-		stdin, stdout, kill, err := h.launch()
+		stdin, stdout, kill, err := h.launch(h.stop)
 		if err != nil {
 			return nil, fmt.Errorf("could not start the UI helper through PowerShell: %v", err)
 		}
@@ -307,6 +309,9 @@ func (h *Helper) CallContext(ctx context.Context, op string, params map[string]a
 // Close kills the child and fails pending and waiting calls; later calls fail.
 func (h *Helper) Close() {
 	h.mu.Lock()
+	if !h.closed {
+		close(h.stop)
+	}
 	h.closed = true
 	c := h.cur
 	for _, w := range h.waiters {

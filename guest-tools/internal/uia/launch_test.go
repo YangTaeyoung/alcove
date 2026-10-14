@@ -37,7 +37,7 @@ func TestNotPreparedNamesTheFolderTheReasonAndTheNextStep(t *testing.T) {
 
 func TestExitGateLetsTheFirstStartThrough(t *testing.T) {
 	var g exitGate
-	if !g.waitPrevious(0) {
+	if !g.waitPrevious(0, nil) {
 		t.Fatal("a gate without an earlier start did not open")
 	}
 }
@@ -49,14 +49,14 @@ func TestExitGateOpensWhenThePreviousProcessHasEnded(t *testing.T) {
 	opened := make(chan bool, 1)
 	go func() {
 		close(waiting)
-		opened <- g.waitPrevious(longWait)
+		opened <- g.waitPrevious(longWait, nil)
 	}()
 	<-waiting
 	ended()
 	if !<-opened {
 		t.Fatal("the gate stayed shut after the previous process ended")
 	}
-	if !g.waitPrevious(0) {
+	if !g.waitPrevious(0, nil) {
 		t.Fatal("the gate shut again for a process that has ended")
 	}
 }
@@ -64,16 +64,16 @@ func TestExitGateOpensWhenThePreviousProcessHasEnded(t *testing.T) {
 func TestExitGateStaysShutWhileThePreviousProcessRuns(t *testing.T) {
 	var g exitGate
 	ended := g.started()
-	if g.waitPrevious(20 * time.Millisecond) {
+	if g.waitPrevious(20*time.Millisecond, nil) {
 		t.Fatal("the gate opened while the previous process ran")
 	}
 	ended()
 	next := g.started()
-	if g.waitPrevious(20 * time.Millisecond) {
+	if g.waitPrevious(20*time.Millisecond, nil) {
 		t.Fatal("the gate opened while the second process ran")
 	}
 	next()
-	if !g.waitPrevious(0) {
+	if !g.waitPrevious(0, nil) {
 		t.Fatal("the gate stayed shut after the second process ended")
 	}
 }
@@ -121,12 +121,12 @@ func TestLauncherPreparesTheFolderOnlyAfterThePreviousProcessEnded(t *testing.T)
 			return second.process(), nil
 		},
 	}, gate)
-	if _, _, _, err := launch(); err != nil {
+	if _, _, _, err := launch(nil); err != nil {
 		t.Fatal(err)
 	}
 	launched := make(chan error, 1)
 	go func() {
-		_, _, _, err := launch()
+		_, _, _, err := launch(nil)
 		launched <- err
 	}()
 	<-waiting
@@ -155,7 +155,7 @@ func TestLauncherPassesTheNumberOfEarlierStarts(t *testing.T) {
 		},
 	}, &exitGate{})
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := launch(); err != nil {
+		if _, _, _, err := launch(nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -173,10 +173,82 @@ func TestLauncherDoesNotStartWhenTheFolderIsNotPrepared(t *testing.T) {
 			return nil, errors.New("unexpected")
 		},
 	}, &exitGate{})
-	if _, _, _, err := launch(); err == nil || err.Error() != "not locked" {
+	if _, _, _, err := launch(nil); err == nil || err.Error() != "not locked" {
 		t.Fatalf("err %v", err)
 	}
 	if started {
 		t.Fatal("the process was started")
+	}
+}
+
+func TestExitGateDoesNotWaitAgainForAProcessThatOutlastedAWait(t *testing.T) {
+	var g exitGate
+	ended := g.started()
+	if g.waitPrevious(20*time.Millisecond, nil) {
+		t.Fatal("the gate opened while the previous process ran")
+	}
+	began := time.Now()
+	if g.waitPrevious(longWait, nil) {
+		t.Fatal("the gate opened while the previous process still ran")
+	}
+	if waited := time.Since(began); waited >= longWait {
+		t.Fatalf("the second wait took %v", waited)
+	}
+	ended()
+	if !g.waitPrevious(0, nil) {
+		t.Fatal("the gate stayed shut after the process ended")
+	}
+	next := g.started()
+	defer next()
+	waits := 0
+	g.onWait = func() { waits++ }
+	g.waitPrevious(20*time.Millisecond, nil)
+	if waits != 1 {
+		t.Fatalf("a new process was waited for %d times", waits)
+	}
+}
+
+func TestExitGateStopsWaitingWhenStopCloses(t *testing.T) {
+	var g exitGate
+	ended := g.started()
+	defer ended()
+	stop := make(chan struct{})
+	g.onWait = func() { close(stop) }
+	if g.waitPrevious(longWait, stop) {
+		t.Fatal("the gate opened while the previous process ran")
+	}
+}
+
+func TestLauncherRunsNoStepAfterStop(t *testing.T) {
+	var steps []string
+	launch := newLauncher(launchSteps{
+		prepare: func() error { steps = append(steps, "prepare"); return nil },
+		start: func(int) (*helperProcess, error) {
+			steps = append(steps, "start")
+			return nil, errors.New("unexpected")
+		},
+	}, &exitGate{})
+	stop := make(chan struct{})
+	close(stop)
+	if _, _, _, err := launch(stop); err == nil || err.Error() != errClosed {
+		t.Fatalf("err %v", err)
+	}
+	if len(steps) != 0 {
+		t.Fatalf("steps %q", steps)
+	}
+}
+
+func TestLauncherDoesNotStartWhenStopClosesDuringPrepare(t *testing.T) {
+	stop := make(chan struct{})
+	started := false
+	launch := newLauncher(launchSteps{
+		prepare: func() error { close(stop); return nil },
+		start: func(int) (*helperProcess, error) {
+			started = true
+			return nil, errors.New("unexpected")
+		},
+	}, &exitGate{})
+	if _, _, _, err := launch(stop); err == nil || err.Error() != errClosed || started {
+		t.Fatalf("err %v, started %v", err, started)
 	}
 }

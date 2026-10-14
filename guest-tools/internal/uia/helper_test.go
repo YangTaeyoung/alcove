@@ -34,7 +34,7 @@ func newFake(play func(n int, in io.Reader, out io.Writer)) *fakeHelper {
 }
 
 func (f *fakeHelper) launcher() Launcher {
-	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
+	return func(<-chan struct{}) (io.WriteCloser, io.ReadCloser, func(), error) {
 		n := int(f.launches.Add(1)) - 1
 		reqR, reqW := io.Pipe()
 		resR, resW := io.Pipe()
@@ -663,12 +663,12 @@ func TestHelperTimeoutKillsAndRestarts(t *testing.T) {
 
 func TestLaunchFailureIsReported(t *testing.T) {
 	var launches int
-	launch := func() (io.WriteCloser, io.ReadCloser, func(), error) {
+	launch := func(<-chan struct{}) (io.WriteCloser, io.ReadCloser, func(), error) {
 		launches++
 		if launches == 1 {
 			return nil, nil, nil, errors.New("file not found")
 		}
-		return newFake(echoPlay).launcher()()
+		return newFake(echoPlay).launcher()(nil)
 	}
 	h := New(launch, nil)
 	defer h.Close()
@@ -941,13 +941,13 @@ func TestFatalEventOfAReadyHelperIsReportedAsItIs(t *testing.T) {
 func blockedLauncher(f *fakeHelper, entered, release chan struct{}) Launcher {
 	launch := f.launcher()
 	first := true
-	return func() (io.WriteCloser, io.ReadCloser, func(), error) {
+	return func(<-chan struct{}) (io.WriteCloser, io.ReadCloser, func(), error) {
 		if first {
 			first = false
 			close(entered)
 			<-release
 		}
-		return launch()
+		return launch(nil)
 	}
 }
 
