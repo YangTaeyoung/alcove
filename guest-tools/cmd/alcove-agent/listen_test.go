@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestListenTriesAgainWithAPauseThatDoublesUpTo30Seconds(t *testing.T) {
+func TestListenTriesAgainWithAPauseThatDoublesUpTo5Seconds(t *testing.T) {
 	failures := 8
 	var pauses []time.Duration
 	var lines []string
@@ -32,11 +32,11 @@ func TestListenTriesAgainWithAPauseThatDoublesUpTo30Seconds(t *testing.T) {
 		t.Fatalf("listener %v", got)
 	}
 	s := time.Second
-	if fmt.Sprint(pauses) != fmt.Sprint([]time.Duration{s, 2 * s, 4 * s, 8 * s, 16 * s, 30 * s, 30 * s, 30 * s}) {
+	if fmt.Sprint(pauses) != fmt.Sprint([]time.Duration{s, 2 * s, 4 * s, 5 * s, 5 * s, 5 * s, 5 * s, 5 * s}) {
 		t.Fatalf("pauses %v", pauses)
 	}
 	if len(lines) != 8 || lines[0] != "listen on 0.0.0.0:7645 failed (Only one usage of each socket address is normally permitted.); trying again in 1 s" ||
-		!strings.HasSuffix(lines[7], "; trying again in 30 s") {
+		!strings.HasSuffix(lines[7], "; trying again in 5 s") {
 		t.Fatalf("lines %q", lines)
 	}
 }

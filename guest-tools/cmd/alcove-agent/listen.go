@@ -10,7 +10,7 @@ import (
 // listenUntilBound.
 const (
 	listenFirstPause = time.Second
-	listenMaxPause   = 30 * time.Second
+	listenMaxPause   = 5 * time.Second
 )
 
 // listenUntilBound calls listen for address until it succeeds. After a

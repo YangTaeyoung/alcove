@@ -222,7 +222,7 @@ Windows the socket is bound with `SO_EXCLUSIVEADDRUSE`, so no other program
 can bind the same port on a specific address of the guest while the agent
 holds it. When the port cannot be bound (another program holds it), the
 agent logs `listen on 0.0.0.0:<port> failed (<system error>); trying again in <n> s`
-and tries again after 1 s, then after twice the previous pause, up to 30 s
+and tries again after 1 s, then after twice the previous pause, up to 5 s
 between attempts, until the bind succeeds.
 
 ## Messages
