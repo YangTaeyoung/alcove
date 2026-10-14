@@ -89,6 +89,31 @@ final class EventBufferTests: XCTestCase {
         XCTAssertEqual(tail.events.map(\.seq), [619, 620])
     }
 
+    func testALongStringOfAnEventIsCutAndTheOtherFieldsStay() async throws {
+        let buffer = EventBuffer()
+        let title = String(repeating: "가", count: 400_000)
+        await buffer.append(name: "window.title", payload: ["window": ["title": .string(title), "hwnd": 7], "pid": 3], at: Date())
+        let kept = await buffer.since(0).events
+        let window = kept.first?.payload["window"]
+        XCTAssertEqual(window?["hwnd"]?.intValue, 7)
+        XCTAssertEqual(kept.first?.payload["pid"]?.intValue, 3)
+        let cut = try XCTUnwrap(window?["title"]?.stringValue)
+        XCTAssertEqual(cut.utf8.count, EventBuffer.maxStringBytes - EventBuffer.maxStringBytes % 3)
+        XCTAssertTrue(title.hasPrefix(cut))
+        XCTAssertEqual(window?["titleCut"]?.boolValue, true)
+    }
+
+    func testAnEventPayloadLargerThanTheLimitAfterCuttingIsReplacedByItsSize() async throws {
+        let buffer = EventBuffer()
+        let items = (0..<20_000).map { JSON.int(Int64($0)) }
+        let payload: JSON = ["list": .array(items)]
+        let bytes = try payload.serialized().count
+        await buffer.append(name: "x", payload: payload, at: Date())
+        let kept = await buffer.since(0).events
+        XCTAssertEqual(kept.first?.payload, ["payloadOmitted": .int(Int64(bytes))])
+        XCTAssertGreaterThan(bytes, EventBuffer.maxPayloadBytes)
+    }
+
     func testEventJSONCarriesSequenceTimeNameAndPayload() {
         let event = GuestEvent(seq: 7, time: Date(timeIntervalSince1970: 1_800_000_000.25), name: "dialog.opened",
                                payload: ["window": ["title": "저장 \"확인\""], "seq": 99, "name": "shadowed"])

@@ -891,7 +891,11 @@ The guest tools report what happens in the guest, and the server keeps the
 newest 500 events of each VM, numbered from 1 in the order they arrived
 (`seq`). The numbers keep counting when old events are dropped, and the
 events stay when the VM stops or the tools reconnect; a new server process
-starts at 1 again.
+starts at 1 again. An event whose fields take more than 64 KiB of JSON has
+every string longer than 4096 bytes of UTF-8 cut to that length, and the
+object that held it gets `<field>Cut: true` (for example `titleCut` in
+`window`); an event still larger than 64 KiB keeps only
+`payloadOmitted: <bytes>`.
 
 | `name` | fields | sent when |
 |---|---|---|

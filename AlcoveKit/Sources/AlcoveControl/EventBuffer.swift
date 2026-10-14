@@ -35,8 +35,13 @@ public struct GuestEvent: Sendable, Equatable {
 }
 
 /// The guest events of one VM. Keeps the newest `capacity` events; sequence numbers keep counting when older events are dropped.
+/// In a payload whose JSON is longer than `maxPayloadBytes`, every string longer than `maxStringBytes` of UTF-8 is cut
+/// to that length on a character boundary, and an object that held such a string as `key` gets `<key>Cut: true`; a
+/// payload still longer than `maxPayloadBytes` is kept as `{"payloadOmitted": <bytes of the payload as it arrived>}`.
 public actor EventBuffer {
     public static let capacity = 500
+    static let maxStringBytes = 4096
+    static let maxPayloadBytes = 64 * 1024
 
     private var events: [GuestEvent] = []
     private var last = 0
@@ -45,8 +50,34 @@ public actor EventBuffer {
 
     public func append(name: String, payload: JSON, at time: Date) {
         last += 1
-        events.append(GuestEvent(seq: last, time: time, name: name, payload: payload))
+        events.append(GuestEvent(seq: last, time: time, name: name, payload: EventBuffer.bounded(payload)))
         if events.count > EventBuffer.capacity { events.removeFirst(events.count - EventBuffer.capacity) }
+    }
+
+    /// `payload` with its long strings cut, or its size in place of it when it is still longer than `maxPayloadBytes`.
+    static func bounded(_ payload: JSON) -> JSON {
+        guard let size = try? payload.serialized().count, size > maxPayloadBytes else { return payload }
+        let cut = cutStrings(payload)
+        if let cutSize = try? cut.serialized().count, cutSize <= maxPayloadBytes { return cut }
+        return ["payloadOmitted": .int(Int64(size))]
+    }
+
+    private static func cutStrings(_ value: JSON) -> JSON {
+        switch value {
+        case .string(let text) where text.utf8.count > maxStringBytes:
+            return .string(ControlHandler.cutUTF8(text, maxBytes: maxStringBytes))
+        case .array(let items):
+            return .array(items.map(cutStrings))
+        case .object(let fields):
+            var out: [String: JSON] = [:]
+            for (key, field) in fields {
+                out[key] = cutStrings(field)
+                if case .string(let text) = field, text.utf8.count > maxStringBytes { out[key + "Cut"] = true }
+            }
+            return .object(out)
+        default:
+            return value
+        }
     }
 
     /// The kept events with a sequence number above `seq`, oldest first; `next`, the sequence number of the newest event
