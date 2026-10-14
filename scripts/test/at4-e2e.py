@@ -215,6 +215,7 @@ class Run:
         self.notepad_copy = None
         self.notepad_names = None
         self.notepad_dirs = []
+        self.title_bar_clicks = 0
 
     # calls
 
@@ -408,10 +409,34 @@ class Run:
             window = r["window"]
         return window
 
-    def focus(self):
-        r = self.call("vm.window.action", window=TITLE, action="focus")
-        expect(r["window"]["foreground"] is True, f"vm.window.action focus left the fixture window behind: {r['window']!r}")
-        return r["window"]
+    def focus(self, window=TITLE):
+        """Brings a window to the foreground and returns it: through vm.window.action focus, and through a click on
+        its title bar when the guest answers that the window did not come to the foreground."""
+        try:
+            found = self.call("vm.window.action", window=window, action="focus")["window"]
+        except ControlTimeout:
+            raise
+        except ControlError as e:
+            if "did not come to the foreground; click its title bar through the display" not in str(e):
+                raise
+            behind = [w for w in self.windows() if window in (w["id"], w["title"])][0]
+            self.call("vm.mouse.click", x=behind["x"] + behind["w"] // 2, y=behind["y"] + 12)
+            self.title_bar_clicks += 1
+            time.sleep(0.5)
+            found = [w for w in self.windows() if w["id"] == behind["id"]][0]
+        expect(found["foreground"] is True, f"the window {window!r} is not in the foreground after vm.window.action focus and a click on its "
+                                            f"title bar; in front is {self.front()}; move that window out of the way and run this script again")
+        return found
+
+    def front(self):
+        """What vm.ui.tree says about the window in the foreground."""
+        try:
+            window = self.call("vm.ui.tree", window="foreground", depth=0)["window"]
+            return f"{window['title']!r} of {window['process']}"
+        except ControlTimeout:
+            raise
+        except ControlError as e:
+            return f"no window ({e})"
 
     def element(self, **selector):
         """The one element of the fixture window the selector fields name."""
@@ -803,8 +828,7 @@ def _(run):
     expect(titled["matched"] == 0 and titled["detail"]["id"] == window["id"], f"vm.wait_for window_title for the page's title answered {titled!r}; the launch returned window {window['id']}")
     browser = [p for p in run.edge_processes() if p["pid"] == window["pid"]]
     expect(len(browser) == 1, f"the window's process {window['pid']} is not an Edge process of the profile {EDGE_PROFILE}")
-    focused = run.call("vm.window.action", window=window["id"], action="focus")
-    expect(focused["window"]["foreground"] is True, f"vm.window.action focus left the Edge window behind: {focused['window']!r}")
+    run.focus(window["id"])
     there = run.wait_for([{"type": "ui_exists", "window": window["id"], "name": "Edge button"}], timeout=60)
     expect(there["matched"] == 0, f"vm.wait_for ui_exists for the page's button answered {there!r}")
     ready = time.monotonic() - began
@@ -1236,7 +1260,7 @@ def _(run):
 
 @check("the MCP server finds and clicks an element, launches an app, reads events, waits for an element and marks a screenshot")
 def _(run):
-    window = run.fixture()
+    window = run.fixture(fresh=True)
     run.focus()
     m = run.mcp()
     err, out, images = m.call("alcove_ui_find", {"name": run.vm, "window": TITLE, "role": "Button", "element_name": "Send"})
