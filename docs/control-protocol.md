@@ -7,9 +7,10 @@ and background jobs in the guest, list and kill guest processes, exchange
 clipboard text, copy, sync, read and write guest files, read the text on the
 screen, list and act on windows, read and operate the UI elements of a
 Windows guest, launch and deploy apps, read guest events, wait for
-conditions, take and restore snapshots, forward ports, cut the guest's
-network link, lease a VM, change guest settings, diagnose a VM, and create
-linked clones and sessions that discard their changes.
+conditions, record what was done, read the guest's event log, collect crash
+dumps, write a diagnostics bundle, take and restore snapshots, forward ports,
+cut the guest's network link, lease a VM, change guest settings, diagnose a
+VM, and create linked clones and sessions that discard their changes.
 
 The same server runs inside the Alcove app (which owns the VMs while it is
 running) and inside `alcovectl serve` (headless, when the app is not running).
@@ -37,7 +38,8 @@ Each connection has two lanes.
 - **Concurrent lane**: every op whose name starts with `vm.exec`,
   `vm.process.` or `vm.fs.`, and `vm.push_file`, `vm.pull_file`,
   `vm.sync_dir`, `vm.find_text`, `vm.window.list`, `vm.ui.tree`,
-  `vm.ui.find`, `vm.ui.text`, `vm.app.launch`, `vm.deploy`. Such a request starts as soon as it arrives and answers when
+  `vm.ui.find`, `vm.ui.text`, `vm.app.launch`, `vm.deploy`,
+  `vm.crash_dumps.pull`, `vm.collect_diagnostics`, `script.run`. Such a request starts as soon as it arrives and answers when
   it finishes, so several can be in flight and their replies arrive in any
   order. Match replies by `id`. Pipelined requests of this lane are unordered
   among themselves: two `vm.fs.write` requests to one file sent back to back
@@ -48,7 +50,8 @@ Each connection has two lanes.
   `vm.wait_for`, snapshots, forwards, `vm.set_network`, leases,
   `vm.set_resolution`, `vm.set_environment`, `vm.doctor`, `vm.clone`,
   `vm.delete`, `vm.window.action`, `vm.ui.click`, `vm.ui.type`,
-  `vm.ui.action`, `vm.events`). These run one after another in the order they arrived, and
+  `vm.ui.action`, `vm.events`, `vm.record.*`, `vm.event_log`,
+  `vm.crash_dumps.enable`, `vm.crash_dumps.disable`, `vm.crash_dumps.list`). These run one after another in the order they arrived, and
   their replies come in that order; a long `vm.wait_for` or `vm.batch` holds
   back the later requests of the serial lane of its connection.
 
@@ -129,6 +132,15 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.app.launch` | `name`, `path`, `args?`, `cwd?`, `env?`, `waitWindow?` s (default 15) | `{pid, window?, windowTimedOut?}` — see [Launching and deploying apps](#launching-and-deploying-apps) |
 | `vm.deploy` | `name`, `path` (host), `guestDir?`, `install?`, `launch?`, `killRunning?`, `waitWindow?` s (default 20) | `{guestDir, sent, skipped, bytes, installCode?, pid?, window?, windowTimedOut?}` |
 | `vm.events` | `name`, `since?` | `{events, next, first}` — see [Guest events](#guest-events) |
+| `vm.record.start` | `name`, `fps?` (1 to 30, default 5), `video?` (default true), `maxSeconds?` (1 to 86400, default 900), `dir?` (host) | `{dir}` — see [Recordings](#recordings) |
+| `vm.record.stop` | `name` | `{dir, trace, frames, seconds, ops, writeErrors, lastWriteError?, video?, videoSeconds?, droppedFrames?}` |
+| `vm.record.status` | `name` | `{recording: true, dir, seconds, ops, writeErrors, lastWriteError?, videoError?}` or `{recording: false, dir?}` |
+| `vm.event_log` | `name`, `log?` (default `Application`), `level?`, `provider?`, `sinceMinutes?` (default 60), `contains?`, `max?` (default 50) | `{entries: [{time, id, level, provider, message}], truncated?}` — see [Event log](#event-log) |
+| `vm.crash_dumps.enable` | `name`, `exe`, `full?` (default false) | `{folder, createdKey}` — see [Crash dumps](#crash-dumps) |
+| `vm.crash_dumps.disable` | `name`, `exe` | `{}` |
+| `vm.crash_dumps.list` | `name` | `{dumps: [{file, exe, bytes, time}]}` |
+| `vm.crash_dumps.pull` | `name`, `file`, `path` (host) | `{path, bytes, sha256}` |
+| `vm.collect_diagnostics` | `name`, `dir?` (host), `sinceMinutes?` (default 30), `logFiles?`, `processName?` | `{dir, files, summary}` — see [Diagnostics bundle](#diagnostics-bundle) |
 
 The reply to an op that is not read-only and names a VM also carries
 `eventSeq` (see [Guest events](#guest-events)).
@@ -1113,7 +1125,8 @@ The read-only ops, which ignore leases, are `hello`, `vm.list`, `vm.status`,
 `vm.fs.list`, `vm.fs.read`, `vm.pull_file`, `vm.snapshot.list`,
 `vm.forward.list`, `vm.lease.acquire`, `vm.lease.release`, `vm.doctor`,
 `vm.record.status`, `vm.window.list`, `vm.ui.tree`, `vm.ui.find`,
-`vm.ui.text` and `vm.events`. Every other op is guarded, among them the power ops,
+`vm.ui.text`, `vm.events`, `vm.event_log`, `vm.crash_dumps.list`,
+`vm.crash_dumps.pull`, `vm.collect_diagnostics` and `script.save`. Every other op is guarded, among them the power ops,
 `vm.window.action`, `vm.ui.click`, `vm.ui.type`, `vm.ui.action`,
 `vm.app.launch`, `vm.deploy`,
 `vm.clone` (through its template's lease) and `vm.delete`. The action ops and
@@ -1212,6 +1225,290 @@ that makes the later ones impossible:
 the system DPI a newly started DPI-aware process reads on Windows, as a
 percentage of 96. A fact the guest cannot measure reads `not checked on this
 guest` and counts as ok.
+
+## Recordings
+
+`vm.record.start` begins a recording of one VM: from then on every op that
+names the VM in `name` (other than `vm.record.*`) is written to a trace, and,
+unless `video` is false, the screen is written to a video. A VM has at most
+one recording; a second start answers `'<vm>' is already recording to <dir>;
+call vm.record.stop first`.
+
+- `dir` is an absolute host path (`dir must be an absolute path`). Without it
+  the recording goes to `~/Library/Application Support/Alcove/Recordings/<vm>-<yyyyMMdd-HHmmss>`
+  (a `/` in the VM name becomes `-`). A directory that already holds a
+  `trace.jsonl` is refused: `'<dir>' already holds a recording; choose another
+  directory`.
+- The directory holds `trace.jsonl`, `frames/` and `video.mp4`.
+- The recording ends by itself after `maxSeconds`, after a `vm.stop` of its VM
+  succeeded, when an op finds its VM not running, and after 20 trace lines in
+  a row could not be written. Its summary then waits for the next
+  `vm.record.stop`, which returns it once.
+- `vm.record.stop` ends the recording and answers its summary: `dir`, `trace`
+  (the path of `trace.jsonl`), `frames` (frame files written), `seconds`,
+  `ops` (trace lines written), `writeErrors` and `lastWriteError` (frames,
+  lines or video that could not be written), and, when the video was written,
+  `video` (its path), `videoSeconds` and `droppedFrames`. Without a recording
+  it answers `'<vm>' is not recording`; while a start is still creating the
+  directory, `'<vm>' is still starting its recording; call vm.record.stop
+  again in a moment`.
+- `vm.record.status` answers `recording: true` with `dir`, `seconds`, `ops`,
+  `writeErrors`, `lastWriteError` and, once the video writer failed,
+  `videoError`; otherwise `recording: false` and the `dir` of the VM's latest
+  recording, if it had one.
+
+**Trace.** `trace.jsonl` holds one JSON object per line, written with one
+write call after the op answered, so the file holds whole lines also when the
+server ends abruptly:
+
+| field | value |
+|---|---|
+| `seq` | 1, 2, … in the order the lines were written |
+| `time` | ISO 8601 with milliseconds: when the op began |
+| `ms` | milliseconds from the start of the recording to `time` |
+| `op` | the op name |
+| `params` | the request without `id` and `op` |
+| `ok` | whether the op succeeded |
+| `result` / `error` | the reply's fields, or its error sentence |
+| `durationMs` | how long the op took |
+| `before`, `after` | `frames/<seq>-before.jpg` and `frames/<seq>-after.jpg`, paths relative to the directory |
+| `target` | the element the op was aimed at, asked of the UI helper before the op ran: `{window?, role, name, automationId?, rect?, password?, byAutomationId?, byName?}` |
+| `script` | for an op that `script.run` made: `step`, `expect`, `lease`, `snapshot` or `failure` |
+
+`params`, `result`, `error` and `target` never hold `lease`; image payloads
+(`png`, `jpeg`) read `<image omitted>`; a string longer than 2000 characters
+is cut to 2000 followed by `…`, and `<key>Truncated: true` is added next to
+it. Values in `env` whose names contain `KEY`, `TOKEN`, `SECRET` or
+`PASSWORD` (any case) read `<masked>`. Text typed into a password element
+(`vm.type`, `vm.ui.type`, `vm.ui.action` with `value`, and text keys of
+`vm.key.*` aimed at such an element) reads `<masked>`; the values of a
+script's secret variables are replaced the same way.
+
+Frames are half-size JPEG files of quality 0.6, taken right before and right
+after the input ops (`vm.mouse.*`, `vm.key.*`, `vm.type`, `vm.batch`,
+`vm.ui.click`, `vm.ui.type`, `vm.ui.action`, `vm.window.action`),
+`vm.app.launch` and `vm.deploy`. A failed op keeps its after-frame. `target`
+is asked for `vm.mouse.click` and `vm.mouse.drag` (the press point), for
+`vm.ui.click`, `vm.ui.type` and `vm.ui.action` given a `ref` alone, and for
+`vm.type` and text keys (the focused element); it is left out when the
+helper is busy or does not answer at once.
+
+**Video.** `video.mp4` is H.264 in an MP4 file. Its size is the first frame's,
+rounded down to even numbers and scaled so that the longer side is at most
+1920; a frame of another size is drawn into it aspect-fit on black. The
+screen is read `fps` times a second; a frame equal to the previous one is
+written again only after 2 s. The frame read when the recording ends closes
+the video: the video lasts until that moment and shows the last frame
+sampled before it. The file is written in movie fragments of one second, so a
+copy taken while the recording runs plays up to its last whole fragment; a
+finished file is an ordinary MP4. When the video cannot be written the
+recording continues without it, `vm.record.status` shows `videoError` at
+once, and the summary has no `video` and carries the reason in
+`lastWriteError` (`the video could not be written: …`, or `no frame could be
+recorded for the video` when no frame could be read); a file the failed
+writer left that still plays is kept in the directory. Measured on Windows
+11 at 1280x800 and `fps` 5: 0.83 MB for 6 s and 35 MB for 192 s of a
+changing screen, `vm.record.start` and `vm.record.stop` each answered within
+0.05 s.
+
+## Event log
+
+`vm.event_log` reads the guest's log through the guest tools (needs
+`--allow-exec`): the Windows event log with PowerShell, the journal with
+`journalctl -o json` on Linux. Entries come newest first by `time`, at most
+`max` of them (1 to 500, default 50), from the last `sinceMinutes` minutes
+(1 to 5256000, default 60) of the guest's clock.
+
+- `log` (Windows only; ignored on Linux) is a log name of 1 to 255
+  characters from letters, digits, space and `_ - . /`, not starting with
+  `-`: `Application`, `System`, `Security`,
+  `Microsoft-Windows-PowerShell/Operational`.
+- `level` is `critical`, `error`, `warning` or `info` and selects that level
+  and every more severe one: Windows levels 1, 1–2, 1–3, and every level for
+  `info`; journal priorities 0–2, 0–3, 0–4 and 0–6. Entries are labelled
+  `critical` (Windows 1), `error` (2), `warning` (3) and `info` (everything
+  else, also the level 0 of Security audit entries).
+- `provider` is the provider's exact name in any case, without wildcards (on
+  Linux the syslog identifier); a provider no entry has gives an empty list.
+- `contains` keeps the entries whose message holds the text, in any case. It
+  is searched in every entry of the time window, which is the slow part of a
+  large log.
+- `provider` and `contains` are at most 1000 characters and hold no NUL.
+- `id` is the event id (on Linux the process id); `message` is cut at 2000
+  UTF-16 units, one less where the cut would split a surrogate pair. `time`
+  is ISO 8601 in UTC from the guest's clock.
+- `truncated: true` says that more entries matched than the output holds: the
+  guest prints at most 150000 bytes of entries, and the newest ones are kept.
+
+The read has 60 s in the guest. Sentences:
+
+| sentence | when |
+|---|---|
+| `the guest has no event log named '<log>'; list the logs with Get-WinEvent -ListLog *` | the log does not exist |
+| `guest tools may not read the event log '<log>'; check that alcove-agent runs elevated` | the agent's user may not open the log |
+| `could not read the event log '<log>': <reason>; check that alcove-agent runs elevated, or read the log with vm.exec` | the read was denied |
+| `could not read the event log '<log>': <reason>; read the log with vm.exec to see the full error` | any other read failure, e.g. an analytic or debug log, which can only be read oldest first |
+| `the guest took more than 60 s to read the event log; narrow it with level, provider or a smaller sinceMinutes` | the read ran out of time |
+| `the guest did not finish reading the event log within 60 s; contains is searched in every entry of the time window, so pass a smaller sinceMinutes, a level or a provider` | the same with `contains` |
+| `journalctl is not installed in the guest; read the logs with vm.exec instead` | Linux without `journalctl` |
+| `journalctl in the guest is too old for these filters; read the logs with vm.exec instead` | Linux, an option was refused |
+
+Measured on Windows 11 (an Application log of a few thousand entries): about
+1.0 s for a read with or without `level` and `provider`, 1.5 s for a
+`contains` without a match over a day, 1.2 s for 500 entries. Windows refuses
+to write entries from a source whose name holds `&`, `<` or `>`; such a
+`provider` gives an empty list. An entry written with an empty description
+reads as a few characters that change from read to read (Windows formats it
+so).
+
+## Crash dumps
+
+The crash dump ops use Windows Error Reporting's local dumps and exist for
+Windows guests only (`crash dumps are only collected on Windows guests`).
+They need guest tools that run commands, elevated.
+
+- `vm.crash_dumps.enable` makes Windows write a dump of every crash of the
+  image `exe` (a file name ending in `.exe`, no folder, no character a Windows
+  file name cannot hold, not a device name such as `CON`) into
+  `C:\alcove-dumps`: mini dumps, or full dumps with `full: true`. It creates
+  the folder, grants the Users group modify rights on it (so a crashing
+  program of any user can write there; the grant stays after `disable`), and
+  writes `DumpFolder`, `DumpCount` 5 and `DumpType` under
+  `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\<exe>`
+  in the 64-bit registry view, which serves ARM64, x64 and x86 programs. When
+  the `LocalDumps` key did not exist, it creates it with the value
+  `AlcoveCreated` (1) and answers `createdKey: true`. The result's `folder`
+  is `C:\alcove-dumps`.
+- While a `LocalDumps` key exists, Windows also writes a mini dump of every
+  other crashing program into that user's `%LOCALAPPDATA%\CrashDumps`. Windows
+  keeps the newest 5 dumps of `C:\alcove-dumps`, counted over all enabled
+  images.
+- `vm.crash_dumps.disable` removes the image's key with every value in it,
+  then the `LocalDumps` key when its only value is `AlcoveCreated` and it has
+  no subkey: a key made by someone else, one that holds another value, or
+  one that still holds another image's key stays. Dumps stay in the folder. An
+  image that was never enabled succeeds and changes nothing else.
+- `vm.crash_dumps.list` lists the `.dmp` files of the folder, newest first and
+  by name within one time: `file`, `exe` (the image of a file named
+  `<image>.<pid>.dmp` or `<image>(<n>).<pid>.dmp`, the second form when the
+  first name was taken; otherwise empty), `bytes` and `time` (last write, ISO
+  8601 UTC on the guest's clock). Without the folder the list is empty. A dump
+  that Windows is still writing is listed with its size so far.
+- `vm.crash_dumps.pull` copies the dump `file`, a name from the list without
+  a folder, to the host `path` like `vm.pull_file`. Sentences: `file must be
+  the name of a .dmp file listed by vm.crash_dumps.list, without a folder`,
+  `C:\alcove-dumps holds no dump named '<file>'; list the dumps with
+  vm.crash_dumps.list`, `the dump '<file>' is still being written; retry in a
+  few seconds` and `the dump changed while it was pulled; retry in a few
+  seconds`.
+
+Guest failures are sentences that end in the next step, e.g. `could not set
+up crash dumps: <reason>; check that alcove-agent runs elevated`, `the crash
+dump setting is still there after its removal; check that alcove-agent runs
+elevated`, `C:\alcove-dumps is not a folder; remove or rename that file,
+then call vm.crash_dumps.enable again`. Measured on Windows 11: a mini dump of
+the fixture app (1.7 MB) is listed 2.9 s after the click that crashed it and
+pulled in 0.09 s; `enable`, `disable` and `list` take 0.1 s to 0.8 s.
+
+## Diagnostics bundle
+
+`vm.collect_diagnostics` writes what can be learned about a VM's current
+state into one host directory and answers `{dir, files, summary}`: `files`
+are the paths of the bundle's files relative to `dir`, sorted, and `summary`
+is `summary.txt` without its last line feed. It is read-only (no lease
+needed) and runs in the concurrent lane; the recording of the VM, if any,
+continues and traces the call as one line after the bundle is written.
+
+- `dir` is an absolute host path to a missing or empty folder. Another
+  folder is refused (`'<dir>' is not empty; choose a directory that is
+  missing or empty, or leave dir out for a new folder`), and so is a `dir`
+  another collection of this server is writing. Without `dir` the bundle goes
+  to a new folder `~/Library/Application Support/Alcove/Diagnostics/<vm>-<yyyyMMdd-HHmmss>`
+  (`-2`, `-3`, … when it exists).
+- `sinceMinutes` (1 to 5256000, default 30) is how far back the event logs,
+  the dumps and an ended recording reach.
+- `logFiles` is a list of 1 to 20 guest file paths; of each, the last 2000
+  lines within 262144 bytes are copied, as UTF-8 also from a UTF-16LE file.
+- `processName` narrows `processes.json` to that program and adds a line
+  saying whether it runs.
+
+The steps run at the same time, each with its own time limit. A step that
+fails writes `<file>.error.txt` holding its sentence, and the others go on:
+
+| file | content | limit |
+|---|---|---|
+| `screenshot.png` | the screen | 10 s |
+| `windows.json` | `{windows}` as `vm.window.list` gives it (Windows) | 15 s for the turn at the UI helper, 30 s for the answer |
+| `ui-tree.txt` | the tree of the window in front, all elements, at most 1000 (Windows) | 40 s for the turn, 50 s for the answer; after the window list; not asked for when the window list was sent and not answered |
+| `processes.json` | `{processes}` as `vm.process.list` gives it; in `command` the value of a `NAME=value` whose name contains `KEY`, `TOKEN`, `SECRET` or `PASSWORD` reads `<masked>` | 35 s |
+| `eventlog-application.json`, `eventlog-system.json` | `vm.event_log` with `level: error`, the bundle's `sinceMinutes` and `max: 500` (Linux: the journal as `eventlog-system.json`) | 80 s each |
+| `events.json` | the guest events the server holds | 30 s |
+| `jobs/<job>.txt` | each job of `vm.exec.list`: state, code, command (masked like `processes.json`), start time, and the end of each stream, at most 262144 bytes from a line start | 45 s for all |
+| `logs/<name>` | each of `logFiles`, named after the file | 45 s each |
+| `dumps/<file>` | the dumps of `C:\alcove-dumps` written within `sinceMinutes` of the guest's clock, newest first, while their sizes add up to at most 500 MiB (Windows) | 100 s for all |
+| `doctor.json` | `vm.doctor` | 85 s |
+| `trace.jsonl` | the whole lines of the recording's trace, the newest 32 MiB | 30 s |
+| `frames/<name>` | the frame files the copied trace lines name, newest first, up to 256 MiB | 30 s |
+| `video.mp4` | the recording's video, at most 1 GiB | 60 s |
+| `summary.txt` | see below | |
+
+Names that come from the guest become single file names without characters
+a host file name cannot hold, and names that differ only in case get `-2`,
+`-3`, …. A step that ran out of time leaves nothing but its error file;
+nothing is written into the folder after the op answered. A call whose client
+went away removes a folder it created and leaves no error files or summary
+in a folder it was given.
+
+**The recording** is the VM's running one; else one that is ending (waited
+for up to 30 s); else the one that ended last, when it ended within
+`sinceMinutes`. Of a running recording, `video.mp4` is a copy of what the file
+held when the copy began: it plays up to its last whole fragment (a note in
+the summary says so); in the first seconds of a recording there is none yet
+and `video.error.txt` says `the recording in <dir> has not written a playable
+part of its video yet; collect again in a few seconds`. Measured: the copy
+lasted 0.04 s to 0.7 s less than the recording's age while the screen
+changed.
+
+**Without guest tools** (not connected after 5 s), on a paused VM and on a
+stopped one, the bundle holds what needs no guest: screenshot (not for a
+stopped VM), doctor report, guest events and the recording's files; one line
+of the summary says what was skipped. When the agent stops answering while
+it stays connected, each guest step ends at its limit with its error file.
+Measured on Windows 11: 2.3 s to 3.4 s for a full bundle (24 files, 5 MB with
+a dump, a trace and a 10 s video), 12.8 s with the agent stopped, 76 s with
+the agent suspended, 30 s while another client's call held the UI helper.
+The worst case is about 110 s: 5 s for the agent, 100 s for the dumps and a
+few seconds for the summary.
+
+**summary.txt** has one fact per line:
+
+```
+VM Windows 11, collected 2026-10-14T03:31:02Z, guest windows
+window not responding: 0x30216 "Alcove Fixture (Not Responding)" (pid 3340, alcove-fixture.exe)
+foreground window: "Alcove Fixture (Not Responding)"
+crash dump alcove-fixture.exe.1420.dmp: 1688134 bytes, 2026-10-14T03:30:31.1234567Z, collected as dumps/alcove-fixture.exe.1420.dmp
+event log Application: 3 entries of level error or worse in the last 30 minutes; newest: Faulting application name: alcove-fixture.exe, …
+event log System: 0 entries of level error or worse in the last 30 minutes
+jobs exited with a non-zero code: none
+process alcove-fixture: running, pid 3340
+recording: /Users/me/rec (running)
+frames: 10 of 10 copied
+video.mp4: copied while recording, up to the last second may be missing
+steps that failed: none
+```
+
+- `windows not responding: none`, or one line per window that is not.
+- `crash dumps: none newer than <n> minutes`, or one line per dump with what
+  became of it (`collected as dumps/<file>`, or `not collected: <why>; pull it
+  with vm.crash_dumps.pull`), and `crash dumps older than <n> minutes: <count>
+  left out, the newest from <time>`.
+- `recording: <dir> (running | ended <time> | ending)`, `recording: <dir>
+  (ended <time>; its folder no longer exists)`, or `recording: none in the
+  last <n> minutes`.
+- A fact whose step failed reads `<topic>: unknown (<step> failed)`. Notes
+  follow for cut files (the trace's first lines, log tails, job streams,
+  frames) and for skipped steps; the last lines list the failed steps with
+  their sentences, or `steps that failed: none`.
 
 ## Scripts
 
@@ -1383,6 +1680,8 @@ element e14 has no clickable point: window 0x501fa "Alcove Fixture" covers the c
 cannot start 'C:\apps\tool.exe': The system cannot find the file specified.; check the path with vm.fs.list
 'C:\alcove-e2e\junction' is a link in the guest; pass the folder it points to
 the request line is not JSON that can be read (broken syntax, or a \u escape of half a surrogate pair); send one JSON object per line
+'Win' is already recording to /Users/me/rec; call vm.record.stop first
+the dump 'app.exe.4242.dmp' is still being written; retry in a few seconds
 ```
 
 ## Limits
@@ -1403,3 +1702,11 @@ the request line is not JSON that can be read (broken syntax, or a \u escape of 
   window or element request, and what happened in between is not reported.
 - A second host that starts a VM this server runs stops this server's engine
   (see the first limit); the guest then loses its unsaved state.
+- Recordings and the last ended recording a bundle may use live in the
+  server: a server that exits leaves the files of a running recording as they
+  were written, without `vm.record.stop`'s finishing, and a new server knows
+  no recording. The crash dump settings live in the guest's registry and stay.
+  Stopping `alcovectl serve` with SIGTERM also shuts down the VMs it runs.
+- Video was recorded with `alcovectl serve` started from a Terminal of the
+  logged-in user; a server process without a window server session (an SSH
+  login, a launchd daemon) was not tried.

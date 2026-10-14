@@ -52,7 +52,7 @@ clipboard and file sharing.
 | **Guest tools** | A small Go agent for Windows and Linux: clipboard both ways, file drop, shell commands and background jobs, processes, file access, display modes that follow the window. |
 | **Snapshots and suspend** | qcow2 snapshots with VM state, plus suspend-to-disk that resumes where you left off. |
 | **USB passthrough** | Hot-plug host USB devices into a running guest. |
-| **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell commands and background jobs, processes, clipboard, file push, pull and folder sync, guest file read and write. |
+| **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell commands and background jobs, processes, clipboard, file push, pull and folder sync, guest file read and write, recordings with a trace and a video, the guest event log, crash dumps and a one-call diagnostics bundle. |
 | **No black boxes** | The engine is a pinned QEMU tag plus three readable patches (`qemu-patches/`). Build it yourself in one command. |
 
 Tested on an M3 Pro running macOS 26 with Windows 11 Pro ARM 25H2 and Ubuntu
@@ -187,7 +187,7 @@ can do.
 | Document | What is in it |
 |---|---|
 | [`docs/display-protocol.md`](docs/display-protocol.md) | The wire format between QEMU's `alcove` display backend and the app |
-| [`docs/control-protocol.md`](docs/control-protocol.md) | The automation API: screenshots, input, commands and jobs, processes, files |
+| [`docs/control-protocol.md`](docs/control-protocol.md) | The automation API: screenshots, input, commands and jobs, processes, files, windows and UI elements, recordings, event log, crash dumps, diagnostics bundles |
 | [`docs/agent-protocol.md`](docs/agent-protocol.md) | The guest agent protocol: SMBIOS token handshake, messages, and the request/response operations |
 | [`docs/superpowers/specs/`](docs/superpowers/specs) | The design, and why each choice was made |
 | [`docs/research/`](docs/research) | Verified notes on QEMU 11.1.1 internals, with citations |
@@ -229,6 +229,7 @@ Windows guest:
 python3 scripts/test/install-agent.py       # copies the built agent in, installs it with --allow-exec, checks hello
 python3 scripts/test/agent-rpc-windows.py   # agent operations on the forwarded agent port
 python3 scripts/test/at1-e2e.py             # control socket -> agent -> guest, and MCP server -> control socket
+python3 scripts/test/at5-e2e.py             # recordings, event log, crash dumps and diagnostics bundles in the guest
 ```
 
 `scripts/test/alcove_ctl.py` is the control-socket client these scripts import;
