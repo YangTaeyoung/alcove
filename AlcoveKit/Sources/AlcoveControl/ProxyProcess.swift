@@ -37,7 +37,8 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
         public var ready: Duration
         /// Longest wait for the answer to one request.
         public var call: Duration
-        /// Longest wait for the child to end after its input was closed, again after SIGTERM and again after SIGKILL.
+        /// Longest wait for the child to end after its input was closed, and again after SIGTERM, which SIGKILL follows.
+        /// Also the longest wait for the exit of a child that closed its output.
         public var exit: Duration
         /// The most bytes of one line the child may send or be sent.
         public var lineBytes: Int
@@ -67,6 +68,8 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
     }
 
     private static let restart = "call vm.http.stop, then vm.http.start to capture again"
+    /// The most bytes of the child's standard error that are kept: its end.
+    static let errorTailBytes = 8192
 
     private let executable: String?
     private let caDirectory: URL
@@ -84,7 +87,9 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
     private var errorSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
     private var writerArmed = false
+    /// The request bytes not yet written to the child; `outboxSent` of them, from the front, are written.
     private var outbox = Data()
+    private var outboxSent = 0
     private var line = Data()
     /// Whether the bytes up to the next newline belong to a line that went over `limits.lineBytes`.
     private var discarding = false
@@ -111,6 +116,13 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
 
     /// The process id of the child; nil before it was started.
     var processIdentifier: Int32? { queue.sync { process?.processIdentifier } }
+
+    /// The number of requests the proxy has taken so far.
+    var requestCount: Int { queue.sync { nextID - 1 } }
+
+    /// How far the buffer of request bytes and the buffer of the child's standard error reach into their storage:
+    /// the end index of each.
+    var bufferExtents: (requests: Int, errors: Int) { queue.sync { (outbox.endIndex, errorTail.endIndex) } }
 
     public func start() async throws -> (port: Int, caPath: String) {
         try await withCheckedThrowingContinuation { waiter in
@@ -143,7 +155,9 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             waiter.resume(throwing: ProxyError.notFound)
             return
         }
-        guard let input = ProxyProcess.makePipe(), let output = ProxyProcess.makePipe(), let errors = ProxyProcess.makePipe() else {
+        let pipes = [ProxyProcess.makePipe(), ProxyProcess.makePipe(), ProxyProcess.makePipe()]
+        guard let input = pipes[0], let output = pipes[1], let errors = pipes[2] else {
+            for pipe in pipes.compactMap({ $0 }) { Darwin.close(pipe.read); Darwin.close(pipe.write) }
             let text = "alcove-proxy could not be started (the host has no free file descriptors); close other programs and call vm.http.start again"
             phase = .ended(text)
             waiter.resume(throwing: ProxyError.failed(text))
@@ -236,6 +250,10 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             return
         }
         data.append(10)
+        guard outbox.count - outboxSent + data.count <= 4 * limits.lineBytes else {
+            waiter.resume(throwing: ProxyError.failed("alcove-proxy is not reading its requests; \(ProxyProcess.restart)"))
+            return
+        }
         pending[id] = PendingCall(op: op, continuation: waiter)
         let seconds = ProxyProcess.seconds(limits.call)
         queue.asyncAfter(deadline: .now() + seconds) { [weak self] in
@@ -247,17 +265,26 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
         flush()
     }
 
+    /// Writes the unsent request bytes until the pipe is full. The buffer is emptied once all of it is written, and
+    /// loses its written front once that is larger than what is left.
     private func flush() {
-        while inputFD >= 0, !outbox.isEmpty {
-            let written = outbox.withUnsafeBytes { write(inputFD, $0.baseAddress, $0.count) }
-            if written > 0 { outbox.removeFirst(written); continue }
+        while inputFD >= 0, outboxSent < outbox.count {
+            let sent = outboxSent
+            let written = outbox.withUnsafeBytes { write(inputFD, $0.baseAddress! + sent, $0.count - sent) }
+            if written > 0 { outboxSent += written; continue }
             if written < 0, errno == EINTR { continue }
             if written < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                if outboxSent > outbox.count - outboxSent {
+                    outbox = Data(outbox.dropFirst(outboxSent))
+                    outboxSent = 0
+                }
                 armWriter()
                 return
             }
-            outbox.removeAll()
+            break
         }
+        outbox = Data()
+        outboxSent = 0
         if writerArmed {
             writeSource?.suspend()
             writerArmed = false
@@ -281,7 +308,8 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
         guard inputFD >= 0 else { return }
         let fd = inputFD
         inputFD = -1
-        outbox.removeAll()
+        outbox = Data()
+        outboxSent = 0
         guard let source = writeSource else {
             Darwin.close(fd)
             return
@@ -308,7 +336,27 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             if count < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
             source.cancel()
             outputSource = nil
+            outputClosed()
             return
+        }
+    }
+
+    /// The child's standard output ended. A child that has not exited `limits.exit` later counts as gone: waiting
+    /// requests and later ones fail, and the child is ended.
+    private func outputClosed() {
+        guard !hasExited, !stopping else { return }
+        queue.asyncAfter(deadline: .now() + ProxyProcess.seconds(limits.exit)) { [weak self] in
+            guard let self, !self.hasExited, !self.stopping, let process = self.process else { return }
+            let text = "alcove-proxy closed its output and gives no more answers; \(ProxyProcess.restart)"
+            switch self.phase {
+            case .starting: self.failStart(text)
+            case .ready:
+                self.phase = .ended(text)
+                self.failPending(text)
+                self.closeInput()
+                if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+            case .idle, .ended: break
+            }
         }
     }
 
@@ -319,7 +367,7 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             let count = chunk.withUnsafeMutableBytes { read(errorFD, $0.baseAddress, $0.count) }
             if count > 0 {
                 errorTail.append(contentsOf: chunk[0..<count])
-                if errorTail.count > 8192 { errorTail.removeFirst(errorTail.count - 4096) }
+                if errorTail.count > ProxyProcess.errorTailBytes { errorTail = Data(errorTail.suffix(ProxyProcess.errorTailBytes)) }
                 continue
             }
             if count < 0, errno == EINTR { continue }
