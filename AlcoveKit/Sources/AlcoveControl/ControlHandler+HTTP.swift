@@ -477,6 +477,40 @@ extension ControlHandler {
         if case .connected(let agent) = await t.agentLink() { await toolsConnected(t, agent) }
     }
 
+    // MARK: - snapshots and VMs the app changes itself
+
+    /// Called after the app created `snapshot` of `vm` without the control protocol: notes it as `vm.snapshot.create`
+    /// does.
+    public func snapshotCreated(vm: String, snapshot: String) async {
+        guard let t = await lookUp(vm) else { return }
+        await noteSnapshot(snapshot, of: t)
+    }
+
+    /// Called after the app restored `snapshot` of `vm` without the control protocol. Drops the control target's agent
+    /// connection, ends a live capture of the VM and makes the snapshot's note the VM's entry, as `vm.snapshot.restore`
+    /// does; when the VM then has an entry, the control target connects its tools, and that connection starts the cleanup.
+    public func snapshotRestored(vm: String, snapshot: String) async {
+        guard let t = await lookUp(vm) else { return }
+        await t.dropAgent(nil)
+        await endCapture(vm)
+        if let noted = captureJournal.snapshotEntry(snapshot, vm: await journalVM(t)) { try? captureJournal.record(noted, now: wallClock()) }
+        await connectForCleanup(t)
+    }
+
+    /// Called after the app deleted `snapshot` of `vm` without the control protocol: removes the snapshot's note.
+    public func snapshotDeleted(vm: String, snapshot: String) async {
+        guard let t = await lookUp(vm) else { return }
+        try? captureJournal.forgetSnapshot(snapshot, vm: await journalVM(t), now: wallClock())
+    }
+
+    /// Called after the app deleted the VM `vm`, whose bundle had the standardized file path `path`, without the control
+    /// protocol: ends its capture and removes its entry and snapshot notes from the capture journal, as `vm.delete` does.
+    public func vmDeleted(vm: String, path: String?) async {
+        await endCapture(vm)
+        try? captureJournal.forget(vm: CaptureJournal.VM(name: vm, path: path), now: wallClock())
+        forget(vm: vm)
+    }
+
     /// The VM `t` as the capture journal knows it.
     func journalVM(_ t: VMTarget) async -> CaptureJournal.VM {
         CaptureJournal.VM(name: t.name, path: await t.bundlePath())

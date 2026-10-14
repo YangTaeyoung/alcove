@@ -92,14 +92,7 @@ extension ControlHandler {
                 throw ControlError.failed("a snapshot named '\(snapshot)' already exists in '\(t.name)'; call vm.snapshot.delete first or choose another name")
             }
             do { try await t.createSnapshot(named: snapshot) } catch { throw ControlError.failed("snapshot create failed: \(engineReason(error))") }
-            let owner = await journalVM(t)
-            if let capture = captures[t.name], capture.guestChanged {
-                try? captureJournal.noteSnapshot(snapshot, during: capture.journalEntry, now: wallClock())
-            } else if let unrestored = captureJournal.entry(for: owner) {
-                try? captureJournal.noteSnapshot(snapshot, during: unrestored, now: wallClock())
-            } else {
-                try? captureJournal.forgetSnapshot(snapshot, vm: owner, now: wallClock())
-            }
+            await noteSnapshot(snapshot, of: t)
             return ["snapshot": .string(snapshot)]
         case "vm.snapshot.restore":
             let snapshot = try string(params, "snapshot")
@@ -183,6 +176,20 @@ extension ControlHandler {
             return ["up": .bool(up)]
         default:
             throw ControlError.unknownOp(op)
+        }
+    }
+
+    /// Notes in the capture journal that `snapshot` of `t` was created during the live capture of the VM whose guest
+    /// steps were begun, or else during the VM's unrestored entry; without either, an earlier note of that snapshot
+    /// name of the VM is removed.
+    func noteSnapshot(_ snapshot: String, of t: VMTarget) async {
+        let owner = await journalVM(t)
+        if let capture = captures[t.name], capture.guestChanged {
+            try? captureJournal.noteSnapshot(snapshot, during: capture.journalEntry, now: wallClock())
+        } else if let unrestored = captureJournal.entry(for: owner) {
+            try? captureJournal.noteSnapshot(snapshot, during: unrestored, now: wallClock())
+        } else {
+            try? captureJournal.forgetSnapshot(snapshot, vm: owner, now: wallClock())
         }
     }
 

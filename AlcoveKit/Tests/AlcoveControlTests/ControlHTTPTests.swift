@@ -1156,6 +1156,115 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertNil(c.journal.entry(for: "Win"))
     }
 
+    // MARK: - snapshots the app makes
+
+    func testASnapshotTheAppTakesIsNotedAsTheOpNotesIt() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        await c.h.snapshotCreated(vm: "Win", snapshot: "live")
+        XCTAssertEqual(c.journal.snapshotEntry("live", vm: "Win"), c.journal.entry(for: "Win"))
+
+        let next = c.makeHandler()
+        await next.snapshotCreated(vm: "Win", snapshot: "unrestored")
+        XCTAssertEqual(c.journal.snapshotEntry("unrestored", vm: "Win")?.port, 49152)
+
+        _ = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        await c.h.snapshotCreated(vm: "Win", snapshot: "live")
+        XCTAssertNil(c.journal.snapshotEntry("live", vm: "Win"))
+        XCTAssertEqual(c.journal.snapshotEntry("unrestored", vm: "Win")?.port, 49152)
+        await c.h.snapshotCreated(vm: "Nope", snapshot: "s")
+        let calls = await c.t.snapshotCalls
+        XCTAssertEqual(calls, [])
+    }
+
+    func testASnapshotTheAppRestoresGetsItsCaptureCleanedOverANewConnection() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        _ = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+        let before = await c.t.agentClient
+        let next = c.makeHandler()
+        await c.t.setLinkAgent(try await newConnection(c))
+        c.log.clear()
+        c.outputs.value["recipe.clearProxy"] = restoredState(caThumbprint)
+
+        await next.snapshotRestored(vm: "Win", snapshot: "mid-capture")
+        let drops = await c.t.drops
+        XCTAssertEqual(drops, [true])
+        let adopted = await c.t.agentClient
+        XCTAssertNotNil(adopted)
+        XCTAssertFalse(adopted === before)
+        let cleaned = await next.runningCleanup(of: "Win")?.value
+        XCTAssertEqual(cleaned, true)
+        XCTAssertEqual(c.log.entries, ["recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+        XCTAssertNotNil(c.journal.snapshotEntry("mid-capture", vm: "Win"))
+        let calls = await c.t.snapshotCalls
+        XCTAssertEqual(calls, ["create:mid-capture"])
+    }
+
+    func testARestoreInTheAppEndsTheLiveCaptureAsTheOpDoes() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        await c.t.setLinkAgent(try await newConnection(c))
+        c.log.clear()
+        await c.h.snapshotRestored(vm: "Win", snapshot: "before-capture")
+        XCTAssertEqual(c.log.entries.first, "proxy.stop")
+        let text = await c.failure("vm.http.requests")
+        XCTAssertEqual(text, "'Win' is not capturing; call vm.http.start first")
+        let cleaned = await c.h.runningCleanup(of: "Win")?.value
+        XCTAssertEqual(cleaned, true)
+        XCTAssertEqual(c.log.entries, ["proxy.stop", "recipe.clearProxy", "recipe.removeCA"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+    }
+
+    func testARestoreInTheAppWithoutAnEntryDropsTheConnectionAndConnectsNothing() async throws {
+        let c = try await capture()
+        _ = try await c.h.handle(op: "vm.status", params: ["name": "Win"])
+        await c.t.setLinkAgent(try await newConnection(c))
+        let calls = await c.t.agentCalls.count
+        await c.h.snapshotRestored(vm: "Win", snapshot: "clean")
+        let drops = await c.t.drops
+        XCTAssertEqual(drops, [true])
+        let after = await c.t.agentCalls.count
+        XCTAssertEqual(after, calls)
+        let unused = await c.t.linkAgent
+        XCTAssertNotNil(unused)
+        let cleanup = await c.h.runningCleanup(of: "Win")
+        XCTAssertNil(cleanup)
+        XCTAssertEqual(c.log.entries, [])
+        await c.h.snapshotRestored(vm: "Nope", snapshot: "s")
+    }
+
+    func testASnapshotTheAppDeletesLosesItsNote() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "kept"])
+        await c.h.snapshotDeleted(vm: "Win", snapshot: "mid-capture")
+        XCTAssertNil(c.journal.snapshotEntry("mid-capture", vm: "Win"))
+        XCTAssertNotNil(c.journal.snapshotEntry("kept", vm: "Win"))
+        XCTAssertNotNil(c.journal.entry(for: "Win"))
+    }
+
+    func testAVMTheAppDeletesLosesItsEntryAndNotes() async throws {
+        let dir = try tempDir()
+        let path = "/VMs/Win.alcove"
+        let c = try await capture(directory: dir, bundle: path)
+        _ = try await c.start()
+        _ = try await c.h.handle(op: "vm.snapshot.create", params: ["name": "Win", "snapshot": "mid-capture"])
+        let other = CaptureJournal.Entry(vm: "Win", port: 49153, thumbprint: otherThumbprint, systemProxy: true, since: "x", path: "/Other/Win.alcove")
+        try c.journal.record(other, now: Date())
+        c.log.clear()
+        await c.h.vmDeleted(vm: "Win", path: path)
+        let here = CaptureJournal.VM(name: "Win", path: path)
+        XCTAssertNil(c.journal.entry(for: here))
+        XCTAssertNil(c.journal.snapshotEntry("mid-capture", vm: here))
+        XCTAssertEqual(c.journal.entry(for: other.owner), other)
+        XCTAssertEqual(c.log.entries, ["proxy.stop"])
+    }
+
     func testACleanupThatFailsKeepsTheEntryForTheNextConnection() async throws {
         let c = try await capture()
         _ = try await c.start()
