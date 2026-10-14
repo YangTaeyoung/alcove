@@ -216,11 +216,7 @@ extension ControlHandler {
             }
             lease = token
         }
-        var failureMaxWidth: Int?
-        if let value = params["maxWidth"], value != .null {
-            guard let width = value.intValue, width >= 1 else { throw ControlError.failed("'maxWidth' must be a whole number of pixels, 1 or more") }
-            failureMaxWidth = width
-        }
+        let failureMaxWidth = ControlHandler.maxWidth(params)
         let owner = "script:" + URL(fileURLWithPath: path).lastPathComponent
         let result = await ScriptRunner(handler: self).run(script, vm: vm, variables: variables, lease: lease,
                                                            owner: owner, snapshot: snapshot, failureMaxWidth: failureMaxWidth, progress: nil)

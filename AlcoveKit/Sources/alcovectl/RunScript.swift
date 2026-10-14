@@ -3,7 +3,7 @@ import AlcoveEngine
 import AlcoveControl
 import AlcoveQMP
 
-/// The variables of the current `run-script` command; secret values are removed from every sentence it prints.
+/// The variables of the current `run-script` command, the script's own defaults included; secret values are removed from every sentence it prints.
 nonisolated(unsafe) private var printedVariables: [String: String] = [:]
 
 /// The directory of the VM bundles: `option`, else `ALCOVE_VM_DIR`, else the app's folder.
@@ -25,14 +25,14 @@ private func finishInterrupted(_ lines: [String], signal: Int32) -> Never {
 }
 
 /// Prints the report of a `script.run` reply, stores or removes the failure screenshot and exits 0 (passed) or 1 (failed).
-private func finishRun(_ reply: JSON, _ options: RunScriptOptions) -> Never {
+private func finishRun(_ reply: JSON, _ options: RunScriptOptions, stopFailed: Bool = false) -> Never {
     var lines = ScriptReport.variablesLine(options.variables).map { [$0] } ?? []
-    lines += ScriptReport.lines(reply, variables: options.variables)
+    lines += ScriptReport.lines(reply, variables: printedVariables)
     print(lines.joined(separator: "\n"))
     if let problem = ScriptReport.storeFailureImage(reply, scriptFile: options.file) {
         FileHandle.standardError.write(Data((problem + "\n").utf8))
     }
-    exit(reply["passed"]?.boolValue == true ? RunScriptExit.passed : RunScriptExit.failed)
+    exit(RunScriptExit.status(passed: reply["passed"]?.boolValue == true, stopFailed: stopFailed))
 }
 
 /// The signal that interrupted a run, once there was one.
@@ -43,9 +43,9 @@ private final class InterruptFlag: @unchecked Sendable {
     func set(_ signal: Int32) { lock.lock(); if number == nil { number = signal }; lock.unlock() }
 }
 
-/// Dispatch sources that call `body` with the signal number of SIGINT and SIGTERM, which are otherwise ignored.
+/// Dispatch sources that call `body` with the signal number of SIGINT, SIGTERM and SIGHUP, which are otherwise ignored.
 private func onTerminationSignals(queue: DispatchQueue, _ body: @escaping @Sendable (Int32) -> Void) -> [DispatchSourceSignal] {
-    [SIGINT, SIGTERM].map { number in
+    [SIGINT, SIGTERM, SIGHUP].map { number in
         signal(number, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
         source.setEventHandler { body(number) }
@@ -65,7 +65,7 @@ func runScriptCommand(_ argv: [String]) -> Never {
     } catch {
         couldNotRun("\(error)")
     }
-    printedVariables = options.variables
+    printedVariables = ScriptReport.variables(ofScriptAt: options.file).merging(options.variables) { _, passed in passed }
     for name in options.repeatedVariables {
         FileHandle.standardError.write(Data("--var \(name) was given more than once; the last value is used\n".utf8))
     }
@@ -121,22 +121,30 @@ private func runInProcess(_ options: RunScriptOptions, socketPath: String) -> Ne
     let handler = ControlHandler(registry: registry, hostKind: "headless", engineDescription: engine.qemuSystem)
     let flag = InterruptFlag()
     let run = Task.detached { try await handler.handle(op: "script.run", params: .object(options.params)) }
+    let vmName = options.vm ?? ScriptReport.vmName(ofScriptAt: options.file) ?? "the VM"
     let sources = onTerminationSignals(queue: .main) { number in
+        if let first = flag.signal {
+            FileHandle.standardError.write(Data((ScriptReport.interruptedAgainSentence(vm: vmName) + "\n").utf8))
+            exit(RunScriptExit.status(forSignal: first) ?? RunScriptExit.failed)
+        }
         flag.set(number)
         run.cancel()
     }
     Task.detached {
         let outcome = await run.result
-        await registry.stopAll()
+        let stopFailures = await registry.stopAll()
         lock?.release()
         withExtendedLifetime(sources) {}
+        for (name, reason) in stopFailures.sorted(by: { $0.key < $1.key }) {
+            FileHandle.standardError.write(Data((ScriptReport.stopFailureSentence(vm: name, reason: reason) + "\n").utf8))
+        }
         if let number = flag.signal {
             var lines = ScriptReport.variablesLine(options.variables).map { [$0] } ?? []
-            if case .success(let reply) = outcome { lines += ScriptReport.lines(reply, variables: options.variables, interrupted: true) } else { lines.append("INTERRUPTED") }
+            if case .success(let reply) = outcome { lines += ScriptReport.lines(reply, variables: printedVariables, interrupted: true) } else { lines.append("INTERRUPTED") }
             finishInterrupted(lines, signal: number)
         }
         switch outcome {
-        case .success(let reply): finishRun(reply, options)
+        case .success(let reply): finishRun(reply, options, stopFailed: !stopFailures.isEmpty)
         case .failure(let error): couldNotRun("\(error)")
         }
     }

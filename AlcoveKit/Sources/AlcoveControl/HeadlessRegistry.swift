@@ -35,11 +35,14 @@ public actor HeadlessRegistry: VMRegistry {
         return t
     }
 
-    /// Gracefully stop every running VM (used on shutdown).
-    public func stopAll() async {
-        for (_, t) in targets where await t.state().isActive {
-            try? await t.stop(force: false)
+    /// Gracefully stop every running VM (used on shutdown). Returns the reason for each VM that could not be stopped, by name.
+    @discardableResult
+    public func stopAll() async -> [String: String] {
+        var failures: [String: String] = [:]
+        for (name, t) in targets where await t.state().isActive {
+            do { try await t.stop(force: false) } catch { failures[name] = ControlHandler.failureReason(error, fallback: "the VM did not stop") }
         }
+        return failures
     }
 
     private func bundle(named name: String) -> VMBundle? {

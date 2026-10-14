@@ -529,8 +529,10 @@ final class ScriptTests: XCTestCase {
         let scaled = try await rig.handler.handle(op: "script.run", params: ["path": .string(path), "maxWidth": 400])
         XCTAssertEqual(scaled["failure"]?["width"]?.intValue, 400)
         XCTAssertEqual(scaled["failure"]?["height"]?.intValue, 300)
-        do { _ = try await rig.handler.handle(op: "script.run", params: ["path": .string(path), "maxWidth": 0]); XCTFail() }
-        catch { XCTAssertEqual("\(error)", "'maxWidth' must be a whole number of pixels, 1 or more") }
+        for ignored: JSON in [0, -5, "wide", 1.5] {
+            let full = try await rig.handler.handle(op: "script.run", params: ["path": .string(path), "maxWidth": ignored])
+            XCTAssertEqual(full["failure"]?["width"]?.intValue, 800, "\(ignored)")
+        }
     }
 
     func testScriptRunOpResult() async throws {

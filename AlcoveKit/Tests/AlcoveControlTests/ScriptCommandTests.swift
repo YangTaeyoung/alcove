@@ -203,7 +203,8 @@ final class ScriptCommandTests: XCTestCase {
     func testSignalsMapToShellExitStatuses() {
         XCTAssertEqual(RunScriptExit.status(forSignal: SIGINT), 130)
         XCTAssertEqual(RunScriptExit.status(forSignal: SIGTERM), 143)
-        XCTAssertNil(RunScriptExit.status(forSignal: SIGHUP))
+        XCTAssertEqual(RunScriptExit.status(forSignal: SIGHUP), 129)
+        XCTAssertNil(RunScriptExit.status(forSignal: SIGUSR1))
     }
 
     func testRunLockIsExclusiveUntilReleased() throws {
@@ -247,5 +248,39 @@ final class ScriptCommandTests: XCTestCase {
         wait(for: [done], timeout: 20)
         XCTAssertEqual(outcome.value as? ControlSocketClient.Interrupted, ControlSocketClient.Interrupted(signal: SIGINT))
         XCTAssertEqual(cancellation.signal, SIGINT)
+    }
+
+    func testStopFailureTurnsAPassedRunIntoExitTwo() {
+        XCTAssertEqual(RunScriptExit.status(passed: true, stopFailed: false), 0)
+        XCTAssertEqual(RunScriptExit.status(passed: true, stopFailed: true), 2)
+        XCTAssertEqual(RunScriptExit.status(passed: false, stopFailed: true), 1)
+        XCTAssertEqual(RunScriptExit.status(passed: false, stopFailed: false), 1)
+        XCTAssertEqual(ScriptReport.stopFailureSentence(vm: "Win", reason: "QMP did not answer"),
+                       "could not stop 'Win' after the run: QMP did not answer; stop it with alcovectl or the app")
+        XCTAssertEqual(ScriptReport.interruptedAgainSentence(vm: "Win"), "interrupted again; 'Win' may still be running")
+    }
+
+    func testScriptFileDefaultsFollowTheSecretNameRule() throws {
+        let file = NSTemporaryDirectory() + "defaults-\(UUID().uuidString).json"
+        try Data("""
+        {"version": 1, "vm": "Win", "variables": {"password": "from-file-secret", "message": "hi"}, "steps": [{"op": "vm.key.press", "params": {"keys": "a"}}]}
+        """.utf8).write(to: URL(fileURLWithPath: file))
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: file) }
+        XCTAssertEqual(ScriptReport.variables(ofScriptAt: file), ["password": "from-file-secret", "message": "hi"])
+        XCTAssertEqual(ScriptReport.variables(ofScriptAt: "/nonexistent/flow.json"), [:])
+        let reply: JSON = ["passed": false, "stepsRun": 1, "failedStep": 1, "seconds": 1.0, "error": "step 1 failed: typed from-file-secret",
+                           "steps": [step(1, label: "type", ok: false, error: "typed from-file-secret")]]
+        let merged = ScriptReport.variables(ofScriptAt: file).merging(["message": "override"]) { _, passed in passed }
+        let text = ScriptReport.lines(reply, variables: merged).joined(separator: "\n")
+        XCTAssertFalse(text.contains("from-file-secret"))
+    }
+
+    func testRunLockFileIsNotInheritedByChildProcesses() throws {
+        let bundle = FileManager.default.temporaryDirectory.appendingPathComponent("run-lock-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: bundle) }
+        let held = try XCTUnwrap(try ScriptRunLock.acquire(in: bundle))
+        defer { held.release() }
+        XCTAssertTrue(held.closesOnExec)
     }
 }

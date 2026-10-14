@@ -181,6 +181,11 @@ public actor ControlHandler {
             || sessionOps.contains(op)
     }
 
+    /// The `maxWidth` of a request: a whole number of pixels of 1 or more; nil for anything else.
+    static func maxWidth(_ params: JSON) -> Int? {
+        params["maxWidth"]?.intValue.flatMap { $0 > 0 ? $0 : nil }
+    }
+
     /// Runs one operation. Input operations for the same VM run one at a time in arrival order.
     public func handle(op: String, params: JSON) async throws -> JSON {
         if !ControlHandler.isReadOnly(op: op), let vm = params["name"]?.stringValue,
@@ -582,7 +587,7 @@ public actor ControlHandler {
         if let window = view.window { area = try windowArea(window, in: frame) }
         var cropped = area == frame.bounds ? frame : frame.crop(area)
         var factor = scale
-        if let maxWidth = params["maxWidth"]?.intValue, maxWidth > 0, maxWidth < Int((Double(cropped.width) * scale).rounded()) {
+        if let maxWidth = ControlHandler.maxWidth(params), maxWidth < Int((Double(cropped.width) * scale).rounded()) {
             factor = Double(maxWidth) / Double(cropped.width)
         }
         var legend: [JSON]?

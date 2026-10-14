@@ -48,11 +48,12 @@ public struct RunScriptOptions: Equatable, Sendable {
     as KEY=<hidden> and its value is removed from the output.
     When a step fails, the screenshot taken at that moment is written next to the script as FILE.failure.png. The
     file is removed when a run starts, so it exists afterwards only when that run failed and produced a screenshot.
-    SIGINT and SIGTERM stop the run; the last line is INTERRUPTED.
+    SIGINT, SIGTERM and SIGHUP stop the run; the last line is INTERRUPTED. A second signal while the VM is being
+    stopped ends the command at once.
 
     exit status: 0 the script passed, 1 a step failed, 2 the script could not run (bad arguments, unreadable
-    script, no VM, no server, refused before step 1; the reason is printed on stderr), 130 interrupted by SIGINT,
-    143 interrupted by SIGTERM
+    script, no VM, no server, refused before step 1, or a passed run whose VM could not be stopped; the reason is printed on stderr), 130
+    interrupted by SIGINT, 143 by SIGTERM, 129 by SIGHUP
     """
 
     /// Parses the arguments that follow `run-script`.
@@ -236,6 +237,22 @@ public enum ScriptReport {
         }
     }
 
+    /// The sentence for a VM the command started and could not stop.
+    public static func stopFailureSentence(vm: String, reason: String) -> String {
+        "could not stop '\(vm)' after the run: \(reason); stop it with alcovectl or the app"
+    }
+
+    /// The sentence for a second signal while the VM is being stopped.
+    public static func interruptedAgainSentence(vm: String) -> String {
+        "interrupted again; '\(vm)' may still be running"
+    }
+
+    /// The `variables` defaults of the script at `file`; empty when it cannot be read.
+    public static func variables(ofScriptAt file: String) -> [String: String] {
+        guard let data = FileManager.default.contents(atPath: file), let script = try? Script.parse(data) else { return [:] }
+        return script.variables
+    }
+
     /// The VM named by the script at `file`, if it can be read and names one.
     public static func vmName(ofScriptAt file: String) -> String? {
         guard let data = FileManager.default.contents(atPath: file), let script = try? Script.parse(data),
@@ -250,9 +267,15 @@ public enum RunScriptExit {
     public static let failed: Int32 = 1
     public static let couldNotRun: Int32 = 2
 
-    /// 128 plus the signal number for SIGINT and SIGTERM; nil for other signals.
+    /// 128 plus the signal number for SIGINT, SIGTERM and SIGHUP; nil for other signals.
     public static func status(forSignal signal: Int32) -> Int32? {
-        signal == SIGINT || signal == SIGTERM ? 128 + signal : nil
+        signal == SIGINT || signal == SIGTERM || signal == SIGHUP ? 128 + signal : nil
+    }
+
+    /// 0 for a passed run, 1 for a failed one; 2 for a passed run whose VM could not be stopped afterwards.
+    public static func status(passed: Bool, stopFailed: Bool) -> Int32 {
+        guard passed else { return failed }
+        return stopFailed ? couldNotRun : RunScriptExit.passed
     }
 }
 
@@ -270,7 +293,7 @@ public final class ScriptRunLock: @unchecked Sendable {
     /// The lock on `fileName` in `bundle`; nil when another descriptor holds it. Throws when the file cannot be opened.
     public static func acquire(in bundle: URL) throws -> ScriptRunLock? {
         let path = bundle.appendingPathComponent(fileName).path
-        let descriptor = open(path, O_RDWR | O_CREAT, 0o600)
+        let descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else {
             throw Failure(description: "cannot open the lock file '\(path)'; check that the VM bundle is writable")
         }
@@ -280,6 +303,11 @@ public final class ScriptRunLock: @unchecked Sendable {
             throw Failure(description: "cannot lock '\(path)'; check that the VM bundle is on a local volume")
         }
         return ScriptRunLock(descriptor: descriptor)
+    }
+
+    /// Whether the lock file descriptor is closed when this process starts another program.
+    public var closesOnExec: Bool {
+        descriptor >= 0 && (fcntl(descriptor, F_GETFD) & FD_CLOEXEC) != 0
     }
 
     public func release() {
