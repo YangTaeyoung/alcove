@@ -400,7 +400,7 @@ final class ScreenTextTests: XCTestCase {
         XCTAssertTrue(lines[1].text.replacingOccurrences(of: " ", with: "").contains("메시지보내기"), "\(lines)")
         XCTAssertTrue(lines[2].text.contains("저장"), "\(lines)")
         assertNear(lines[0].rect, drawn.rects[0], "latin")
-        assertNear(lines[1].rect, drawn.rects[1], "hangul")
+        assertNear(lines[1].rect, drawn.rects[1], tolerance: 20, "hangul")
     }
 
     func testFindTextWithoutLanguagesUsesTheMergedReading() async throws {

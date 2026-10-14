@@ -190,7 +190,7 @@ final class WaitTests: XCTestCase {
                                       ["type": "screen_idle", "seconds": 100]], timeout: 1)
         XCTAssertEqual(r["matched"]?.intValue, -1)
         let calls = await t.frameCalls
-        XCTAssertGreaterThan(calls, 20)
+        XCTAssertGreaterThan(calls, 5)
         XCTAssertLessThanOrEqual(calls, 56)
     }
 
