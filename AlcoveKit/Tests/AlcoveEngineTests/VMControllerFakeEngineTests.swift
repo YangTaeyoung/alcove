@@ -301,6 +301,24 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try await vm.shutdown(force: true)
     }
 
+    func testRestoreWhoseCallerIsCancelledDuringTheLoadFinishesAndResumesTheGuest() async throws {
+        let vm = try makeVM(mode: "slow-load")
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        let restore = Task { try await vm.restoreSnapshot(named: "base") }
+        let loading = await waitUntil { await vm.state == .paused }
+        XCTAssertTrue(loading, "the restore did not stop the guest")
+        try await Task.sleep(for: .milliseconds(200))
+        restore.cancel()
+        _ = await restore.result
+        let resumed = await waitUntil(timeout: .seconds(5)) { await vm.state == .running }
+        let state = await vm.state
+        XCTAssertTrue(resumed, "the controller state is \(state) after the cancelled restore")
+        let status = try await vm.qmp!.queryStatus()
+        XCTAssertTrue(status.running, "the engine reports \(status) after the cancelled restore")
+        try await vm.shutdown(force: true)
+    }
+
     func testUSBAttachIDsAreUniquePerAttachment() async throws {
         let vm = try makeVM()
         try await vm.start()
@@ -968,6 +986,16 @@ def handle(req):
             snapshots.discard(tag)
         jobs[jid] = e
         ok()
+        if cmd == "snapshot-load" and mode == "slow-load":
+            def load():
+                orig = dict(st)
+                st.update(running=False, status="restore-vm")
+                time.sleep(1.0)
+                st.update(orig)
+                for s in ("created", "running", "waiting", "pending", "concluded"):
+                    event("JOB_STATUS_CHANGE", {"id": jid, "status": s})
+            threading.Thread(target=load, daemon=True).start()
+            return
         for s in ("created", "running", "waiting", "pending", "concluded"):
             event("JOB_STATUS_CHANGE", {"id": jid, "status": s})
     elif cmd == "query-jobs":

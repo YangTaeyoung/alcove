@@ -438,17 +438,24 @@ public actor VMController {
     }
 
     /// Load a snapshot; a running guest is stopped for the load and resumed
-    /// afterwards, also when the load fails.
+    /// afterwards, also when the load fails. Once the guest is touched, the
+    /// stop, load and resume run to their end in a task of their own, also
+    /// when the caller is cancelled.
     public func restoreSnapshot(named name: String) async throws {
         try checkSnapshotName(name)
         guard state == .running || state == .paused, let qmp, let disks = runningConfig?.disks, let vmstate = disks.first?.id else {
             throw ControllerError.notRunning
         }
+        try Task.checkCancellation()
         let wasRunning = state == .running
+        try await Task { try await self.loadSnapshot(name, qmp: qmp, vmstate: vmstate, devices: disks.map(\.id), resume: wasRunning) }.value
+    }
+
+    private func loadSnapshot(_ name: String, qmp: QMPClient, vmstate: String, devices: [String], resume wasRunning: Bool) async throws {
         try await qmp.stop()
         state = .paused
         do {
-            try await qmp.snapshotLoad(tag: name, vmstate: vmstate, devices: disks.map(\.id))
+            try await qmp.snapshotLoad(tag: name, vmstate: vmstate, devices: devices)
         } catch {
             if wasRunning, (try? await qmp.cont()) != nil { state = .running }
             throw error
