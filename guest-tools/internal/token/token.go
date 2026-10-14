@@ -59,21 +59,19 @@ func ParseType11(table []byte) []string {
 		if length < 4 || i+length > len(table) {
 			break
 		}
-		// the string set follows the formatted area, terminated by "\0\0"
+		// the string set follows the formatted area and ends at the first
+		// "\0\0" there; a structure without strings has only that pair
 		j := i + length
-		var strs []string
-		for j < len(table) {
-			end := j
-			for end < len(table) && table[end] != 0 {
-				end++
-			}
-			if end == j { // empty string == end of set
-				j = end + 1
-				break
-			}
-			strs = append(strs, string(table[j:end]))
-			j = end + 1
+		for j+1 < len(table) && (table[j] != 0 || table[j+1] != 0) {
+			j++
 		}
+		var strs []string
+		for _, s := range strings.Split(string(table[i+length:j]), "\x00") {
+			if s != "" {
+				strs = append(strs, s)
+			}
+		}
+		j += 2
 		if typ == 11 {
 			out = append(out, strs...)
 		}

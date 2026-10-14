@@ -57,3 +57,12 @@ func TestAHostKeyThatIsNot64HexadecimalDigitsIsNone(t *testing.T) {
 		t.Errorf("no alcove-hostkey gave %x", got)
 	}
 }
+
+func TestAStructureWithoutStringsBeforeTheOEMStructureIsSkipped(t *testing.T) {
+	table := []byte{32, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	table = append(table, oemTable("alcove-token=6f1c")...)
+	strs := ParseType11(table)
+	if got := FromOEMStrings(strs); got != "6f1c" {
+		t.Fatalf("token %q from %v", got, strs)
+	}
+}
