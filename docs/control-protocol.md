@@ -17,7 +17,9 @@ The same server runs inside the Alcove app (which owns the VMs while it is
 running) and inside `alcovectl serve` (headless, when the app is not running).
 Clients connect to the unix socket
 `~/Library/Application Support/Alcove/control.sock`; a client that cannot
-connect may start `alcovectl serve` itself.
+connect may start `alcovectl serve` itself. `alcovectl serve` ends on SIGTERM
+or SIGINT: it ends every recording and every HTTP capture, then shuts down
+each VM it runs (as `vm.stop` without `force`) and exits.
 
 Transport: newline-delimited JSON. Request `{"id": n, "op": "...", ...params}`;
 response `{"id": n, "ok": true, ...result}` or `{"id": n, "ok": false, "error": "message"}`.
