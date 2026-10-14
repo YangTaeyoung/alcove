@@ -187,7 +187,7 @@ can do.
 | Document | What is in it |
 |---|---|
 | [`docs/display-protocol.md`](docs/display-protocol.md) | The wire format between QEMU's `alcove` display backend and the app |
-| [`docs/control-protocol.md`](docs/control-protocol.md) | The automation API: screenshots, input, commands and jobs, processes, files, windows and UI elements, recordings, event log, crash dumps, diagnostics bundles |
+| [`docs/control-protocol.md`](docs/control-protocol.md) | The automation API: screenshots, input, commands and jobs, processes, files, windows and UI elements, recordings, event log, crash dumps, diagnostics bundles, scripts saved from a recording and replayed (`script.save`, `script.run`, `alcovectl run-script`) |
 | [`docs/agent-protocol.md`](docs/agent-protocol.md) | The guest agent protocol: SMBIOS token handshake, messages, and the request/response operations |
 | [`docs/superpowers/specs/`](docs/superpowers/specs) | The design, and why each choice was made |
 | [`docs/research/`](docs/research) | Verified notes on QEMU 11.1.1 internals, with citations |
@@ -230,6 +230,7 @@ python3 scripts/test/install-agent.py       # copies the built agent in, install
 python3 scripts/test/agent-rpc-windows.py   # agent operations on the forwarded agent port
 python3 scripts/test/at1-e2e.py             # control socket -> agent -> guest, and MCP server -> control socket
 python3 scripts/test/at5-e2e.py             # recordings, event log, crash dumps and diagnostics bundles in the guest
+python3 scripts/test/at6-e2e.py             # a recording saved as a script and replayed with alcovectl run-script and alcove_script_run
 ```
 
 `scripts/test/alcove_ctl.py` is the control-socket client these scripts import;

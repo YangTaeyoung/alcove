@@ -144,6 +144,8 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.crash_dumps.list` | `name` | `{dumps: [{file, exe, bytes, time}]}` |
 | `vm.crash_dumps.pull` | `name`, `file`, `path` (host) | `{path, bytes, sha256}` |
 | `vm.collect_diagnostics` | `name`, `dir?` (host), `sinceMinutes?` (default 30), `logFiles?`, `processName?` | `{dir, files, summary}` — see [Diagnostics bundle](#diagnostics-bundle) |
+| `script.run` | `path` (host), `name?`, `variables?`, `snapshot?`, `lease?`, `maxWidth?` | `{passed, stepsRun, steps, failedStep?, label?, error?, warning?, seconds, failure?}` — see [Scripts](#scripts) |
+| `script.save` | `dir` or `trace` (host), `path` (host, `.json`), `name?`, `from?`, `to?`, `overwrite?` | `{path, steps, skipped, warnings?}` — see [Saving a script from a recording](#saving-a-script-from-a-recording) |
 
 The reply to an op that is not read-only and names a VM also carries
 `eventSeq` (see [Guest events](#guest-events)).
@@ -1534,8 +1536,11 @@ the concurrent lane.
 Parameters: `path` (script file on the host; use an absolute path, a relative
 one resolves against the server's working directory), `name` (VM; overrides the
 script's `vm`), `variables` (object of strings that override the script's
-defaults), `snapshot` (restored before the first step) and `lease`. The VM
-comes from `name` or the script's `vm`; with neither the op fails.
+defaults), `snapshot` (restored before the first step), `lease` and `maxWidth`
+(the width of the failure screenshot, as for `vm.screenshot`: a whole number of
+1 or more; any other value is ignored and the screenshot keeps the frame's
+size). The VM comes from `name` or the script's `vm`; with neither the op
+fails.
 
 Leases: without `lease` the run holds a lease of its own (owner
 `script:<file name>`, 600 s, renewed every 200 s), checks before each step that
@@ -1590,6 +1595,233 @@ encoded entries pass 256 KiB, later entries keep only `{step, op, label?, ok,
 seconds}` (and `error` for the failing step). An entry whose encoded size
 alone exceeds 64 KiB is replaced by that lean form plus `resultOmitted: "<N
 bytes>"`.
+
+A step entry also carries `usedAltSelector: true` when its op ran again with
+`altSelector`, `usedFallback: true` when it clicked its `fallback` point, and
+`positional: true` when the selector that ran last has an `index` (never after
+the fallback click). The entry of a step that a cancellation interrupted has
+the error `the run was cancelled during step N; start it again`.
+
+### Selectors that back each other up
+
+- `altSelector` is a second selector in the `params` of `vm.ui.click`,
+  `vm.ui.type`, `vm.ui.action`, `vm.ui.find` and `vm.ui.text`, next to
+  `selector`. The step runs its op with `selector` first; only when the UI
+  helper answers that no element matches does it run the op once more with
+  `altSelector`. Any other failure of the first try fails the step.
+- `fallback: {x, y}` is accepted by `vm.ui.click` only. When the element is
+  still not found (no match, its window is gone, or the ref no longer exists),
+  the step clicks the point with `vm.mouse.click`, with the step's button,
+  count and observe options. When both selectors and the click fail, the
+  step's error names the selector's failure and the click's.
+- `index` in a selector picks the element by its position among the elements
+  that match. A script that `script.save` wrote uses it when more than one
+  element matched while recording; a replay whose list differs picks whatever
+  is at that position, and nothing checks role or name again. Such a step
+  carries `positional: true`.
+
+### Saving a script from a recording
+
+`script.save` writes a script from the trace of a recording. It ignores
+leases and runs in the serial lane.
+
+Parameters: `dir` (the recording directory; its `trace.jsonl` is read) or
+`trace` (the path of a trace file), not both; `path` (absolute, ending in
+`.json`; its folder is created when the folder above it exists); `name` (the
+script's `vm`; default: the VM the trace names); `from` and `to` (the `seq`
+range of the trace lines used, integers of 1 or more, `from` not above `to`);
+`overwrite` (replace a file at `path`; default false, which answers `'<path>'
+exists; pass overwrite: true or another path`). The result is `{path, steps,
+skipped, warnings?}`.
+
+- The trace is read one line at a time. A line that is not a JSON object with
+  an integer `seq` and a string `op`, or that is longer than 8 MiB, is left
+  out and counted in `skipped`. When the line after the last readable `seq`
+  lies in `from`...`to` (always, without `from` and `to`), a warning says
+  `trace line <n> was skipped (<reason>); a step may be missing`.
+- The script must pass the checks `script.run` makes before its first step,
+  and its encoded form may not exceed 4 MiB; otherwise nothing is written and
+  the error names the step and its `seq`. A script that still holds the
+  trace's mask marker `<masked>` is refused with the step that holds it.
+- The file is written through a temporary file beside it and renamed, with
+  mode 0600.
+- A trace without a step to replay answers `the trace holds no op to replay;
+  record clicks, keys or other changing ops first` (or names the range).
+
+Which trace lines become steps:
+
+- Only lines of ops that succeeded and that a client sent or a script ran as a
+  step. Read-only ops are left out, except `vm.wait_for` that matched a
+  condition and `vm.wait_idle`. `name` is removed from the params, `${` is
+  written as `$${` in every string, and the `since` of an `event` condition is
+  dropped.
+- A `vm.mouse.click` without `hold` whose trace line has a `target` becomes
+  `vm.ui.click` with `selector`, `altSelector` when there is one, and
+  `fallback` at the clicked point, when the element can be found again and
+  the point counts as a click on the element: always for `Button`,
+  `CheckBox`, `RadioButton`, `MenuItem`, `TabItem`, `ListItem`, `TreeItem` and
+  `Hyperlink` (a click on a part of a list or tree item that the helper does
+  not list, such as an expander, replays at the item's centre); for `Edit`,
+  `ComboBox`, `SplitButton`, `Spinner`, `HeaderItem`, `DataItem` and `Text`
+  only within `max(6, w/4)` pixels horizontally and `max(6, h/4)` vertically
+  of the centre. Any other click stays a `vm.mouse.click` at its coordinates.
+- The selector holds `window` (see below), `role`, and `automationId` when the
+  element has one, else `name`; `altSelector` holds the `name` when the
+  selector uses the automation id and the element has both. Each carries
+  `index` when more than one element matched; such a step gets the warning
+  `step <n> (<label>) selects number <k> of <matches> elements that look the
+  same; it replays whatever is at that position`.
+- A `vm.ui.*` op that named its element by `ref` gets the selectors of its
+  `target` in place of the ref; without them a `vm.ui.click` becomes a
+  `vm.mouse.click` at the point it clicked and any other such op is left out.
+  A `vm.window.action` on a window id names the window by the title in its
+  result. Left out, each with a warning: a `vm.wait_for` whose condition names
+  a ref, a `vm.batch` with a step that holds a ref, a step with a value the
+  trace cut at 2000 characters, a window id without a title.
+- Consecutive `vm.type` lines with the same other params and no expectation
+  merge into one step.
+- A step whose line shows a foreground window with another title part than the
+  steps before it gains `expect: [{"type": "window_title", "contains":
+  <part>}]`; switching between windows with the same part adds nothing.
+- Steps that name a job id or a pid of the recorded session keep them and get
+  a warning to change them by hand.
+
+Window titles: a script names a window by the stable part of its title, the
+text after the last ` - `, ` – ` or ` — ` when it has at least 3 characters,
+but only when no other window title the trace shows (`target.window`, the
+foreground of observations and their window events, `result.window` of any op,
+the `vm.window.list` entries) contains that part, ignoring case; otherwise by
+the whole title. A title shown only by windows that also showed the named
+title (one window that changed its title) does not count as another window; a
+title seen without a window id does. This holds for `selector.window`,
+`altSelector.window`, the window expectation and the title that replaces a
+window id in `vm.window.action`. Warnings: `steps name the window "<part>" by a
+part of its title "<title>"; another window whose title contains "<part>"
+would be used instead` (once per part) and `steps name the window "<title>";
+more than one window had that title while recording, the first one found is
+used`. A window that the trace never shows can still match at replay.
+
+Passwords and masked values: no typed secret is written to a script.
+
+- The `text` of a `vm.ui.type` and the `value` of a `vm.ui.action` aimed at a
+  password element, and the `text` of a `vm.type` when the latest line that
+  said what it was aimed at was a password element, become the variables
+  `password`, `password2`, … without a default; `script.run` refuses the
+  script until they are passed. Every value the trace masks as a whole
+  becomes a variable as well (a masked env value is named after its key), and
+  each gets a warning.
+- A step whose value holds the mask marker inside a longer string is left out
+  with `step <n> (<op>) holds a masked value inside "<key>"; write the step by
+  hand with a variable`. Labels show `hidden text` in place of the marker.
+- Before a `vm.key.press` or `vm.key.down` whose keys are one printable
+  character (a space included), alone or after `shift+`, the recording asks
+  the UI helper which element has the focus. When it is a password element,
+  the key is masked in the trace, its `vm.key.up` follows it, and the steps
+  are left out of the script with `step <n> pressed keys in a password field;
+  type the password with vm.type and a variable instead`. Named keys (`enter`,
+  `tab`, arrows, `space`), combinations with ctrl, alt, cmd or win, and keys
+  inside a `vm.batch` are never masked.
+- Not masked, and so written to the script in clear: a `vm.type` whose
+  question about the focus got no answer in time, a selector-addressed
+  `vm.ui.type` or `vm.ui.action` that failed, text inside a `vm.batch`, and
+  the clipboard.
+
+What a recording costs per action: before a click, a drag, a `vm.type`, a text
+key and a ref-addressed `vm.ui.*` op, one `ui.at` question to the UI helper,
+waited for 300 ms at most (the helper's own budget is 200 ms). The question is
+skipped while the helper serves another request, so such a line has no
+`target`: a click stays coordinates and a ref op is left out. Right after the
+helper starts (up to 120 s on a new session) questions are skipped as well.
+
+### Secrets during a run
+
+A variable whose name contains `password`, `key`, `token` or `secret` (any
+case) is a secret. While `script.run` runs, every trace line written on its
+behalf (a recording may be active) has each string equal to a secret value
+replaced by `<masked>`, and a secret value of 8 or more characters replaced
+inside longer strings as well. Not covered: object keys, base64 content (such
+as `vm.fs.write` `content`), frames and video of the recording, a secret of
+fewer than 8 characters inside a longer string, and trace lines of other
+clients' ops during the run. A text pasted into the guest through the
+clipboard (`vm.type` and `vm.ui.type` paste text with a character outside the
+US layout, such as Korean) stays in the guest clipboard after the step.
+
+### `alcovectl run-script`
+
+```
+alcovectl run-script [--vm NAME] [--var KEY[=VALUE]]... [--snapshot NAME] [--socket PATH] [--in-process] [--] FILE
+```
+
+It sends `script.run` for FILE (made absolute) to the control server at the
+socket (default: the app's socket), with `--vm` as `name`, the `--var` values
+as `variables` and `--snapshot` as `snapshot`, waits for the reply and prints
+one line per step, then `PASSED: <n> steps in <s> s` or `FAILED: step <n>
+failed after <s> s`:
+
+```
+variables: PASSWORD=<hidden>, button=Sned
+ok   1 vm.ui.type Edit "Message" 600 ms
+FAIL 2 vm.ui.click Button "Send" 0 ms
+     no element matches {"window":"Alcove Fixture","role":"Button","name":"Sned"}; call ui.tree to see what exists
+error: step 2 (vm.ui.click Button "Send") failed: no element matches {"window":"Alcove Fixture","role":"Button","name":"Sned"}; call ui.tree to see what exists
+FAILED: step 2 failed after 0.7 s
+```
+
+- A step line is `ok` or `FAIL`, the step number, its label (the op without
+  one), the milliseconds, and the markers `[fallback]`, `[alt selector]` and
+  `[positional]`. Lines are printed when the run has ended, not while it runs.
+  A `warning:` line follows when the reply has one.
+- `--var KEY=VALUE` gives `${KEY}` a value (repeatable; the last one wins and
+  a repeat is reported on stderr; VALUE may contain `=`). `--var KEY` reads the
+  value of the environment variable KEY; use it for secrets, since the
+  arguments of a process are visible to other users. The first line lists the
+  passed variables, a secret one as `KEY=<hidden>`; the values of secret
+  variables, the script's defaults included, are replaced by `<hidden>` in
+  every printed line.
+- On a failed step the failure screenshot is written next to the script as
+  `FILE.failure.png` (full size). The file is removed when a run starts, so it
+  exists afterwards only when that run failed and produced a screenshot.
+- Exit status: 0 passed; 1 a step failed; 2 the script could not run (bad
+  arguments, unreadable script, no VM, no server, a refusal before step 1, or
+  an `--in-process` run that passed but whose VM could not be stopped; the
+  reason is on stderr); 130, 143 and 129 after SIGINT, SIGTERM and SIGHUP.
+- Without a server at the socket the command stops with exit 2 and `no control
+  server answers at <socket>; start one with alcovectl serve, or pass
+  --in-process to run the script without a server`. `--in-process` while a
+  server answers is refused: `a control server answers at <socket>; run the
+  script without --in-process, or stop that server first`.
+- `--in-process` runs the script in the command's own process with a headless
+  registry of the VMs in `ALCOVE_VM_DIR` (default
+  `~/Library/Application Support/Alcove/VMs`). It holds an exclusive lock on
+  `run-script.lock` in the VM's bundle for the whole run (`another run-script
+  --in-process is using '<vm>'; wait for it or use a control server`) and
+  refuses a VM whose engine runs under another process (`'<vm>' is running
+  under another process and no control server answers at <socket>; start the
+  Alcove app or alcovectl serve, or stop the VM, and run the script again`).
+  The lock stops only other `run-script --in-process` commands; the app or
+  `alcovectl serve` may still start the VM, and the engine check of
+  [Starting](#starting) then refuses one of the two hosts. A stopped VM is
+  started only by a `vm.start` step of the script; every VM the run started
+  is stopped when the run ends, also after a failure or a signal. The lock
+  file stays in the bundle.
+- SIGINT, SIGTERM and SIGHUP stop the run: through a server, the command
+  closes its connection, the server cancels the run before its next step and
+  releases the run's lease, and the command prints `INTERRUPTED` at once.
+  In-process, the run is cancelled, the VM is stopped, the step lines up to
+  the interrupted step are printed and the last line is `INTERRUPTED`. A
+  second signal while the VM is being stopped ends the command at once.
+
+### MCP tools
+
+The `replay` toolset of the MCP server has `alcove_script_save` (`dir` or
+`trace`, `path`, `name`, `from`, `to`, `overwrite`; it answers `saved <path>`,
+the step count, the skipped trace lines and each warning) and
+`alcove_script_run` (`path`, `variables`, `snapshot`, `name`). The run tool
+sends `maxWidth: 1280`, prints the same step lines as `run-script`, ends with
+`PASSED` or `FAILED`, adds the failure screenshot as image content, and hides
+secret values (the passed ones and the script file's defaults) in its text and
+structured content. Pass `name` when the session holds a lease on the VM so
+the run uses it. The client waits up to 7,925,000 ms for a run.
 
 ## Shell, processes and files
 
