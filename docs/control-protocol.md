@@ -25,11 +25,14 @@ that cannot be read as JSON (broken syntax, or a `\u` escape of half a
 surrogate pair) is answered with `the request line is not JSON that can be
 read (broken syntax, or a \u escape of half a surrogate pair); send one JSON
 object per line`. That reply carries the request's `id` when the line begins
-as an object whose top-level `id`, a number or a string, comes before the
-broken part; otherwise its `id` is `null`.
+as an object whose top-level key `"id"` holds a number or a string and
+everything before that key is JSON syntax: UTF-8 strings with valid escapes (a `\u`
+escape with four hex digits, half a surrogate pair included), numbers, `true`,
+`false`, `null`, and objects and arrays of these nested at most 512 deep.
+Otherwise its `id` is `null`.
 Coordinates are guest pixels of the guest frame as it is when the op runs:
-the pointer ops read the frame size for every move, so they follow a guest
-that changed its resolution.
+each pointer op reads the frame size once, so the ops follow a guest that
+changed its resolution.
 
 ## Lanes
 
@@ -87,7 +90,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.mouse.down` / `vm.mouse.up` | `name`, `button?` ("left" default), `x?` and `y?` together, observe params | `{}` or `{observation}` — presses or releases the button and leaves it so; with `x`/`y` the pointer moves there first |
 | `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms, observe params | `{}` or `{observation}` — presses modifiers then the key, releases in reverse |
 | `vm.key.down` / `vm.key.up` | `name`, `key`, observe params | `{}` or `{observation}` |
-| `vm.type` | `name`, `text`, `delay?` ms per key (default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content, otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again`. The guest clipboard holds the text afterwards |
+| `vm.type` | `name`, `text`, `delay?` ms per key (default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content (the guest reports the first 700,000 bytes of UTF-8 of a longer text, and those are compared), otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again` (`vm.ui.type` names itself). Guest tools without a clipboard answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs wl-copy or xclip in its session), so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only`; text whose message to the guest tools would reach 1 MiB answers `the text is too large for the guest clipboard (<n> bytes of UTF-8; one message to the guest tools holds less than 1 MiB); split it over several vm.type calls`. The guest clipboard holds the text afterwards |
 | `vm.batch` | `name`, `steps`, observe params | `{completed, results, failedStep?, error?, observation?}` — see [Batches](#batches) |
 | `vm.find_text` | `name`, `query?`, `regex?`, `region?`, `languages?` | `{matches, lines}` — see [Finding text](#finding-text) |
 | `vm.wait_for` | `name`, `conditions`, `timeout?`, observe params | `{matched, waited, type?, detail?, problems?, observation?}` — see [Waiting for conditions](#waiting-for-conditions) |
@@ -270,7 +273,9 @@ guest`.
 - A failed request gives `uiError` `the foreground window and focused element
   could not be read: <reason>`, `the foreground window could not be read:
   <reason>` or `the UI tree could not be read: <reason>`; the screen fields
-  stay.
+  stay. At level `ui`, a `uiError` from the request for `foreground` and
+  `focused` or from the window list (late or failed) also leaves out `tree`,
+  which is not asked for then.
 - `events` lists the newest 20 events as `<name> "<window title>"` (the
   process name for a window without a title), `process.exited <file> code
   <n>`, `job.exited <job> code <n>` or `events.dropped (<count>)`, preceded
@@ -650,7 +655,8 @@ with a small page 27.
 `nodes` being the node objects (`ref`, `role`, `name`, `aid` when the element
 has an automation id, `value` when it has one, `x`, `y`, `w`, `h`, `flags`,
 `depth` 0) and `text` the same elements as tree lines. `limit` is the most
-matches (1 or more, default 20; otherwise `limit must be 1 or more`). With
+matches (1 or more, default 20; a value above 2000 counts as 2000; otherwise
+`limit must be 1 or more`). With
 `ref` it returns that one element as it is now. When the search ran out of
 time after some matches, the result has `truncated: true` and `text` ends
 with a line that says so.
@@ -671,7 +677,9 @@ result is `{x, y, node}`: the point and the element. An element whose centre
 cannot be clicked answers `element <ref> has no clickable point: <reason>; or
 act on it with vm.ui.action`, with the guest's reason, such as `window
 0x501fa "Alcove Fixture" covers the centre of the element; focus the
-element's window with win.action`. A window that an app or `vm.app.launch`
+element's window with win.action`; without a reason from the guest it
+answers `element <ref> has no clickable point (off screen or covered); use
+vm.ui.action or scroll it into view`. A window that an app or `vm.app.launch`
 just opened is often behind another one; `vm.window.action` with `focus`
 comes first then. Two clicks on one point within the guest's double-click
 time (500 ms by default) are a double click to the guest.
@@ -679,11 +687,12 @@ time (500 ms by default) are a double click to the guest.
 **`vm.ui.type`** clicks the element in the same way, waits 120 ms and types
 `text` with real keys as `vm.type` does (text outside the US layout goes
 through the guest clipboard and `ctrl+v`, and replaces what the clipboard
-held). With `clear: true` it first
-presses `ctrl+a`, `ctrl+home` and `ctrl+shift+end`, so the typed text
-replaces what the field holds, also in controls that ignore `ctrl+a` (a
-classic Win32 edit control does); with `clear` and an empty `text` it presses
-`backspace` after them. `submit: true` presses `enter` at the end. `text` is
+held). With `clear: true` it first selects what the element holds: on an
+element whose role is `Edit` or `Document` it presses `ctrl+a`, `ctrl+home`
+and `ctrl+shift+end`, so the typed text replaces the content also in controls
+that ignore `ctrl+a` (a classic Win32 edit control does); on an element of
+any other role (a grid cell, a list, a drop-down) it presses `ctrl+a` alone.
+With `clear` and an empty `text` it presses `backspace` after them. `submit: true` presses `enter` at the end. `text` is
 required and may be empty. The result is `{node}`, the element as it was
 before the typing.
 
@@ -707,7 +716,10 @@ parameters.
 and no `value` in every result, and `vm.ui.text` answers `the element is a
 password field; its text is not read; it cannot be read through UI
 Automation`. A selector still finds a labelled password field by `name`.
-Text typed into such a field is in no result of these ops.
+Text typed into such a field is in no result of these ops. Text outside the US
+layout that `vm.ui.type` pastes into it stays in the guest clipboard, where
+`vm.clipboard.get` and other programs in the guest read it; put other text
+there with `vm.clipboard.set` after the typing.
 
 **Elevated and hung windows.** The helper runs with the agent's elevated
 token (high integrity) and reads windows of elevated processes: an app the
@@ -773,7 +785,10 @@ the first has finished. The steps, in order:
    processes that started it are never killed; when one of them runs from
    `guestDir` nothing is killed and the op answers `the guest agent or a
    process that started it (<name>, pid <n>) runs from '<dir>'; pass another
-   guestDir`.
+   guestDir`. When the agent's own process is not in the process list,
+   nothing is killed and the op answers `vm.deploy could not find the guest
+   agent's own process, so it stopped nothing under '<dir>'; stop the running
+   copies with vm.process.kill, or pass killRunning: false`.
 4. The marker file `.alcove-deploy` is written into `guestDir` when it is not
    there. It holds one line of text and is never deleted or replaced by a
    deploy.
@@ -951,6 +966,7 @@ server checks before it launches the engine:
 | `the template of '<clone>' was not found at <path>; the clone cannot run without it` | a clone whose template bundle is gone or unreadable |
 | `the VM at <path> is not the template '<clone>' was cloned from; the clone cannot run` | another VM is stored at the template's path |
 | `the template '<template>' was started after '<clone>' was cloned from it, so the clone's disk no longer matches; delete the clone and clone again` | the template ran a session that keeps its changes after the clone was made |
+| `'<vm>' is running in another Alcove host (<process name> pid <ppid>); stop the VM there or quit that host, then start it here` | the engine that holds the VM's `run/qemu.pid` lock is the child of another live process (the Alcove app or another `alcovectl serve`); an engine whose host has exited (its parent is launchd) or that this server started is stopped before the start instead |
 | `'<vm>' has been cloned, so each start is recorded in <path>/config.json, and that file could not be saved; make the bundle folder writable and start it again` | a VM that was cloned before cannot save its `config.json` (the system's description follows on a second line) |
 
 Other failures carry the engine's own output after `start failed: `.
@@ -1700,8 +1716,10 @@ the dump 'app.exe.4242.dmp' is still being written; retry in a few seconds
 - Window events are reported only while the guest's UI helper runs. After the
   agent replaced a helper that did not answer, they resume with the next
   window or element request, and what happened in between is not reported.
-- A second host that starts a VM this server runs stops this server's engine
-  (see the first limit); the guest then loses its unsaved state.
+- A start refuses while the VM's engine runs under another live host:
+  `start failed: '<vm>' is running in another Alcove host (<process name> pid
+  <ppid>); stop the VM there or quit that host, then start it here`. The
+  engine of a host that has exited is stopped by the next start.
 - Recordings and the last ended recording a bundle may use live in the
   server: a server that exits leaves the files of a running recording as they
   were written, without `vm.record.stop`'s finishing, and a new server knows

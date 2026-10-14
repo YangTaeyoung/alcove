@@ -142,8 +142,8 @@ headless engine when it is not.
 | `evidence` | `alcove_event_log` / `alcove_crash_dumps` | Entries of the guest's event log; crash dumps of a Windows program, copied to the Mac |
 | `evidence` | `alcove_collect_diagnostics` | Screenshot, windows, UI tree, processes, logs and dumps of a VM in one directory |
 | `replay` | `alcove_script_save` / `alcove_script_run` | Turn a recording into a script; replay it without a model |
-| `http` | `alcove_http_capture_start` / `alcove_http_capture_stop` | Capture the HTTP and HTTPS traffic of a VM through a proxy on the Mac |
-| `http` | `alcove_http_requests` / `alcove_http_rule` | List and read captured exchanges; answer, delay or drop matching requests |
+| `http` | `alcove_http_capture_start` / `alcove_http_capture_stop` | Capture the HTTP and HTTPS traffic of a VM through a proxy on the Mac (listed now; the control ops they call arrive with AT7, until then they answer an unknown-op error) |
+| `http` | `alcove_http_requests` / `alcove_http_rule` | List and read captured exchanges; answer, delay or drop matching requests (listed now; the control ops arrive with AT7) |
 
 </details>
 
