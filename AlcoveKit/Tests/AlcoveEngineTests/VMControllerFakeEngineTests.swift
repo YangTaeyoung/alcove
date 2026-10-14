@@ -497,6 +497,34 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try await vm.shutdown(force: true)
     }
 
+    func testARestoreAskedForDuringASaveWaitsForTheSaveToEnd() async throws {
+        let vm = try makeVM(mode: "slow-save")
+        try await vm.start()
+        let save = Task { try await vm.createSnapshot(named: "base") }
+        let sent = await waitUntil { (try? self.qmpCommands(vm))?.contains("snapshot-save") == true }
+        XCTAssertTrue(sent, "the save was not sent")
+        try await vm.restoreSnapshot(named: "base")
+        try await save.value
+        let commands = try qmpCommands(vm).filter { ["snapshot-save", "job-dismiss", "stop", "snapshot-load", "cont"].contains($0) }
+        XCTAssertEqual(commands, ["snapshot-save", "job-dismiss", "stop", "snapshot-load", "job-dismiss", "cont"])
+        try await vm.shutdown(force: true)
+    }
+
+    func testARestoreAskedForDuringADeleteWaitsForTheDeleteToEnd() async throws {
+        let vm = try makeVM(mode: "slow-delete")
+        try await vm.start()
+        try await vm.createSnapshot(named: "base")
+        try await vm.createSnapshot(named: "other")
+        let delete = Task { try await vm.deleteSnapshot(named: "other") }
+        let sent = await waitUntil { (try? self.qmpCommands(vm))?.contains("snapshot-delete") == true }
+        XCTAssertTrue(sent, "the delete was not sent")
+        try await vm.restoreSnapshot(named: "base")
+        try await delete.value
+        let commands = try qmpCommands(vm).filter { ["snapshot-delete", "job-dismiss", "stop", "snapshot-load", "cont"].contains($0) }
+        XCTAssertEqual(Array(commands.drop { $0 != "snapshot-delete" }), ["snapshot-delete", "job-dismiss", "stop", "snapshot-load", "job-dismiss", "cont"])
+        try await vm.shutdown(force: true)
+    }
+
     func testTheDrainFlagGivesEachStartsDisplayConnectionADrainThatEndsWithTheEngine() async throws {
         let vm = try makeVM()
         try await vm.start()
@@ -1060,9 +1088,11 @@ final class VMControllerFakeEngineTests: XCTestCase {
 }
 
 /// See the class comment. `FAKE_QEMU_MODE`: "" or a comma-separated list of exit-early |
-/// bad-status | migrate-fails | incoming-fails | slow-incoming | ignore-powerdown | slow-load | slow-stop.
+/// bad-status | migrate-fails | incoming-fails | slow-incoming | ignore-powerdown | slow-load | slow-stop | slow-save | slow-delete.
 /// slow-load: `snapshot-load` holds the QMP connection for 1 s before its job events,
 /// and no other command is answered meanwhile. slow-stop: `stop` does the same for 0.5 s before it pauses the guest.
+/// slow-save, slow-delete: `snapshot-save` or `snapshot-delete` sends its job events 1 s after its answer, and other
+/// commands are answered meanwhile.
 private let fakeQEMUSource = #"""
 #!/usr/bin/env python3
 import fcntl, json, os, socket, sys, threading, time
@@ -1185,6 +1215,13 @@ def handle(req):
             snapshots.discard(tag)
         jobs[jid] = e
         ok()
+        if (cmd == "snapshot-save" and "slow-save" in modes) or (cmd == "snapshot-delete" and "slow-delete" in modes):
+            def conclude(jid=jid):
+                time.sleep(1.0)
+                for s in ("created", "running", "waiting", "pending", "concluded"):
+                    event("JOB_STATUS_CHANGE", {"id": jid, "status": s})
+            threading.Thread(target=conclude, daemon=True).start()
+            return
         if cmd == "snapshot-load" and "slow-load" in modes:
             orig = dict(st)
             st.update(running=False, status="restore-vm")

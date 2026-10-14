@@ -1141,7 +1141,9 @@ image for later writes, and the image file keeps its size.
   guest tools, the clock setting and the cleanup of an earlier HTTP capture
   that follow it run to their end as well. A second restore, a
   `vm.snapshot.create` or a `vm.snapshot.delete` of the same VM waits until
-  the restore has ended. A `vm.stop` during the load stops the VM, and the
+  the restore has ended, and a restore waits for a save or delete of the same
+  VM that runs (also one started in the app); a save or delete runs to its
+  end when its client disconnects. A `vm.stop` during the load stops the VM, and the
   restore fails: it answers `snapshot restore failed: the VM is not running;
   check vm.status`, or `snapshot restore failed: the engine closed the
   connection (<reason>); check vm.status` when the engine quits before the
