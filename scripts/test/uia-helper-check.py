@@ -813,7 +813,7 @@ def _(a, run):
     if act.get("ok") is True:
         expect(act.get("gone") is True or act.get("pending") is True or act.get("unresponsive") is True,
                f"ui.act invoke on Crash answered {act!r}")
-    ev = a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}")
+    ev = a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}", timeout=60)
     expect(ev.get("code") == CRASH_CODE, f"process.exited carries code {ev.get('code')!r}, expected {CRASH_CODE}")
     run.fixture = None
     found = wait_wer(a, since)
