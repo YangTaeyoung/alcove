@@ -6,6 +6,31 @@ loopback port to it (`hostfwd=tcp:127.0.0.1:<port>-:7645`); the app connects
 from the host. Newline-delimited JSON objects in both directions, discriminated
 by `t`.
 
+## Who is served
+
+The agent serves only connections whose peer address is `10.0.2.2`, the
+address from which QEMU's user-mode network delivers the connections it
+forwards from the host. Processes inside the guest reach the port from
+`127.0.0.1` or from the guest's own address and are not served. Each
+`--allow-peer <address or CIDR range>` (repeatable; `--install` passes them on
+to the scheduled task or the systemd unit) adds a range, for tests and for
+guests on another network. A refused peer gets one line and the connection
+closes; it gets no `hello`:
+
+```
+{"t":"refused","error":"alcove-agent serves only connections from 10.0.2.2/32 and this one comes from 127.0.0.1; start alcove-agent with --allow-peer 127.0.0.1/32 to serve it"}
+```
+
+This is the trust boundary of the agent. It runs elevated on Windows (a
+scheduled task with the highest run level) and as root on Linux, and every
+peer it serves can use every operation its capabilities name: with
+`--allow-exec` that is running commands, writing files and starting programs
+with the agent's rights. On the host, every process that can connect to the
+forwarded loopback port of the VM is such a peer. A range given with
+`--allow-peer` makes every program at those addresses one too; a range that
+contains a guest address (or `127.0.0.1`) lets programs inside the guest,
+including a standard user's, use the agent's rights.
+
 ## Handshake
 
 Agent → host on connect:
@@ -38,6 +63,7 @@ Capabilities:
 
 | Direction | `t` | Fields | Meaning |
 |---|---|---|---|
+| agent → host | `refused` | `error` | the only line to a peer that is not served ([Who is served](#who-is-served)); the connection closes |
 | both | `ping` / `pong` | — | keepalive every 10 s |
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
 | host → agent | `clipboard.get` | — | ask for the current text; answered with `clipboard.text` |

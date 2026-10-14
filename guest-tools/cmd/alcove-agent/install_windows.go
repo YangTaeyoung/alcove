@@ -48,9 +48,9 @@ func lockDataFolder() (string, error) {
 
 // installAtLogon registers a scheduled task that starts the agent in the
 // interactive session at logon (the clipboard is per session, so a service
-// in session 0 could not see it) with its log in dataDir, opens the firewall
-// port and starts the task.
-func installAtLogon(port int, allowExec bool, dataDir string) error {
+// in session 0 could not see it) with its log in dataDir and peerArgs added to
+// its arguments, opens the firewall port and starts the task.
+func installAtLogon(port int, allowExec bool, peerArgs []string, dataDir string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -85,6 +85,9 @@ func installAtLogon(port int, allowExec bool, dataDir string) error {
 	args := fmt.Sprintf(`--port %d --log "%s"`, port, filepath.Join(dataDir, "agent.log"))
 	if allowExec {
 		args += " --allow-exec"
+	}
+	for _, a := range peerArgs {
+		args += " " + a
 	}
 	tr := fmt.Sprintf(`"%s" %s`, dst, args)
 	_ = exec.Command("schtasks", "/Delete", "/TN", "AlcoveAgent", "/F").Run()

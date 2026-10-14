@@ -102,6 +102,32 @@ func TestDataFoldersNameNoFolderWithoutProgramData(t *testing.T) {
 	}
 }
 
+func TestPeerFlagTakesRangesAndSingleAddresses(t *testing.T) {
+	var peers peerFlag
+	for _, v := range []string{"192.168.64.0/24", "10.0.2.15", "fd00::/8", "::1"} {
+		if err := peers.Set(v); err != nil {
+			t.Fatalf("Set(%q): %v", v, err)
+		}
+	}
+	want := "192.168.64.0/24,10.0.2.15/32,fd00::/8,::1/128"
+	if peers.String() != want {
+		t.Fatalf("peers %q, expected %q", peers.String(), want)
+	}
+	if got := peers.args(); strings.Join(got, " ") != "--allow-peer 192.168.64.0/24 --allow-peer 10.0.2.15/32 --allow-peer fd00::/8 --allow-peer ::1/128" {
+		t.Fatalf("args %q", got)
+	}
+}
+
+func TestPeerFlagRefusesAnythingElse(t *testing.T) {
+	for _, v := range []string{"", "localhost", "10.0.2.2/33", "10.0.2.2:7645", "192.168.64.1/24"} {
+		var peers peerFlag
+		err := peers.Set(v)
+		if err == nil || !strings.Contains(err.Error(), "an address such as 10.0.2.2 or a range such as 192.168.64.0/24") {
+			t.Fatalf("Set(%q): %v", v, err)
+		}
+	}
+}
+
 func TestNoHelperAnswersEveryCallWithItsError(t *testing.T) {
 	_, _, err := dataFolders("")
 	ui := noHelper{err}

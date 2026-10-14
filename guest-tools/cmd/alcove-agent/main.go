@@ -1,6 +1,7 @@
-// alcove-agent runs inside a guest and serves docs/agent-protocol.md on TCP 7645.
+// alcove-agent runs inside a guest and serves docs/agent-protocol.md on TCP 7645
+// to connections from 10.0.2.2 and from the ranges given with --allow-peer.
 //
-//	alcove-agent [--port 7645] [--allow-exec] [--token T]
+//	alcove-agent [--port 7645] [--allow-exec] [--allow-peer CIDR]... [--token T]
 //	alcove-agent --install   (Windows: scheduled task at logon + firewall rule)
 package main
 
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +29,8 @@ func main() {
 	tok := flag.String("token", "", "override the SMBIOS token")
 	install := flag.Bool("install", false, "install to start at logon (Windows) and exit")
 	logPath := flag.String("log", "", "log file (default: stderr)")
+	var peers peerFlag
+	flag.Var(&peers, "allow-peer", "also serve connections from this address or CIDR range (repeatable; 10.0.2.2 is always served)")
 	flag.Parse()
 
 	if *install {
@@ -35,7 +39,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "install failed:", err)
 			os.Exit(1)
 		}
-		if err := installAtLogon(*port, *allowExec, dir); err != nil {
+		if err := installAtLogon(*port, *allowExec, peers.args(), dir); err != nil {
 			fmt.Fprintln(os.Stderr, "install failed:", err)
 			writeInstallLog(dir, "install failed: "+err.Error())
 			os.Exit(1)
@@ -76,7 +80,8 @@ func main() {
 	if err != nil {
 		logger.Fatalf("listen: %v", err)
 	}
-	logger.Printf("alcove-agent %s listening on %s (token %s, exec %v)", server.AgentVersion, l.Addr(), mask(*tok), *allowExec)
+	allowed := append(append([]netip.Prefix{}, server.DefaultPeers...), peers...)
+	logger.Printf("alcove-agent %s listening on %s for %s (token %s, exec %v)", server.AgentVersion, l.Addr(), peerList(allowed).String(), mask(*tok), *allowExec)
 	var s *server.Server
 	var ui server.UI
 	if dataErr != nil {
@@ -89,7 +94,7 @@ func main() {
 		helper.SetLogPath(filepath.Join(uiaDir, "helper.log"))
 		ui = helper
 	}
-	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui})
+	s = server.New(server.Options{Token: *tok, AllowExec: *allowExec, Logger: logger, UI: ui, AllowPeers: allowed})
 	err = s.Serve(l)
 	s.Close()
 	logger.Fatal(err)
@@ -140,6 +145,47 @@ func insideDir(dir, path string) bool {
 	}
 	rel, err := filepath.Rel(strings.ToLower(filepath.Clean(dir)), strings.ToLower(filepath.Clean(path)))
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// peerFlag collects the --allow-peer values.
+type peerFlag []netip.Prefix
+
+// peerList prints address ranges separated by commas.
+type peerList []netip.Prefix
+
+func (p peerList) String() string {
+	parts := make([]string, len(p))
+	for i, r := range p {
+		parts[i] = r.String()
+	}
+	return strings.Join(parts, ",")
+}
+
+func (p *peerFlag) String() string { return peerList(*p).String() }
+
+// Set adds a CIDR range, or a single address as a range of that address only.
+// A range with bits set after its prefix length is refused.
+func (p *peerFlag) Set(v string) error {
+	bad := fmt.Errorf("--allow-peer %q is not an address such as 10.0.2.2 or a range such as 192.168.64.0/24; pass one of those", v)
+	if a, err := netip.ParseAddr(v); err == nil && a.Zone() == "" {
+		*p = append(*p, netip.PrefixFrom(a, a.BitLen()))
+		return nil
+	}
+	r, err := netip.ParsePrefix(v)
+	if err != nil || r != r.Masked() {
+		return bad
+	}
+	*p = append(*p, r)
+	return nil
+}
+
+// args returns the command-line arguments that pass the same ranges again.
+func (p peerFlag) args() []string {
+	var out []string
+	for _, r := range p {
+		out = append(out, "--allow-peer", r.String())
+	}
+	return out
 }
 
 func mask(t string) string {

@@ -18,8 +18,9 @@ func lockDataFolder() (string, error) {
 	return filepath.Join(os.TempDir(), "Alcove"), nil
 }
 
-// installAtLogon installs a systemd system unit on Linux.
-func installAtLogon(port int, allowExec bool, _ string) error {
+// installAtLogon installs a systemd system unit on Linux whose command line
+// carries peerArgs.
+func installAtLogon(port int, allowExec bool, peerArgs []string, _ string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -31,6 +32,9 @@ func installAtLogon(port int, allowExec bool, _ string) error {
 	extra := ""
 	if allowExec {
 		extra = " --allow-exec"
+	}
+	for _, a := range peerArgs {
+		extra += " " + a
 	}
 	unit := fmt.Sprintf(`[Unit]
 Description=Alcove guest agent

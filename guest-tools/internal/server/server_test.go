@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -40,12 +41,16 @@ func (f *fakeClipboard) external(s string) {
 	f.seq++
 }
 
+// loopbackPeers is the AllowPeers of the servers the tests connect to.
+var loopbackPeers = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+
 func startServer(t *testing.T, opt Options) (*proto.Reader, *proto.Writer, net.Conn) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	opt.AllowPeers = loopbackPeers
 	go New(opt).Serve(l)
 	c, err := net.Dial("tcp", l.Addr().String())
 	if err != nil {

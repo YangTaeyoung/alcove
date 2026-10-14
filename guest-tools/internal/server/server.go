@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,7 +37,18 @@ type Options struct {
 	Logger   *log.Logger
 	// UI serves the ui and win ops; nil means the guest has no ui capability.
 	UI UI
+	// AllowPeers holds the address ranges whose connections are served; empty
+	// means DefaultPeers.
+	AllowPeers []netip.Prefix
 }
+
+// DefaultPeers is the address from which QEMU's user-mode network delivers the
+// connections it forwards from the host.
+var DefaultPeers = []netip.Prefix{netip.MustParsePrefix("10.0.2.2/32")}
+
+// refusalWriteTimeout bounds the write of the refusal line to a peer that is
+// not served.
+const refusalWriteTimeout = 5 * time.Second
 
 // Server serves one connection at a time (the app reconnects as needed).
 type Server struct {
@@ -118,9 +130,55 @@ type fileXfer struct {
 	sum  func() []byte
 }
 
+// allowPeers returns the address ranges whose connections are served.
+func (s *Server) allowPeers() []netip.Prefix {
+	if len(s.opt.AllowPeers) == 0 {
+		return DefaultPeers
+	}
+	return s.opt.AllowPeers
+}
+
+// peerAllowed returns the IP address of a peer, with an IPv4-mapped IPv6
+// address turned into IPv4, and whether it lies in one of the allowed ranges.
+// A peer without an IP address is not allowed.
+func (s *Server) peerAllowed(remote net.Addr) (netip.Addr, bool) {
+	tcp, ok := remote.(*net.TCPAddr)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	addr := tcp.AddrPort().Addr().Unmap().WithZone("")
+	for _, p := range s.allowPeers() {
+		if p.Contains(addr) {
+			return addr, true
+		}
+	}
+	return addr, false
+}
+
+// refusal is the sentence sent to a peer whose address is not allowed.
+func refusal(allowed []netip.Prefix, addr netip.Addr) string {
+	ranges := make([]string, len(allowed))
+	for i, p := range allowed {
+		ranges[i] = p.String()
+	}
+	head := "alcove-agent serves only connections from " + strings.Join(ranges, ", ")
+	if !addr.IsValid() {
+		return head + " and this one has no IP address; connect over TCP"
+	}
+	return fmt.Sprintf("%s and this one comes from %s; start alcove-agent with --allow-peer %s to serve it",
+		head, addr, netip.PrefixFrom(addr, addr.BitLen()))
+}
+
 func (s *Server) handle(c net.Conn) {
 	defer c.Close()
 	lg := s.opt.Logger
+	addr, ok := s.peerAllowed(c.RemoteAddr())
+	if !ok {
+		lg.Printf("refused the connection from %s", c.RemoteAddr())
+		_ = c.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
+		_ = proto.NewWriter(c).Send(proto.Message{"t": "refused", "error": refusal(s.allowPeers(), addr)})
+		return
+	}
 	lg.Printf("connection from %s", c.RemoteAddr())
 	cn := newConn(c, lg)
 	go cn.writeLoop()

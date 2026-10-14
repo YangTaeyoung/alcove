@@ -16,6 +16,7 @@ func startServerS(t *testing.T, opt Options) (*Server, *proto.Reader, *proto.Wri
 	if err != nil {
 		t.Fatal(err)
 	}
+	opt.AllowPeers = loopbackPeers
 	s := New(opt)
 	go s.Serve(l)
 	c, err := net.Dial("tcp", l.Addr().String())
