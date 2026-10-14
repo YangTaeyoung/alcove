@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -107,32 +108,20 @@ func killByName(name string, tree bool) (int, error) {
 	return killed, nil
 }
 
-// resolveProgram returns the program to start for an app.launch path. A bare
-// file name that is not on the search path is looked up under the App Paths
-// registry keys, where programs such as msedge.exe register themselves.
-func resolveProgram(path string) string {
-	if strings.ContainsAny(path, `\/:`) {
-		return path
+// resolveProgram returns systemProgramPath of path with the folders of the
+// machine's PATH, read from the registry, and the HKLM App Paths keys.
+func resolveProgram(path string) (string, error) {
+	var dirs []string
+	for _, dir := range strings.Split(registryString(syscall.HKEY_LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, "Path"), ";") {
+		dirs = append(dirs, strings.TrimSpace(dir))
 	}
-	if _, err := exec.LookPath(path); err == nil {
-		return path
+	exists := func(p string) bool {
+		fi, err := os.Stat(p)
+		return err == nil && fi.Mode().IsRegular()
 	}
-	name := path
-	if filepath.Ext(name) == "" {
-		name += ".exe"
-	}
-	keys := []string{
-		`SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\` + name,
-		`SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\` + name,
-	}
-	for _, root := range []syscall.Handle{syscall.HKEY_CURRENT_USER, syscall.HKEY_LOCAL_MACHINE} {
-		for _, key := range keys {
-			if full := registryString(root, key, ""); full != "" {
-				return strings.Trim(full, `"`)
-			}
-		}
-	}
-	return path
+	return systemProgramPath(path, dirs, exists, func(key string) string {
+		return registryString(syscall.HKEY_LOCAL_MACHINE, key, "")
+	})
 }
 
 var procExpandEnvironmentStrings = syscall.NewLazyDLL("kernel32.dll").NewProc("ExpandEnvironmentStringsW")

@@ -89,8 +89,9 @@ func killByName(name string, tree bool) (int, error) {
 	return killed, nil
 }
 
-// resolveProgram returns the program to start for an app.launch path.
-func resolveProgram(path string) string { return path }
+// resolveProgram returns the program to start for an app.launch path: path
+// itself.
+func resolveProgram(path string) (string, error) { return path, nil }
 
 // processParents maps each running process to its parent.
 func processParents() map[int]int {

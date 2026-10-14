@@ -231,12 +231,15 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 
 ### App launch (`app.launch`)
 
-- `path` is the program. A bare file name that is not on the search path is
-  looked up under `HKCU` and `HKLM`
-  `SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\<name>` and the 32-bit
-  view `SOFTWARE\WOW6432Node\…\App Paths\<name>` (`.exe` added when the name
-  has no extension), so `msedge.exe` starts Edge; a `REG_EXPAND_SZ` value has
-  its `%VAR%` references expanded.
+- `path` is the program. On Windows a bare file name (`.exe` added when it
+  has no extension) is looked for only in places a standard user cannot
+  change: the folders of the machine's `PATH` (the `Path` value under
+  `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, in
+  order), then `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\<name>`
+  and the 32-bit view `HKLM\SOFTWARE\WOW6432Node\…\App Paths\<name>`, so
+  `msedge.exe` starts Edge; a `REG_EXPAND_SZ` value has its `%VAR%`
+  references expanded. A name found in none of them answers
+  `'<name>' is not in the system folders of PATH or under HKLM App Paths; pass the full path of the program`.
 - The program starts directly with `args` as its arguments and with a normal
   window. Without `cwd` it runs in the directory of the program file; `cwd`
   resolves like the `cwd` of `exec.run`. `env` adds variables to the agent's

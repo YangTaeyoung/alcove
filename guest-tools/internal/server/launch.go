@@ -113,6 +113,40 @@ func (c *claimSet) clearReleased() {
 	c.order = order
 }
 
+// systemProgramPath returns the program an app.launch path names on Windows.
+// A path with a separator, a colon or a drive is returned as it is. A bare
+// name, with ".exe" added when it has no extension, is looked for in dirs,
+// the folders of the machine's PATH, in their order, with exists, and then
+// under the HKLM App Paths keys of the 64-bit and the 32-bit view with
+// appPath, whose value loses its surrounding quotes. A name found in neither
+// is an error.
+func systemProgramPath(path string, dirs []string, exists func(string) bool, appPath func(key string) string) (string, error) {
+	if strings.ContainsAny(path, `\/:`) {
+		return path, nil
+	}
+	name := path
+	if filepath.Ext(name) == "" {
+		name += ".exe"
+	}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		if full := strings.TrimRight(dir, `\`) + `\` + name; exists(full) {
+			return full, nil
+		}
+	}
+	for _, key := range []string{
+		`SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\` + name,
+		`SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\` + name,
+	} {
+		if full := appPath(key); full != "" {
+			return strings.Trim(full, `"`), nil
+		}
+	}
+	return "", fmt.Errorf("'%s' is not in the system folders of PATH or under HKLM App Paths; pass the full path of the program", path)
+}
+
 func (s *Server) registerLaunch() {
 	s.register("app.launch", true, s.appLaunch)
 }
@@ -136,7 +170,11 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 		waitMs = maxLaunchWaitMs
 	}
 
-	c := exec.Command(resolveProgram(path), req.Strings("args")...)
+	program, err := resolveProgram(path)
+	if err != nil {
+		return nil, err
+	}
+	c := exec.Command(program, req.Strings("args")...)
 	if cwd := req.String("cwd"); cwd != "" {
 		c.Dir = resolveHomePath(s.opt.HomeDir, cwd)
 	} else if filepath.IsAbs(c.Path) {
