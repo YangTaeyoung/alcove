@@ -25,6 +25,7 @@ var (
 	procSetNamedSecurityInfo = advapi32.NewProc("SetNamedSecurityInfoW")
 	procLocalFree            = kernel32.NewProc("LocalFree")
 	procGetSystemDirectory   = kernel32.NewProc("GetSystemDirectoryW")
+	procGetWindowsDirectory  = kernel32.NewProc("GetSystemWindowsDirectoryW")
 	procGetFileAttributes    = kernel32.NewProc("GetFileAttributesW")
 )
 
@@ -289,10 +290,22 @@ func secureDir(dir string, keep, leave map[string]bool) error {
 
 // systemDirectory returns the Windows system directory.
 func systemDirectory() (string, error) {
+	return folderOf(procGetSystemDirectory)
+}
+
+// windowsDirectory returns the system's Windows directory, the same for every
+// user and session.
+func windowsDirectory() (string, error) {
+	return folderOf(procGetWindowsDirectory)
+}
+
+// folderOf calls a kernel32 function that writes a folder name into a buffer
+// and returns its length.
+func folderOf(proc *syscall.LazyProc) (string, error) {
 	buf := make([]uint16, syscall.MAX_PATH)
-	n, _, e := procGetSystemDirectory.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	n, _, e := proc.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	if n == 0 || int(n) >= len(buf) {
-		return "", fmt.Errorf("GetSystemDirectory: %v", e)
+		return "", fmt.Errorf("%s: %v", proc.Name, e)
 	}
 	return syscall.UTF16ToString(buf[:n]), nil
 }

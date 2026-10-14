@@ -8,45 +8,22 @@ import (
 	"time"
 )
 
-func TestCleanHelperEnv(t *testing.T) {
-	environ := []string{
-		`SystemRoot=C:\Windows`,
-		`COR_ENABLE_PROFILING=1`,
-		`cor_profiler={1234}`,
-		`COMPlus_Version=v2`,
-		`complus_x=1`,
-		`DOTNET_ROOT=C:\dotnet`,
-		`DotNet_Startup_Hooks=C:\x.dll`,
-		`PSModulePath=C:\mods`,
-		`psmodulepath=C:\other`,
-		`TEMP=C:\Users\a\Temp`,
-		`Tmp=C:\Users\a\Tmp`,
-		`TEMPORARY=kept`,
-		`CORE=kept`,
-		`=C:=C:\Users`,
-		`NOEQUALS`,
-		`EMPTY=`,
-		`A=b=c`,
-	}
-	got := cleanHelperEnv(environ, `C:\ProgramData\Alcove\uia\tmp`)
+func TestHelperEnvHoldsOnlyTheSystemFoldersAndTheLockedTemp(t *testing.T) {
+	got := helperEnv(`D:\WINDOWS`, `D:\WINDOWS\system32`, `C:\ProgramData\Alcove\uia\tmp`, 3)
 	want := []string{
-		`SystemRoot=C:\Windows`,
-		`TEMPORARY=kept`,
-		`CORE=kept`,
-		`=C:=C:\Users`,
-		`EMPTY=`,
-		`A=b=c`,
+		`SystemRoot=D:\WINDOWS`,
+		`windir=D:\WINDOWS`,
+		`SystemDrive=D:`,
+		`ComSpec=D:\WINDOWS\system32\cmd.exe`,
+		`PATH=D:\WINDOWS\system32;D:\WINDOWS;D:\WINDOWS\system32\Wbem;D:\WINDOWS\system32\WindowsPowerShell\v1.0`,
+		`PSModulePath=D:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules`,
+		`PSModuleAnalysisCachePath=C:\ProgramData\Alcove\uia\tmp\ModuleAnalysisCache`,
 		`TEMP=C:\ProgramData\Alcove\uia\tmp`,
 		`TMP=C:\ProgramData\Alcove\uia\tmp`,
+		`ALCOVE_UIA_START=3`,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("env\n got %q\nwant %q", got, want)
-	}
-	if got := cleanHelperEnv(nil, "T"); !reflect.DeepEqual(got, []string{"TEMP=T", "TMP=T"}) {
-		t.Fatalf("env of an empty environment: %q", got)
-	}
-	if environ[1] != `COR_ENABLE_PROFILING=1` || len(environ) != 17 {
-		t.Fatalf("the input was changed: %q", environ)
 	}
 }
 

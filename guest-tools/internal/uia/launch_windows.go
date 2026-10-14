@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 )
@@ -35,8 +34,8 @@ func Available() bool { return true }
 // started when the previous process still runs after previousExitWait or when
 // the folders cannot be locked. Each start passes the number of helpers this
 // launcher started before it as ALCOVE_UIA_START. The helper's environment is
-// cleanHelperEnv of the agent's, with the tmp folder inside dir as its
-// temporary directory.
+// helperEnv of the system's folders, with the tmp folder inside dir as its
+// temporary directory; nothing of the agent's environment is passed on.
 func DefaultLauncher(dir string) Launcher {
 	tmp := filepath.Join(dir, "tmp")
 	prepare := func() error {
@@ -59,6 +58,10 @@ func DefaultLauncher(dir string) Launcher {
 		if err != nil {
 			return nil, notStarted(err)
 		}
+		windows, err := windowsDirectory()
+		if err != nil {
+			return nil, notStarted(err)
+		}
 		logFile, err := openCappedLog(filepath.Join(dir, "helper.log"), maxLogBytes)
 		if err != nil {
 			return nil, notPrepared(dir, err)
@@ -66,7 +69,7 @@ func DefaultLauncher(dir string) Launcher {
 		cmd := exec.Command(filepath.Join(system, "WindowsPowerShell", "v1.0", "powershell.exe"),
 			"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(dir, "bootstrap.ps1"))
 		cmd.Dir = dir
-		cmd.Env = append(cleanHelperEnv(os.Environ(), tmp), "ALCOVE_UIA_START="+strconv.Itoa(starts))
+		cmd.Env = helperEnv(windows, system, tmp, starts)
 		cmd.Stderr = logFile
 		cmd.WaitDelay = stderrDrainWait
 		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}

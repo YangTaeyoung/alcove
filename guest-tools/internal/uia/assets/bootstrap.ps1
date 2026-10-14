@@ -1,3 +1,4 @@
+$env:PSModulePath = $PSHOME + '\Modules'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 

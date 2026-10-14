@@ -3,6 +3,7 @@ package uia
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -11,25 +12,30 @@ import (
 // before it to end.
 const previousExitWait = 10 * time.Second
 
-// cleanHelperEnv returns environ without the COR_*, COMPlus_*, DOTNET_*,
-// PSModulePath, TEMP and TMP variables and without entries that have no '=',
-// followed by TEMP and TMP set to tmp. Names are compared without regard to
-// case.
-func cleanHelperEnv(environ []string, tmp string) []string {
-	env := make([]string, 0, len(environ)+2)
-	for _, kv := range environ {
-		eq := strings.IndexByte(kv, '=')
-		if eq < 0 {
-			continue
-		}
-		name := strings.ToUpper(kv[:eq])
-		if strings.HasPrefix(name, "COR_") || strings.HasPrefix(name, "COMPLUS_") ||
-			strings.HasPrefix(name, "DOTNET_") || name == "PSMODULEPATH" || name == "TEMP" || name == "TMP" {
-			continue
-		}
-		env = append(env, kv)
+// helperEnv returns the whole environment of a helper process, built from the
+// Windows folder windows, the system folder system and the locked temporary
+// folder tmp: SystemRoot, windir, SystemDrive, ComSpec, PATH of the system
+// folders, PSModulePath of the system's PowerShell modules only, the
+// PowerShell module analysis cache inside tmp, TEMP and TMP set to tmp, and
+// ALCOVE_UIA_START set to starts.
+func helperEnv(windows, system, tmp string, starts int) []string {
+	drive := ""
+	if len(windows) >= 2 && windows[1] == ':' {
+		drive = windows[:2]
 	}
-	return append(env, "TEMP="+tmp, "TMP="+tmp)
+	ps := system + `\WindowsPowerShell\v1.0`
+	return []string{
+		"SystemRoot=" + windows,
+		"windir=" + windows,
+		"SystemDrive=" + drive,
+		"ComSpec=" + system + `\cmd.exe`,
+		"PATH=" + strings.Join([]string{system, windows, system + `\Wbem`, ps}, ";"),
+		"PSModulePath=" + ps + `\Modules`,
+		"PSModuleAnalysisCachePath=" + tmp + `\ModuleAnalysisCache`,
+		"TEMP=" + tmp,
+		"TMP=" + tmp,
+		"ALCOVE_UIA_START=" + strconv.Itoa(starts),
+	}
 }
 
 // notPrepared is the error for a helper folder whose files could not be

@@ -346,18 +346,19 @@ process failures) or `UI helper failed to start through PowerShell: ` (a
 failure the bootstrap script reports before the helper is ready); the
 `the UI helper stopped: …` sentence of a helper that had been ready comes
 without a prefix.
-The helper's environment is the agent's without `COR_*`, `COMPlus_*`,
-`DOTNET_*` and `PSModulePath`, and `TEMP`/`TMP` point inside the locked
-folder. Measured on the Windows 11 ARM64 test guest: the first `ui.ping` after
+The helper's environment takes nothing from the agent's: it holds
+`SystemRoot`, `windir` and `SystemDrive` of the system's Windows folder,
+`ComSpec` (`cmd.exe` of the system folder), a `PATH` of the system folder,
+the Windows folder, `Wbem` and Windows PowerShell's folder, a `PSModulePath`
+of Windows PowerShell's own `Modules` folder only (`bootstrap.ps1` sets it
+again before its first command), `PSModuleAnalysisCachePath` and
+`TEMP`/`TMP` inside the locked folder, and `ALCOVE_UIA_START`. Measured on the Windows 11 ARM64 test guest: the first `ui.ping` after
 an agent start answers after 0.59–0.60 s (1.1–2.0 s for the first one after a
 boot), of which the compile takes 0.35 s; a helper that was killed is replaced
 in 0.6–1.1 s. A helper killed while it starts leaves no process behind that
 blocks the next start: of 84 kills between 0 and 1.3 s after the start, the
 compiler was running in 8 and the next start succeeded in all of those.
-Without the repeated deletion, 4 of 24 kills between 0.3 and 1.2 s after the
-start made the next start fail once because deleting the file the compile had
-just written was refused; with it, none of 40 further kills between 0.7 and
-1.3 s did, and the slowest next start took 0.25 s longer than the others. The helper, and an app launched through
+The helper, and an app launched through
 `app.launch`, inherit the agent's elevated token. `alcove-agent --install`
 locks the folders in the same way before it copies or registers anything and
 fails, with exit code 1 and a line on stderr that begins `install failed: `,
