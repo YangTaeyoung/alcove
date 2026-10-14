@@ -34,12 +34,18 @@ final class AgentKeyLinkTests: XCTestCase {
             return []
         }
         let key = self.key
-        let link = AgentLink(events: EventBuffer(), retryDelay: .milliseconds(10), isRunning: { true },
+        let running = LockedBox(true)
+        let link = AgentLink(events: EventBuffer(), retryDelay: .milliseconds(10), isRunning: { running.value },
                              endpoint: { (agent.port, "tok") }, agentKey: { key })
         let client = await link.agent(timeout: .seconds(1))
         XCTAssertNil(client)
         let refusal = await link.lastRefusal()
         XCTAssertEqual(refusal, sentence)
+
+        running.value = false
+        _ = await link.agent(timeout: .zero)
+        let afterTheStop = await link.lastRefusal()
+        XCTAssertNil(afterTheStop)
     }
 
     func testAnOperationOnAVMWhoseAgentRefusedTheHostSaysWhy() async throws {

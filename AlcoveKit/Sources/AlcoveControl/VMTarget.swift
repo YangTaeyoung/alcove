@@ -62,7 +62,7 @@ public protocol VMTarget: Sendable {
     /// The standardized file path of the VM's bundle; nil when the target has no bundle.
     func bundlePath() async -> String?
     /// The sentence of the agent's `refused` line from the latest connection attempt that the agent refused, kept
-    /// until an attempt connects; nil when there is none.
+    /// until an attempt connects or the connection is dropped (the VM stopped); nil when there is none.
     func agentRefusal() async -> String?
 }
 
@@ -109,7 +109,8 @@ actor AgentLink {
     private let endpoint: @Sendable () async -> (port: Int, token: String?)
     /// The VM's agent key, read for every connection attempt.
     private let agentKey: @Sendable () async -> String?
-    /// The sentence of the agent's `refused` line from the latest refused attempt; cleared when an attempt connects.
+    /// The sentence of the agent's `refused` line from the latest refused attempt; cleared when an attempt connects
+    /// and by `drop`.
     private var refusal: String?
     private let events: EventBuffer
     private let retryDelay: Duration
@@ -151,7 +152,8 @@ actor AgentLink {
         self.agentKey = agentKey
     }
 
-    /// The sentence of the agent's `refused` line from the latest refused attempt; nil once an attempt connected.
+    /// The sentence of the agent's `refused` line from the latest refused attempt; nil once an attempt connected or
+    /// the link was dropped.
     func lastRefusal() -> String? { refusal }
 
     /// The connected agent client; nil when the VM is not running or the agent is not reachable within `timeout`.
@@ -242,6 +244,7 @@ actor AgentLink {
         client = nil
         generation += 1
         lastAttemptFailed = false
+        refusal = nil
         feed?.cancel()
         feed = nil
         await dropped?.disconnect()
