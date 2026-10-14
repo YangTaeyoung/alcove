@@ -695,8 +695,9 @@ extension ControlHandler {
         "the guest keeps the proxy settings and the CA certificate of the capture (\(reason)); Alcove restores them when its guest tools next connect"
     }
 
-    /// Ends every capture: restores the guests whose guest tools are connected, and stops the proxies.
+    /// Ends every recording, then every capture: restores the guests whose guest tools are connected, and stops the proxies.
     public func shutdown() async {
+        await endRecordings()
         for vm in Array(captures.keys) {
             if let t = await lookUp(vm) { _ = await restoreCaptureGuest(t) }
             await endCapture(vm)

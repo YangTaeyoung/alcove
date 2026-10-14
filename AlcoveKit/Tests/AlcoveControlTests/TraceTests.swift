@@ -360,6 +360,41 @@ final class TraceTests: XCTestCase {
         for frame in frames { XCTAssertEqual(try mode(frame), 0o600, frame.lastPathComponent) }
     }
 
+    func testShutdownEndsTheActiveRecording() async throws {
+        let (h, _, _) = setup()
+        let dir = try await start(h)
+        _ = try await h.handle(op: "vm.mouse.click", params: ["name": "Win", "x": 5, "y": 5])
+        let held = await h.activeRecording("Win")
+        let recording = try XCTUnwrap(held)
+        await h.shutdown()
+        let active = await h.activeRecording("Win")
+        XCTAssertNil(active)
+        let live = await recording.isActive
+        XCTAssertFalse(live)
+        let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["dir"]?.stringValue, dir.path)
+        XCTAssertEqual(stop["ops"]?.intValue, 1)
+    }
+
+    func testShutdownReturnsAfterARecordingThatIsEndingHasEnded() async throws {
+        let (h, _, _) = setup()
+        let gate = AsyncGate()
+        let sink = GatedSink(gate: gate)
+        await h.setRecordingSeams(RecordingSeams(openWriter: { try TraceWriter(directory: $0) }, makeSink: { _, _ in sink }))
+        _ = try await start(h, ["video": true])
+        let stopping = Task { try await h.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+        await gate.waitUntilWaiting()
+        let shutdown = Task {
+            await h.shutdown()
+            return sink.finished
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        await gate.open()
+        let finishedWhenShutdownReturned = await shutdown.value
+        XCTAssertEqual(finishedWhenShutdownReturned, 1)
+        _ = try await stopping.value
+    }
+
     func testDoubleStartRefused() async throws {
         let (h, _, _) = setup()
         let dir = try await start(h)
@@ -860,6 +895,19 @@ private final class CountingSink: VideoSink, @unchecked Sendable {
     func append(frame: Frame, at time: Duration) {}
     func finish() async { bump() }
     private func bump() { lock.lock(); count += 1; lock.unlock() }
+}
+
+private final class GatedSink: VideoSink, @unchecked Sendable {
+    private let gate: AsyncGate
+    private let lock = NSLock()
+    private var count = 0
+    init(gate: AsyncGate) { self.gate = gate }
+    var finished: Int { lock.withLock { count } }
+    func append(frame: Frame, at time: Duration) {}
+    func finish() async {
+        await gate.wait()
+        lock.withLock { count += 1 }
+    }
 }
 
 private actor AsyncGate {
