@@ -132,6 +132,8 @@ enum ErrorText {
         case .vmIsActive(let name): "“\(name)” is running. Shut it down first."
         case .vmRunsInAnotherHost(let name, let host):
             "“\(name)” is running in another Alcove host (\(host)). Stop it there or quit that host first."
+        case .vmHeldByEarlierEngine(let name):
+            "An engine from an earlier session still holds “\(name)”. Start the VM once to stop that engine, shut it down, then try again."
         case .nameAlreadyUsed(let name): "A virtual machine named “\(name)” already exists."
         case .templateHasClones(let name, let clones):
             "“\(name)” is the template of \(clones.joined(separator: ", ")). Delete the clones first."

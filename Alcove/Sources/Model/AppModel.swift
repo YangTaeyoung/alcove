@@ -13,6 +13,7 @@ final class AppModel {
         case engineUnavailable(String)
         case vmIsActive(String)
         case vmRunsInAnotherHost(String, host: String)
+        case vmHeldByEarlierEngine(String)
         case nameAlreadyUsed(String)
         case templateHasClones(String, clones: [String])
     }
@@ -226,14 +227,15 @@ final class AppModel {
     // MARK: - internals
 
     /// Throws when the session is active or an engine holds its bundle's pidfile lock; names the other host
-    /// when that engine runs under one (`VMBundle.otherEngineHost`).
+    /// when that engine runs under one (`VMBundle.otherEngineHost`), and otherwise says that an engine of an
+    /// earlier session holds the bundle.
     private func refuseRunning(_ session: VMSession) throws {
         guard !session.state.isActive else { throw AppError.vmIsActive(session.name) }
         guard session.bundle.isRunning else { return }
         if let host = session.bundle.otherEngineHost {
             throw AppError.vmRunsInAnotherHost(session.name, host: "\(host.name) pid \(host.pid)")
         }
-        throw AppError.vmIsActive(session.name)
+        throw AppError.vmHeldByEarlierEngine(session.name)
     }
 
     /// Throws when clones are backed by this session's disks.
