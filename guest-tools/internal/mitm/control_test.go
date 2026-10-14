@@ -11,7 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -118,6 +121,62 @@ func TestControlLoop(t *testing.T) {
 type failingListener struct{ net.Listener }
 
 func (f failingListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed") }
+
+// exhaustedListener fails its first fails accepts with "too many open files".
+type exhaustedListener struct {
+	net.Listener
+	fails atomic.Int32
+}
+
+func (l *exhaustedListener) Accept() (net.Conn, error) {
+	if l.fails.Add(-1) >= 0 {
+		return nil, &net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept", syscall.EMFILE)}
+	}
+	return l.Listener.Accept()
+}
+
+func TestServeKeepsAcceptingAfterRunningOutOfFiles(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "served") }))
+	defer up.Close()
+	ca, err := LoadOrCreateCA(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProxy(ca)
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &exhaustedListener{Listener: inner}
+	l.fails.Store(3)
+	var serveErr error
+	served := make(chan struct{})
+	go func() {
+		serveErr = p.Serve(l)
+		close(served)
+	}()
+	defer func() {
+		p.Close()
+		inner.Close()
+		<-served
+	}()
+	tr := &http.Transport{Proxy: http.ProxyURL(mustURL("http://" + inner.Addr().String()))}
+	defer tr.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: tr, Timeout: 5 * time.Second}).Get(up.URL)
+	if err != nil {
+		select {
+		case <-served:
+			t.Fatalf("Serve returned %v", serveErr)
+		default:
+		}
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "served" {
+		t.Fatalf("body %q", body)
+	}
+}
 
 func TestControlLoopReportsListenerFailure(t *testing.T) {
 	ca, _ := LoadOrCreateCA(t.TempDir())

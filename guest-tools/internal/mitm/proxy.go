@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -129,6 +130,7 @@ func (p *Proxy) Serve(l net.Listener) error {
 	}
 	p.listener = l
 	p.mu.Unlock()
+	var backoff time.Duration
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -138,8 +140,18 @@ func (p *Proxy) Serve(l net.Listener) error {
 			if closed || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			if !transientAcceptError(err) {
+				return err
+			}
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			select {
+			case <-time.After(backoff):
+			case <-p.done:
+				return nil
+			}
+			continue
 		}
+		backoff = 0
 		if !p.track(conn) {
 			conn.Close()
 			return nil
@@ -149,6 +161,17 @@ func (p *Proxy) Serve(l net.Listener) error {
 			p.handleConn(conn)
 		}()
 	}
+}
+
+// transientAcceptError reports whether Accept failed for a reason that passes:
+// a timeout or running out of file descriptors. Serve retries those with a
+// backoff from 5 ms to 1 s.
+func transientAcceptError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
 }
 
 // Close stops the listener, ends rule delays, closes every open connection and
