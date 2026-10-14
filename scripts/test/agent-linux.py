@@ -37,6 +37,7 @@ class Agent:
             if not line: fail("agent closed")
             m = json.loads(line)
             if m.get("t") == typ: return m
+            if m.get("t") == "refused": fail(f"the agent refused the connection: {m.get('error')}")
             if m.get("t") == "ping": self.send({"t": "pong"})
         fail(f"timeout waiting for {typ}")
     def exec(self, cmd):

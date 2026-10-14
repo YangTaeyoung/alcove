@@ -201,7 +201,8 @@ def wait_for_new_process(ssh_port, before):
 
 
 def read_hello(port):
-    """Returns the agent's hello, or None when nothing answers on the port."""
+    """Returns the agent's first message (its hello, or a `refused` line), or None when nothing answers on the
+    port."""
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=5)
     except OSError:
@@ -272,6 +273,8 @@ def main():
         if hello:
             break
         time.sleep(2)
+    if hello and hello.get("t") == "refused":
+        fail(f"the agent on port {args.agent_port} refused the connection: {hello.get('error')}")
     if not hello or hello.get("t") != "hello":
         fail(f"no hello on port {args.agent_port}")
     log("hello:", {k: hello.get(k) for k in ("os", "agent", "v", "proto", "caps")})
