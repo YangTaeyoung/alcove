@@ -849,6 +849,33 @@ final class TraceTests: XCTestCase {
         XCTAssertNil(after)
     }
 
+    func testDeletingTheVMEndsItsRecordingAndForgetsIt() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        let h = ControlHandler(registry: FakeProvisioningRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory, recordingsDirectory: base)
+        _ = try await start(h)
+        let held = await h.activeRecording("Win")
+        let recording = try XCTUnwrap(held)
+        _ = try await h.handle(op: "vm.delete", params: ["name": "Win"])
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status, ["recording": false])
+        let stop = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(stop, "'Win' is not recording")
+        let ended = await eventually("the recording of the deleted VM ended") { await !recording.isActive }
+        XCTAssertTrue(ended)
+    }
+
+    func testVMDeletedByTheAppEndsItsRecordingAndForgetsIt() async throws {
+        let (h, _, _) = setup()
+        _ = try await start(h)
+        let held = await h.activeRecording("Win")
+        let recording = try XCTUnwrap(held)
+        await h.vmDeleted(vm: "Win", path: nil)
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status, ["recording": false])
+        let ended = await eventually("the recording of the deleted VM ended") { await !recording.isActive }
+        XCTAssertTrue(ended)
+    }
+
     func testVideoSinkIsFinishedOnStop() async throws {
         let dir = base.appendingPathComponent("sink")
         let sink = CountingSink()

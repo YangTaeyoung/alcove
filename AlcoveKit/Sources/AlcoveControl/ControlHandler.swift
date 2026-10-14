@@ -439,9 +439,10 @@ public actor ControlHandler {
         return t
     }
 
-    /// Drops the lease, the runtime forwards, the cached frame size, the event positions, the agent mark and the
-    /// pending cleanup reconnect of `vm`.
+    /// Drops the lease, the runtime forwards, the cached frame size, the event positions, the agent mark, the
+    /// pending cleanup reconnect and the recordings of `vm`; an active recording of `vm` is ended.
     func forget(vm: String) {
+        forgetRecording(vm)
         observedTargets[vm] = nil
         staleRetries.remove(vm)
         leases.forget(vm: vm)
