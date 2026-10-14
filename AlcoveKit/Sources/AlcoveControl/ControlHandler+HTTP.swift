@@ -566,7 +566,6 @@ extension ControlHandler {
     /// snapshot notes in the capture journal the new name and path, and drops what the handler keeps under the old name.
     public func vmRenamed(from oldName: String, oldPath: String?, to newName: String, newPath: String?) async {
         await endCapture(oldName)
-        lostCaptures[oldName] = nil
         try? ControlHandler.vmRenamed(from: oldName, oldPath: oldPath, to: newName, newPath: newPath, captureDirectory: captureJournal.url
             .deletingLastPathComponent(), now: wallClock())
         forget(vm: oldName)

@@ -1450,6 +1450,16 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(c.log.entries, ["proxy.stop"])
     }
 
+    func testAVMTheAppDeletesLeavesNoReasonOfALostCaptureToItsName() async throws {
+        let c = try await capture()
+        _ = try await c.start()
+        c.factory.latest.end("alcove-proxy exited with status 2")
+        _ = await c.factory.latest.stopped()
+        await c.h.vmDeleted(vm: "Win", path: nil)
+        let text = await c.failure("vm.http.requests")
+        XCTAssertEqual(text, "'Win' is not capturing; call vm.http.start first")
+    }
+
     func testAVMTheAppRenamesKeepsItsEntryAndNotesUnderItsNewNameAndPath() async throws {
         let dir = try tempDir()
         let path = "/VMs/Win.alcove"
