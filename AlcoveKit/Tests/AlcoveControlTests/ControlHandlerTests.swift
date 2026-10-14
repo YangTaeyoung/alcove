@@ -130,8 +130,15 @@ actor FakeTarget: VMTarget {
     /// What `createSnapshot`, `restoreSnapshot` and `deleteSnapshot` throw when set.
     var snapshotError: Error?
     func setSnapshotError(_ e: Error?) { snapshotError = e }
+    /// Runs once, on the next `monitorCommand`, before it answers.
+    var monitorHook: (@Sendable (FakeTarget) async -> Void)?
+    func setMonitorHook(_ hook: (@Sendable (FakeTarget) async -> Void)?) { monitorHook = hook }
     func monitorCommand(_ line: String) async throws -> String {
         monitorLines.append(line)
+        if let hook = monitorHook {
+            monitorHook = nil
+            await hook(self)
+        }
         if !monitorReplies.isEmpty { return monitorReplies.removeFirst() }
         let remove = "hostfwd_remove \(VMController.netdevID) "
         return line.hasPrefix(remove) ? "host forwarding rule for \(line.dropFirst(remove.count)) removed\r\n" : ""
