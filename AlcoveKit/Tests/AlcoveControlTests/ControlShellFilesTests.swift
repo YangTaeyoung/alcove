@@ -328,6 +328,22 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "req" })
     }
 
+    func testPushAndSyncCheckTheHostPathAndDestBeforeWaitingForTools() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
+        await t.setAgentWait(.seconds(20))
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        let local = try tempDir().appendingPathComponent("x.bin")
+        try Data("x".utf8).write(to: local)
+        let missing = await failure(h, "vm.push_file", ["name": "Win", "path": "/nonexistent/alcove-x.bin", "guestPath": "/x"])
+        XCTAssertEqual(missing, "'/nonexistent/alcove-x.bin' is not a file on the host; check the path")
+        let dest = await failure(h, "vm.push_file", ["name": "Win", "path": .string(local.path), "dest": "documents"])
+        XCTAssertEqual(dest, "dest must be 'desktop' or 'downloads'; pass guestPath for another folder")
+        let notDir = await failure(h, "vm.sync_dir", ["name": "Win", "path": .string(local.path), "guestPath": "/x"])
+        XCTAssertEqual(notDir, "'\(local.path)' is not a directory on the host; check the path")
+        let waits = await t.agentWaits
+        XCTAssertEqual(waits, 0)
+    }
+
     func testSyncDir() async throws {
         let root = try tempDir()
         let a = Data("same".utf8), b = Data("new contents".utf8)

@@ -1311,6 +1311,13 @@ final class WaitTests: XCTestCase {
         }
     }
 
+    func testAWaitWhoseFirstFrameCannotBeReadNamesTheNextStep() async throws {
+        let (h, t) = await screenRig(frames: [solid(64, 64, 10)])
+        await t.setFailingFrameCalls([0])
+        let message = await failure(h, ["name": "Win", "conditions": [["type": "screen_idle"]]])
+        XCTAssertEqual(message, "the screen could not be read when vm.wait_for began: no surface is mapped; call vm.screenshot to check the display, then vm.wait_for again")
+    }
+
     func testFieldValidation() async throws {
         let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
         let cases: [(JSON, String)] = [

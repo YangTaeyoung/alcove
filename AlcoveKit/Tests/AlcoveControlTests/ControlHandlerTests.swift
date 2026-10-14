@@ -223,7 +223,7 @@ struct FakeRegistry: VMRegistry {
     func target(named name: String) async -> VMTarget? { targets[name] }
 }
 
-/// A minimal 1x1 or WxH PNG produced with ImageIO so the header parser has real data.
+/// A WxH PNG of one colour, encoded with ImageIO.
 func makePNG(width: Int, height: Int, gray: UInt8 = 0x80) -> Data {
     let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!

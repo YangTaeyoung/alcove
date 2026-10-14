@@ -510,7 +510,7 @@ public actor ControlHandler {
         return t
     }
 
-    /// The guest agent; waits a while because the guest may still be logging in.
+    /// The agent of `t`, waiting up to 25 s for it to connect; `noTools` when it does not.
     func tools(_ t: VMTarget) async throws -> AgentClient {
         guard let a = await t.agent(timeout: .seconds(25)) else { throw ControlError.noTools(t.name) }
         return a
@@ -637,7 +637,12 @@ public actor ControlHandler {
         }
         let regex = params["regex"]?.boolValue ?? false
         let query = params["query"]?.stringValue ?? ""
-        if regex { _ = try ScreenText.filter([], query: query, regex: true) }
+        if regex {
+            guard !query.isEmpty else {
+                throw ControlError.failed("regex: true needs the expression in query; pass a query or leave regex out to list every line")
+            }
+            _ = try ScreenText.filter([], query: query, regex: true)
+        }
 
         let frame = try await screenshot(t)
         var area = frame.bounds

@@ -33,7 +33,7 @@ struct LeaseTable {
     }
 
     /// Removes the lease of `vm`; a VM without a lease is a no-op.
-    mutating func release(vm: String, token: String, now: ContinuousClock.Instant = .now) throws {
+    mutating func release(vm: String, token: String, now: ContinuousClock.Instant) throws {
         guard let current = active(vm: vm, now: now) else { return }
         guard current.token == token else {
             throw ControlHandler.ControlError.failed("lease token does not match; only the holder can release '\(vm)'")

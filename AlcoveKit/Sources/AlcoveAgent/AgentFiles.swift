@@ -43,10 +43,12 @@ private func hex(_ digest: SHA256.Digest) -> String {
     digest.map { String(format: "%02x", $0) }.joined()
 }
 
-private func joinGuestPath(_ base: String, _ relative: String) -> String {
+/// `relative`, whose parts are separated by `/`, below the guest folder `base`, with `\\` as the separator when `base`
+/// holds one and `/` otherwise, and one separator between `base` and `relative`.
+func joinGuestPath(_ base: String, _ relative: String) -> String {
     let separator = base.contains("\\") ? "\\" : "/"
     var root = base
-    while root.count > 1, root.hasSuffix("/") || root.hasSuffix("\\") { root.removeLast() }
+    while root.hasSuffix("/") || root.hasSuffix("\\") { root.removeLast() }
     let tail = relative.replacingOccurrences(of: "/", with: separator)
     return root + separator + tail
 }

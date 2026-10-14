@@ -268,6 +268,20 @@ final class ScreenTextTests: XCTestCase {
         XCTAssertEqual(calls.value, 1)
     }
 
+    func testFindTextWithRegexAndNoQueryIsRefused() async throws {
+        let (h, t) = textHandler(drawText([], width: 200, height: 100).frame)
+        for params: JSON in [["name": "Win", "regex": true], ["name": "Win", "regex": true, "query": ""]] {
+            do {
+                _ = try await h.handle(op: "vm.find_text", params: params)
+                XCTFail("\(params) succeeded")
+            } catch let e as ControlHandler.ControlError {
+                XCTAssertEqual(e.description, "regex: true needs the expression in query; pass a query or leave regex out to list every line")
+            }
+        }
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 0)
+    }
+
     func testFindTextReadsBothRecognitionsAgainWhenTheSecondOneOfAReadingWithoutLanguagesFails() async throws {
         let seen = LockedBox<[[String]]>([])
         WaitTiming.recognizer = { _, languages in

@@ -420,6 +420,13 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertNil(fs["/g/a.txt"])
     }
 
+    func testJoinGuestPathPutsOneSeparatorAfterARoot() {
+        XCTAssertEqual(joinGuestPath("/", "x/y"), "/x/y")
+        XCTAssertEqual(joinGuestPath("/g//", "x"), "/g/x")
+        XCTAssertEqual(joinGuestPath("C:\\", "x/y"), "C:\\x\\y")
+        XCTAssertEqual(joinGuestPath("C:\\g", "x"), "C:\\g\\x")
+    }
+
     func testWindowsCaseConflictFindsNamesDifferingOnlyByCase() {
         XCTAssertNil(windowsCaseConflict(in: ["a.txt", "b.txt", "sub/a.txt"]))
         let pair = windowsCaseConflict(in: ["A.txt", "b.txt", "a.txt"])

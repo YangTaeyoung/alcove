@@ -17,11 +17,17 @@ extension ControlHandler {
                 var target: [String: JSON] = [:]
                 try pass(params, "guestPath", to: &target, where: isString)
                 let overwrite = try optional(params, "overwrite", .boolean)?.boolValue ?? false
-                let agent = try await tools(t)
+                var dest = AgentClient.Destination.desktop
+                if let value = params["dest"], value != .null {
+                    guard let named = value.stringValue.flatMap(AgentClient.Destination.init(rawValue:)) else {
+                        throw ControlError.failed("dest must be 'desktop' or 'downloads'; pass guestPath for another folder")
+                    }
+                    dest = named
+                }
                 try requireHostFile(path)
+                let agent = try await tools(t)
                 let url = URL(fileURLWithPath: path)
                 guard let guestPath = target["guestPath"]?.stringValue else {
-                    let dest: AgentClient.Destination = params["dest"]?.stringValue == "downloads" ? .downloads : .desktop
                     return ["guestPath": .string(try await agent.pushFile(url, to: dest))]
                 }
                 let r = try await agent.pushFile(url, toGuestPath: guestPath, overwrite: overwrite)
@@ -42,11 +48,11 @@ extension ControlHandler {
                 let path = try string(params, "path")
                 let guestPath = try string(params, "guestPath")
                 let deleteExtras = try optional(params, "delete", .boolean)?.boolValue ?? false
-                let agent = try await tools(t)
                 var isDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
                     throw ControlError.failed("'\(path)' is not a directory on the host; check the path")
                 }
+                let agent = try await tools(t)
                 let r = try await agent.syncDirectory(URL(fileURLWithPath: path), toGuestPath: guestPath,
                                                       deleteExtras: deleteExtras)
                 return ["sent": .array(r.sent.map(JSON.string)), "skipped": .int(Int64(r.skipped)),

@@ -116,7 +116,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.process.list` | `name`, `filter?` | `{processes: [{pid, ppid, name, path, command, memoryKB}]}` — `filter` is a case-insensitive substring of the process name |
 | `vm.process.kill` | `name`, `pid?` or `processName?`, `tree?` | `{killed}` — `tree` also kills child processes |
 | `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` |
-| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads") or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` |
+| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` |
 | `vm.pull_file` | `name`, `guestPath`, `path` (host) | `{path, bytes, sha256}` |
 | `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` |
 | `vm.fs.list` | `name`, `path`, `recursive?` | `{entries: [{name, dir, size, mtime}], truncated}` |
@@ -358,7 +358,9 @@ batch whose steps all ran leaves them as its steps left them.
 
 - `query` (default empty): a case-insensitive substring; with `regex: true`
   a case-insensitive regular expression (an invalid one answers
-  `'<query>' is not a valid regular expression`). An empty query returns every
+  `'<query>' is not a valid regular expression`, and one without a query
+  `regex: true needs the expression in query; pass a query or leave regex out
+  to list every line`). An empty query returns every
   recognized line.
 - `region` is as for `vm.screenshot`.
 - `languages` is a non-empty array of recognition languages. Any other value
@@ -558,7 +560,10 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   condition meaningless end the wait with an error instead: a guest-tools
   connection that is lost or too old, a `region` outside the frame
   (`condition <i>: region is outside the <W>x<H> frame`), an unknown job, a
-  `port_listening` on a guest OS that is not supported.
+  `port_listening` on a guest OS that is not supported, and a screen that
+  cannot be read when the wait begins (`the screen could not be read when
+  vm.wait_for began: <reason>; call vm.screenshot to check the display, then
+  vm.wait_for again`).
 - `observe` at a level above `none` adds `observation` or `observationError`
   as for an action op, comparing the final screen with the screen at the start
   of the wait. When the wait ends while one of its own helper requests has

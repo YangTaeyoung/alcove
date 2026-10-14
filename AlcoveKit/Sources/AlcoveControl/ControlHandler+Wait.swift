@@ -186,7 +186,17 @@ extension ControlHandler {
         let started = clock.now
         let deadline = started + .milliseconds(Int((timeout * 1000).rounded()))
         let needsFrame = options.level != .none || conditions.contains(where: \.needsFrame)
-        let first = needsFrame ? try await screenshot(t) : nil
+        var first: Frame?
+        if needsFrame {
+            do {
+                first = try await t.frame()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw ControlError.failed("the screen could not be read when vm.wait_for began: \(ControlHandler.failureReason(error, fallback: "the display gave no image")); call vm.screenshot to check the display, then vm.wait_for again")
+            }
+            if let first { lastSize[t.name] = (first.width, first.height) }
+        }
         for (index, condition) in conditions.enumerated() {
             states[index].quietSince = started
             states[index].previous = first
