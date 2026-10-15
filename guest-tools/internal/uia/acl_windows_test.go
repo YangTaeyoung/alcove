@@ -26,18 +26,21 @@ func fileID(t *testing.T, path string) uint64 {
 	return uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
 }
 
-const fileWriteAttributes = 0x00000100
+const (
+	fileWriteData       = 0x00000002
+	fileWriteAttributes = 0x00000100
+)
 
-// holdDir opens path itself with the rights to change its access list and its
-// attributes and the given share mode, as a standard user's handle opened
-// before the lock would be.
+// holdDir opens path itself with the rights to add files to it, change its
+// access list and its attributes and the given share mode, as a standard
+// user's handle opened before the lock would be.
 func holdDir(t *testing.T, path string, share uint32) syscall.Handle {
 	t.Helper()
 	name, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := syscall.CreateFile(name, readControl|writeDAC|fileWriteAttributes, share, nil, syscall.OPEN_EXISTING,
+	h, err := syscall.CreateFile(name, fileWriteData|readControl|writeDAC|fileWriteAttributes, share, nil, syscall.OPEN_EXISTING,
 		syscall.FILE_FLAG_OPEN_REPARSE_POINT|syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
 	if err != nil {
 		t.Fatalf("open %s: %v", path, err)
