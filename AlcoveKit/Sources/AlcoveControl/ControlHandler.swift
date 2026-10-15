@@ -141,20 +141,24 @@ public actor ControlHandler {
     var staleRetries: Set<String> = []
     /// Receives one line for each event of the handler that no op reports.
     let log: @Sendable (String) -> Void
+    /// Whether a `script.run` with a `snapshot` starts its VM, as `vm.start` does, before the restore.
+    nonisolated let startsVMForScriptSnapshot: Bool
 
     struct Forward: Equatable { let hostPort: Int; let guestPort: Int }
 
     /// `captureDirectory` is the folder of the proxy's CA certificate and of the capture journal; a handler that serves
     /// a user's VMs gets `ProxyProcess.defaultCADirectory`. Without `makeProxy` a capture runs `alcove-proxy` as found
     /// by `ToolLocator`, with `captureDirectory` as its CA directory. Without `log` the handler's lines go to the system
-    /// log under the subsystem `io.github.yangtaeyoung.Alcove`, category `control`.
+    /// log under the subsystem `io.github.yangtaeyoung.Alcove`, category `control`. With `startsVMForScriptSnapshot` a
+    /// `script.run` with a `snapshot` starts its VM before the restore (`alcovectl run-script --in-process`).
     public init(registry: VMRegistry, hostKind: String, captureDirectory: URL,
                 clock: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
                 engineDescription: String? = nil, now: @escaping @Sendable () -> Date = { Date() },
                 recordingsDirectory: URL? = nil, diagnosticsDirectory: URL? = nil, httpTiming: HTTPTiming = HTTPTiming(),
                 makeProxy: (@Sendable () -> ProxyControlling)? = nil,
-                log: (@Sendable (String) -> Void)? = nil) {
+                log: (@Sendable (String) -> Void)? = nil, startsVMForScriptSnapshot: Bool = false) {
         self.log = log ?? { line in ControlHandler.systemLog.notice("\(line, privacy: .public)") }
+        self.startsVMForScriptSnapshot = startsVMForScriptSnapshot
         self.makeProxy = makeProxy ?? { ProxyProcess(executable: ToolLocator.proxy(), caDirectory: captureDirectory) }
         self.httpTiming = httpTiming
         self.captureJournal = CaptureJournal(directory: captureDirectory)

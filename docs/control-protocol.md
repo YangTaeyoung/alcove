@@ -2333,7 +2333,9 @@ that passes leaves them as its steps left them.
 Errors and results: everything that prevents step 1 from starting answers with
 an error (`ok: false`): an unreadable, oversized (over 4 MiB) or malformed
 script, an undefined variable, a condition that does not parse, no VM, a lease
-refusal, a failed snapshot restore, a cancellation before step 1. A run
+refusal, a failed snapshot restore (`restoring snapshot '<s>' failed:
+<reason>`, the reason as `vm.snapshot.restore` gives it), a cancellation
+before step 1. A run
 cancelled during the restore of `snapshot` ends when the restore has ended
 (see `vm.snapshot.restore` in [Snapshots](#snapshots)) and holds its lease
 until then. Otherwise the
@@ -2580,9 +2582,12 @@ FAILED: step 2 failed after 0.7 s
   The lock stops only other `run-script --in-process` commands; the app or
   `alcovectl serve` may still start the VM, and the engine check of
   [Starting](#starting) then refuses one of the two hosts. A stopped VM is
-  started only by a `vm.start` step of the script; every VM the run started
-  is stopped when the run ends, also after a failure or a signal. The lock
-  file stays in the bundle.
+  started by a `vm.start` step of the script or, with `--snapshot`, before
+  the restore (a VM with a session saved to disk resumes it, and the restore
+  then replaces it); every VM the run started is stopped when the run ends,
+  also after a failure or a signal. A start for `--snapshot` that fails ends
+  the command with exit 2 and `'<vm>' could not be started to restore
+  snapshot '<s>': start failed: <reason>`. The lock file stays in the bundle.
 - SIGINT, SIGTERM and SIGHUP stop the run: through a server, the command
   closes its connection, the server cancels the run before its next step and
   releases the run's lease, and the command prints `INTERRUPTED` at once.
@@ -2590,8 +2595,10 @@ FAILED: step 2 failed after 0.7 s
   runs to its end (up to the 600 s limit of the load) and the guest is
   resumed; the run keeps its lease until then.
   In-process, the run is cancelled, the VM is stopped, the step lines up to
-  the interrupted step are printed and the last line is `INTERRUPTED`. A
-  second signal while the VM is being stopped ends the command at once.
+  the interrupted step are printed and the last line is `INTERRUPTED`; a
+  signal during the start for `--snapshot` lets the start end, skips the
+  restore and stops the VM. A second signal while the VM is being stopped
+  ends the command at once.
 
 ### MCP tools
 

@@ -31,7 +31,7 @@ enum ScriptCall: String, Sendable {
     case expect
     /// Acquiring, renewing or releasing the run's lease.
     case lease
-    /// Restoring the snapshot the run starts from.
+    /// Starting the VM for the snapshot the run starts from, and restoring that snapshot.
     case snapshot
     /// The screenshot after a failing step.
     case failure
@@ -189,15 +189,25 @@ struct ScriptRunner: Sendable {
     }
 
     /// Restores the snapshot and runs the steps; returns the failure sentence, or nil when all passed. `held` takes in
-    /// the buttons and keys that the steps which ran pressed and did not release.
+    /// the buttons and keys that the steps which ran pressed and did not release. When the handler starts VMs for
+    /// script snapshots, a VM that is stopped or failed is started (`vm.start`) before the restore.
     private func execute(_ script: Script, vm: String, token: String?, holdsOwnLease: Bool, snapshot: String?,
                          progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?,
                          leaseLost: inout Bool, held: inout ControlHandler.HeldInput, into result: inout ScriptResult) async -> String? {
         if let snapshot {
+            let cancelled = "the run was cancelled before step 1; start it again"
+            if handler.startsVMForScriptSnapshot, await handler.vmIsInactive(vm) {
+                do { _ = try await call(.snapshot, "vm.start", base(vm, token, [:])) }
+                catch {
+                    if Task.isCancelled || error is CancellationError { return cancelled }
+                    return "'\(vm)' could not be started to restore snapshot '\(snapshot)': \(error)"
+                }
+                if Task.isCancelled { return cancelled }
+            }
             do { _ = try await call(.snapshot, "vm.snapshot.restore", base(vm, token, ["snapshot": .string(snapshot)])) }
             catch {
-                if Task.isCancelled || error is CancellationError { return "the run was cancelled before step 1; start it again" }
-                return "restoring snapshot '\(snapshot)' failed: \(error); check the snapshot name with vm.snapshot.list"
+                if Task.isCancelled || error is CancellationError { return cancelled }
+                return "restoring snapshot '\(snapshot)' failed: \(error)"
             }
         }
         var stepsBytes = 0

@@ -55,7 +55,17 @@ actor FakeTarget: VMTarget {
     var stopError: Error?
     func setStartError(_ e: Error?) { startError = e }
     func setStopError(_ e: Error?) { stopError = e }
+    /// How long `start` takes; the wait runs to its end also when the caller is cancelled.
+    var startDuration: Duration = .zero
+    func setStartDuration(_ d: Duration) { startDuration = d }
+    /// The `start` calls that began, finished or not.
+    var startsBegun = 0
     func start(discardChanges: Bool) async throws {
+        startsBegun += 1
+        if startDuration > .zero {
+            let duration = startDuration
+            await Task { try? await Task.sleep(for: duration) }.value
+        }
         if let startError { throw startError }
         startCount += 1; startDiscard.append(discardChanges)
         ephemeral = discardChanges; stateValue = .running; suspended = false
