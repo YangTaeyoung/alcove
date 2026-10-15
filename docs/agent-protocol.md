@@ -478,7 +478,9 @@ does not start on connect, so a wait for a window event must be preceded by
 `ui.ping` (and `app.launch` with `wait_window_ms: 0` does not start it). The
 helper runs in the agent's logon session. Its files are in
 `C:\ProgramData\Alcove\uia`: `bootstrap.ps1`, `helper.cs`, `helper.log` and
-`helper.log.1` (1 MiB each), and a `tmp` folder the compile uses. Every start
+`helper.log.1` (1 MiB each: a write that would make `helper.log` larger moves
+it to `helper.log.1` first, or empties it when it cannot be moved), and a
+`tmp` folder the compile uses. Every start
 compiles `helper.cs` in memory; no compiled helper is stored.
 `C:\ProgramData` stands for the folder Windows names as ProgramData: the
 `ProgramData` value of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`
@@ -496,7 +498,8 @@ so `agent.log`, `install.log` and `helper.log` are readable by administrators
 only. Each folder is opened without following a reparse point, and its owner
 and access list are checked and set on that handle (`SetSecurityInfo`). The
 lock is applied first thing at install and at agent start, before a log file
-is opened, and again at every helper start; the parent keeps the agent's logs,
+is opened, and again at every helper start; the parent keeps the agent's logs
+(`agent.log` and `agent.log.1`, 1 MiB each, kept like `helper.log`),
 the uia folder keeps only its logs (every other entry is deleted at each
 start; a deletion refused because something is in use, access is denied or
 a folder is not empty yet is tried again every 50 ms for 2 s), and a

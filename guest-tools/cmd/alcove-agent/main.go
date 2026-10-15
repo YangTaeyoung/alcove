@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/logfile"
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/server"
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/token"
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/uia"
@@ -160,20 +161,27 @@ func (n noHelper) CallContext(context.Context, string, map[string]any, time.Dura
 	return nil, n.err
 }
 
-// openLog opens the log file for appending after creating its folder. A log
-// file inside lockedDir is not opened when locking that folder failed with
-// lockErr, and a log file that is a reparse point or a symbolic link is not opened.
-func openLog(path, lockedDir string, lockErr error) (*os.File, error) {
+// openLog opens the log file as a logfile.Log of logfile.MaxBytes after
+// creating its folder. A log file inside lockedDir is not opened when locking
+// that folder failed with lockErr, and a log file that is a reparse point or a
+// symbolic link is not opened.
+func openLog(path, lockedDir string, lockErr error) (*logfile.Log, error) {
 	if lockErr != nil && insideDir(lockedDir, path) {
 		return nil, fmt.Errorf("%s is not opened because its folder is not locked (%v)", path, lockErr)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	if err := refuseReparse(path); err != nil {
+	return logfile.Open(path, logfile.MaxBytes, openNoLink)
+}
+
+// openNoLink opens name as os.OpenFile does, unless it is a reparse point or
+// a symbolic link.
+func openNoLink(name string, flag int, perm os.FileMode) (*os.File, error) {
+	if err := refuseReparse(name); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|openNoFollow, 0o644)
+	return os.OpenFile(name, flag|openNoFollow, perm)
 }
 
 // insideDir reports whether path lies in dir or below it; names are compared
