@@ -546,7 +546,7 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 	}
 	fsys, name, err := s.writerIn(v, path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+		return nil, err
 	}
 	defer fsys.Close()
 	if !appendMode {
@@ -603,7 +603,7 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 		}
 		if err != nil {
 			f.Close()
-			return nil, fmt.Errorf("cannot set the execute bits of '%s': %v", path, err)
+			return nil, fmt.Errorf("cannot set the execute bits of '%s': %v; the data is written, so set them with exec.run (chmod)", path, err)
 		}
 	}
 	fi, statErr := f.Stat()
@@ -634,7 +634,7 @@ func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, 
 	}
 	fsys, fromName, err := s.writerIn(v, from)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+		return nil, err
 	}
 	defer fsys.Close()
 	toName, sameSide := to, !v.contains(to)
@@ -678,7 +678,7 @@ func (s *Server) fsMkdir(_ context.Context, req proto.Message) (proto.Message, e
 	}
 	fsys, name, err := s.writerIn(v, path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+		return nil, err
 	}
 	defer fsys.Close()
 	if err := fsys.MkdirAll(name); err != nil {
@@ -820,7 +820,7 @@ func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, 
 	}
 	fsys, name, err := s.writerIn(v, path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+		return nil, err
 	}
 	defer fsys.Close()
 	fi, err := fsys.Lstat(name)

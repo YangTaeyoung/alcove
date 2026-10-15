@@ -277,7 +277,8 @@ func homeRelative(home, path string) (string, bool) {
 
 // writerIn returns the file system that changes path and path's name in it:
 // the session's home of v opened as an os.Root for a path in that home, the
-// plain file system otherwise. The caller closes the file system.
+// plain file system otherwise. The caller closes the file system. The error
+// is the sentence of homeOpenError.
 func (s *Server) writerIn(v homeView, path string) (writeFS, string, error) {
 	if !v.contains(path) {
 		return plainFS{}, path, nil
@@ -285,7 +286,18 @@ func (s *Server) writerIn(v homeView, path string) (writeFS, string, error) {
 	rel, _ := homeRelative(v.dir, path)
 	root, err := os.OpenRoot(v.dir)
 	if err != nil {
-		return nil, "", err
+		return nil, "", homeOpenError(v, err)
 	}
 	return homeFS{home: v.dir, root: root, owner: v.owner, user: v.sess.User, uid: v.sess.UID}, rel, nil
+}
+
+// homeOpenError is the sentence for err from opening the session's home of
+// v: for a home that does not exist, the command that creates it for the
+// session's user.
+func homeOpenError(v homeView, err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("the home folder '%s' of the desktop user %s does not exist; create it with exec.run (mkdir '%s' && chown %s: '%s'), then retry",
+			v.dir, v.sess.User, v.dir, v.sess.User, v.dir)
+	}
+	return fmt.Errorf("cannot open the home folder '%s' of the desktop user: %v; check it with exec.run (ls -ld '%s'), then retry", v.dir, err, v.dir)
 }

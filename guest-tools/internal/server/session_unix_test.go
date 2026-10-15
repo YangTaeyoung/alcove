@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +77,26 @@ func TestFileDropsGoToTheSessionHome(t *testing.T) {
 	done := expect(t, c.r, "file.done")
 	if want := filepath.Join(home, "Downloads", "drop.bin"); done.String("path") != want {
 		t.Fatalf("file.done %v, want path %s", done, want)
+	}
+}
+
+func TestAMissingSessionHomeNamesHowToCreateIt(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "bob")
+	c := sessionClient(t, session.Session{User: "bob", Home: home}, true)
+	want := "the home folder '" + home + "' of the desktop user bob does not exist; create it with exec.run (mkdir '" +
+		home + "' && chown bob: '" + home + "'), then retry"
+	data := base64.StdEncoding.EncodeToString([]byte("x"))
+	for _, res := range []proto.Message{
+		c.call("fs.write", proto.Message{"path": "~/x", "data": data}),
+		c.call("fs.mkdir", proto.Message{"path": home}),
+	} {
+		if res["ok"] != false || res.String("error") != want {
+			t.Fatalf("answer %v, want the error %q", res, want)
+		}
+	}
+	send(t, c.w, proto.Message{"t": "file.begin", "id": "d1", "name": "drop.bin", "size": 1})
+	if done := expect(t, c.r, "file.done"); done.String("error") != want {
+		t.Fatalf("file.done %v, want the error %q", done, want)
 	}
 }
 
@@ -195,6 +216,46 @@ func TestCapsAreSentAgainWhenTheClipboardAppears(t *testing.T) {
 	cb.on.Store(false)
 	if capSet(expect(t, r, "caps"))["clipboard"] {
 		t.Fatal("the caps update keeps a clipboard that is gone")
+	}
+}
+
+// gatedClipboard is a toggleClipboard whose Available waits for gate to
+// close while held is set.
+type gatedClipboard struct {
+	toggleClipboard
+	gate chan struct{}
+	held atomic.Bool
+}
+
+func (c *gatedClipboard) Available() bool {
+	if c.held.Load() {
+		<-c.gate
+	}
+	return c.on.Load()
+}
+
+func TestTheHelloCarriesTheCapsFoundLastAndTheirCheckFollowsTheHandshake(t *testing.T) {
+	cb := &gatedClipboard{gate: make(chan struct{})}
+	cb.on.Store(true)
+	_, r, _, first := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
+	if !capSet(expect(t, r, "hello"))["clipboard"] {
+		t.Fatal("the first hello lacks the clipboard")
+	}
+	cb.on.Store(false)
+	cb.held.Store(true)
+	c, err := net.Dial("tcp", first.RemoteAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	r2 := proto.NewReader(c)
+	if !capSet(expect(t, r2, "hello"))["clipboard"] {
+		t.Fatal("the second hello does not carry the caps found last")
+	}
+	close(cb.gate)
+	if capSet(expect(t, r2, "caps"))["clipboard"] {
+		t.Fatal("the caps checked after the handshake keep a clipboard that is gone")
 	}
 }
 

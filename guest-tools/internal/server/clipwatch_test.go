@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -10,17 +11,22 @@ import (
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
 
-// stuckClipboard is a clipboard whose Text waits until release is closed and
-// that counts its Sequence calls.
+// stuckClipboard is a clipboard whose Text waits until release is closed,
+// after a send on entered when entered is set, and that counts its Sequence
+// calls.
 type stuckClipboard struct {
 	fakeClipboard
 	release   chan struct{}
+	entered   chan struct{}
 	stuck     atomic.Bool
 	sequences atomic.Int64
 }
 
 func (c *stuckClipboard) Text() (string, error) {
 	if c.stuck.Load() {
+		if c.entered != nil {
+			c.entered <- struct{}{}
+		}
 		<-c.release
 	}
 	return c.fakeClipboard.Text()
@@ -56,6 +62,40 @@ func TestClipboardSetAndGetOfAConnectionRunInOrder(t *testing.T) {
 		if got := expect(t, r, "clipboard.text"); got.String("text") != text {
 			t.Fatalf("clipboard.get after set %q answered %v", text, got)
 		}
+	}
+}
+
+func TestClipboardGetsBeyondTheQueueAreRefusedAndRepliesCarryTheirID(t *testing.T) {
+	cb := &stuckClipboard{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	cb.external("guest text")
+	cb.stuck.Store(true)
+	_, r, w, _ := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
+	expect(t, r, "hello")
+	send(t, w, proto.Message{"t": "clipboard.get", "id": "0"})
+	select {
+	case <-cb.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first clipboard.get did not reach the clipboard")
+	}
+	for i := 1; i <= clipboardQueueSize+1; i++ {
+		send(t, w, proto.Message{"t": "clipboard.get", "id": fmt.Sprint(i)})
+	}
+	refused := expect(t, r, "clipboard.text")
+	want := "64 clipboard operations of this connection are waiting for the guest's clipboard tool; retry once it answers"
+	if refused.String("id") != fmt.Sprint(clipboardQueueSize+1) || refused.String("error") != want || refused.String("text") != "" {
+		t.Fatalf("the clipboard.get beyond the queue answered %v", refused)
+	}
+	cb.stuck.Store(false)
+	close(cb.release)
+	for i := 0; i <= clipboardQueueSize; i++ {
+		got := expect(t, r, "clipboard.text")
+		if got.String("id") != fmt.Sprint(i) || got.Has("error") || got.String("text") != "guest text" {
+			t.Fatalf("reply %d: %v", i, got)
+		}
+	}
+	send(t, w, proto.Message{"t": "clipboard.get"})
+	if got := expect(t, r, "clipboard.text"); got.Has("id") {
+		t.Fatalf("a clipboard.get without an id answered %v", got)
 	}
 }
 

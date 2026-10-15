@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/clipboard"
@@ -123,6 +124,9 @@ type Server struct {
 	// ownHome is the agent's own home directory, used without HomeDir and
 	// without a session.
 	ownHome string
+
+	// lastCaps is the capability list caps returned last.
+	lastCaps atomic.Pointer[[]string]
 }
 
 func New(opt Options) *Server {
@@ -189,7 +193,24 @@ func agentHome() string {
 // an open connection.
 var capsCheckInterval = 5 * time.Second
 
+// caps checks the capabilities, which on Linux looks up the desktop
+// session, and records the list as the one found last.
 func (s *Server) caps() []string {
+	caps := s.checkCaps()
+	s.lastCaps.Store(&caps)
+	return caps
+}
+
+// helloCaps returns the capability list found last, or checks it when none
+// was found yet.
+func (s *Server) helloCaps() []string {
+	if caps := s.lastCaps.Load(); caps != nil {
+		return *caps
+	}
+	return s.caps()
+}
+
+func (s *Server) checkCaps() []string {
 	caps := []string{"files", "shutdown"}
 	if resolutionSupported {
 		caps = append(caps, "resolution")
@@ -255,7 +276,7 @@ func (s *Server) beginDrop(dest, name string) (*fileXfer, error) {
 	dir := filepath.Join(v.dir, folder)
 	fsys, dirName, err := s.writerIn(v, dir)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+		return nil, err
 	}
 	if _, err := fsys.Stat(dirName); errors.Is(err, fs.ErrNotExist) {
 		_ = fsys.MkdirAll(dirName)
@@ -324,7 +345,7 @@ func (s *Server) handle(c net.Conn) {
 	}
 	limit := &lineLimit{r: c, max: preAuthLineMax}
 	r := proto.NewReader(limit)
-	sentCaps := s.caps()
+	sentCaps := s.helloCaps()
 	if !s.handshakeWith(c, r, limit, sentCaps) {
 		return
 	}
@@ -336,12 +357,15 @@ func (s *Server) handle(c net.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	cn.setCaps(sentCaps)
+	if caps := s.caps(); cn.replaceCaps(caps) {
+		send(proto.Message{"t": "caps", "caps": caps})
+	}
 	s.addConn(cn)
 	defer s.removeConn(cn)
 
 	quit := make(chan struct{})
 	defer close(quit)
-	cn.setCaps(sentCaps)
 	s.startWatchers()
 	clipOps := newSerialQueue(quit)
 	go func() { // keepalive
@@ -387,22 +411,35 @@ func (s *Server) handle(c net.Conn) {
 				send(proto.Message{"t": "res", "id": m["id"], "ok": false, "error": tooManyRequests()})
 			}
 		case "clipboard.get":
-			clipOps.run(lg, func() {
+			reply := proto.Message{"t": "clipboard.text"}
+			if id, ok := m["id"]; ok {
+				reply["id"] = id
+			}
+			queued := clipOps.run(func() {
 				text, err := s.opt.Clipboard.Text()
 				if err != nil {
 					lg.Printf("clipboard.get: %v", err)
 				}
-				send(proto.Message{"t": "clipboard.text", "text": cutUTF8Bytes(text, clipboardMaxBytes)})
+				reply["text"] = cutUTF8Bytes(text, clipboardMaxBytes)
+				send(reply)
 			})
+			if !queued {
+				lg.Printf("clipboard.get: %s", errClipboardQueueFull)
+				reply["text"], reply["error"] = "", errClipboardQueueFull
+				send(reply)
+			}
 		case "clipboard.set":
 			text := m.String("text")
-			clipOps.run(lg, func() {
+			queued := clipOps.run(func() {
 				if err := s.opt.Clipboard.SetText(text); err != nil {
 					lg.Printf("clipboard.set: %v", err)
 				} else {
 					s.markOwnClipboard()
 				}
 			})
+			if !queued {
+				lg.Printf("clipboard.set dropped: %s", errClipboardQueueFull)
+			}
 		case "resolution.set":
 			if err := setResolution(m.Int("w"), m.Int("h")); err != nil {
 				lg.Printf("resolution.set: %v", err)
@@ -616,12 +653,17 @@ func newSerialQueue(done chan struct{}) serialQueue {
 	return q
 }
 
-// run queues f; when the queue is full f is dropped and logged.
-func (q serialQueue) run(lg *log.Logger, f func()) {
+// errClipboardQueueFull answers a clipboard operation that finds the queue
+// of its connection full.
+var errClipboardQueueFull = fmt.Sprintf("%d clipboard operations of this connection are waiting for the guest's clipboard tool; retry once it answers", clipboardQueueSize)
+
+// run queues f and reports whether it did; a full queue does not take f.
+func (q serialQueue) run(f func()) bool {
 	select {
 	case q <- f:
+		return true
 	default:
-		lg.Printf("%d clipboard operations are waiting; one more was dropped", clipboardQueueSize)
+		return false
 	}
 }
 

@@ -12,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // Target is the session the clipboard tools run in: their environment and,
@@ -60,9 +62,17 @@ func envValue(env []string, name string) string {
 }
 
 // sessionClipboard runs the clipboard tools in the session target returns,
-// or in the agent's own environment when target finds none.
+// or in the agent's own environment when target finds none. last holds the
+// sequence of the last text read.
 type sessionClipboard struct {
 	target func() (Target, bool)
+	last   *lastSequence
+}
+
+// lastSequence is the sequence Sequence returned last.
+type lastSequence struct {
+	mu sync.Mutex
+	v  uint64
 }
 
 // New uses the clipboard of the agent's own environment.
@@ -70,7 +80,9 @@ func New() Clipboard { return NewSession(nil) }
 
 // NewSession uses the clipboard of the session target returns at each call;
 // without one, or with a nil target, that of the agent's own environment.
-func NewSession(target func() (Target, bool)) Clipboard { return sessionClipboard{target: target} }
+func NewSession(target func() (Target, bool)) Clipboard {
+	return sessionClipboard{target: target, last: &lastSequence{}}
+}
 
 func (c sessionClipboard) current() (tool, Target, bool) {
 	t, ok := Target{}, false
@@ -84,8 +96,8 @@ func (c sessionClipboard) current() (tool, Target, bool) {
 	return tl, t, found
 }
 
-// ReadLimit is the most bytes Text reads from the clipboard tool, the
-// 700000 bytes of UTF-8 the agent reports.
+// ReadLimit is the most bytes of UTF-8 Text returns, the 700000 bytes the
+// agent reports.
 const ReadLimit = 700000
 
 // toolTimeout bounds one run of a clipboard tool.
@@ -107,9 +119,11 @@ func (c sessionClipboard) Available() bool {
 	return ok
 }
 
-// Text runs the reader for at most toolTimeout and returns the first
-// ReadLimit bytes it prints; a reader that fails returns "" (the tools exit
-// non-zero for an empty clipboard).
+// Text runs the reader for at most toolTimeout and returns the longest
+// prefix of what it prints that is at most ReadLimit bytes and ends on a
+// character boundary; a reader that exits non-zero returns "" (the tools do
+// for an empty clipboard). A reader that cannot start or does not finish in
+// time is an error.
 func (c sessionClipboard) Text() (string, error) {
 	tl, t, ok := c.current()
 	if !ok {
@@ -123,16 +137,28 @@ func (c sessionClipboard) Text() (string, error) {
 		return "", err
 	}
 	if err := cmd.Start(); err != nil {
-		return "", nil
+		return "", fmt.Errorf("%s did not start: %v", tl.read[0], err)
 	}
-	data, _ := io.ReadAll(io.LimitReader(out, ReadLimit))
+	data, _ := io.ReadAll(io.LimitReader(out, ReadLimit+1))
 	timedOut := ctx.Err() != nil
 	cancel()
 	_ = cmd.Wait()
 	if timedOut {
 		return "", fmt.Errorf("%s did not answer within %v", tl.read[0], toolTimeout)
 	}
-	return string(data), nil
+	return string(cutAtCharacter(data, ReadLimit)), nil
+}
+
+// cutAtCharacter returns the longest prefix of b that is at most max bytes
+// and does not end inside a UTF-8 character.
+func cutAtCharacter(b []byte, max int) []byte {
+	if len(b) <= max {
+		return b
+	}
+	for max > 0 && !utf8.RuneStart(b[max]) {
+		max--
+	}
+	return b[:max]
 }
 
 // SetText runs the writer, through t.Scope when set, for at most
@@ -153,9 +179,16 @@ func (c sessionClipboard) SetText(s string) error {
 	return err
 }
 
+// Sequence returns a hash of the text; while the reader fails it returns
+// the value it returned last (0 before the first text).
 func (c sessionClipboard) Sequence() uint64 {
-	t, _ := c.Text()
-	h := fnv.New64a()
-	h.Write([]byte(t))
-	return h.Sum64()
+	t, err := c.Text()
+	c.last.mu.Lock()
+	defer c.last.mu.Unlock()
+	if err == nil {
+		h := fnv.New64a()
+		h.Write([]byte(t))
+		c.last.v = h.Sum64()
+	}
+	return c.last.v
 }

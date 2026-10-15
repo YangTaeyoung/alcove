@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func lookPathOf(found ...string) func(string) (string, error) {
@@ -144,5 +145,36 @@ func TestClipboardWithoutASessionToolIsUnavailable(t *testing.T) {
 	}
 	if err := c.SetText("x"); err == nil {
 		t.Fatal("SetText succeeded without a clipboard")
+	}
+}
+
+func TestClipboardTextCutAtTheLimitEndsOnAWholeCharacter(t *testing.T) {
+	fakeTools(t, map[string]string{"wl-paste": "yes 가 | tr -d '\\n' | head -c 900000"})
+	c := NewSession(func() (Target, bool) { return waylandTarget(t), true })
+	text, err := c.Text()
+	if err != nil || !utf8.ValidString(text) || len(text) != ReadLimit-1 {
+		t.Fatalf("read %d bytes, valid UTF-8 %v, %v", len(text), utf8.ValidString(text), err)
+	}
+}
+
+func TestSequenceKeepsTheLastValueWhileTheReaderFails(t *testing.T) {
+	shortToolTimeout(t)
+	dir := fakeTools(t, map[string]string{"wl-paste": `if [ -e "$HANG" ]; then sleep 30; fi; printf 'guest text'`})
+	hang := filepath.Join(dir, "hang")
+	target := waylandTarget(t)
+	target.Env = append(target.Env, "HANG="+hang)
+	c := NewSession(func() (Target, bool) { return target, true })
+	before := c.Sequence()
+	if err := os.WriteFile(hang, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Sequence(); got != before {
+		t.Fatalf("a timed-out read changed the sequence from %x to %x", before, got)
+	}
+	if err := os.Remove(hang); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Sequence(); got != before {
+		t.Fatalf("the same text after a timed-out read changed the sequence from %x to %x", before, got)
 	}
 }

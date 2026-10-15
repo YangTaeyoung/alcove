@@ -80,10 +80,16 @@ Capabilities:
 | `jobs`, `proc`, `fs` | started with `--allow-exec` | `exec.*`, `proc.*`, `fs.*`, `app.launch` and `session.info` operations |
 | `ui` | Windows agents | `win.*` and `ui.*` operations and the window events |
 
-While a connection is open the agent checks its capabilities again every
-5 s, once for all connections. To each connection whose last list differs it
-sends `{"t":"caps","caps":[…]}` with the whole new list, which replaces the
-hello's. On Linux this is how `clipboard` appears once a user signs in to the
+The hello carries the list the agent found last, at an earlier connection
+or check; only the first hello after the agent starts waits for a check. On
+Linux a check looks up the desktop session, so a hello does not wait for
+`loginctl`. Right after the handshake the agent checks its capabilities and,
+when they differ from the hello's, sends `{"t":"caps","caps":[…]}` with the
+whole new list before any other message, which replaces the hello's. A host
+can receive that line before it has finished its own handshake steps and
+applies it to the hello. While a connection is open the agent checks its
+capabilities again every 5 s, once for all connections, and sends the same
+line to each connection whose last list differs. On Linux this is how `clipboard` appears once a user signs in to the
 desktop after the host connected, as an autologin does a few seconds after the
 agent starts at boot, and disappears when the session ends.
 
@@ -130,6 +136,11 @@ directory and groups come from the user database. A lookup is reused for
   `fs.rename` from inside the home to outside it or back answers
   `'<from>' and '<to>' lie on different sides of the home folder of the desktop user; rename within it or outside it, or copy the file`.
   Paths outside the home are changed as root, as on other systems.
+  When the home does not exist, those operations, `fs.mkdir` of the home
+  itself included, fail with
+  `the home folder '<home>' of the desktop user <user> does not exist; create it with exec.run (mkdir '<home>' && chown <user>: '<home>'), then retry`;
+  when it cannot be opened for another reason, with
+  `cannot open the home folder '<home>' of the desktop user: <reason>; check it with exec.run (ls -ld '<home>'), then retry`.
 - `app.launch` and the clipboard tools run as that user (its user id, group
   id and groups), in a session of their own, with the session's environment:
   `HOME`, `USER`, `LOGNAME`, the agent's `PATH`,
@@ -158,10 +169,11 @@ directory and groups come from the user database. A lookup is reused for
   names, if any.
 - A clipboard tool that has not finished after 5 s is killed with its process
   group; a read then fails (`clipboard.text` carries `""`) and a write is
-  dropped, both logged. The agent reads at most 700000 bytes of the
-  clipboard. `clipboard.get` and `clipboard.set` of one connection run one
-  after another, apart from the connection's other messages, so a clipboard
-  that does not answer delays neither `pong` nor requests.
+  dropped, both logged. A read that fails, or a reader that does not start,
+  is not a change of the clipboard: the watcher keeps the text it read last,
+  so the next good read of the same text sends no `clipboard.changed`. The
+  agent keeps at most 700000 bytes of the clipboard, cut on a character
+  boundary.
 
 `alcove-agent --install` on Linux writes the running program to a temporary
 file in `/usr/local/bin`, flushes it to disk and renames it over
@@ -171,6 +183,7 @@ file; it then writes the unit and runs `systemctl daemon-reload`,
 prints `installed` only after every step succeeded. A step that fails ends
 the install with exit code 1, a line on stderr that begins
 `install failed: ` and the same line in `/var/log/alcove/install.log`:
+`the path of the running alcove-agent cannot be read (<reason>); run it by its full path`,
 `cannot read <file> (<reason>); run alcove-agent --install from a copy you can read`,
 `cannot replace /usr/local/bin/alcove-agent (<reason>); check with sudo that /usr/local/bin is writable and that /usr/local/bin/alcove-agent is not immutable (lsattr /usr/local/bin/alcove-agent; chattr -i removes the flag), then run alcove-agent --install again`,
 `cannot write /etc/systemd/system/alcove-agent.service (<reason>); run alcove-agent --install as root` or
@@ -336,8 +349,8 @@ between attempts, until the bind succeeds.
 | both | `ping` / `pong` | — | keepalive every 10 s |
 | agent → host | `caps` | `caps` | the capabilities changed; the list replaces the hello's ([Handshake](#handshake)) |
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
-| host → agent | `clipboard.get` | — | ask for the current text; answered with `clipboard.text` |
-| agent → host | `clipboard.text` | `text` | reply to `clipboard.get`; text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
+| host → agent | `clipboard.get` | `id` (optional) | ask for the current text; answered with `clipboard.text` |
+| agent → host | `clipboard.text` | `text`, `id` (the `clipboard.get`'s, when it carried one), `error` (when the get was not run) | reply to `clipboard.get`; text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
 | agent → host | `clipboard.changed` | `text` | the guest clipboard changed (text only in v1; one watcher per agent polls while a connection is open: on Windows the clipboard sequence number every 0.4 s; on Linux it runs `wl-paste` or `xclip -o` 0.5 s after a change and then at twice the interval after each poll that found none, up to every 4 s; a change the agent made itself is not reported); text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
 | host → agent | `resolution.set` | `w`, `h` | ask the guest to switch its primary display mode (agents with the `resolution` capability; others log the request and ignore it) |
 | agent → host | `resolution` | `w`, `h` | current primary display mode (sent after hello and on change) |
@@ -348,6 +361,19 @@ between attempts, until the bind succeeds.
 | host → agent | `shutdown` | — | graceful OS shutdown (`shutdown /s /t 0` or `systemctl poweroff`); the UI helper is closed only after that command succeeded |
 | host → agent | `exec` | `cmd` (string) | run a command with the default shell and no time limit; answered with `exec.result` (`code` -1 and `out` "exec disabled" unless the agent was started with `--allow-exec`) |
 | agent → host | `exec.result` | `code`, `out` | exit code and combined stdout and stderr of `exec`; `out` keeps the last 200000 bytes, starting on a character boundary when older bytes were dropped (there is no `truncated` field) |
+
+`clipboard.get` and `clipboard.set` of one connection run one after another
+in the order they arrived, apart from the connection's other messages, so a
+clipboard that does not answer delays neither `pong` nor requests. Each
+`clipboard.get` gets one `clipboard.text`, in the order of the gets. A
+connection holds at most 64 clipboard operations waiting; one more
+`clipboard.get` is answered at once with `"text":""` and the `error`
+`64 clipboard operations of this connection are waiting for the guest's clipboard tool; retry once it answers`,
+and one more `clipboard.set` is dropped and logged. The host sends an `id`
+with each `clipboard.get` and takes a `clipboard.text` only as the reply of
+the get with that `id`, so a reply that arrives after the host stopped
+waiting is not taken for a later get; a reply without `id` (agents before
+0.2.1) goes to the oldest get.
 
 Unknown `t` values are ignored, and after `authed` so is a line that is not
 a JSON object with a string `t`. Strings are UTF-8; the guest clipboard is
@@ -397,7 +423,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`, `executable` (outside Windows, for regular files: the owner's execute bit)}], `truncated` (more than 5000 entries), `skipped` (entries that could not be read, when above 0) |
 | `fs.read` | `path`, `offset` (default 0), `length` (default and cap 262144) | `data` (base64), `size` (of the file), `eof`, `encoding` |
 | `fs.tail` | `path`, `lines` (default 200) | `data` (base64 of the last lines, taken from at most the last 262144 bytes), `size`, `encoding` |
-| `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool), `executable` (bool; outside Windows `true` adds the execute bit wherever the file has the read bit and `false` removes every execute bit; Windows ignores it) | `size` (of the file afterwards) |
+| `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool), `executable` (bool; outside Windows `true` adds the execute bit wherever the file has the read bit and `false` removes every execute bit; Windows ignores it; when the mode cannot be changed after the data was written: `cannot set the execute bits of '<path>': <reason>; the data is written, so set them with exec.run (chmod)`) | `size` (of the file afterwards) |
 | `fs.rename` | `from`, `to`, `overwrite` (bool) | `path` |
 | `fs.mkdir` | `path` | `path` |
 | `fs.delete` | `path`, `recursive` (bool) | `deleted` (bool) |
@@ -515,7 +541,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   an agent that is not elevated
   `could not kill <n> of the <total> processes named '<name>' because access was denied (<k> were killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry`,
   and from an elevated agent
-  `could not kill <n> of the <total> processes named '<name>' because Windows denied access to the elevated agent (<k> were killed); such a process is protected or needs more than administrator rights, so stop it through its service (sc stop <service>) or leave it running`.
+  `could not kill <n> of the <total> processes named '<name>' because Windows denied access to the elevated agent (<k> were killed); such a process is protected or needs more than administrator rights, so stop it through its service (sc stop <service>) or leave it running`
+  (`(1 was killed)` when one was).
   Elsewhere `killed` counts the processes that were sent SIGKILL, with `tree`
   to the process group a match leads.
   No match answers `killed: 0`.
@@ -755,7 +782,7 @@ the line to `install.log` too, each with its next step:
 |---|---|
 | finding the running program | `the path of this alcove-agent.exe could not be read (<reason>); run alcove-agent --install again from the folder that holds alcove-agent.exe` |
 | reading the running program | `<file> could not be read (<reason>); copy alcove-agent.exe to a local folder and run alcove-agent --install from there` |
-| copying the program to `C:\Program Files\Alcove` | `could not write <file> (<reason>); delete <file>, then run alcove-agent --install again from an elevated prompt`, or `the copy at <file> holds <n> bytes instead of <m>; delete <file>, then run alcove-agent --install again from an elevated prompt` |
+| copying the program to `C:\Program Files\Alcove` | `could not write <file> (<reason>); delete <file>, then run alcove-agent --install again from an elevated prompt`, `the copy at <file> holds <n> bytes instead of <m>; delete <file>, then run alcove-agent --install again from an elevated prompt`, or `the copy at <file> could not be checked (<reason>); delete <file>, then run alcove-agent --install again from an elevated prompt` |
 | creating the scheduled task | `the scheduled task AlcoveAgent could not be created (<error>: <schtasks output>); run alcove-agent --install again from an elevated prompt` |
 | adding the firewall rule | `the firewall rule AlcoveAgent for TCP port <port> could not be added (<error>: <netsh output>); run alcove-agent --install again from an elevated prompt` |
 | starting the task | `the scheduled task AlcoveAgent was created but did not start (<error>: <schtasks output>); start it with schtasks /Run /TN AlcoveAgent, or sign out and in again` |
