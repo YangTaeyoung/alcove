@@ -425,6 +425,63 @@ func TestAHandshakeReplacedWhileItsHelloIsWrittenIsRefusedWithoutWaitingForAuth(
 	}
 }
 
+// fillOnAuth passes reads of r through; the first read that returns an auth
+// line runs fill before it returns.
+type fillOnAuth struct {
+	r      io.Reader
+	fill   func()
+	filled bool
+}
+
+func (f *fillOnAuth) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if !f.filled && bytes.Contains(p[:n], []byte(`"t":"auth"`)) {
+		f.filled = true
+		f.fill()
+	}
+	return n, err
+}
+
+func TestAHandshakeReplacedAfterItsSignatureArrivedIsServed(t *testing.T) {
+	a := startAuthServer(t, Options{AuthTimeout: 5 * time.Second})
+	server, client := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	var oldest *pendingHandshake
+	fill := func() {
+		a.s.handshakes.mu.Lock()
+		oldest = a.s.handshakes.entries[0]
+		a.s.handshakes.mu.Unlock()
+		for i := 0; i < maxHandshakes; i++ {
+			other, peer := net.Pipe()
+			t.Cleanup(func() { other.Close(); peer.Close() })
+			a.s.handshakes.join(other)
+		}
+	}
+	limit := &lineLimit{r: &fillOnAuth{r: server, fill: fill}, max: preAuthLineMax}
+	r := proto.NewReader(limit)
+	served := make(chan bool, 1)
+	go func() { served <- a.s.handshake(server, r, limit) }()
+
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	c := &authConn{c: client, r: proto.NewReader(client), w: proto.NewWriter(client)}
+	c.hello = c.next(t)
+	c.authenticate(t)
+	if !<-served {
+		t.Fatal("the handshake was not served")
+	}
+	a.s.handshakes.mu.Lock()
+	replaced := oldest != nil && oldest.c == server && oldest.replaced
+	a.s.handshakes.mu.Unlock()
+	if !replaced {
+		t.Fatal("the handshake was not replaced after its auth line was read")
+	}
+	go c.w.Send(proto.Message{"t": "ping"})
+	if m, err := r.Next(); err != nil || m.Type() != "ping" {
+		t.Fatalf("after authed the connection read %v, %v", m, err)
+	}
+}
+
 func TestAServedConnectionIsNotClosedForANewerHandshake(t *testing.T) {
 	a := startAuthServer(t, Options{})
 	served := a.dial()
