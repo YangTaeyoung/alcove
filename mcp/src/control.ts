@@ -13,6 +13,20 @@ export interface ControlReply { ok: boolean; error?: string; [key: string]: unkn
 
 export class ControlError extends Error {}
 
+/** Op name prefixes that the control server runs outside the request order of a connection (`ControlHandler.isConcurrent`). */
+export const CONCURRENT_PREFIXES: readonly string[] = ["vm.exec", "vm.process.", "vm.fs."];
+
+/** Op names besides those of `CONCURRENT_PREFIXES` that the control server runs outside the request order of a connection. */
+export const CONCURRENT_OPS: ReadonlySet<string> = new Set([
+  "vm.push_file", "vm.pull_file", "vm.sync_dir", "vm.find_text", "vm.crash_dumps.pull", "vm.collect_diagnostics", "script.run",
+  "vm.window.list", "vm.ui.tree", "vm.ui.find", "vm.ui.text", "vm.app.launch", "vm.deploy",
+]);
+
+/** Whether the control server runs `op` outside the request order of its connection; every other op waits for the one sent before it. */
+export function isConcurrent(op: string): boolean {
+  return CONCURRENT_PREFIXES.some((prefix) => op.startsWith(prefix)) || CONCURRENT_OPS.has(op);
+}
+
 export class ControlClient {
   private sock: net.Socket | null = null;
   private dialing: net.Socket | null = null;
@@ -22,6 +36,8 @@ export class ControlClient {
   private pending = new Map<number, { op: string; resolve: (r: ControlReply) => void; reject: (e: Error) => void }>();
   private headless: ChildProcess | null = null;
   private closes = 0;
+  /** Settles when the serial call sent last has answered or failed. */
+  private serialTail: Promise<void> = Promise.resolve();
 
   constructor(readonly socketPath = process.env.ALCOVE_CONTROL_SOCKET ?? DEFAULT_SOCKET) {}
 
@@ -133,26 +149,44 @@ export class ControlClient {
     this.pending.clear();
   }
 
-  /** Send one request and await its reply; throws ControlError on `ok: false`. The request's `id` and `op` are the envelope's, whatever `params` holds under those names. */
+  /**
+   * Send one request and await its reply; throws ControlError on `ok: false`. The request's `id` and `op` are the envelope's, whatever `params` holds under those names.
+   * `timeoutMs` counts from the send for an op of `isConcurrent`, and for any other op from the moment the serial call sent before it has answered or failed.
+   */
   async call(op: string, params: Record<string, unknown> = {}, timeoutMs = 600000): Promise<ControlReply> {
     await this.connect();
     const sock = this.sock;
     if (!sock) throw new ControlError(`the connection to the Alcove control server closed before ${op} was sent; call the tool again`);
     const id = this.nextId++;
     const line = JSON.stringify({ ...params, id, op }) + "\n";
+    const before = isConcurrent(op) ? null : this.serialTail;
+    let settled = () => {};
+    if (before) this.serialTail = new Promise<void>((resolve) => { settled = resolve; });
     const reply = await new Promise<ControlReply>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new ControlError(
-          `${op} timed out after ${timeoutMs / 1000} s; the control server may still be running it: check alcove_vm_status before you call the tool again`,
-        ));
-      }, timeoutMs);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let done = false;
+      const finish = () => {
+        done = true;
+        clearTimeout(timer);
+        settled();
+      };
+      const arm = () => {
+        if (done) return;
+        timer = setTimeout(() => {
+          this.pending.delete(id);
+          finish();
+          reject(new ControlError(
+            `${op} timed out after ${timeoutMs / 1000} s; the control server may still be running it: check alcove_vm_status before you call the tool again`,
+          ));
+        }, timeoutMs);
+      };
       this.pending.set(id, {
         op,
-        resolve: (r) => { clearTimeout(timer); resolve(r); },
-        reject: (e) => { clearTimeout(timer); reject(e); },
+        resolve: (r) => { finish(); resolve(r); },
+        reject: (e) => { finish(); reject(e); },
       });
       sock.write(line);
+      if (before) void before.then(arm); else arm();
     });
     if (!reply.ok) throw new ControlError(reply.error ?? `${op} failed`);
     return reply;

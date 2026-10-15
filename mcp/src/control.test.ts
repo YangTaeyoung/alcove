@@ -4,7 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import { ControlClient, ControlError } from "./control.js";
+import { ControlClient, ControlError, CONCURRENT_OPS, CONCURRENT_PREFIXES, isConcurrent } from "./control.js";
 
 type Request = { id: number; op: string; [key: string]: unknown };
 
@@ -117,6 +117,73 @@ test("a call without an answer in time fails with a sentence that says the serve
   } finally {
     await s.close();
   }
+});
+
+/** A request the server holds back, with the socket to answer it on. */
+type Held = { request: Request; socket: net.Socket };
+const answerHeld = (h: Held, fields: Record<string, unknown>) => h.socket.write(JSON.stringify({ id: h.request.id, ...fields }) + "\n");
+
+test("a serial call's timeout counts from the answer of the serial call before it", async () => {
+  const held: Held[] = [];
+  const s = await serve((request, socket) => { held.push({ request, socket }); return null; });
+  try {
+    const first = s.client.call("vm.wait_for", {}, 10000);
+    const second = s.client.call("vm.status", {}, 300);
+    await until(() => held.length === 2);
+    await new Promise((r) => setTimeout(r, 600));
+    answerHeld(held[0], { ok: true, op: "vm.wait_for" });
+    answerHeld(held[1], { ok: true, op: "vm.status" });
+    assert.deepEqual([(await first).op, (await second).op], ["vm.wait_for", "vm.status"]);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a serial call's timeout counts from the timeout of the serial call before it", async () => {
+  const held: Held[] = [];
+  const s = await serve((request, socket) => { held.push({ request, socket }); return null; });
+  try {
+    const first = s.client.call("vm.wait_for", {}, 50);
+    const second = s.client.call("vm.status", {}, 300);
+    await assert.rejects(first, (e: Error) => e instanceof ControlError && /^vm\.wait_for timed out/.test(e.message));
+    await assert.rejects(second, (e: Error) => e instanceof ControlError && e.message.startsWith("vm.status timed out after 0.3 s"));
+    assert.equal(held.length, 2);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a concurrent call's timeout counts from its send", async () => {
+  const held: Held[] = [];
+  const s = await serve((request, socket) => { held.push({ request, socket }); return null; });
+  try {
+    const serial = s.client.call("vm.wait_for", {}, 10000);
+    await assert.rejects(s.client.call("vm.exec", {}, 50), (e: Error) =>
+      e instanceof ControlError && e.message.startsWith("vm.exec timed out after 0.05 s"));
+    answerHeld(held[0], { ok: true });
+    await serial;
+  } finally {
+    await s.close();
+  }
+});
+
+test("the concurrent ops of the client are the ones ControlHandler.isConcurrent names", () => {
+  const swift = fs.readFileSync(new URL("../../AlcoveKit/Sources/AlcoveControl/ControlHandler.swift", import.meta.url), "utf8");
+  const fn = /public static func isConcurrent\(op: String\) -> Bool \{([\s\S]*?)\n {4}\}/.exec(swift);
+  assert.ok(fn, "isConcurrent(op:) in ControlHandler.swift");
+  const body = fn[1];
+  const prefixes = [...body.matchAll(/op\.hasPrefix\("([^"]+)"\)/g)].map((m) => m[1]);
+  const exact = [...body.matchAll(/op == "([^"]+)"/g)].map((m) => m[1]);
+  const sets = [...body.matchAll(/(\w+)\.contains\(op\)/g)].map((m) => m[1]);
+  for (const name of sets) {
+    const literal = new RegExp(`static let ${name}: Set<String> = \\[([\\s\\S]*?)\\]`).exec(swift);
+    assert.ok(literal, `${name} in ControlHandler.swift`);
+    exact.push(...[...literal[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]));
+  }
+  assert.deepEqual([...CONCURRENT_PREFIXES].sort(), prefixes.sort());
+  assert.deepEqual([...CONCURRENT_OPS].sort(), exact.sort());
+  for (const op of ["vm.exec", "vm.exec.start", "vm.fs.read", "vm.process.list", "vm.ui.tree", "script.run"]) assert.equal(isConcurrent(op), true, op);
+  for (const op of ["vm.status", "vm.wait_for", "vm.ui.click", "vm.http.requests", "script.save"]) assert.equal(isConcurrent(op), false, op);
 });
 
 test("close during the first dial starts no server", async () => {
