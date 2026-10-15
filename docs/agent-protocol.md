@@ -84,9 +84,12 @@ The hello carries the list the agent found last. The agent checks its
 capabilities once when it starts serving, before it accepts a connection,
 so a hello does not wait for a check; a connection that arrives during that
 first check is accepted after it. From then on it checks them every 5 s,
-whether or not a connection is open, so the list of a hello is at most 5 s
-old. On Linux a check looks up the desktop session, so a hello does not wait
-for `loginctl`.
+whether or not a connection is open, so the list of a hello comes from a
+check at most 5 s old. On Linux a check reads the desktop session through a
+lookup (`loginctl`) that the agent reuses for 5 s, also for the requests
+that read the session's home folder; so on Linux the session state behind a
+hello's list can be up to about 10 s old, and a hello does not wait for
+`loginctl`.
 
 When the host has sent its first message after the handshake (its
 `welcome`, or a request), the agent checks its capabilities and, when they
@@ -102,8 +105,8 @@ when the session ends.
 A host of Alcove 0.2.0 ignores the `caps` line: it keeps the hello's list
 for the whole connection. With such a host, a capability that appears or
 goes after the hello (on Linux `clipboard` at a sign-in that follows the
-connection) is seen only on the next connection, whose hello is at most
-5 s old.
+connection) is seen only on the next connection, whose hello is as old as
+described above.
 
 ### The desktop session (Linux)
 

@@ -563,9 +563,9 @@ func (s *Server) sendCapsUpdate(c *conn) {
 }
 
 // watchCaps checks the capabilities every capsCheckInterval, also while no
-// connection is open, so that a hello carries a list at most one interval
-// old, and sends {"t":"caps"} with the new list to each open connection that
-// sendCapsUpdate has followed and whose last list differs.
+// connection is open, so that a hello carries the list of a check at most
+// one interval old, and sends {"t":"caps"} with the new list to each open
+// connection that sendCapsUpdate has followed and whose last list differs.
 func (s *Server) watchCaps() {
 	for {
 		time.Sleep(s.timing.caps)
