@@ -252,6 +252,11 @@ main checkout. Host as above. VMs `Windows 11` (ssh 2222) and `Ubuntu`
 
 | Check | Result | Evidence |
 |---|---|---|
+| `agent-linux.py --vm Ubuntu` (installs the new agent) | PASS | VM started by the script (`alcovectl run`); `install: 0 installed / active / 1`; `hello: {'os': 'linux', 'agent': '0.2.1', 'caps': ['files', 'shutdown', 'exec', 'rpc', 'jobs', 'proc', 'fs'], …}`; `waiting for the desktop session (clipboard in a caps message)`; 4 s later `caps: ['files', 'shutdown', 'clipboard', 'exec', 'rpc', 'jobs', 'proc', 'fs']`; `session: alcove /home/alcove`; `exec: 0 root \| aarch64`; `file push OK -> /home/alcove/Downloads/drop.bin owner alcove`; `PASS` (2 min 21 s, the guest powered off by the script). `/usr/local/bin/alcove-agent` afterwards has the SHA-256 of `build/alcove-agent-linux-arm64` (`cab53a28…2c9b`) |
+| Caps update after login, through a 0.2.1 host | PASS | `alcovectl serve`, `vm.start Ubuntu` (stopped by the script before): `vm.status` at 2.1 s `tools: false`; 10.1 s tools with `agentCaps` `files shutdown exec rpc jobs proc fs` (the hello, before the autologin session); 24.8 s `agentCaps` with `clipboard` (the caps line the host applied) |
+| Final fix wave M1: 300000 `가` from the guest | PASS | as `alcove` in the session: `yes 가 \| tr -d '\n' \| head -c 900000 \| wl-copy` (`wl-paste -n \| wc -c` → 900000); `vm.clipboard.get` → 233333 characters, 699999 bytes, all `가`, no U+FFFD (the documented 700000-byte cut on a character boundary); repeated once with the same answer |
+| 300000 `가` set from the host | PASS | `vm.clipboard.set` of 300000 `가` → ok; `vm.clipboard.get` → 233333 characters, 699999 bytes, all `가`, no U+FFFD; `alcove-t17 리눅스 클립보드` round trip equal, and `wl-paste` as `alcove` prints it; clipboard set back to empty (as found) |
+| Task 13 round 3: absolute links in the home | PASS | as `alcove`: `~/alcove-t17-out -> /etc`, `~/alcove-t17-in -> /home/alcove/Documents`. `vm.fs.write ~/alcove-t17-out/alcove-t17.txt` → `cannot open '/home/alcove/alcove-t17-out/alcove-t17.txt' for writing: '/home/alcove/alcove-t17-out' is a link with the absolute target '/etc' outside the home folder of the desktop user, which the agent does not follow there; pass the path it leads to` (no relink advice); `vm.push_file guestPath=alcove-t17-out/alcove-t17-push.md` → the same sentence for `….md.alcove-part`; the in-home link keeps `… and the agent follows only relative links inside the home folder of the desktop user; make it a relative link or pass the path it leads to`. Nothing written to `/etc` or `Documents`; links removed |
 
 ## Defects (final pass)
 
@@ -264,4 +269,48 @@ main checkout. Host as above. VMs `Windows 11` (ssh 2222) and `Ubuntu`
 
 ## Not run (final pass), and why
 
+- 12.1 and 12.6: they need clicks in the app's windows (controller ruling:
+  no clicking).
+- 12.2 with a VM running: the quit then shows the alert with Suspend All,
+  Shut Down All and Cancel (`AlcoveApp.swift:180-205`), which needs a click;
+  the case without a running VM ran (D).
+- 12.5, and the rename half of 12.3: no control op renames a VM (rename is
+  `AppModel.rename`, reached from the window only), so the app's socket
+  cannot ask for it; the delete half of 12.3 ran through `vm.delete` (D11).
+- 15b-5 `npm --version`: Node is not installed in the guest.
+- 15b-11 Process Monitor on the exec PowerShell: Process Monitor is not in
+  the guest; the HKCU Policies write test of that item ran.
+- 16-2 needed a session saved to disk, and no control op suspends a VM: it
+  was made with a scratch harness on AlcoveEngine (`VMController.start()`,
+  then `suspendToDisk()`), not through the app's Suspend All.
+
 ## End state (final pass)
+
+- `Windows 11` and `Ubuntu` stopped through `vm.stop`; no `alcovectl`,
+  engine, `alcove-proxy`, app or MCP process left; the control socket file is
+  gone; capture journal `{"captures":[],"snapshots":[],"version":1}`;
+  `qemu-img snapshot -l` lists nothing on either disk; no suspended state;
+  the clone `T17 clone` deleted. `Windows 11.alcovevm/run-script.lock` (from
+  2026-10-14) stays, as documented.
+- Windows guest as found: `HKCU\Environment` the four values of A (user
+  `Path` `%USERPROFILE%\AppData\Local\Microsoft\WindowsApps;`, REG_EXPAND_SZ),
+  no `Command Processor` key, every execution policy scope `Undefined`, no
+  `Documents\WindowsPowerShell`, no `HKCU\Software\Policies\…\PowerShell`,
+  machine `Path` as saved (ExpandString) and no `ALCOVE_T`, no value `X` under
+  the ProfileList key, users `alcove` only, scheduled tasks as found (no
+  `AlcoveT17-*`), no `LocalDumps` key, no `C:\alcove-e2e`, `C:\alcove-t17`,
+  `C:\alcove-dumps`, `C:\Users\alcove\gt17`, no test files in
+  `C:\Users\Public`, `C:\alcove-apps` empty, `C:\ProgramData\Alcove` holds
+  `uia`, `agent.log`, `install.log`; proxy off, no Alcove CA, time zone UTC,
+  clipboard empty. Changed and left so: the agent is the 0.2.1 build of
+  34d22b4; the Desktop keeps the `alcove-drop*.bin` files of earlier
+  sessions.
+- Ubuntu guest: the agent is the 0.2.1 build of 34d22b4 (SHA-256 equal to
+  `build/alcove-agent-linux-arm64`); the test links removed, `Downloads` and
+  `Desktop` empty, clipboard empty (as found).
+- Host: the binaries, scripts, recordings and harness of this pass are in
+  the session's scratch folder only; the `__pycache__` the drivers made in
+  `scripts/test` and the harness's SwiftPM lock files in the temporary
+  folder were removed, as was an empty `/tmp/t17` made by mistake.
+- Commits: 67c1f74, 166779d, d3f6cec and the commit of this file (results
+  only; no script or product change).
