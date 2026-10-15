@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import AlcoveControl
 @testable import AlcoveEngine
 import AlcoveAgent
@@ -69,12 +70,17 @@ final class ControllerTargetTests: XCTestCase {
         addTeardownBlock { agent.stop() }
         try await vm.start()
 
+        let launchedKey = await vm.config.agentKey
         var edited = await vm.config
         edited.agentHostPort = agent.port == 17_999 ? 17_998 : 17_999
         edited.network = .user(portForwards: [VMConfig.PortForward(hostPort: 33_333, guestPort: 80)])
+        edited.agentToken = "next-token"
+        edited.agentKey = VMConfig.randomAgentKey()
         try await vm.update(config: edited)
-        let next = await vm.config.agentHostPort
-        XCTAssertNotEqual(next, agent.port)
+        let next = await vm.config
+        XCTAssertNotEqual(next.agentHostPort, agent.port)
+        XCTAssertEqual(next.agentToken, "next-token")
+        XCTAssertNotEqual(next.agentKey, launchedKey)
 
         let target = ControllerTarget(name: "Fake", controller: vm)
         let port = await target.agentHostPort()
@@ -86,8 +92,26 @@ final class ControllerTargetTests: XCTestCase {
         let authenticated = await connected.hello?.authenticated
         XCTAssertEqual(authenticated, true)
         XCTAssertEqual(agent.received.first?["t"]?.stringValue, "auth")
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: XCTUnwrap(hexData(XCTUnwrap(AgentKey.publicKey(launchedKey)))))
+        let signature = try XCTUnwrap(hexData(XCTUnwrap(agent.received.first?["signature"]?.stringValue)))
+        let nonce = try XCTUnwrap(hexData(String(repeating: "c3", count: 32)))
+        XCTAssertTrue(publicKey.isValidSignature(signature, for: Data((AgentKey.authContext + agent.token).utf8) + nonce))
         await target.dropAgent(nil)
     }
+}
+
+/// The bytes an even number of hexadecimal digits encode, or nil.
+private func hexData(_ text: String) -> Data? {
+    guard text.count % 2 == 0 else { return nil }
+    var out = Data()
+    var index = text.startIndex
+    while index < text.endIndex {
+        let next = text.index(index, offsetBy: 2)
+        guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+        out.append(byte)
+        index = next
+    }
+    return out
 }
 
 private let fakeEngineSource = #"""

@@ -33,7 +33,7 @@ export function register(r: Registrar, client: ControlClient): void {
     "alcove_vm_status",
     {
       title: "VM status",
-      description: "Detailed status of one VM: state, screen size, whether the guest tools (agent) are connected and which capabilities they offer (exec, clipboard, files). When the guest tools refused the host or the host refused them, `toolsRefused` holds the sentence that names the fix.",
+      description: "Detailed status of one VM: state, screen size, whether the guest tools (agent) are connected and which capabilities they offer (exec, clipboard, files). When the guest tools refused the host or the host refused them, `toolsRefused` holds a sentence that says which side refused (`… refused the connection: …` for the guest tools, `… cannot be used: …` for the host) and names the fix.",
       inputSchema: { name: vmName },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -53,7 +53,7 @@ export function register(r: Registrar, client: ControlClient): void {
     {
       title: "Start VM",
       description:
-        "Boot a VM (or resume it from suspend). A resumed session is reported with whether the guest tools reconnected and the guest clock was synced. By default waits until the guest tools connect (the OS has booted and a user is logged in), up to wait_timeout_s; when the guest tools refuse the host it returns at once with the sentence that names the fix; when the guest has no tools it returns after the wait and you should use alcove_wait_idle / screenshots to judge readiness. When neither the Alcove app nor another control server answers, this MCP session starts a headless control server, and the VMs it runs shut down when the session ends.",
+        "Boot a VM (or resume it from suspend). A resumed session is reported with whether the guest tools reconnected and the guest clock was synced. By default waits until the guest tools connect (the OS has booted and a user is logged in), up to wait_timeout_s; when the guest tools refuse the host, or the host refuses them, it returns at once with the sentence that says which side refused and names the fix; when the guest has no tools it returns after the wait and you should use alcove_wait_idle / screenshots to judge readiness. When neither the Alcove app nor another control server answers, this MCP session starts a headless control server, and the VMs it runs shut down when the session ends.",
       inputSchema: {
         name: vmName,
         wait_for_tools: z.boolean().optional().describe("Wait for the guest tools to connect (default true)"),
@@ -94,7 +94,7 @@ export function register(r: Registrar, client: ControlClient): void {
         }
         const toolsPart = !wait ? ""
           : tools ? "; guest tools connected (desktop ready)"
-          : refused !== undefined ? `; guest tools refused the connection: ${refused}`
+          : refused !== undefined ? `; ${refused}`
           : "; guest tools did not connect in time (no tools installed, or still booting) — use alcove_wait_idle and alcove_screenshot";
         return text(`${name}: ${r.state}${r.ephemeral === true ? " (changes will be discarded when it stops)" : ""}${toolsPart}`);
       } catch (e) {

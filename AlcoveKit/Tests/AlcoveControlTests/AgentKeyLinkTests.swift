@@ -86,7 +86,7 @@ final class AgentKeyLinkTests: XCTestCase {
         await t.setRefusal(sentence)
         let status = try await h.handle(op: "vm.status", params: ["name": "Win"])
         XCTAssertEqual(status["tools"]?.boolValue, false)
-        XCTAssertEqual(status["toolsRefused"]?.stringValue, sentence)
+        XCTAssertEqual(status["toolsRefused"]?.stringValue, "the guest tools in 'Win' refused the connection: \(sentence)")
     }
 
     func testVMDoctorShowsTheRefusalOfTheGuestToolsAndItsFix() async throws {
@@ -97,7 +97,7 @@ final class AgentKeyLinkTests: XCTestCase {
         let rows = doctor["checks"]?.arrayValue ?? []
         XCTAssertEqual(rows.last?["id"]?.stringValue, "tools")
         XCTAssertEqual(rows.last?["ok"]?.boolValue, false)
-        XCTAssertEqual(rows.last?["detail"]?.stringValue, "the guest tools refused the connection: \(sentence)")
+        XCTAssertEqual(rows.last?["detail"]?.stringValue, "the guest tools in 'Win' refused the connection: \(sentence)")
         XCTAssertEqual(rows.last?["hint"]?.stringValue,
                        "start the VM with Alcove 0.2 or later")
     }

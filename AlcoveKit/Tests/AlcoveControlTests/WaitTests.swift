@@ -1260,6 +1260,21 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(miss["detail"]?.stringValue, "job exited")
     }
 
+    func testAWaitEndedByAnAgentSentenceNamesControlOps() async throws {
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            guard m["op"]?.stringValue == "exec.read" else { return [] }
+            return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "no job 'j9'; call exec.list"]]
+        }
+        let (h, _) = try await agentRig(agent)
+        do {
+            _ = try await waitFor(h, [["type": "job_output_matches", "job": "j9", "pattern": "x"]], timeout: 10)
+            XCTFail("the wait did not end with the agent's sentence")
+        } catch let e as ControlHandler.ControlError {
+            XCTAssertEqual(e.description, "no job 'j9'; call vm.exec.list")
+        }
+    }
+
     func testProcessNameFilterDropsTheExecutableSuffix() async throws {
         let agent = FakeAgent()
         agent.handler = { m, _ in

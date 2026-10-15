@@ -573,19 +573,46 @@ public actor ControlHandler {
         return try! NSRegularExpression(pattern: pattern)
     }()
 
-    /// `sentence`, an agent's error sentence, with each agent op it names as a word (`agentOpName`) replaced by its
-    /// control op.
+    /// `sentence`, an agent's error sentence, with each agent op it names as a word (`agentOpName`) outside a quoted
+    /// value (`quotedRanges`) replaced by its control op.
     nonisolated static func namingControlOps(_ sentence: String) -> String {
         let text = sentence as NSString
+        let quoted = quotedRanges(text)
         var result = ""
         var at = 0
-        for match in agentOpName.matches(in: sentence, range: NSRange(location: 0, length: text.length)) {
+        for match in agentOpName.matches(in: sentence, range: NSRange(location: 0, length: text.length))
+        where !quoted.contains(where: { NSLocationInRange(match.range.location, $0) }) {
             let name = text.substring(with: match.range)
             result += text.substring(with: NSRange(location: at, length: match.range.location - at))
             result += controlOpOfAgentOp[name] ?? name
             at = match.range.location + match.range.length
         }
         return result + text.substring(from: at)
+    }
+
+    /// The quoted values of `text`, quotes included: from a `"` to the next `"` that no `\` precedes, and from a `'`
+    /// that no letter or digit precedes to the next `'` that no letter or digit follows. A quote that is not closed
+    /// opens no value.
+    private nonisolated static func quotedRanges(_ text: NSString) -> [NSRange] {
+        func isWord(_ unit: unichar) -> Bool {
+            Unicode.Scalar(unit).map { CharacterSet.alphanumerics.contains($0) } ?? true
+        }
+        let doubleQuote = unichar(UInt8(ascii: "\"")), singleQuote = unichar(UInt8(ascii: "'")), backslash = unichar(UInt8(ascii: "\\"))
+        var ranges: [NSRange] = []
+        var open: (quote: unichar, at: Int)?
+        for index in 0..<text.length {
+            let unit = text.character(at: index)
+            if let current = open {
+                guard unit == current.quote else { continue }
+                if unit == doubleQuote, text.character(at: index - 1) == backslash { continue }
+                if unit == singleQuote, index + 1 < text.length, isWord(text.character(at: index + 1)) { continue }
+                ranges.append(NSRange(location: current.at, length: index - current.at + 1))
+                open = nil
+            } else if unit == doubleQuote || (unit == singleQuote && (index == 0 || !isWord(text.character(at: index - 1)))) {
+                open = (unit, index)
+            }
+        }
+        return ranges
     }
 
     /// The control error for a failure of `op` against the agent of `vm`.
@@ -631,7 +658,7 @@ public actor ControlHandler {
             } else {
                 obj["tools"] = false
                 if let refusal = await t.agentRefusal() {
-                    obj["toolsRefused"] = .string(AgentClient.isHostRefusal(refusal) ? ControlHandler.refusal(refusal, vm: t.name) : refusal)
+                    obj["toolsRefused"] = .string(ControlHandler.refusal(refusal, vm: t.name))
                 }
             }
         }

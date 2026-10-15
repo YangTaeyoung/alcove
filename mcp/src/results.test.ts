@@ -123,6 +123,8 @@ test("descriptions name what the control ops need and do", () => {
   assert.match(core.get("alcove_start_vm")!, /session ends/);
   assert.match(core.get("alcove_start_vm")!, /refuse the host/);
   assert.match(core.get("alcove_vm_status")!, /`toolsRefused`/);
+  assert.match(core.get("alcove_vm_status")!, /which side refused/);
+  assert.match(core.get("alcove_start_vm")!, /which side refused/);
 });
 
 test("parameter descriptions carry the path rules the server enforces", () => {

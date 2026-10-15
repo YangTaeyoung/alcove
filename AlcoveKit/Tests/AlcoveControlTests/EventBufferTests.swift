@@ -532,6 +532,27 @@ final class EventBufferTests: XCTestCase {
         XCTAssertTrue(agentRequests(plain, "ui.ping").isEmpty)
     }
 
+    func testTheLinkMarksItsAdoptionPingAsTheStartOfTheUIHelper() async throws {
+        let agent = FakeAgent()
+        agent.caps = ["clipboard", "ui"]
+        _ = agent.start()
+        addTeardownBlock { agent.stop() }
+        let link = AgentLink(events: EventBuffer(), isRunning: { true }, endpoint: { (agent.port, nil) })
+        let connected = await link.agent(timeout: .seconds(60))
+        let client = try XCTUnwrap(connected)
+        let pinged = await eventually { agentRequests(agent, "ui.ping").count == 1 }
+        XCTAssertTrue(pinged)
+        XCTAssertTrue(client.isStartingUIHelper)
+        let started = await link.helperStart
+        XCTAssertNotNil(started)
+        XCTAssertTrue(client.startUIHelper(timeout: .seconds(60)) == started)
+
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.ping").first), ["pong": true]))
+        await started?.value
+        XCTAssertFalse(client.isStartingUIHelper)
+        XCTAssertEqual(agentRequests(agent, "ui.ping").count, 1)
+    }
+
     func testLinkCallsItsObserverForEveryConnectionItAdopts() async throws {
         let agents = [fakeAgent(caps: ["clipboard"]), fakeAgent(caps: ["clipboard"]), fakeAgent(caps: ["clipboard"])]
         let port = LockedBox(agents[0].port)

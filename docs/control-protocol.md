@@ -1034,14 +1034,16 @@ events: events of an earlier session are in `vm.events` only.
 the guest tools) and `agentCaps` when they are connected. When they are not
 connected because the agent refused the host's latest connection attempt,
 or the host refused guest tools whose hello does not ask for the VM's key
-(docs/agent-protocol.md, Host key), it adds `toolsRefused`, which names the
-fix: the agent's sentence, for example
-`this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later`,
-or the host's refusal
+(docs/agent-protocol.md, Host key), it adds `toolsRefused`: a sentence that
+says which side refused and ends with the refusal, which names the fix.
+A refusal by the agent reads
+`the guest tools in '<vm>' refused the connection: <sentence>`, for example
+`the guest tools in 'Win' refused the connection: this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later`;
+the host's refusal reads
 `the guest tools in '<vm>' cannot be used: the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)`.
 It is kept until an attempt connects or the VM stops. An op that needs the
-guest tools answers `the guest tools in '<vm>' refused the connection:
-<sentence>` for a refusal by the agent and the host's refusal as above.
+guest tools answers with the same sentence, and the doctor's `tools` row
+shows it.
 
 ## Starting
 
@@ -1379,7 +1381,7 @@ that makes the later ones impossible:
 | `host` | `app` or `headless` | never | |
 | `state` | the VM's state | not `running` (hint `call vm.start`; `call vm.resume` when paused; `wait until vm.status shows running, then retry` while starting; `wait until vm.status shows stopped, then call vm.start` while stopping or suspending) | when not running |
 | `display` | `<W>x<H>` of the current frame | no frame can be read | |
-| `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s: `guest tools are not connected` (hint `install alcove-agent in the guest with scripts/test/install-agent.py`), or, when the agent refused the host, `the guest tools refused the connection: <the sentence>`, or, when the host refused guest tools that do not ask for the VM's key, `the guest tools in '<vm>' cannot be used: <the sentence>`, each with the sentence's next step (the text after its first `; `) as hint | when not ok |
+| `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s: `guest tools are not connected` (hint `install alcove-agent in the guest with scripts/test/install-agent.py`), or, when the agent refused the host or the host refused guest tools that do not ask for the VM's key, the sentence of `toolsRefused` ([VM rows](#vm-rows)), with the refusal's next step (the text after its first `; `) as hint | when not ok |
 | `rpc` | `proto <n>` | below 2 | when `rpc` or `exec` is not ok |
 | `exec` | `enabled` or `disabled` | the tools were started without `--allow-exec` | |
 | `probe` | why the guest probe gave nothing | present only on failure: the guest OS has no probe script, the script failed or printed no JSON | always |
@@ -2554,8 +2556,12 @@ stands for it: `exec.run` → `vm.exec`, `exec.start`, `exec.read`,
 `fs.write`, `fs.delete` → `vm.fs.*`, `app.launch` → `vm.app.launch`,
 `win.list` → `vm.window.list`, `win.action` → `vm.window.action`, `ui.tree`,
 `ui.find`, `ui.text` → `vm.ui.*`, `ui.act` → `vm.ui.action`. A name inside a
-path or a quoted value is kept, and so is an agent operation without an op of
-its own here, such as `fs.stat`.
+path or a quoted value (from `"` to the next `"` without a `\` before it, or
+from a `'` that does not follow a letter or digit to the next `'` that no
+letter or digit follows) is kept, and so is an agent operation without an op
+of its own here, such as `fs.stat`. The same rule applies to the agent
+sentences a `vm.wait_for` reply carries (its error, a condition's `detail`
+and the `error` of its `problems`).
 
 **Commands** (`vm.exec`, `vm.exec.start`)
 
@@ -2642,7 +2648,7 @@ its own here, such as `fs.stat`.
   UTF-8; a byte order mark at the start is left out and invalid sequences
   become U+FFFD. A range is cut by bytes, so a character that straddles two
   ranges reads as U+FFFD in both; use even offsets in a UTF-16 file. A range
-  from a later offset has no mark and is read as UTF-8.
+  of a UTF-32 file from a later offset has no mark and is read as UTF-8.
 - `vm.fs.write` writes `text` as UTF-8 without a byte order mark, creates
   missing folders and replaces the file unless `append` is true.
 - `vm.fs.list` reports `mtime` as RFC 3339 in UTC and `name` relative to

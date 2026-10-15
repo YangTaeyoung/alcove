@@ -612,6 +612,8 @@ final class ControlShellFilesTests: XCTestCase {
             "win.list": "window 0x2a is not responding; wait and retry, or end its process with proc.kill when win.list still shows responding false after 10 s",
             "ui.find": "no element matches {\"name\":\"ui.tree\"}; call ui.tree to see what exists",
             "ui.text": "an element disappeared while the text was read; call ui.text again, or vm.ui.text, 'exec.list' or C:\\exec.list.",
+            "win.action": "no window has \"notes on fs.list usage\" in its title; call win.list to see the open windows",
+            "ui.tree": "the window 'a ui.tree view' and the helper's state changed; call ui.tree again",
         ]
         let agent = FakeAgent()
         agent.caps = ["clipboard", "files", "exec", "ui"]
@@ -633,6 +635,9 @@ final class ControlShellFilesTests: XCTestCase {
             ("vm.ui.find", ["name": "Win", "selector": ["name": "ui.tree"]], "no element matches {\"name\":\"ui.tree\"}; call vm.ui.tree to see what exists"),
             ("vm.ui.text", ["name": "Win", "ref": "e5"],
              "an element disappeared while the text was read; call vm.ui.text again, or vm.ui.text, 'exec.list' or C:\\exec.list."),
+            ("vm.window.action", ["name": "Win", "window": "notes", "action": "focus"],
+             "no window has \"notes on fs.list usage\" in its title; call vm.window.list to see the open windows"),
+            ("vm.ui.tree", ["name": "Win"], "the window 'a ui.tree view' and the helper's state changed; call vm.ui.tree again"),
         ]
         for (op, params, sentence) in expected {
             let text = await failure(h, op, params)

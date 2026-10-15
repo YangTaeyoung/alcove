@@ -646,7 +646,7 @@ extension ControlHandler {
     private func judge(_ condition: WaitCondition, _ result: Result<JSON, Error>, state: inout WaitState,
                        at now: ContinuousClock.Instant) throws -> Verdict {
         if case .failure(let error) = result, case AgentClient.AgentError.remote(let message) = error, HelperSentence(message).isPermanent {
-            throw HardFailure(error: .failed(message))
+            throw HardFailure(error: .failed(ControlHandler.namingControlOps(message)))
         }
         switch condition {
         case .uiExists(let element), .uiGone(let element), .uiEnabled(let element):
@@ -682,12 +682,12 @@ extension ControlHandler {
             let r: JSON
             do { r = try result.get() }
             catch AgentClient.AgentError.remote(let message) where HelperSentence(message) == .passwordField {
-                throw HardFailure(error: .failed(message))
+                throw HardFailure(error: .failed(ControlHandler.namingControlOps(message)))
             } catch AgentClient.AgentError.remote(let message) where element["ref"] != nil || state.lastText != nil {
                 guard HelperSentence(message).saysAbsent(ref: element["ref"]?.stringValue, orNoMatch: true) else {
                     throw AgentClient.AgentError.remote(message)
                 }
-                return .over(.string(message))
+                return .over(.string(ControlHandler.namingControlOps(message)))
             }
             let text = r["text"]?.stringValue ?? ""
             let total = r["total"] ?? .int(Int64(text.utf16.count))
@@ -772,7 +772,7 @@ extension ControlHandler {
                     reply = try await call("exec.read", ["job": .string(job), "out_offset": .int(Int64(state.outOffset)),
                                                          "err_offset": .int(Int64(state.errOffset))])
                 } catch AgentClient.AgentError.remote(let message) {
-                    throw HardFailure(error: .failed(message))
+                    throw HardFailure(error: .failed(ControlHandler.namingControlOps(message)))
                 }
                 guard let r = reply else { return .unanswered }
                 let out = r["out"]?.stringValue ?? "", err = r["err"]?.stringValue ?? ""
