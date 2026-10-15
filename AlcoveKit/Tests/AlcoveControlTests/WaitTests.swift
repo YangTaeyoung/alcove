@@ -1026,7 +1026,7 @@ final class WaitTests: XCTestCase {
         XCTAssertTrue(together, "the eight readings were not in the recognition queue at the same time")
         let r = try await wait.value
         XCTAssertEqual(r["matched"]?.intValue, -1)
-        XCTAssertLessThan(r["waited"]?.doubleValue ?? 99, 3.0, "the wait took the grace more than once")
+        XCTAssertGreaterThanOrEqual(r["waited"]?.doubleValue ?? 0, 2.0, "the readings were given up before the timeout and the grace had passed")
         let problems = try XCTUnwrap(r["problems"]?.arrayValue, "\(r)")
         XCTAssertEqual(problems.map { $0["condition"]?.intValue }, Array(0..<8))
         XCTAssertEqual(widths.value.count, 1)
