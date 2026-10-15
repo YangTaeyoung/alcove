@@ -35,6 +35,8 @@ enum DiagnosticsTiming {
     nonisolated(unsafe) static var video = Duration.seconds(60)
     /// Added to the limit of a step whose work ends by itself at that limit.
     static let grace = Duration.seconds(5)
+    /// Runs after the video of a running recording was copied and before the op checks whether that recording still runs.
+    nonisolated(unsafe) static var afterRunningVideoCopy: (@Sendable () async -> Void)?
 }
 
 /// The size limits of a diagnostics bundle.
@@ -147,6 +149,8 @@ final class DiagnosticsLog: @unchecked Sendable {
         /// The recording the bundle uses, as the summary names it.
         var recording: String?
         var frames: (copied: Int, referenced: Int)?
+        /// The HTTP capture of the VM, as the summary names it.
+        var httpCapture: String?
     }
 
     private let lock = NSLock()
@@ -294,6 +298,8 @@ extension ControlHandler {
         } else if os != .windows {
             log.note("windows, UI tree and crash dumps are collected on Windows guests only; skipped on this \(os.rawValue) guest")
         }
+        let capture = await httpCaptureState(t)
+        log.update { $0.httpCapture = capture }
 
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.collectScreenshot(t, displays: displays, state: state, bundle, log) }
@@ -840,6 +846,34 @@ extension ControlHandler {
         log.update { $0.dumps = found }
     }
 
+    // MARK: - HTTP capture
+
+    /// The HTTP capture of `t` as the summary names it: the capture that runs, with the reason its proxy ended when it
+    /// did; else the reason the last capture ended; then, while the capture journal holds an entry of the VM, the
+    /// capture whose guest is not restored when none runs, and the path of the journal. `none` when there is nothing.
+    func httpCaptureState(_ t: VMTarget) async -> String {
+        let owner = await journalVM(t)
+        let live = captures[t.name]
+        let exited = await live?.proxy.exitReason()
+        let lost = lostCaptures[t.name]
+        let entry = captureJournal.entry(for: owner)
+        var parts: [String] = []
+        if let live {
+            var text = "active on port \(live.port) since \(live.since)"
+            if let exited { text += ", but its proxy ended because \(exited); call vm.http.stop, then vm.http.start" }
+            parts.append(text)
+        } else if let lost {
+            parts.append("ended because \(lost); call vm.http.start to capture again")
+        }
+        if let entry {
+            if live == nil {
+                parts.append("the guest is not restored from the capture on port \(entry.port) since \(entry.since); call vm.http.stop to restore it")
+            }
+            parts.append("journal \(captureJournal.url.path)")
+        }
+        return parts.isEmpty ? "none" : parts.joined(separator: "; ")
+    }
+
     // MARK: - recording
 
     /// The recording the bundle uses: the VM's active one; else the one that is ending, once it ended or
@@ -1043,6 +1077,7 @@ extension ControlHandler {
         var ended: LastRecording?
         switch chosen {
         case .ending(let recording):
+            log.update { $0.recording = "\(recording.directory.path) (ending)" }
             fail("the recording in \(recording.directory.path) has not ended within \(Int(DiagnosticsTiming.recordingEnd.components.seconds)) s; its video is complete there when vm.record.stop has returned")
             return
         case .ended(let last):
@@ -1060,6 +1095,7 @@ extension ControlHandler {
                 try ControlHandler.copyStart(of: source, bytes: bytes, to: scratch)
                 guard await VideoRecorder.isPlayable(scratch) else { throw notYet }
             }
+            if let hook = DiagnosticsTiming.afterRunningVideoCopy { await hook() }
             if await recording.isActive {
                 switch copied {
                 case .success:
@@ -1223,6 +1259,7 @@ extension ControlHandler {
                 unknown("process \(name)", "processes")
             }
         }
+        if let capture = state.httpCapture { lines.append("HTTP capture: \(oneLine(capture, limit: 600))") }
         if let recording = state.recording { lines.append("recording: \(oneLine(recording, limit: 400))") }
         if let frames = state.frames {
             lines.append("frames: \(frames.copied) of \(frames.referenced) copied")

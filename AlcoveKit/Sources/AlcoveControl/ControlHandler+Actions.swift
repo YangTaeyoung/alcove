@@ -121,8 +121,11 @@ extension ControlHandler {
         mutating func press(key code: Int) { keys.removeAll { $0 == code }; keys.append(code) }
         mutating func lift(key code: Int) { keys.removeAll { $0 == code } }
 
-        /// Takes in a step `op` with `params` that ran: a button or key it pressed or released.
-        mutating func note(_ op: String, _ params: [String: JSON]) {
+        /// Takes in a step `op` with `params` that ran and answered `result`: a button or key it pressed or released.
+        /// Of a `vm.batch` it takes in the steps that `result` counts as `completed`, in order (all of them without
+        /// `result`); when `result` names a `failedStep`, the buttons and keys those steps pressed and left down count
+        /// as released, as the batch released them.
+        mutating func note(_ op: String, _ params: [String: JSON], result: JSON? = nil) {
             switch op {
             case "vm.mouse.down", "vm.mouse.up":
                 guard let button = try? ControlHandler.inputButton(params["button"]?.stringValue) else { return }
@@ -130,6 +133,18 @@ extension ControlHandler {
             case "vm.key.down", "vm.key.up":
                 guard let name = params["key"]?.stringValue, let key = try? KeyNames.key(named: name) else { return }
                 if op == "vm.key.down" { press(key: key.code) } else { lift(key: key.code) }
+            case "vm.batch":
+                guard let steps = params["steps"]?.arrayValue else { return }
+                let ran = steps.prefix(max(0, result?["completed"]?.intValue ?? steps.count))
+                var pressed = HeldInput()
+                for step in ran {
+                    guard let fields = step.objectValue, let stepOp = fields["op"]?.stringValue else { continue }
+                    note(stepOp, fields)
+                    pressed.note(stepOp, fields)
+                }
+                guard result?["failedStep"] != nil else { return }
+                for button in pressed.buttons { lift(button) }
+                for code in pressed.keys { lift(key: code) }
             default:
                 return
             }

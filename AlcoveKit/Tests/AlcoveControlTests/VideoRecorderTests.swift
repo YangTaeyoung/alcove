@@ -343,6 +343,38 @@ final class VideoRecorderTests: XCTestCase {
         await recorder.finish()
     }
 
+    func testTheFrameReadAtTheEndIsShownForOneFrameInterval() async throws {
+        let url = base.appendingPathComponent("last.mp4")
+        let recorder = VideoRecorder(url: url, fps: 5)
+        for i in 0..<5 { recorder.append(frame: Frame(width: 320, height: 240, pixels: Data(repeating: 0x20, count: 320 * 240 * 4)), at: .milliseconds(i * 200)); _ = await recorder.waitUntilReady() }
+        await recorder.appendFinal(frame: Frame(width: 320, height: 240, pixels: Data(repeating: 0xFF, count: 320 * 240 * 4)), at: .milliseconds(1000))
+        await recorder.finish()
+        XCTAssertNil(recorder.errorMessage)
+        XCTAssertEqual(recorder.appendedSeconds, 1.0, accuracy: 0.01)
+        let info = try await inspect(url)
+        XCTAssertEqual(info.seconds, 1.2, accuracy: 0.01)
+
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let (image, shown) = try await generator.image(at: CMTime(value: 660, timescale: 600))
+        XCTAssertEqual(CMTimeGetSeconds(shown), 1.0, accuracy: 0.01)
+        XCTAssertGreaterThan(try XCTUnwrap(averageGray(image)), 200)
+    }
+
+    /// The mean of the gray values of `image` drawn into 16 x 16 pixels.
+    private func averageGray(_ image: CGImage) -> Double? {
+        var pixels = [UInt8](repeating: 0, count: 16 * 16)
+        let drawn: Bool = pixels.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            guard let context = CGContext(data: raw.baseAddress, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 16,
+                                          space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: 16, height: 16))
+            return true
+        }
+        guard drawn else { return nil }
+        return Double(pixels.reduce(0) { $0 + Int($1) }) / Double(pixels.count)
+    }
+
     func testDurationStartsAtTheFirstAppendedFrame() async {
         let url = base.appendingPathComponent("late-start.mp4")
         let recorder = VideoRecorder(url: url, fps: 5)

@@ -888,6 +888,22 @@ final class TraceTests: XCTestCase {
         XCTAssertTrue(ended)
     }
 
+    func testRenamingTheVMEndsItsRecordingAndForgetsIt() async throws {
+        let (h, _, _) = setup()
+        _ = try await start(h)
+        let held = await h.activeRecording("Win")
+        let recording = try XCTUnwrap(held)
+        await h.vmRenamed(from: "Win", oldPath: nil, to: "Win 2", newPath: nil)
+        let status = try await h.handle(op: "vm.record.status", params: ["name": "Win"])
+        XCTAssertEqual(status, ["recording": false])
+        let stop = await failure(h, "vm.record.stop", ["name": "Win"])
+        XCTAssertEqual(stop, "'Win' is not recording")
+        let last = await h.lastRecording("Win")
+        XCTAssertNil(last)
+        let ended = await eventually("the recording of the renamed VM ended") { await !recording.isActive }
+        XCTAssertTrue(ended)
+    }
+
     func testVideoSinkIsFinishedOnStop() async throws {
         let dir = base.appendingPathComponent("sink")
         let sink = CountingSink()

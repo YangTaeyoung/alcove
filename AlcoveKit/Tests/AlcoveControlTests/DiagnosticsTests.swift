@@ -88,6 +88,8 @@ private final class Guest: @unchecked Sendable {
 
 private extension ControlHandler {
     func eventPositions(of vm: String) -> (baseline: Int?, observed: Int?) { (eventBaseline[vm]?.seq, observedEvents[vm]?.seq) }
+    func setCapture(_ capture: HTTPCapture?, vm: String) { captures[vm] = capture }
+    func setLostCapture(_ reason: String?, vm: String) { lostCaptures[vm] = reason }
 }
 
 private extension JSON {
@@ -154,6 +156,7 @@ final class DiagnosticsTests: XCTestCase {
         DiagnosticsTiming.tree = .seconds(50)
         DiagnosticsTiming.processes = .seconds(35)
         DiagnosticsTiming.agentWait = .seconds(5)
+        DiagnosticsTiming.afterRunningVideoCopy = nil
     }
 
     private struct Rig {
@@ -164,7 +167,7 @@ final class DiagnosticsTests: XCTestCase {
     }
 
     private func rig(os: VMConfig.GuestOS = .windows, caps: [String] = ["clipboard", "files", "exec", "ui"], now: LockedBox<Date>? = nil,
-                     _ configure: (Guest) -> Void = { _ in }) async throws -> Rig {
+                     captureDirectory: URL = scratchCaptureDirectory, _ configure: (Guest) -> Void = { _ in }) async throws -> Rig {
         let guest = Guest()
         configure(guest)
         let agent = FakeAgent()
@@ -177,7 +180,7 @@ final class DiagnosticsTests: XCTestCase {
         let target = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         await target.setAgent(client)
         await target.setOS(os)
-        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", captureDirectory: scratchCaptureDirectory, now: { now?.value ?? Date() },
+        let handler = ControlHandler(registry: FakeRegistry(targets: ["Win": target]), hostKind: "test", captureDirectory: captureDirectory, now: { now?.value ?? Date() },
                                      recordingsDirectory: scratch.appendingPathComponent("recordings"),
                                      diagnosticsDirectory: scratch.appendingPathComponent("diagnostics"))
         return Rig(handler: handler, target: target, agent: agent, guest: guest)
@@ -457,6 +460,39 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(lines.contains("crash dumps: none newer than 30 minutes"))
         XCTAssertTrue(lines.contains("event log Application: 0 entries of level error or worse in the last 30 minutes"))
         XCTAssertTrue(lines.contains("jobs exited with a non-zero code: none"))
+    }
+
+    func testSummaryNamesTheHTTPCaptureState() async throws {
+        let captureDirectory = scratch.appendingPathComponent("captures")
+        let r = try await rig(captureDirectory: captureDirectory)
+        let journal = CaptureJournal(directory: captureDirectory)
+        let since = "2026-10-14T03:00:00Z"
+        func line(_ name: String) async throws -> String? {
+            try summaryLines(try await collect(r.handler, dir: bundleDirectory(name))).first { $0.hasPrefix("HTTP capture: ") }
+        }
+        let none = try await line("none")
+        XCTAssertEqual(none, "HTTP capture: none")
+
+        let proxy = FakeProxy(log: CallLog(), port: 49152, caPath: "/ca.pem")
+        let thumbprint = String(repeating: "A", count: 40)
+        await r.handler.setCapture(HTTPCapture(owner: .init(name: "Win", path: nil), proxy: proxy, port: 49152, thumbprint: thumbprint,
+                                               os: .windows, instance: 0, since: since, guestChanged: true), vm: "Win")
+        try journal.record(.init(vm: "Win", port: 49152, thumbprint: thumbprint, systemProxy: true, since: since, path: nil), now: Date())
+        let active = try await line("active")
+        XCTAssertEqual(active, "HTTP capture: active on port 49152 since \(since); journal \(journal.url.path)")
+
+        proxy.end("alcove-proxy exited with status 2")
+        let broken = try await line("broken")
+        XCTAssertEqual(broken, "HTTP capture: active on port 49152 since \(since), but its proxy ended because alcove-proxy exited with status 2; call vm.http.stop, then vm.http.start; journal \(journal.url.path)")
+
+        await r.handler.setCapture(nil, vm: "Win")
+        await r.handler.setLostCapture("the VM stopped", vm: "Win")
+        let lost = try await line("lost")
+        XCTAssertEqual(lost, "HTTP capture: ended because the VM stopped; call vm.http.start to capture again; the guest is not restored from the capture on port 49152 since \(since); call vm.http.stop to restore it; journal \(journal.url.path)")
+
+        try journal.remove(vm: .init(name: "Win", path: nil), now: Date())
+        let restored = try await line("restored")
+        XCTAssertEqual(restored, "HTTP capture: ended because the VM stopped; call vm.http.start to capture again")
     }
 
     func testEventLogsAskForErrorsInTheWindowRequested() async throws {
@@ -1246,6 +1282,48 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(try read("video.error.txt"), "the recording in \(recording.path) has not ended within 1 s; its video is complete there when vm.record.stop has returned\n")
         await sink.gate.open()
         _ = try await stop.value
+    }
+
+    func testRecordingThatEndsDuringTheCopyIsWaitedForAndCopiedWhole() async throws {
+        let r = try await rig()
+        await r.target.setFrames((0..<300).map { blockFrame(step: $0) })
+        let recording = try await startRecording(r.handler, ["video": true, "fps": 10])
+        let source = recording.appendingPathComponent("video.mp4")
+        let growing = await eventually { await VideoRecorder.isPlayable(source) }
+        XCTAssertTrue(growing)
+        let handler = r.handler
+        DiagnosticsTiming.afterRunningVideoCopy = { _ = try? await handler.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+
+        let result = try await collect(r.handler)
+        XCTAssertTrue(files(result).contains("video.mp4"))
+        XCTAssertFalse(files(result).contains("video.error.txt"))
+        XCTAssertEqual(try Data(contentsOf: bundleDirectory().appendingPathComponent("video.mp4")), try Data(contentsOf: source))
+        let lines = try summaryLines(result)
+        XCTAssertTrue(lines.contains { $0.hasPrefix("recording: \(recording.path) (ended 20") && $0.hasSuffix("Z)") }, "\(lines)")
+        XCTAssertFalse(lines.contains { $0.hasPrefix("video.mp4:") }, "\(lines)")
+        XCTAssertEqual(lines.last, "steps that failed: none")
+    }
+
+    func testRecordingThatEndsDuringTheCopyButDoesNotFinishIsNamedEndingInTheSummary() async throws {
+        let r = try await rig()
+        DiagnosticsTiming.recordingEnd = .seconds(1)
+        let sink = GatedSink()
+        await r.handler.setRecordingSeams(RecordingSeams(makeSink: { _, _ in sink }))
+        let recording = try await startRecording(r.handler, ["video": true])
+        let handler = r.handler
+        let stop = LockedBox<Task<JSON, Error>?>(nil)
+        DiagnosticsTiming.afterRunningVideoCopy = {
+            stop.value = Task { try await handler.handle(op: "vm.record.stop", params: ["name": "Win"]) }
+            _ = await eventually("vm.record.stop waits for the video sink") { await sink.gate.arrivals == 1 }
+        }
+
+        let result = try await collect(r.handler)
+        let lines = try summaryLines(result)
+        XCTAssertTrue(lines.contains("recording: \(recording.path) (ending)"), "\(lines)")
+        XCTAssertFalse(lines.contains { $0.contains("(running)") }, "\(lines)")
+        XCTAssertEqual(try read("video.error.txt"), "the recording in \(recording.path) has not ended within 1 s; its video is complete there when vm.record.stop has returned\n")
+        await sink.gate.open()
+        _ = try await XCTUnwrap(stop.value).value
     }
 
     func testVideoLargerThanTheLimitIsLeftOutWithItsSize() async throws {

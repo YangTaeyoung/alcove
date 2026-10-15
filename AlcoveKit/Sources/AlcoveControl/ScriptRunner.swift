@@ -222,9 +222,9 @@ struct ScriptRunner: Sendable {
             if run.usedFallback { entry["usedFallback"] = true }
             if run.positional { entry["positional"] = true }
             switch outcome {
-            case .success:
+            case .success(let value):
                 entry["ok"] = true
-                held.note(step.op, step.params)
+                held.note(step.op, step.params, result: value)
             case .failure(let error):
                 entry["ok"] = false
                 entry["error"] = .string(Task.isCancelled || error is CancellationError ? ScriptRunner.cancelledDuring(number) : "\(error)")

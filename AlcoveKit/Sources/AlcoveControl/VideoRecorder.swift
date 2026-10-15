@@ -160,7 +160,11 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
         }
     }
 
-    /// Completes the file; later calls do nothing, and later frames are ignored. A writer that failed leaves the file it
+    /// One frame interval, `1 / fps` seconds.
+    private var frameInterval: CMTime { CMTime(value: 1, timescale: CMTimeScale(max(1, fps))) }
+
+    /// Completes the file, which ends one frame interval after the last appended frame so that frame is shown for that
+    /// long; later calls do nothing, and later frames are ignored. A writer that failed leaves the file it
     /// wrote when that file opens as a movie and removes it when it does not; a session without an appended frame is
     /// cancelled and its file removed; without any writer the error is that no frame could be recorded. A file this
     /// recorder's writer did not create is never removed.
@@ -197,7 +201,7 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
             return true
         }
         guard writing else { return await removeFileUnlessPlayable() }
-        writer.endSession(atSourceTime: last)
+        writer.endSession(atSourceTime: CMTimeAdd(last, frameInterval))
         await writer.finishWriting()
         let failed = lock.withLock {
             if writer.status == .failed, failure == nil { failure = describe(writer.error) }

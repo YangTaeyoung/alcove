@@ -1389,9 +1389,10 @@ call vm.record.stop first`.
 - When the control server shuts down (the app quits, also with no VM running, or
   `alcovectl serve` and `alcovectl run-script --in-process` end), every
   recording is ended and its files completed before the HTTP captures end.
-  When its VM is deleted (`vm.delete` or in the app), the recording is ended
-  and the server forgets it: `vm.record.status` answers `recording: false`
-  without `dir`, and `vm.record.stop` answers `'<vm>' is not recording`.
+  When its VM is deleted (`vm.delete` or in the app) or renamed in the app,
+  the recording is ended and the server forgets it: `vm.record.status` answers
+  `recording: false` without `dir` (under the old name and the new one), and
+  `vm.record.stop` answers `'<vm>' is not recording`.
 - `vm.record.stop` ends the recording and answers its summary: `dir`, `trace`
   (the path of `trace.jsonl`), `frames` (frame files written), `seconds`,
   `ops` (trace lines written), `writeErrors` and `lastWriteError` (frames,
@@ -1445,10 +1446,12 @@ helper is busy or does not answer at once.
 rounded down to even numbers and scaled so that the longer side is at most
 1920; a frame of another size is drawn into it aspect-fit on black. The
 screen is read `fps` times a second; a frame equal to the previous one is
-written again only after 2 s. The frame read when the recording ends closes
-the video: the video lasts until that moment and shows the last frame
-sampled before it. That read is waited for 2 s at most; without its frame the
-last sampled frame closes the video. The file is written in movie fragments of one second, so a
+written again only after 2 s. The frame read when the recording ends is the
+video's last frame, and the video ends one frame interval (1/`fps` s) after
+it, so that frame is shown for that long; `videoSeconds` counts from the
+first frame to the last, one frame interval less than the file plays. That
+read is waited for 2 s at most; without its frame the last sampled frame is
+the last one. The file is written in movie fragments of one second, so a
 copy taken while the recording runs plays up to its last whole fragment; a
 finished file is an ordinary MP4. When the video cannot be written the
 recording continues without it, `vm.record.status` shows `videoError` at
@@ -1494,6 +1497,8 @@ changing screen, `vm.record.start` and `vm.record.stop` each answered within
   is ISO 8601 in UTC from the guest's clock.
 - `truncated: true` says that more entries matched than the output holds: the
   guest prints at most 150000 bytes of entries, and the newest ones are kept.
+  Entries left out by `max` do not set it: a list of `max` entries may have
+  older matches behind it.
 
 The read has 60 s in the guest. Sentences:
 
@@ -1616,7 +1621,7 @@ fails writes `<file>.error.txt` holding its sentence, and the others go on:
 | `events.json` | the guest events the server holds | 30 s |
 | `jobs/<job>.txt` | each job of `vm.exec.list`: state, code, command (masked like `processes.json`), start time, and the end of each stream, at most 262144 bytes from a line start | 45 s for all |
 | `logs/<name>` | each of `logFiles`, named after the file | 45 s each |
-| `dumps/<file>` | the dumps of `C:\alcove-dumps` written within `sinceMinutes` of the guest's clock, newest first, while their sizes add up to at most 500 MiB (Windows) | 100 s for all |
+| `dumps/<file>` | the dumps of `C:\alcove-dumps` written within `sinceMinutes` of the guest's clock, and those whose time the guest does not report readably, newest first (those last), while their sizes add up to at most 500 MiB (Windows) | 100 s for all |
 | `doctor.json` | `vm.doctor` | 85 s |
 | `trace.jsonl` | the whole lines of the recording's trace, the newest 32 MiB | 30 s |
 | `frames/<name>` | the frame files the copied trace lines name, newest first, up to 256 MiB | 30 s |
@@ -1634,7 +1639,10 @@ of the bundle mode 0600.
 
 **The recording** is the VM's running one; else one that is ending (waited
 for up to 30 s); else the one that ended last, when it ended within
-`sinceMinutes`. Of a running recording, `video.mp4` is a copy of what the file
+`sinceMinutes`. A running recording that ends while its video is copied is
+waited for in the same way and its whole video copied; when it has not ended
+within 30 s the summary names it `(ending)` and `video.error.txt` says so.
+Of a running recording, `video.mp4` is a copy of what the file
 held when the copy began: it plays up to its last whole fragment (a note in
 the summary says so: `video.mp4: copied while recording; its last seconds may
 be missing`); in the first seconds of a recording there is none yet
@@ -1670,6 +1678,7 @@ event log Application: 3 entries of level error or worse in the last 30 minutes;
 event log System: 0 entries of level error or worse in the last 30 minutes
 jobs exited with a non-zero code: none
 process alcove-fixture: running, pid 3340
+HTTP capture: none
 recording: /Users/me/rec (running)
 frames: 10 of 10 copied
 video.mp4: copied while recording; its last seconds may be missing
@@ -1681,6 +1690,14 @@ steps that failed: none
   became of it (`collected as dumps/<file>`, or `not collected: <why>; pull it
   with vm.crash_dumps.pull`), and `crash dumps older than <n> minutes: <count>
   left out, the newest from <time>`.
+- `HTTP capture: none`; or `HTTP capture: active on port <port> since <time>`
+  (with `, but its proxy ended because <reason>; call vm.http.stop, then
+  vm.http.start` when the proxy has exited and the capture is not ended yet);
+  or `HTTP capture: ended because <reason>; call vm.http.start to capture
+  again` after a capture ended on its own. While the capture journal holds an
+  entry of the VM, `; the guest is not restored from the capture on port
+  <port> since <time>; call vm.http.stop to restore it` follows when no
+  capture runs, and `; journal <path of captures.json>` last.
 - `recording: <dir> (running | ended <time> | ending)`, `recording: <dir>
   (ended <time>; its folder no longer exists)`, or `recording: none in the
   last <n> minutes`.
@@ -2220,8 +2237,10 @@ with its own `vm.wait_for`, for up to the step's `timeout` (default 10 s, 1 to
 600) counted from the end of the op, and at least 1 s. A `vm.wait_for` step
 fails when it matches nothing. The run stops at the first failing step. A
 run that fails or is cancelled releases the buttons and keys that its
-`vm.mouse.down` and `vm.key.down` steps pressed and no later step released; a
-run that passes leaves them as its steps left them.
+`vm.mouse.down` and `vm.key.down` steps pressed and no later step released,
+also those of the steps of a `vm.batch` step that ran (a batch that stopped
+at a failed step has released its own already); a run that passes leaves
+them as its steps left them.
 
 Errors and results: everything that prevents step 1 from starting answers with
 an error (`ok: false`): an unreadable, oversized (over 4 MiB) or malformed

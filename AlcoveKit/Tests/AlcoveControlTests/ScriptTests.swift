@@ -1013,6 +1013,33 @@ final class ScriptTests: XCTestCase {
         XCTAssertEqual(ScriptTests.pressed(afterPass), ["key 59", "left"])
     }
 
+    func testAFailedRunReleasesWhatAPassedBatchStepLeftPressed() async throws {
+        let rig = try await rig()
+        let batch = "{\"op\": \"vm.batch\", \"params\": {\"steps\": [{\"op\": \"vm.key.down\", \"key\": \"ctrl\"}, " +
+            "{\"op\": \"vm.mouse.down\", \"button\": \"right\"}, {\"op\": \"vm.key.down\", \"key\": \"a\"}, " +
+            "{\"op\": \"vm.key.up\", \"key\": \"a\"}]}}"
+        let failing = "{\"op\": \"vm.key.press\", \"params\": {\"keys\": \"nosuchkey\"}}"
+        let failed = await run(rig, try script(steps([batch, failing])))
+        XCTAssertEqual(failed.failedStep, 2)
+        let afterFailure = await rig.target.sent
+        XCTAssertEqual(ScriptTests.pressed(afterFailure), [])
+        XCTAssertEqual(Array(afterFailure.suffix(3)), [.btn(con: 0, button: .right, down: false), .sync, .key(mac: 59, q: nil, down: false)])
+    }
+
+    func testAFailedRunReleasesNothingForTheStepsOfABatchThatStoppedAtAFailedStep() async throws {
+        let rig = try await rig()
+        let batch = "{\"op\": \"vm.batch\", \"params\": {\"steps\": [{\"op\": \"vm.key.down\", \"key\": \"shift\"}, " +
+            "{\"op\": \"vm.key.press\", \"keys\": \"nosuchkey\"}, {\"op\": \"vm.mouse.down\", \"button\": \"middle\"}]}}"
+        let failing = "{\"op\": \"vm.key.press\", \"params\": {\"keys\": \"nosuchkey\"}}"
+        let failed = await run(rig, try script(steps([batch, failing])))
+        XCTAssertEqual(failed.failedStep, 2)
+        let sent = await rig.target.sent
+        XCTAssertEqual(ScriptTests.pressed(sent), [])
+        XCTAssertEqual(sent.filter { if case .key = $0 { return true } else { return false } },
+                       [.key(mac: 56, q: nil, down: true), .key(mac: 56, q: nil, down: false)])
+        XCTAssertFalse(sent.contains { if case .btn = $0 { return true } else { return false } })
+    }
+
     /// The buttons and keys that `sent` leaves pressed, in the order they went down.
     private static func pressed(_ sent: [ToQEMU]) -> [String] {
         var down: [String] = []
