@@ -621,7 +621,15 @@ when they cannot be locked
 (`the Alcove data folder <dir> could not be locked (<reason>); fix its owner and access list with icacls, then run alcove-agent --install again`)
 or when Windows names no ProgramData folder
 (`the ProgramData folder could not be located (<system error>), so the Alcove data folder cannot be located; run alcove-agent --install again as an administrator`);
-it then writes no `install.log`.
+it then writes no `install.log`. The later steps fail the same way and write
+the line to `install.log` too, each with its next step:
+
+| Step | Line after `install failed: ` |
+|---|---|
+| copying the program to `C:\Program Files\Alcove` | `could not write <file> (<reason>); delete <file>, then run alcove-agent --install again from an elevated prompt`, or `the copy at <file> holds <n> bytes instead of <m>; delete <file>, then run alcove-agent --install again from an elevated prompt` |
+| creating the scheduled task | `the scheduled task AlcoveAgent could not be created (<error>: <schtasks output>); run alcove-agent --install again from an elevated prompt` |
+| adding the firewall rule | `the firewall rule AlcoveAgent for TCP port <port> could not be added (<error>: <netsh output>); run alcove-agent --install again from an elevated prompt` |
+| starting the task | `the scheduled task AlcoveAgent was created but did not start (<error>: <schtasks output>); start it with schtasks /Run /TN AlcoveAgent, or sign out and in again` |
 
 **One request at a time.** The agent hands requests to the helper one by one
 in the order they arrived. An operation's time limit (20 s; 30 s for

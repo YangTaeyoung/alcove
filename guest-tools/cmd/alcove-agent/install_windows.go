@@ -57,7 +57,7 @@ func lockDataFolder() (string, error) {
 func installAtLogon(port int, allowExec bool, peerArgs []string, dataDir string) error {
 	exe, err := os.Executable()
 	if err != nil {
-		return err
+		return selfError(err)
 	}
 	dir := `C:\Program Files\Alcove`
 	_ = os.MkdirAll(dir, 0o755)
@@ -65,7 +65,7 @@ func installAtLogon(port int, allowExec bool, peerArgs []string, dataDir string)
 	if !strings.EqualFold(exe, dst) {
 		data, err := os.ReadFile(exe)
 		if err != nil {
-			return err
+			return selfReadError(exe, err)
 		}
 		// a running copy locks the file: stop the task and any agent process first
 		_ = exec.Command("schtasks", "/End", "/TN", "AlcoveAgent").Run()
@@ -80,10 +80,14 @@ func installAtLogon(port int, allowExec bool, peerArgs []string, dataDir string)
 			time.Sleep(250 * time.Millisecond)
 		}
 		if werr != nil {
-			return fmt.Errorf("copy to %s: %w", dst, werr)
+			return copyError(dst, werr)
 		}
-		if st, err := os.Stat(dst); err != nil || st.Size() != int64(len(data)) {
-			return fmt.Errorf("copy to %s verification failed", dst)
+		st, err := os.Stat(dst)
+		if err != nil {
+			return copyCheckError(dst, 0, int64(len(data)), err)
+		}
+		if st.Size() != int64(len(data)) {
+			return copyCheckError(dst, st.Size(), int64(len(data)), nil)
 		}
 	}
 	args := fmt.Sprintf(`--port %d --log "%s"`, port, filepath.Join(dataDir, "agent.log"))
@@ -96,15 +100,15 @@ func installAtLogon(port int, allowExec bool, peerArgs []string, dataDir string)
 	tr := fmt.Sprintf(`"%s" %s`, dst, args)
 	_ = exec.Command("schtasks", "/Delete", "/TN", "AlcoveAgent", "/F").Run()
 	if out, err := exec.Command("schtasks", "/Create", "/TN", "AlcoveAgent", "/SC", "ONLOGON", "/RL", "HIGHEST", "/F", "/TR", tr).CombinedOutput(); err != nil {
-		return fmt.Errorf("schtasks: %v: %s", err, out)
+		return taskCreateError(err, out)
 	}
 	_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=AlcoveAgent").Run()
 	if out, err := exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=AlcoveAgent", "dir=in", "action=allow", "protocol=TCP", fmt.Sprintf("localport=%d", port)).CombinedOutput(); err != nil {
-		return fmt.Errorf("netsh: %v: %s", err, out)
+		return firewallError(port, err, out)
 	}
 	// start it now in this session too
 	if out, err := exec.Command("schtasks", "/Run", "/TN", "AlcoveAgent").CombinedOutput(); err != nil {
-		return fmt.Errorf("schtasks run: %v: %s", err, out)
+		return taskRunError(err, out)
 	}
 	return nil
 }
