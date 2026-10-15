@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TOOLSETS, selectedToolsets, clip, registrar, text, fail } from "./toolkit.js";
+import fs from "node:fs";
+import { TOOLSETS, OP_TOOLS, selectedToolsets, clip, registrar, text, fail, type Registrar } from "./toolkit.js";
 import { ControlError } from "./control.js";
+import { textOf } from "./test-rig.js";
+import { register as core } from "./tools/core.js";
+import { register as actions } from "./tools/actions.js";
+import { register as shell } from "./tools/shell.js";
+import { register as files } from "./tools/files.js";
+import { register as state } from "./tools/state.js";
+import { register as ui } from "./tools/ui.js";
+import { register as evidence } from "./tools/evidence.js";
+import { register as replay } from "./tools/replay.js";
+import { register as http } from "./tools/http.js";
 
 test("unset or empty selects all toolsets", () => {
   assert.deepEqual([...selectedToolsets(undefined)].sort(), [...TOOLSETS].sort());
@@ -36,6 +47,33 @@ test("registrar registers tools of enabled toolsets and skips the others", () =>
   r.tool("core", "a", {}, handler);
   r.tool("shell", "b", {}, handler);
   assert.deepEqual(seen, ["a"]);
+});
+
+test("fail names tools and tool parameters in server sentences", () => {
+  const said = (message: string): string => textOf(fail(new ControlError(message)));
+  assert.equal(said("no VM named 'Win'; call vm.list"), "no VM named 'Win'; call alcove_list_vms");
+  assert.equal(said("wait until vm.status shows stopped, then call vm.start"), "wait until alcove_vm_status shows stopped, then call alcove_start_vm");
+  assert.equal(
+    said("call vm.http.stop again once vm.status shows tools; vm.exec.start, vm.http.rule.add and script.run are refused."),
+    "call alcove_http_capture_stop again once alcove_vm_status shows tools; alcove_exec_start, alcove_http_rule and alcove_script_run are refused.",
+  );
+  assert.equal(said("missing or invalid parameter 'hostPort'"), "missing or invalid parameter 'host_port'");
+  assert.equal(said("parameter 'keyboardLayouts' must be an array"), "parameter 'keyboard_layouts' must be an array");
+  assert.equal(said("missing or invalid parameter 'name'"), "missing or invalid parameter 'name'");
+  assert.equal(said("vm.unknown failed; see C:\\vm.list and my-vm.status"), "vm.unknown failed; see C:\\vm.list and my-vm.status");
+  assert.equal(textOf(fail(new Error("vm.list broke"))), "unexpected error: Error: vm.list broke");
+});
+
+test("every op the control server knows maps to a registered tool", () => {
+  const swift = fs.readFileSync(new URL("../../AlcoveKit/Sources/AlcoveControl/ControlHandler.swift", import.meta.url), "utf8");
+  const known = /static let knownOps: \[String\] = \[([\s\S]*?)\]/.exec(swift);
+  assert.ok(known, "knownOps in ControlHandler.swift");
+  const ops = [...known[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).filter((op) => op !== "hello");
+  assert.deepEqual(Object.keys(OP_TOOLS).sort(), ops.sort());
+  const tools = new Set<string>();
+  const stub: Registrar = { tool: (_set, name) => { tools.add(name); } };
+  for (const register of [core, actions, shell, files, state, ui, evidence, replay, http]) register(stub, {} as never);
+  for (const [op, tool] of Object.entries(OP_TOOLS)) assert.ok(tools.has(tool), `${op} -> ${tool}`);
 });
 
 test("text carries structured content and fail marks errors", () => {

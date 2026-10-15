@@ -69,8 +69,54 @@ export function text(t: string, structured?: Record<string, unknown>): ToolResul
   return { content: [{ type: "text", text: t }], ...(structured ? { structuredContent: structured } : {}) };
 }
 
+/** The tool that sends each control op; `vm.status` is `alcove_vm_status`. */
+export const OP_TOOLS: Readonly<Record<string, string>> = {
+  "vm.list": "alcove_list_vms", "vm.status": "alcove_vm_status", "vm.start": "alcove_start_vm", "vm.stop": "alcove_stop_vm",
+  "vm.pause": "alcove_pause_vm", "vm.resume": "alcove_resume_vm", "vm.screenshot": "alcove_screenshot",
+  "vm.clone": "alcove_clone_vm", "vm.delete": "alcove_delete_vm",
+  "vm.mouse.move": "alcove_move_mouse", "vm.mouse.click": "alcove_click", "vm.mouse.drag": "alcove_drag", "vm.mouse.scroll": "alcove_scroll",
+  "vm.mouse.down": "alcove_mouse_down", "vm.mouse.up": "alcove_mouse_up",
+  "vm.key.press": "alcove_press_keys", "vm.key.down": "alcove_key_down", "vm.key.up": "alcove_key_up", "vm.type": "alcove_type",
+  "vm.batch": "alcove_batch",
+  "vm.exec": "alcove_exec", "vm.exec.start": "alcove_exec_start", "vm.exec.read": "alcove_exec_read", "vm.exec.write": "alcove_exec_write",
+  "vm.exec.kill": "alcove_exec_kill", "vm.exec.list": "alcove_exec_list",
+  "vm.process.list": "alcove_process_list", "vm.process.kill": "alcove_process_kill",
+  "vm.clipboard.get": "alcove_get_clipboard", "vm.clipboard.set": "alcove_set_clipboard",
+  "vm.push_file": "alcove_push_file", "vm.pull_file": "alcove_pull_file", "vm.sync_dir": "alcove_sync_dir",
+  "vm.fs.list": "alcove_fs_list", "vm.fs.read": "alcove_fs_read", "vm.fs.write": "alcove_fs_write", "vm.fs.delete": "alcove_fs_delete",
+  "vm.snapshot.list": "alcove_snapshot_list", "vm.snapshot.create": "alcove_snapshot_create",
+  "vm.snapshot.restore": "alcove_snapshot_restore", "vm.snapshot.delete": "alcove_snapshot_delete",
+  "vm.forward.add": "alcove_port_forward_add", "vm.forward.remove": "alcove_port_forward_remove", "vm.forward.list": "alcove_port_forward_list",
+  "vm.set_network": "alcove_set_network", "vm.lease.acquire": "alcove_lease_acquire", "vm.lease.release": "alcove_lease_release",
+  "vm.set_resolution": "alcove_set_resolution", "vm.wait_idle": "alcove_wait_idle", "vm.wait_for": "alcove_wait_for",
+  "vm.set_environment": "alcove_set_environment", "vm.doctor": "alcove_doctor", "vm.find_text": "alcove_find_text",
+  "vm.event_log": "alcove_event_log", "vm.crash_dumps.enable": "alcove_crash_dumps", "vm.crash_dumps.disable": "alcove_crash_dumps",
+  "vm.crash_dumps.list": "alcove_crash_dumps", "vm.crash_dumps.pull": "alcove_crash_dumps",
+  "vm.record.start": "alcove_record_start", "vm.record.stop": "alcove_record_stop", "vm.record.status": "alcove_record_status",
+  "script.run": "alcove_script_run", "script.save": "alcove_script_save",
+  "vm.window.list": "alcove_list_windows", "vm.window.action": "alcove_window_action", "vm.ui.tree": "alcove_ui_tree",
+  "vm.ui.find": "alcove_ui_find", "vm.ui.text": "alcove_ui_get_text", "vm.ui.click": "alcove_ui_click", "vm.ui.type": "alcove_ui_type",
+  "vm.ui.action": "alcove_ui_action", "vm.app.launch": "alcove_launch_app", "vm.deploy": "alcove_deploy", "vm.events": "alcove_events",
+  "vm.collect_diagnostics": "alcove_collect_diagnostics",
+  "vm.http.start": "alcove_http_capture_start", "vm.http.stop": "alcove_http_capture_stop", "vm.http.requests": "alcove_http_requests",
+  "vm.http.request": "alcove_http_requests", "vm.http.clear": "alcove_http_requests",
+  "vm.http.rule.add": "alcove_http_rule", "vm.http.rule.list": "alcove_http_rule", "vm.http.rule.remove": "alcove_http_rule",
+  "vm.http.rule.clear": "alcove_http_rule",
+};
+
+/**
+ * `sentence` with each op name of `OP_TOOLS` replaced by its tool and each `parameter '<camelCase>'` by the snake_case
+ * name; an op name that follows a letter, digit, `.`, `-`, `/` or `\` is part of another word and stays.
+ */
+export function toolSentence(sentence: string): string {
+  return sentence
+    .replace(/(?<![\w./\\-])(?:vm|script)(?:\.[a-z_]+)+/g, (op) => OP_TOOLS[op] ?? op)
+    .replace(/\bparameter '([a-z][A-Za-z0-9]*)'/g, (_, name: string) => `parameter '${name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)}'`);
+}
+
+/** An error result: a ControlError's sentence with tool and parameter names (`toolSentence`), anything else as an unexpected error. */
 export function fail(e: unknown): ToolResult {
-  const msg = e instanceof ControlError ? e.message : `unexpected error: ${String(e)}`;
+  const msg = e instanceof ControlError ? toolSentence(e.message) : `unexpected error: ${String(e)}`;
   return { content: [{ type: "text", text: msg }], isError: true };
 }
 

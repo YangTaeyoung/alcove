@@ -113,7 +113,7 @@ test("alcove_lease_release clears the stored token when the VM does not exist", 
   leases.set("Win", "tok-1");
   const r = await run("alcove_lease_release", { name: "Win" });
   assert.equal(r.isError, true);
-  assert.equal(textOf(r), "no VM named 'Win'; call vm.list");
+  assert.equal(textOf(r), "no VM named 'Win'; call alcove_list_vms");
   assert.equal(leases.get("Win"), undefined);
 });
 

@@ -165,7 +165,7 @@ test("a client timeout says that the run may still be going in the guest", async
   assert.equal(r.isError, true);
   assert.equal(
     textOf(r),
-    "script.run timed out after 7925 s. The run may still be going in the guest and holding the VM's lease; look with alcove_vm_status or alcove_screenshot, wait for it to end, then run the script again.",
+    "alcove_script_run timed out after 7925 s. The run may still be going in the guest and holding the VM's lease; look with alcove_vm_status or alcove_screenshot, wait for it to end, then run the script again.",
   );
 });
 
