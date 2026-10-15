@@ -46,11 +46,11 @@ jobs:
         working-directory: AlcoveKit
         run: swift build --build-tests
 
-      # No filter needed: VMControllerTests calls XCTSkipIf in setUpWithError
-      # when EngineLocator finds no build/qemu-build, so its 3 end-to-end cases
-      # are skipped, not failed. Everything else (119 tests) runs against fakes
-      # — VMControllerFakeEngineTests drives a python3 stand-in for
-      # qemu-system-aarch64, and python3 is preinstalled on the image.
+      # Runs every AlcoveKit test without a filter. Tests that boot the real
+      # engine call XCTSkip when EngineLocator finds no build/qemu-build, so
+      # they are skipped here; the rest run against fakes, such as the python3
+      # stand-in for qemu-system-aarch64 that VMControllerFakeEngineTests drives
+      # (python3 is preinstalled on the image).
       - name: Test
         working-directory: AlcoveKit
         run: swift test --skip-build
