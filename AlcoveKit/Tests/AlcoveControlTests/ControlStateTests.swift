@@ -137,6 +137,8 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(sentence, "no VM named 'A'; call vm.list")
         XCTAssertEqual(ControlHandler.failureReason(VMBundle.CloneError.sourceRunning("A"), fallback: "x"), "'A' is running; stop it before cloning it")
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.remote("denied"), fallback: "x"), "denied")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.remote("exec disabled; list them with proc.list, then call fs.read 'fs.read'"), fallback: "x"),
+                       "exec disabled; list them with vm.process.list, then call vm.fs.read 'fs.read'")
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.tokenMismatch, fallback: "x"),
                        "the guest tools refused the connection token; reinstall alcove-agent in the guest")
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.connect("refused"), fallback: "x"),

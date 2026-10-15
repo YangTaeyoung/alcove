@@ -293,7 +293,8 @@ extension ControlHandler {
         }
     }
 
-    /// A sentence for any failure: engine errors through `engineReason`, errors that carry their own sentence
+    /// A sentence for any failure: engine errors through `engineReason`, an agent's error sentence with the agent ops it
+    /// names replaced by their control ops (`namingControlOps`), errors that carry their own sentence
     /// (`ControlError`, `LocalizedError`, `CustomStringConvertible`) as they are, `fallback` for the rest.
     nonisolated static func failureReason(_ error: Error, fallback: String) -> String {
         switch error {
@@ -306,7 +307,7 @@ extension ControlHandler {
         case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected:
             return "the guest tools are not connected; check vm.status"
         case AgentClient.AgentError.timeout(let what): return "the guest tools did not answer \(what) in time; check vm.status and retry"
-        case AgentClient.AgentError.remote(let message): return message
+        case AgentClient.AgentError.remote(let message): return ControlHandler.namingControlOps(message)
         case AgentClient.AgentError.unsupported(let what): return "the guest tools do not support \(what); update alcove-agent in the guest"
         case KeyNames.KeyError.unknownKey(let key): return "unknown key '\(key)'; use a key name such as ctrl, shift, enter or a letter"
         case KeyNames.KeyError.untypableCharacter(let ch): return "cannot type '\(ch)' with the US keyboard layout"
