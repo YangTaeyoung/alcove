@@ -41,6 +41,7 @@ func testEnvInputs(t *testing.T) windowsEnvInputs {
 		},
 		folders:     folders,
 		programData: `D:\ProgramData`,
+		public:      `D:\Users\Public`,
 		profile:     `D:\Users\alcove`,
 		user:        "alcove",
 		domain:      "DESKTOP-1",
@@ -68,6 +69,7 @@ func TestTheWindowsChildEnvironmentIsBuiltFromTheMachineAndTheProfile(t *testing
 	plantInAgentEnvironment(t)
 	got := windowsChildEnv(testEnvInputs(t))
 	want := []string{
+		`ALLUSERSPROFILE=D:\ProgramData`,
 		`APPDATA=D:\Users\alcove\AppData\Roaming`,
 		`CommonProgramFiles=D:\Program Files\Common Files`,
 		`COMPUTERNAME=DESKTOP-1`,
@@ -85,6 +87,7 @@ func TestTheWindowsChildEnvironmentIsBuiltFromTheMachineAndTheProfile(t *testing
 		`ProgramFiles=D:\Program Files`,
 		`ProgramFiles(x86)=D:\Program Files (x86)`,
 		`PSModulePath=D:\Program Files\WindowsPowerShell\Modules;D:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules`,
+		`PUBLIC=D:\Users\Public`,
 		`SystemDrive=D:`,
 		`SystemRoot=D:\WINDOWS`,
 		`TEMP=D:\Users\alcove\AppData\Local\Temp`,
@@ -133,11 +136,12 @@ func TestAMachineValueExpandsTheMachinesOwnTextValuesOneLevel(t *testing.T) {
 
 func TestTheWindowsChildEnvironmentLeavesOutWhatTheAccountDoesNotName(t *testing.T) {
 	in := testEnvInputs(t)
-	in.user, in.domain, in.computer, in.programData = "", "", "", ""
+	in.user, in.domain, in.computer, in.programData, in.public = "", "", "", "", ""
+	in.machine = append(in.machine, sysfolder.Value{Name: "ALLUSERSPROFILE", Text: `C:\ProgramData`}, sysfolder.Value{Name: "PUBLIC", Text: `C:\Users\Public`})
 	for _, kv := range windowsChildEnv(in) {
 		name, _, _ := strings.Cut(kv, "=")
 		switch strings.ToUpper(name) {
-		case "USERNAME", "USERDOMAIN", "COMPUTERNAME", "PROGRAMDATA":
+		case "USERNAME", "USERDOMAIN", "COMPUTERNAME", "PROGRAMDATA", "ALLUSERSPROFILE", "PUBLIC":
 			t.Errorf("%s is set without a value of its own", kv)
 		}
 	}

@@ -64,7 +64,7 @@ func TestTheChildEnvironmentTakesNothingFromTheAgentsEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"COR_ENABLE_PROFILING", "COR_PROFILER", "DOTNET_STARTUP_HOOKS", "PSModuleAnalysisCachePath", "PATH", "PATHEXT", "ComSpec", "TEMP", "TMP",
 		"USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "windir", "SystemDrive", "ProgramData",
-		"ProgramFiles", "USERNAME", "USERDOMAIN", "COMPUTERNAME"} {
+		"ProgramFiles", "USERNAME", "USERDOMAIN", "COMPUTERNAME", "ALLUSERSPROFILE", "PUBLIC"} {
 		t.Setenv(name, dir)
 	}
 	got, err := childEnvironment()
@@ -87,8 +87,11 @@ func TestTheChildEnvironmentTakesNothingFromTheAgentsEnvironment(t *testing.T) {
 	if envValue(want, "OS") != "Windows_NT" {
 		t.Errorf("OS is %q", envValue(want, "OS"))
 	}
+	if envValue(want, "ALLUSERSPROFILE") != envValue(want, "ProgramData") {
+		t.Errorf("ALLUSERSPROFILE is %q, ProgramData %q", envValue(want, "ALLUSERSPROFILE"), envValue(want, "ProgramData"))
+	}
 	for _, name := range []string{"Path", "PATHEXT", "ComSpec", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "SystemRoot", "windir",
-		"SystemDrive", "ProgramData", "ProgramFiles", "COMPUTERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA"} {
+		"SystemDrive", "ProgramData", "ProgramFiles", "COMPUTERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "PUBLIC"} {
 		if envValue(want, name) == "" {
 			t.Errorf("%s is missing from %q", name, want)
 		}

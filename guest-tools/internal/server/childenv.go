@@ -17,6 +17,8 @@ type windowsEnvInputs struct {
 	folders map[string]string
 	// programData is the ProgramData folder of the ProfileList key, or "".
 	programData string
+	// public is the Public folder of the ProfileList key, or "".
+	public string
 	// profile is the profile folder of the agent's account, from the
 	// ProfileList key.
 	profile string
@@ -34,7 +36,8 @@ var systemFolderVariables = []string{"SystemRoot", "windir", "SystemDrive", "Pro
 // takes from the account and the system folders and never from the machine
 // values.
 var sessionVariables = map[string]bool{"USERNAME": true, "USERDOMAIN": true, "COMPUTERNAME": true, "USERPROFILE": true,
-	"HOMEDRIVE": true, "HOMEPATH": true, "APPDATA": true, "LOCALAPPDATA": true, "TEMP": true, "TMP": true, "PROGRAMDATA": true}
+	"HOMEDRIVE": true, "HOMEPATH": true, "APPDATA": true, "LOCALAPPDATA": true, "TEMP": true, "TMP": true, "PROGRAMDATA": true,
+	"ALLUSERSPROFILE": true, "PUBLIC": true}
 
 // windowsChildEnv returns the base environment of the processes the agent
 // starts on Windows, sorted by the upper-case names:
@@ -45,8 +48,9 @@ var sessionVariables = map[string]bool{"USERNAME": true, "USERDOMAIN": true, "CO
 //     machinePathFolders keeps with those variables;
 //   - USERNAME, USERDOMAIN and COMPUTERNAME; USERPROFILE, HOMEDRIVE and
 //     HOMEPATH of the profile, APPDATA (its AppData\Roaming), LOCALAPPDATA
-//     (its AppData\Local), TEMP and TMP (LOCALAPPDATA\Temp); ProgramData;
-//     each of these is left out when its input is "";
+//     (its AppData\Local), TEMP and TMP (LOCALAPPDATA\Temp); ProgramData
+//     and ALLUSERSPROFILE of programData; PUBLIC; each of these is left out
+//     when its input is "";
 //   - the systemFolderVariables that folders holds, replacing a machine
 //     value of the same name without regard to case.
 func windowsChildEnv(in windowsEnvInputs) []string {
@@ -70,7 +74,8 @@ func windowsChildEnv(in windowsEnvInputs) []string {
 		}
 		set(v.Name, text)
 	}
-	for name, value := range map[string]string{"USERNAME": in.user, "USERDOMAIN": in.domain, "COMPUTERNAME": in.computer, "ProgramData": in.programData} {
+	for name, value := range map[string]string{"USERNAME": in.user, "USERDOMAIN": in.domain, "COMPUTERNAME": in.computer,
+		"ProgramData": in.programData, "ALLUSERSPROFILE": in.programData, "PUBLIC": in.public} {
 		if value != "" {
 			set(name, value)
 		}

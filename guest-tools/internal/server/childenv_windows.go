@@ -10,8 +10,8 @@ import (
 )
 
 // childEnvironment returns windowsChildEnv of this machine: the values of
-// sessionEnvironmentKey, sysfolder.MachineVars, the ProgramData value of
-// the ProfileList key, the profile folder of the agent's account
+// sessionEnvironmentKey, sysfolder.MachineVars, the ProgramData and Public
+// values of the ProfileList key, the profile folder of the agent's account
 // (sysfolder.ProfileFolder of the SID of its token), the account's name and
 // domain (LookupAccountSidW of that SID) and the computer name
 // (GetComputerNameW). No environment variable is read.
@@ -36,6 +36,9 @@ func childEnvironment() ([]string, error) {
 	in := windowsEnvInputs{machine: machine, folders: folders, profile: profile}
 	if raw, err := sysfolder.MachineString(sysfolder.ProfileListKey, "ProgramData"); err == nil {
 		in.programData, _ = sysfolder.Expand(raw, folders)
+	}
+	if raw, err := sysfolder.MachineString(sysfolder.ProfileListKey, "Public"); err == nil {
+		in.public, _ = sysfolder.Expand(raw, folders)
 	}
 	in.user, in.domain, _, _ = sid.sid.LookupAccount("")
 	in.computer, _ = syscall.ComputerName()

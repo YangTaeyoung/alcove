@@ -531,8 +531,10 @@ starts with an environment the agent builds when the request arrives:
   `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList` expanded
   from the system folders; `APPDATA` (`<profile>\AppData\Roaming`),
   `LOCALAPPDATA` (`<profile>\AppData\Local`), `TEMP` and `TMP`
-  (`<profile>\AppData\Local\Temp`); `ProgramData` (the `ProgramData` value
-  of that key); `SystemRoot`, `windir`, `SystemDrive`, `ProgramFiles`,
+  (`<profile>\AppData\Local\Temp`); `ProgramData` and `ALLUSERSPROFILE`
+  (the `ProgramData` value of that key) and `PUBLIC` (its `Public` value),
+  both expanded from the system folders; `SystemRoot`, `windir`,
+  `SystemDrive`, `ProgramFiles`,
   `ProgramFiles(x86)`, `ProgramW6432`, `CommonProgramFiles`,
   `CommonProgramFiles(x86)` and `CommonProgramW6432` of the system folders.
 - The request's `env` after it: a name given there replaces one of the same
@@ -540,8 +542,8 @@ starts with an environment the agent builds when the request arrives:
 
 Folder redirection of `AppData`, the user's own variables and `PATH`
 entries (such as `%LOCALAPPDATA%\Microsoft\WindowsApps`, which holds app
-execution aliases like `winget.exe`), `OneDrive`, `PUBLIC`,
-`ALLUSERSPROFILE`, `LOGONSERVER` and `SESSIONNAME` are not part of it, and
+execution aliases like `winget.exe`), `OneDrive`, `LOGONSERVER` and
+`SESSIONNAME` are not part of it, and
 neither is a `PSModuleAnalysisCachePath` other than the machine's: pass what
 a command needs with `env`, or the full path of a program. A change an
 installer makes to the machine's variables reaches the next command without
