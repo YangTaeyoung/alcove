@@ -1734,7 +1734,7 @@ runs at a time; the others wait for it.
 | Param | Default | Meaning |
 |---|---|---|
 | `hosts` | all hosts | array of host globs (`*` matches any run of characters), e.g. `["api.example.com", "*.corp.net"]`; other hosts are tunnelled and recorded as `tunnel` rows with byte counts only |
-| `secrets` | `false` | keep the values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `x-api-key` and `api-key`; without it they are stored as `<redacted n chars>` |
+| `secrets` | `false` | keep the values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `x-api-key` and `api-key`; without it they are stored as `<redacted n chars>`. Other headers (such as `X-Auth-Token`, `X-Amz-Security-Token` or `X-Goog-Api-Key`) and query strings are stored as sent, with or without it |
 | `bodies` | `true` | keep request and response bodies |
 | `systemProxy` | `true` | point the guest's system proxy at the capture (Windows) |
 
@@ -1869,9 +1869,11 @@ newest 2000 exchanges. The bodies and headers of the stored exchanges and the
 bodies of exchanges in flight take at most 256 MiB together; beyond that the
 oldest exchanges lose their bodies and report `bodyDropped: true`, and an
 exchange in flight keeps no more of its body when no stored body is left to
-drop. A streamed response (server-sent events, a chunked model reply) is
-passed to the guest as each piece arrives; the capture holds it once it has
-ended.
+drop. The number of concurrent proxy connections is not limited, and the
+headers of exchanges in flight (up to 1 MiB of request headers and 1 MiB of
+response headers each) count outside that budget. A streamed response
+(server-sent events, a chunked model reply) is passed to the guest as each
+piece arrives; the capture holds it once it has ended.
 
 A WebSocket (an HTTP/1.1 request with `Connection: upgrade` and `Upgrade:
 websocket`) passes through: the upgrade request goes through the rules like
