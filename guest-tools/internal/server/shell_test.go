@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -333,6 +334,7 @@ func TestEventNeverPrecedesHello(t *testing.T) {
 				return
 			default:
 				s.emit("tick", proto.Message{})
+				runtime.Gosched()
 			}
 		}
 	}()
