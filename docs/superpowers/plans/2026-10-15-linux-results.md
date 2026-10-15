@@ -193,3 +193,27 @@ linux/arm64, pass in the guest as root and as `alcove`; as root
 ownership (uid and gid 65534 for every created folder and file, an existing
 file kept as root). End state: VM stopped, control server stopped, the test
 files and links removed from the guest.
+
+### Fix round 2 (2026-10-15)
+
+The same VM and base (fa0f23e); the agent installed over the running one
+(`installed`, pid 1135 → 3003). Guest facts read for the round:
+`systemd-run --version` → `systemd 259 (259.5-0ubuntu3.4)` (the scope and
+`--expand-environment=no` are used from 254 on; an older systemd starts
+launches and the clipboard writer without the scope),
+`sysctl fs.protected_hardlinks` → `1`, `fs.protected_symlinks` → `1`.
+
+| Change | Before | After |
+|---|---|---|
+| Launch through the scope (systemd ≥ 254) | `--expand-environment=no` passed whatever the version | `gnome-text-editor` in `user@1000.service/app.slice/run-p3747-….scope`, sid = pid, user `alcove` |
+| Relative program and the scope | `./run.sh cwd=apps` was looked up in the agent's folder and started without the scope | `vm.app.launch path=./run.sh args=["$HOME"] cwd=apps` → the script ran in `run-p3813-….scope` and wrote `ran $HOME` (the argument passed as written) |
+| Clipboard | — | `vm.clipboard.set` `round 2 한글` → `vm.clipboard.get` the same text |
+| Home write | — | `vm.sync_dir guestPath=proj` → `proj`, `proj/src` `alcove:alcove 755`, `a.c` `alcove:alcove 644` (folders given by a chown that does not follow links) |
+| Absolute link in the home | `the path leads out of the home folder …` for a link that stays in the home | `~/abslink` → `/home/alcove/Documents/real`: `vm.fs.write ~/abslink/x.txt` → `cannot open '/home/alcove/abslink/x.txt' for writing: '/home/alcove/abslink' is a link with the absolute target '/home/alcove/Documents/real', and the agent follows only relative links inside the home folder of the desktop user; make it a relative link or pass the path it leads to` |
+| Hard link of a root file | written through as root | as `alcove`, `ln /var/tmp/alcove-r2-secret ~/hl` → `Permission denied` (`protected_hardlinks`); a hard link root made in the home: `vm.fs.write ~/hl-root` → `cannot open '/home/alcove/hl-root' for writing: it has other hard links and does not belong to alcove, so it may be a file outside the home folder of the desktop user; write to that file's own path`; the root file still reads `secret` |
+
+The Go test binaries of `internal/server`, `internal/clipboard` and
+`internal/session` pass in the guest as root and as `alcove`; as root
+`TestEntriesCreatedInTheHomeBelongToTheSessionUser` and
+`TestAHardLinkedFileOfTheSessionUserIsWritten` ran. End state: VM stopped,
+control server stopped, test files, links and binaries removed from the guest.
