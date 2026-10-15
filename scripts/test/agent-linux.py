@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """End-to-end test of the guest agent inside the Ubuntu 24.04 bundle
 (ssh forward 2223->22 with the test key, agent forward 7647->7645). The host
-side authenticates with the agentKey of the bundle's config.json."""
-import base64, hashlib, json, os, socket, subprocess, sys, time
+side authenticates with the agentKey of the bundle's config.json.
+
+Usage: agent-linux.py [--vm NAME]
+"""
+import argparse, base64, hashlib, json, os, socket, subprocess, sys, time
 
 sys.dont_write_bytecode = True
 from agent_key import AgentKeyError, agent_key, check_answer, first_message
@@ -45,6 +48,10 @@ class Agent:
 
 
 def main():
+    global VM
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--vm", default=VM)
+    VM = ap.parse_args().vm
     vm = subprocess.Popen([CTL, "run", VM, "--seconds", "400"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         for _ in range(60):
