@@ -121,6 +121,8 @@ test("descriptions name what the control ops need and do", () => {
   assert.doesNotMatch(core.get("alcove_list_vms")!, /paused, suspended/);
   assert.match(core.get("alcove_screenshot")!, /region and window exclude each other/);
   assert.match(core.get("alcove_start_vm")!, /session ends/);
+  assert.match(core.get("alcove_start_vm")!, /refuse the host/);
+  assert.match(core.get("alcove_vm_status")!, /`toolsRefused`/);
 });
 
 test("parameter descriptions carry the path rules the server enforces", () => {

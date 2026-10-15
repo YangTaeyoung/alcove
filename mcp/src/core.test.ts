@@ -37,3 +37,11 @@ test("alcove_start_vm sends waitTools 0 when wait_for_tools is false", async () 
   await run("alcove_start_vm", { name: "Win", wait_for_tools: false });
   assert.deepEqual(calls, [{ op: "vm.start", params: { name: "Win", waitTools: 0 } }]);
 });
+
+test("alcove_start_vm stops waiting and prints the sentence when the guest tools refuse the host", async () => {
+  const sentence = "this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later";
+  const { run, calls } = rig(register, { state: "running", ephemeral: false, tools: false, toolsRefused: sentence });
+  const r = await run("alcove_start_vm", { name: "Win", wait_timeout_s: 1 });
+  assert.equal(textOf(r), `Win: running; guest tools refused the connection: ${sentence}`);
+  assert.deepEqual(calls.map((c) => c.op), ["vm.start", "vm.status"]);
+});
