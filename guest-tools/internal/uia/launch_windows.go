@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/logfile"
 )
 
 //go:embed assets/bootstrap.ps1
@@ -67,7 +69,7 @@ func DefaultLauncher(dir string, logf func(format string, args ...any)) Launcher
 		if err != nil {
 			return nil, notStarted(err)
 		}
-		logFile, err := openCappedLog(filepath.Join(dir, "helper.log"), maxLogBytes)
+		logFile, err := logfile.Open(filepath.Join(dir, "helper.log"), logfile.MaxBytes, nil)
 		if err != nil {
 			return nil, notPrepared(dir, err)
 		}

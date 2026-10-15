@@ -1,4 +1,4 @@
-package uia
+package logfile
 
 import (
 	"bytes"
@@ -21,7 +21,7 @@ func TestCappedLogAppendsToAnExistingFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	l, err := openCappedLog(path, 100)
+	l, err := Open(path, 100, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestCappedLogAppendsToAnExistingFile(t *testing.T) {
 
 func TestCappedLogMovesAFullFileAside(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "helper.log")
-	l, err := openCappedLog(path, 10)
+	l, err := Open(path, 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestCappedLogMovesAFullFileAside(t *testing.T) {
 
 func TestCappedLogKeepsTheEndOfAnOversizedWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "helper.log")
-	l, err := openCappedLog(path, 8)
+	l, err := Open(path, 8, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestCappedLogStartsOverWhenTheFileCannotBeMoved(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(path+".1", "blocker"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	l, err := openCappedLog(path, 10)
+	l, err := Open(path, 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,46 +97,13 @@ func TestCappedLogStartsOverWhenTheFileCannotBeMoved(t *testing.T) {
 	}
 }
 
-func TestCappedLogKeepsAcceptingWritesWhileTheFileCannotBeOpened(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "uia")
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "helper.log")
-	l, err := openCappedLog(path, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	if _, err := l.Write([]byte("aaaaaa")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-	for _, s := range []string{"bbbbbb", "cccccc"} {
-		if n, err := l.Write([]byte(s)); n != len(s) || err != nil {
-			t.Fatalf("Write(%q) without the folder returned %d, %v", s, n, err)
-		}
-	}
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := l.Write([]byte("dddddd")); n != 6 || err != nil {
-		t.Fatalf("Write with the folder back returned %d, %v", n, err)
-	}
-	if got := string(readFile(t, path)); got != "dddddd" {
-		t.Fatalf("file holds %q", got)
-	}
-}
-
 func TestCappedLogAppendsAfterStartingOver(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "helper.log")
 	if err := os.MkdirAll(filepath.Join(path+".1", "blocker"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	l, err := openCappedLog(path, 10)
+	l, err := Open(path, 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,8 +129,40 @@ func TestCappedLogAppendsAfterStartingOver(t *testing.T) {
 	}
 }
 
+func TestTheFileKeptAfterAStartOverIsOpenedForAppendingOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "helper.log")
+	if err := os.MkdirAll(filepath.Join(path+".1", "blocker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var flags []int
+	open := func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		flags = append(flags, flag)
+		return os.OpenFile(name, flag, perm)
+	}
+	l, err := Open(path, 10, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	for _, s := range []string{"aaaaaa", "bbbbbb"} {
+		if _, err := l.Write([]byte(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(flags) < 2 {
+		t.Fatalf("opens %v", flags)
+	}
+	if last := flags[len(flags)-1]; last&os.O_APPEND == 0 || last&os.O_TRUNC != 0 {
+		t.Fatalf("the file kept for writing was opened with flags %#x", last)
+	}
+	if got := string(readFile(t, path)); got != "bbbbbb" {
+		t.Fatalf("file holds %q", got)
+	}
+}
+
 func TestCappedLogWriteAfterCloseFails(t *testing.T) {
-	l, err := openCappedLog(filepath.Join(t.TempDir(), "helper.log"), 10)
+	l, err := Open(filepath.Join(t.TempDir(), "helper.log"), 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
