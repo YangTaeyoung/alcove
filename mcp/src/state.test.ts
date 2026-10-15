@@ -152,3 +152,11 @@ test("alcove_set_environment text names the offered display scale steps and the 
   assert.match(cfg.description ?? "", /alcove_set_resolution/);
   assert.match(cfg.inputSchema?.dpi_scale?.description ?? "", /100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450 or 500/);
 });
+
+test("alcove_set_resolution prints the warning of a guest that set another mode", async () => {
+  const warning = "the guest set 1280x800, not 1366x768; it does not offer that mode";
+  const r = await rig({ width: 1280, height: 800, warning }).run("alcove_set_resolution", { name: "Win", width: 1366, height: 768 });
+  assert.equal(textOf(r), `Win: screen is now 1280x800\nwarning: ${warning}`);
+  const plain = await rig({ width: 1366, height: 768 }).run("alcove_set_resolution", { name: "Win", width: 1366, height: 768 });
+  assert.equal(textOf(plain), "Win: screen is now 1366x768");
+});

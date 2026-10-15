@@ -86,9 +86,9 @@ test("unknown batch op throws naming the valid ones", () => {
 
 const textOf = (r: { content: Array<{ type: string; text?: string }> }) => r.content[0].text;
 
-test("observationError renders as a line after the action line without isError", () => {
+test("observationError renders with tool names as a line after the action line without isError", () => {
   const r = actionResult("clicked", { observationError: "the screen could not be read after vm.mouse.click; call vm.screenshot to see the result" });
-  assert.equal(textOf(r), "clicked\nscreen not read after the action: the screen could not be read after vm.mouse.click; call vm.screenshot to see the result");
+  assert.equal(textOf(r), "clicked\nscreen not read after the action: the screen could not be read after alcove_click; call alcove_screenshot to see the result");
   assert.equal((r as { isError?: boolean }).isError, undefined);
 });
 

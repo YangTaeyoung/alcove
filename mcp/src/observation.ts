@@ -2,7 +2,7 @@
 // the parameters that ask for it.
 import { z } from "zod";
 import { ControlError } from "./control.js";
-import { UI_FACTS_BUDGET_MS, type ToolResult } from "./toolkit.js";
+import { UI_FACTS_BUDGET_MS, toolSentence, type ToolResult } from "./toolkit.js";
 
 export interface TextContent { type: "text"; text: string }
 export interface ImageContent { type: "image"; data: string; mimeType: string }
@@ -106,7 +106,7 @@ export function actionResult(line: string, reply: Record<string, unknown>, settl
   const head = seq ? `${line}\n${seq}` : line;
   const structured = seq ? { structuredContent: { eventSeq: reply.eventSeq } } : {};
   if (typeof reply.observationError === "string") {
-    return { content: [{ type: "text", text: `${head}\nscreen not read after the action: ${reply.observationError}` }], ...structured };
+    return { content: [{ type: "text", text: `${head}\nscreen not read after the action: ${toolSentence(reply.observationError)}` }], ...structured };
   }
   const obs = renderObservation(reply.observation as Record<string, unknown> | undefined, settleTimeoutMs);
   if (obs.length === 0) return { content: [{ type: "text", text: head }], ...structured };

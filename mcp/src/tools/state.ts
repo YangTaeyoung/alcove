@@ -331,7 +331,7 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     "alcove_set_resolution",
     {
       title: "Set screen resolution",
-      description: "Change the guest screen resolution and report the size a screenshot has afterwards.",
+      description: "Change the guest screen resolution and report the size a screenshot has afterwards, with a warning when the guest set another mode than asked.",
       inputSchema: {
         name: vmName,
         width: z.number().int().min(320).max(7680).describe("Width in pixels"),
@@ -342,7 +342,8 @@ export function register(r: Registrar, client: LeasedControlClient): void {
     async ({ name, width, height }) => {
       try {
         const res = await client.call("vm.set_resolution", { name, width, height });
-        return text(`${name}: screen is now ${res.width}x${res.height}`);
+        const warning = typeof res.warning === "string" ? `\nwarning: ${res.warning}` : "";
+        return text(`${name}: screen is now ${res.width}x${res.height}${warning}`);
       } catch (e) {
         return fail(e);
       }
