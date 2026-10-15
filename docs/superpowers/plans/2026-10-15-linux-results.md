@@ -162,7 +162,34 @@ seconds after ssh came up): `install: 0 installed / active / 1`; `hello:
 The second run gave the same lines with `drop (2).bin`, the first file still
 being there; both were removed afterwards.
 
-Not changed: files and folders the `fs.*` operations create, and `vm.exec`
-commands, belong to root; a `vm.sync_dir` skips a guest file whose content
-equals the host's, so a copy made before the fix keeps its mode until its
-content changes or it is deleted.
+At that point files and folders the `fs.*` operations created in the home
+belonged to root, the agent followed the user's links out of the home, and
+`vm.sync_dir` skipped a file whose mode alone had changed. The review of the
+task found those and more; the fix round below changed them.
+
+### Fix round 1 (2026-10-15)
+
+The same VM, the tree rebased onto `followups-0.2.1` at fa0f23e, the agent
+installed over the running one (`installed`, new digest and pid) and an
+`alcovectl serve` of the fixed tree on the private socket.
+
+| Finding | Before | After |
+|---|---|---|
+| C-1 drop through a planted link | `~/Downloads` → `/etc/apt/apt.conf.d`: root created the file there and gave it to the user | as `alcove`: `mv ~/Downloads ~/Downloads.real; ln -s /etc/alcove-c1-target ~/Downloads`; `vm.push_file dest=downloads` of `build-log` → `the path leads out of the home folder of the desktop user through a link, which the agent does not follow there; pass the path the link leads to`; `/etc/alcove-c1-target` stays empty. With the folder restored the drop lands in `/home/alcove/Downloads/build-log`, `alcove:alcove 644` |
+| I-1 links out of the home | `fs.write ~/x` with `~/x` → `/etc/shadow` overwrote the target | `~/x` → `/etc/alcove-i1-secret` (root, 600, `secret`) and `~/etclink` → `/etc`: `vm.fs.write ~/x` (truncate and append), `vm.fs.write ~/etclink/alcove-new` and `vm.push_file guestPath=etclink/alcove-push` all answer `cannot open '<path>' for writing: the path leads out of the home folder …`; the secret still reads `secret`, nothing new in `/etc` |
+| I-1 ownership | `vm.sync_dir` into the home made `root:root` folders the user cannot write | `vm.sync_dir guestPath=proj` → `proj`, `proj/src`, `proj/src/lib` `alcove:alcove 755`, `a.c` `alcove:alcove 644`, `run.sh` `alcove:alcove 755`; `touch ~/proj/src/new.txt` as `alcove` succeeds; `vm.deploy` to `/home/alcove/apps/t13` with `launch run.sh` → `apps`, `t13`, `run.sh`, `.alcove-deploy` all `alcove`, and the script wrote `app.log` beside itself: `ran as alcove LANG=en_US.UTF-8`; `vm.push_file dest=desktop`, `dest=downloads` and `guestPath=Desktop/big2.bin` all `alcove:alcove 644` |
+| m-5 mode-only change | a later `chmod -x` on the host was never synced | after `chmod 644 run.sh` on the host `vm.sync_dir` sent `run.sh` again (`sent: ["run.sh"], skipped: 1`), guest mode `644` |
+| m-2 agent restart | launched apps and the clipboard holder lived in `alcove-agent.service` and died with it | `gnome-text-editor` runs in `user@1000.service/app.slice/run-p2428-….scope`, its own session (sid = pid 2428), `LANG=en_US.UTF-8` (m-3); after `systemctl restart alcove-agent` the editor is still running and `vm.clipboard.get` returns the text set before the restart |
+| I-2 clipboard cost | per connection a `wl-paste` every 0.4 s and a `loginctl` lookup every 2 s | `alcove-agent.service` used 129 ms of CPU in 60 s idle with one connection open (one watcher, backing off to a poll every 4 s, session lookup every 5 s). A hung clipboard owner and an oversized clipboard were checked by the unit tests only (`TestAHungClipboardDoesNotStopPongsOrRequests`, `TestAHungClipboardToolTimesOut`, `TestClipboardTextIsReadUpToTheLimit`) |
+| m-4 MCP | `noWindowWait` named `vm.wait_for` | MCP `alcove_launch_app` prints `… wait for the program with alcove_wait_for (process_started or text_visible)` |
+| m-6 agent-linux.py | passed with the drop in `/root/Downloads` | `waiting for the desktop session (clipboard in a caps message)`, `caps: [… 'clipboard' …]` 5 s later, `file push OK -> /home/alcove/Downloads/drop.bin owner alcove`, `PASS` |
+| m-8 install sentence | `… run alcove-agent --install as root` printed to root | with `chattr +i`: `install failed: cannot replace /usr/local/bin/alcove-agent (rename …: operation not permitted); check with sudo that /usr/local/bin is writable and that /usr/local/bin/alcove-agent is not immutable (lsattr /usr/local/bin/alcove-agent; chattr -i removes the flag), then run alcove-agent --install again` |
+
+D1 to D9 were run again on this build with the results of the table above
+(D9 after an ssh login, which starts `sshd`). The Go test binaries of
+`internal/server`, `internal/clipboard` and `internal/session`, built for
+linux/arm64, pass in the guest as root and as `alcove`; as root
+`TestEntriesCreatedInTheHomeBelongToTheSessionUser` checks the real
+ownership (uid and gid 65534 for every created folder and file, an existing
+file kept as root). End state: VM stopped, control server stopped, the test
+files and links removed from the guest.
