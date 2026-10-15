@@ -1061,6 +1061,8 @@ final class ScriptTests: XCTestCase {
         XCTAssertEqual(result.error, "step 1 (keys) failed: vm.batch stopped at its step 1 (vm.key.press, counted from 0): "
                        + "bad key spec 'nosuchkey': unknown key 'nosuchkey'; use a key name such as ctrl, shift, enter or a letter")
         XCTAssertEqual(result.stepResults[0]["ok"]?.boolValue, false)
+        XCTAssertEqual(result.stepResults[0]["result"]?["completed"]?.intValue, 1)
+        XCTAssertEqual(result.stepResults[0]["result"]?["failedStep"]?.intValue, 1)
         XCTAssertEqual(execCommands(rig), [])
         let sent = await rig.target.sent
         XCTAssertEqual(ScriptTests.pressed(sent), [])

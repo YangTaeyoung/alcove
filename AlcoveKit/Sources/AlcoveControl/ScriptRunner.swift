@@ -229,7 +229,7 @@ struct ScriptRunner: Sendable {
                 entry["ok"] = false
                 entry["error"] = .string(Task.isCancelled || error is CancellationError ? ScriptRunner.cancelledDuring(number) : "\(error)")
             }
-            if case .success(let value) = outcome, stepsBytes <= ScriptLimits.stepsBytes {
+            if let value = run.acted, stepsBytes <= ScriptLimits.stepsBytes {
                 var withResult = entry
                 withResult["result"] = ScriptRunner.bounded(value)
                 let size = (try? JSON.object(withResult).serialized().count) ?? 0

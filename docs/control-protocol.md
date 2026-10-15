@@ -2309,7 +2309,9 @@ numbers and expectation numbers start at 1. `stepsRun` counts the steps that sta
 `failure` is a screenshot taken after the failing step and is complete.
 
 Each entry of `steps` is `{step, op, label?, seconds, ok, result?, error?}`.
-`result` is a copy of the op's result in which a string under a key named `png`
+`result` is present when the step's op succeeded, also when the step then
+failed on an expectation or on a batch's `failedStep`. It is a copy of the
+op's result in which a string under a key named `png`
 or `jpeg` becomes `<omitted: N bytes>` and any other string over 2048 characters is cut
 to its first 2048 characters followed by `… (N more characters)`. Once the
 encoded entries pass 256 KiB, later entries keep only `{step, op, label?, ok,
