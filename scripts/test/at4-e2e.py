@@ -786,7 +786,7 @@ def _(run):
     starts = [l for l in run.log() if " start pid " in l]
     expect([l.split(" start pid ")[1].split()[0] for l in starts] == [str(first["pid"]), str(second["pid"])],
            f"the fixture log holds the start lines {starts!r}; the deploys started pids {first['pid']} and {second['pid']}")
-    return f"{size} bytes to {APP_DIR} in {took:.1f} s, window {window['id']} of pid {first['pid']}; then sent nothing and restarted as pid {second['pid']}"
+    return f"{size} bytes to {APP_DIR} in {took:.1f} s, window {window['id']} of pid {first['pid']}; then wrote it again and restarted as pid {second['pid']}"
 
 
 @check("vm.ui.tree lists the fixture window with its edit, its button and its Korean label in fewer than 60 lines")
@@ -1422,7 +1422,7 @@ def _(run):
     return f"found {ref}; clicked; Character Map pid {started.group(1)}; events since {since}; {marked[0]}"
 
 
-@check("vm.deploy of a single file writes it into guestDir with the marker and starts it; a second deploy sends nothing and restarts it")
+@check("vm.deploy of a single file writes it into guestDir with the marker and starts it; a second deploy writes it again and restarts it")
 def _(run):
     run.prepare_guest()
     source = os.path.join(run.app_source(), EXE)
@@ -1435,13 +1435,13 @@ def _(run):
     expect(sorted(run.names(folder)) == sorted([MARKER, EXE]) and run.read(folder + "\\" + MARKER) == MARKER_TEXT,
            f"{folder} holds {run.names(folder)!r} after the deploy of one file")
     second = run.call("vm.deploy", 600, path=source, guestDir=folder, launch=launch)
-    expect(second["sent"] == [] and second["skipped"] == 1 and second["bytes"] == 0 and second["pid"] != first["pid"]
-           and (second.get("window") or {}).get("pid") == second["pid"], f"a second deploy of the unchanged file answered {second!r}")
+    expect(second["sent"] == [EXE] and second["skipped"] == 0 and second["bytes"] == size and second["pid"] != first["pid"]
+           and (second.get("window") or {}).get("pid") == second["pid"], f"a second deploy of the same file answered {second!r}")
     running = {p["pid"] for p in run.own_processes() if under(p["path"] or "", folder)}
     expect(running == {second["pid"]}, f"after the second deploy the processes from {folder} are {sorted(running)}; the second deploy started {second['pid']}")
     left = run.end(run.c, lambda: [p for p in run.own_processes() if under(p["path"] or "", folder)])
     expect(not left, f"the copy in {folder} still runs 15 s after vm.process.kill: {[p['pid'] for p in left]!r}")
-    return f"{size} bytes to {folder} as pid {first['pid']}; then sent nothing and restarted as pid {second['pid']}"
+    return f"{size} bytes to {folder} as pid {first['pid']}; then wrote it again and restarted as pid {second['pid']}"
 
 
 @check("vm.deploy with an exe installer runs it in guestDir and returns 3010 as installCode, and names the code and output of a failing one")
