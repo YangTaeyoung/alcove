@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -211,9 +210,7 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 		}
 		c.Env = append(base, extra...)
 	}
-	if file, err := prepareProgram(c); errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("cannot start '%s': %v; check the path with fs.stat", path, err)
-	} else if err != nil {
+	if file, err := prepareProgram(c); err != nil {
 		return nil, err
 	} else if file != "" {
 		started = file

@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"io/fs"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -179,13 +178,24 @@ func TestAProgramPathThatNamesNoFileIsRefused(t *testing.T) {
 		{`C:\repo\gradlew`, []string{"PATHEXT=.EXE"}, []string{`C:\repo\gradlew.bat`}},
 		{`C:\repo\missing.exe`, nil, nil},
 		{`C:\repo\build.v2`, []string{"PATHEXT=.EXE"}, []string{`C:\repo\build.v2.cmd`}},
+		{`C:\T\p`, []string{`PATHEXT=.x\y`}, []string{`C:\T\p.x\y`, `C:\T\p.x\y.bat`}},
 	} {
 		c := &exec.Cmd{Path: tc.path, Args: []string{tc.path}, Env: tc.env}
 		_, _, err := windowsStart(c, `D:\WINDOWS\System32`, fakeFullPath, testFiles(tc.files...))
-		want := "'" + tc.path + "' names no file, also not with an extension of the command's PATHEXT"
-		if err == nil || err.Error() != want || !errors.Is(err, fs.ErrNotExist) || c.Path != tc.path {
+		want := "'" + tc.path + "' names no file, also not with an extension of the command's PATHEXT; pass the file name with its extension, or check PATHEXT in env"
+		if err == nil || err.Error() != want || c.Path != tc.path {
 			t.Errorf("%s with %q gives %v, path %q", tc.path, tc.files, err, c.Path)
 		}
+	}
+}
+
+func TestPATHEXTEntriesWithASeparatorAreLeftOut(t *testing.T) {
+	got := pathExts([]string{`PATHEXT=.x\y;.EXE;.a/b;.c:d;cmd`})
+	if want := []string{".exe", ".cmd"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PATHEXT gives %q; expected %q", got, want)
+	}
+	if got, want := pathExts([]string{`PATHEXT=.x\y`}), []string{".com", ".exe", ".bat", ".cmd"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("a PATHEXT of separators only gives %q; expected %q", got, want)
 	}
 }
 

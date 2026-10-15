@@ -869,7 +869,10 @@ program with vm.wait_for (process_started or text_visible)"` in place of
 - The new window is not brought to the foreground.
 - Refusals: `missing or invalid parameter 'path'` (also for `args`, `cwd`,
   `env` of the wrong shape), `waitWindow must be between 0 and 300 seconds`,
-  `cannot start '<path>': <system error>; check the path with vm.fs.list`.
+  `cannot start '<path>': <system error>; check the path with vm.fs.list`;
+  on Windows a path that names no file answers `'<path>' names no file, also
+  not with an extension of the command's PATHEXT; pass the file name with its
+  extension, or check PATHEXT in env`.
 
 **`vm.deploy`** copies the host file or directory `path` into the guest
 folder `guestDir`, optionally runs an installer, and starts a program. It
@@ -2804,7 +2807,7 @@ the UI helper is busy with other requests; retry
 pass ref or selector
 element e12 no longer exists; call vm.ui.tree again
 element e14 has no clickable point: window 0x501fa "Alcove Fixture" covers the centre of the element; focus the element's window with vm.window.action; or act on it with vm.ui.action
-cannot start 'C:\apps\tool.exe': The system cannot find the file specified.; check the path with vm.fs.list
+'C:\apps\tool.exe' names no file, also not with an extension of the command's PATHEXT; pass the file name with its extension, or check PATHEXT in env
 'C:\alcove-e2e\junction' is a link in the guest; pass the folder it points to
 the request line is not JSON that can be read (broken syntax, or a \u escape of half a surrogate pair); send one JSON object per line
 'Win' is already recording to /Users/me/rec; call vm.record.stop first

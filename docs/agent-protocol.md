@@ -555,8 +555,9 @@ a restart of the agent.
 A bare `argv[0]` (without `\`, `/` or `:`) is looked up in the folders of
 the `PATH` of that environment, `env` included, that start with a drive and
 a backslash or with `\\`, in order: the name itself when it has an
-extension, then the name with each extension of its `PATHEXT` (`.com`,
-`.exe`, `.bat`, `.cmd` without one). The working directory is not searched.
+extension, then the name with each extension of its `PATHEXT`, leaving out
+entries with `\`, `/` or `:` (`.com`, `.exe`, `.bat`, `.cmd` when none is
+left). The working directory is not searched.
 A name found in none answers
 `'<name>' is not in a folder of the command's PATH (the machine's PATH, or PATH of env); pass the full path of the program`.
 `shell: "cmd"` runs `cmd.exe` of the System32 folder (with `/D`, see above)
@@ -587,13 +588,11 @@ as a file before it starts:
   is relative and resolved with the `PATHEXT` of the
   [environment of a command](#environment-of-a-command-on-windows): the path
   itself when its last element has an extension and the file exists, else
-  the path with each extension of `PATHEXT` in turn, so
+  the path with each extension of `PATHEXT` in turn (as for a bare name), so
   `C:\Tools\build.v2` starts `C:\Tools\build.v2.cmd` when only that file
   exists. The agent starts exactly the file found; the agent's own `PATHEXT`
-  plays no part. A path that names no file answers
-  `cannot start the command: '<path>' names no file, also not with an extension of the command's PATHEXT; check cmd, argv, cwd and shell`
-  (`app.launch`:
-  `cannot start '<path>': '<path>' names no file, also not with an extension of the command's PATHEXT; check the path with fs.stat`).
+  plays no part. A path that names no file answers, before anything starts,
+  `'<path>' names no file, also not with an extension of the command's PATHEXT; pass the file name with its extension, or check PATHEXT in env`.
 - When the path, joined with the working directory and made absolute by
   Windows (`GetFullPathNameW`, which also drops trailing dots and spaces),
   ends in `.bat` or `.cmd` without regard to case, the agent starts
@@ -778,7 +777,10 @@ the same way:
   output and error are the null device, so a console program that reads its
   input ends at once.
 - A program that cannot be started answers
-  `cannot start '<path>': <system error>; check the path with fs.stat`.
+  `cannot start '<path>': <system error>; check the path with fs.stat`. On
+  Windows a path that names no file answers, before anything starts,
+  `'<path>' names no file, also not with an extension of the command's PATHEXT; pass the file name with its extension, or check PATHEXT in env`
+  (see [Batch files on Windows](#batch-files-on-windows)).
 - When the process ends the agent sends
   `{"t":"ev","name":"process.exited","pid":<int>,"code":<int>,"path":"<program file>"}`.
   `code` is the unsigned exit code: a process killed by `proc.kill` reports

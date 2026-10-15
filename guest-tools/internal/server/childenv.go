@@ -162,7 +162,7 @@ func envValue(env []string, name string) string {
 // the first one isFile finds in the folders of the PATH of env that start
 // with a drive and a backslash or with two backslashes, in their order,
 // trying name itself when it has an extension and then name with each
-// extension of the PATHEXT of env (.com, .exe, .bat and .cmd without one).
+// extension of pathExts of env.
 // The current directory is not searched. ok is false when no folder holds
 // such a file.
 func lookWindowsProgram(name string, env []string, isFile func(string) bool) (string, bool) {

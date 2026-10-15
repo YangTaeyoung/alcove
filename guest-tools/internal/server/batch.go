@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"io/fs"
 	"os/exec"
 	"strings"
 	"unicode"
@@ -134,11 +133,12 @@ func batchScript(path, dir string, fullPath func(string) (string, error)) (strin
 }
 
 // pathExts returns the extensions of the PATHEXT of env in lower case, each
-// with a leading '.', or .com, .exe, .bat and .cmd without one.
+// with a leading '.', leaving out entries with '\', '/' or ':'; or .com,
+// .exe, .bat and .cmd when none is left.
 func pathExts(env []string) []string {
 	var exts []string
 	for _, e := range strings.Split(strings.ToLower(envValue(env, "PATHEXT")), ";") {
-		if e == "" {
+		if e == "" || strings.ContainsAny(e, `\/:`) {
 			continue
 		}
 		if e[0] != '.' {
@@ -164,9 +164,9 @@ func hasExt(path string) bool {
 // joinProgramDir does and resolved with the PATHEXT of c.Env as Go's
 // findExecutable resolves it: the path itself when its last element has an
 // extension and isFile finds it, else the path with each extension in turn;
-// c.Path becomes the file found, which has an extension, so that Cmd.Start
-// looks up nothing more. A path that names no file is an error that wraps
-// fs.ErrNotExist, and c is left as it is. When the file, normalised by
+// c.Path becomes the file found, an existing file whose last element has an
+// extension. A path that names no file is an error, and c is left as it is.
+// When the file, normalised by
 // fullPath, is a batch file, file is that script, c.Path becomes cmd.exe of
 // the folder system and line is batchCommandLine of the script and
 // c.Args[1:], which the caller passes as the raw command line; otherwise
@@ -186,7 +186,7 @@ func windowsStart(c *exec.Cmd, system string, fullPath func(string) (string, err
 			}
 		}
 		if found == "" {
-			return "", "", noProgramFile{c.Path}
+			return "", "", fmt.Errorf("'%s' names no file, also not with an extension of the command's PATHEXT; pass the file name with its extension, or check PATHEXT in env", c.Path)
 		}
 		c.Path = found
 	}
@@ -205,13 +205,3 @@ func windowsStart(c *exec.Cmd, system string, fullPath func(string) (string, err
 	c.Path = system + `\cmd.exe`
 	return script, line, nil
 }
-
-// noProgramFile is the error of windowsStart for a program path that names
-// no file; it is fs.ErrNotExist.
-type noProgramFile struct{ path string }
-
-func (e noProgramFile) Error() string {
-	return "'" + e.path + "' names no file, also not with an extension of the command's PATHEXT"
-}
-
-func (noProgramFile) Is(target error) bool { return target == fs.ErrNotExist }

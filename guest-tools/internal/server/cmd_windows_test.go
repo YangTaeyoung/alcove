@@ -175,12 +175,13 @@ func TestAProgramPathIsResolvedWithTheCommandsPATHEXTBeforeItStarts(t *testing.T
 	}
 
 	gradlew := filepath.Join(dir, "gradlew")
+	refusal := "'" + gradlew + "' names no file, also not with an extension of the command's PATHEXT; pass the file name with its extension, or check PATHEXT in env"
 	res = c.call("exec.run", proto.Message{"argv": []any{gradlew}, "env": map[string]any{"PATHEXT": ".EXE"}})
-	if res["ok"] != false || !strings.Contains(res.String("error"), "'"+gradlew+"' names no file, also not with an extension of the command's PATHEXT") {
+	if res["ok"] != false || res.String("error") != refusal {
 		t.Fatalf("gradlew with PATHEXT .EXE gave %v", res)
 	}
 	res = c.call("app.launch", proto.Message{"path": gradlew, "env": map[string]any{"PATHEXT": ".EXE"}, "wait_window_ms": 0})
-	if res["ok"] != false || !strings.HasPrefix(res.String("error"), "cannot start '"+gradlew+"': ") {
+	if res["ok"] != false || res.String("error") != refusal {
 		t.Fatalf("app.launch of gradlew with PATHEXT .EXE gave %v", res)
 	}
 	if _, err := os.Stat(ran); err == nil {
