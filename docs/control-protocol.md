@@ -2654,6 +2654,8 @@ and the `error` of its `problems`).
   strings) starts a program directly, with `shell` left out or `none`; another
   `shell` with `argv` answers `shell '<shell>' does not run argv; pass shell
   'none' or leave shell out`. One of the two is required.
+- `cmd` is `cmd.exe /D /S /C "<command>"` of the system folder: it runs no
+  `AutoRun` command of the registry, and the command runs as typed.
 - `powershell` is Windows PowerShell of the system folder with no profile,
   the `Restricted` execution policy (commands run, `.ps1` files and script
   modules do not) and only its own module folder in `PSModulePath`; see

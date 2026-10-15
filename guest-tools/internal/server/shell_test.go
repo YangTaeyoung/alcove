@@ -114,7 +114,7 @@ func TestBuildCommandForms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{`D:\WINDOWS\System32\cmd.exe`, "/S", "/C", "dir"}; cmd.Path != want[0] || !reflect.DeepEqual(cmd.Args, want) ||
+	if want := []string{`D:\WINDOWS\System32\cmd.exe`, "/D", "/S", "/C", "dir"}; cmd.Path != want[0] || !reflect.DeepEqual(cmd.Args, want) ||
 		!reflect.DeepEqual(cmd.Env, []string{`PSModulePath=C:\Users\alcove\Documents\WindowsPowerShell\Modules`}) {
 		t.Fatalf("cmd path %q, args %q, env %q", cmd.Path, cmd.Args, cmd.Env)
 	}
@@ -252,10 +252,10 @@ func TestTheAgentsPowerShellRecipeRunsInAnEnvironmentOfTheSystemFoldersOnly(t *t
 
 func TestCmdExeLineWrapsCommandInOuterQuotes(t *testing.T) {
 	for cmdline, want := range map[string]string{
-		`dir`:                         `cmd.exe /S /C "dir"`,
-		`echo hello & dir "C:\a b"`:   `cmd.exe /S /C "echo hello & dir "C:\a b""`,
-		`"C:\a b\x.exe" /C "echo ok"`: `cmd.exe /S /C ""C:\a b\x.exe" /C "echo ok""`,
-		`"C:\a b\x.exe"`:              `cmd.exe /S /C ""C:\a b\x.exe""`,
+		`dir`:                         `cmd.exe /D /S /C "dir"`,
+		`echo hello & dir "C:\a b"`:   `cmd.exe /D /S /C "echo hello & dir "C:\a b""`,
+		`"C:\a b\x.exe" /C "echo ok"`: `cmd.exe /D /S /C ""C:\a b\x.exe" /C "echo ok""`,
+		`"C:\a b\x.exe"`:              `cmd.exe /D /S /C ""C:\a b\x.exe""`,
 	} {
 		if got := cmdExeLine(cmdline); got != want {
 			t.Errorf("cmdExeLine(%s) = %s, want %s", cmdline, got, want)

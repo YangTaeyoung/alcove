@@ -104,7 +104,7 @@ SLOW_SEARCH_S = 4.5
 BUSY_CLICK_LIMIT_S = 6.5
 TICK_S = 0.25
 RESTART_AGENT = ("$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "
-                 "'cmd.exe /c schtasks /End /TN AlcoveAgent & ping -n 3 127.0.0.1 >nul & schtasks /Run /TN AlcoveAgent' }; "
+                 "'cmd.exe /d /c schtasks /End /TN AlcoveAgent & ping -n 3 127.0.0.1 >nul & schtasks /Run /TN AlcoveAgent' }; "
                  "\"created=$($r.ReturnValue)\"")
 INTEGRITY = r'''
 Add-Type -Namespace AlcoveE2E -Name Token -MemberDefinition @"
@@ -540,12 +540,12 @@ class Run:
     def junction(self, link, target):
         """Creates a junction in the guest that the cleanup removes."""
         self.junctions.append(link)
-        self.exec(f'cmd /c mklink /J "{link}" "{target}"')
+        self.exec(f'cmd /d /c mklink /J "{link}" "{target}"')
 
     def remove_junction(self, c, link):
         """Removes one junction with rmdir and reports whether its path is gone."""
         r = c.call("vm.exec", 90, name=self.vm, timeout=60,
-                   command=f'if (Test-Path -LiteralPath "{link}") {{ cmd /c rmdir "{link}" }}; Test-Path -LiteralPath "{link}"')
+                   command=f'if (Test-Path -LiteralPath "{link}") {{ cmd /d /c rmdir "{link}" }}; Test-Path -LiteralPath "{link}"')
         return r["code"] == 0 and lines(r["stdout"])[-1:] == ["False"]
 
     # Notepad

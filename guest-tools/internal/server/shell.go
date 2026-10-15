@@ -56,10 +56,10 @@ func isFile(path string) bool {
 // command's environment is the base environment of sys, with PSModulePath
 // set to Windows PowerShell's own module folder for shell powershell, which
 // runs powershell.exe of the Windows folder with commandArgs; shell cmd runs
-// cmd.exe of the System32 folder; a bare argv[0] is looked up by
-// lookWindowsProgram in that environment with env of the request added.
-// Elsewhere the command inherits the agent's environment. env of the request
-// is added after the environment.
+// cmd.exe of the System32 folder with cmdExeLine; a bare argv[0] is looked
+// up by lookWindowsProgram in that environment with env of the request
+// added. Elsewhere the command inherits the agent's environment. env of the
+// request is added after the environment.
 func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 	cmdline := req.String("cmd")
 	argv := req.Strings("argv")
@@ -110,7 +110,7 @@ func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 			if err != nil {
 				return nil, fmt.Errorf("cmd.exe could not be located (%v); restart alcove-agent and retry", err)
 			}
-			c = exec.Command(system+`\cmd.exe`, "/S", "/C", cmdline)
+			c = exec.Command(system+`\cmd.exe`, "/D", "/S", "/C", cmdline)
 			setRawCommandLine(c, cmdExeLine(cmdline))
 		case "sh":
 			c = exec.Command("/bin/sh", "-c", cmdline)
@@ -146,10 +146,11 @@ func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 	return c, nil
 }
 
-// cmdExeLine is the raw command line that makes cmd.exe run cmdline verbatim:
-// with /S, cmd.exe removes exactly the outer pair of quotes.
+// cmdExeLine is the raw command line that makes cmd.exe run cmdline verbatim
+// without the AutoRun commands of the registry: /D skips them, and with /S
+// cmd.exe removes exactly the outer pair of quotes.
 func cmdExeLine(cmdline string) string {
-	return `cmd.exe /S /C "` + cmdline + `"`
+	return `cmd.exe /D /S /C "` + cmdline + `"`
 }
 
 // commandLine is the text shown for a request in job listings.

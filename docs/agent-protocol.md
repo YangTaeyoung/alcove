@@ -460,7 +460,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   | `shell` | Command line |
   |---|---|
   | `powershell` (Windows only) | `<System32>\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Restricted -Command "<prefix><cmd>"` with the prefix `$env:PSModulePath = $PSHOME + '\Modules'; [Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; ` (see [Windows PowerShell](#windows-powershell)) |
-  | `cmd` (Windows only) | `cmd.exe /S /C "<cmd>"`, passed to the process verbatim, so `cmd.exe` removes exactly the outer quotes and runs `<cmd>` as typed |
+  | `cmd` (Windows only) | `<System32>\cmd.exe /D /S /C "<cmd>"`, passed to the process verbatim, so `cmd.exe` runs neither `AutoRun` command (the `AutoRun` value of `Software\Microsoft\Command Processor` under `HKLM` and under `HKCU`), removes exactly the outer quotes and runs `<cmd>` as typed |
   | `sh` | `/bin/sh -c <cmd>` |
 
 - `cwd` is the working directory; `~`, `~/x` and relative paths resolve
@@ -542,9 +542,9 @@ with each extension of its `PATHEXT` (`.com`, `.exe`, `.bat`, `.cmd`
 without one). The working directory is not searched. A name found in none
 answers
 `'<name>' is not in a folder of the command's PATH (the machine's PATH, or PATH of env); pass the full path of the program`.
-`shell: "cmd"` runs `cmd.exe` of the System32 folder of the Windows folder
-that Windows reports (`GetSystemWindowsDirectoryW`); when that folder
-cannot be read the request answers
+`shell: "cmd"` runs `cmd.exe` of the System32 folder (with `/D`, see above)
+of the Windows folder that Windows reports (`GetSystemWindowsDirectoryW`);
+when that folder cannot be read the request answers
 `cmd.exe could not be located (<reason>); restart alcove-agent and retry`.
 
 When the environment cannot be built the request answers

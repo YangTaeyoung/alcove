@@ -68,7 +68,7 @@ COPY_NOTE = "video.mp4: copied while recording; its last seconds may be missing"
 LONG_RECORDING_S = 185
 AGENT_STOP_S = 45
 RESTART_AGENT_LATER = ("$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "
-                       "'cmd.exe /c ping -n 4 127.0.0.1 >nul & schtasks /End /TN AlcoveAgent & ping -n SECONDS 127.0.0.1 >nul & "
+                       "'cmd.exe /d /c ping -n 4 127.0.0.1 >nul & schtasks /End /TN AlcoveAgent & ping -n SECONDS 127.0.0.1 >nul & "
                        "schtasks /Run /TN AlcoveAgent' }; \"created=$($r.ReturnValue)\"")
 REG_QUERY = "$k = 'KEY'; $out = & reg.exe query $k /s /reg:64 2>$null; \"exit=$LASTEXITCODE\"; $out"
 VIDEO_PROBE = r'''
