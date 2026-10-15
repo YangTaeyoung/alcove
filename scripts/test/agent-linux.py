@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """End-to-end test of the guest agent inside the Ubuntu 24.04 bundle
 (ssh forward 2223->22 with the test key, agent forward 7647->7645). The host
-side authenticates with the agentKey of the bundle's config.json.
+side authenticates with the agentKey of the bundle's config.json. The file
+drop is checked after the agent listed clipboard, i.e. once it found the
+desktop session: it must land in the desktop user's home, owned by that user.
 
 Usage: agent-linux.py [--vm NAME]
 """
@@ -18,6 +20,7 @@ SSH = ["ssh", "-i", KEY, "-p", "2223", "-o", "StrictHostKeyChecking=no", "-o", "
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR", "alcove@127.0.0.1"]
 AGENT_PORT = 7647
 VM = "Ubuntu 24.04"
+SESSION_WAIT_S = 120
 
 
 def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
@@ -81,6 +84,15 @@ def main():
         except AgentKeyError as e:
             fail(str(e))
         agent.send({"t": "welcome", "v": 1})
+        if "clipboard" not in (hello.get("caps") or []):
+            log("waiting for the desktop session (clipboard in a caps message)")
+            end = time.time() + SESSION_WAIT_S
+            while time.time() < end:
+                caps = agent.recv("caps", max(1, end - time.time())).get("caps") or []
+                if "clipboard" in caps: break
+            else:
+                fail(f"no desktop session within {SESSION_WAIT_S} s: the agent never listed clipboard; check the autologin and wl-clipboard")
+            log("caps:", caps)
         code, out = agent.exec("id -un; uname -m")
         log("exec:", code, out.strip().replace("\n", " | "))
         if "aarch64" not in out: fail("exec output unexpected")
@@ -93,7 +105,10 @@ def main():
         if done.get("error"): fail("file push: " + done["error"])
         code, out = agent.exec(f"sha256sum '{done['path']}'")
         if digest not in out: fail(f"digest mismatch: {out!r}")
-        log("file push OK ->", done["path"])
+        code, owner = agent.exec(f"stat -c %U '{done['path']}'; rm -f '{done['path']}'")
+        if not done["path"].startswith("/home/"): fail(f"the drop landed outside the desktop user's home: {done['path']}")
+        if owner.strip() == "root": fail(f"the drop {done['path']} belongs to root, not to the desktop user")
+        log("file push OK ->", done["path"], "owner", owner.strip())
         print("PASS: guest agent verified in Ubuntu")
     finally:
         try: ssh("sudo systemctl poweroff", timeout=20)
