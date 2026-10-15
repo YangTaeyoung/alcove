@@ -15,7 +15,8 @@ struct CaptureJournal: Sendable {
         var path: String?
     }
 
-    /// What a capture changed in the guest of one VM.
+    /// What a capture changed in the guest of one VM. Two entries are equal when they describe the same capture; their
+    /// generations are not compared.
     struct Entry: Equatable, Sendable {
         /// The name of the VM.
         var vm: String
@@ -29,9 +30,20 @@ struct CaptureJournal: Sendable {
         var systemProxy: Bool
         /// When the capture started, as ISO 8601 text.
         var since: String
+        /// The write that stored the entry: `record` gives each entry it stores a new one. Nil in an entry not yet
+        /// recorded, in a snapshot note, and in an entry of a file written without generations.
+        var generation: String?
 
         /// The VM the entry was written for.
         var owner: VM { VM(name: vm, path: path) }
+
+        static func == (lhs: Entry, rhs: Entry) -> Bool {
+            lhs.vm == rhs.vm && lhs.path == rhs.path && lhs.port == rhs.port && lhs.thumbprint == rhs.thumbprint
+                && lhs.systemProxy == rhs.systemProxy && lhs.since == rhs.since
+        }
+
+        /// Whether `other` is this entry as one write stored it: equal, with the same generation.
+        func isSameWrite(as other: Entry) -> Bool { self == other && generation == other.generation }
 
         /// Whether the entry belongs to `other`: the same bundle path when both have one, otherwise the same name.
         func belongs(to other: VM) -> Bool {
@@ -43,6 +55,7 @@ struct CaptureJournal: Sendable {
             var fields: [String: JSON] = ["vm": .string(vm), "port": .int(Int64(port)), "thumbprint": .string(thumbprint),
                                           "systemProxy": .bool(systemProxy), "since": .string(since)]
             if let path { fields["path"] = .string(path) }
+            if let generation { fields["generation"] = .string(generation) }
             return fields
         }
 
@@ -55,16 +68,23 @@ struct CaptureJournal: Sendable {
                 guard let text = value.stringValue, !text.isEmpty else { return nil }
                 path = text
             }
-            self.init(vm: vm, port: port, thumbprint: thumbprint.uppercased(), systemProxy: systemProxy, since: since, path: path)
+            var generation: String?
+            if let value = json["generation"], value != .null {
+                guard let text = value.stringValue, !text.isEmpty else { return nil }
+                generation = text
+            }
+            self.init(vm: vm, port: port, thumbprint: thumbprint.uppercased(), systemProxy: systemProxy, since: since, path: path,
+                      generation: generation)
         }
 
-        init(vm: String, port: Int, thumbprint: String, systemProxy: Bool, since: String, path: String? = nil) {
+        init(vm: String, port: Int, thumbprint: String, systemProxy: Bool, since: String, path: String? = nil, generation: String? = nil) {
             self.vm = vm
             self.path = path
             self.port = port
             self.thumbprint = thumbprint
             self.systemProxy = systemProxy
             self.since = since
+            self.generation = generation
         }
     }
 
@@ -102,12 +122,16 @@ struct CaptureJournal: Sendable {
         read()?.snapshots.first { $0.snapshot == snapshot && $0.entry.belongs(to: vm) }?.entry
     }
 
-    /// Stores `entry` in place of the entries of its VM.
-    func record(_ entry: Entry, now: Date) throws {
+    /// Stores `entry` with a new generation in place of the entries of its VM, and returns the entry as stored.
+    @discardableResult
+    func record(_ entry: Entry, now: Date) throws -> Entry {
+        var stored = entry
+        stored.generation = UUID().uuidString
         try change(now: now) { contents in
-            contents.captures.removeAll { $0.belongs(to: entry.owner) }
-            contents.captures.append(entry)
+            contents.captures.removeAll { $0.belongs(to: stored.owner) }
+            contents.captures.append(stored)
         }
+        return stored
     }
 
     /// Removes the entries of `vm`.
@@ -116,18 +140,21 @@ struct CaptureJournal: Sendable {
         try change(now: now) { $0.captures.removeAll { $0.belongs(to: vm) } }
     }
 
-    /// Removes `entry` when the file holds it as it is; an entry of its VM that differs stays.
+    /// Removes `entry` when the file holds it as the same write: equal and with the same generation. An entry of its VM
+    /// that differs, or that a later `record` wrote, stays.
     func remove(_ entry: Entry, now: Date) throws {
-        guard read()?.captures.contains(entry) == true else { return }
-        try change(now: now) { $0.captures.removeAll { $0 == entry } }
+        guard read()?.captures.contains(where: { $0.isSameWrite(as: entry) }) == true else { return }
+        try change(now: now) { $0.captures.removeAll { $0.isSameWrite(as: entry) } }
     }
 
     /// Notes that `snapshot` was created during the capture `entry` describes, in place of an earlier note for that
     /// snapshot name of its VM.
     func noteSnapshot(_ snapshot: String, during entry: Entry, now: Date) throws {
+        var noted = entry
+        noted.generation = nil
         try change(now: now) { contents in
-            contents.snapshots.removeAll { $0.snapshot == snapshot && $0.entry.belongs(to: entry.owner) }
-            contents.snapshots.append((snapshot, entry))
+            contents.snapshots.removeAll { $0.snapshot == snapshot && $0.entry.belongs(to: noted.owner) }
+            contents.snapshots.append((snapshot, noted))
         }
     }
 

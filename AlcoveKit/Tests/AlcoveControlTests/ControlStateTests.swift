@@ -282,10 +282,47 @@ final class ControlStateTests: XCTestCase {
                                    calls.value += 1
                                    return base + .seconds(9 * calls.value)
                                })
-        let began = ContinuousClock.now
-        let r = try await h.handle(op: "vm.set_resolution", params: ["name": "Win", "width": 1024, "height": 768])
-        XCTAssertEqual(r["width"]?.intValue, 800)
-        XCTAssertLessThan(ContinuousClock.now - began, .seconds(4))
+        let reply = LockedBox<JSON?>(nil)
+        let answered = await finishes("vm.set_resolution answers") {
+            reply.value = try? await h.handle(op: "vm.set_resolution", params: ["name": "Win", "width": 1024, "height": 768])
+        }
+        XCTAssertTrue(answered)
+        XCTAssertEqual(reply.value?["width"]?.intValue, 800)
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 2)
+    }
+
+    func testSetResolutionWarnsWhenTheGuestSetsAnotherSize() async throws {
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            if m["t"]?.stringValue == "resolution.set" {
+                Task { await t.setPNG(makePNG(width: 1920, height: 1200)) }
+            }
+            return []
+        }
+        _ = agent.start()
+        addTeardownBlock { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        await t.setAgent(client)
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        let r = try await h.handle(op: "vm.set_resolution", params: ["name": "Win", "width": 2560, "height": 1600])
+        XCTAssertEqual(r["width"], 1920)
+        XCTAssertEqual(r["height"], 1200)
+        XCTAssertEqual(r["warning"]?.stringValue, "the guest set 1920x1200, not 2560x1600; it does not offer that mode")
+
+        await t.setPNG(makePNG(width: 800, height: 600))
+        agent.handler = { m, _ in
+            if m["t"]?.stringValue == "resolution.set" {
+                Task { await t.setPNG(makePNG(width: 1024, height: 768)) }
+            }
+            return []
+        }
+        let exact = try await h.handle(op: "vm.set_resolution", params: ["name": "Win", "width": 1024, "height": 768])
+        XCTAssertEqual(exact["width"], 1024)
+        XCTAssertEqual(exact["height"], 768)
+        XCTAssertNil(exact["warning"])
     }
 
     func testForwardAddReportsMonitorError() async throws {

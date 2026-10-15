@@ -139,7 +139,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.set_network` | `name`, `up` (bool) | `{up}` — see [Network link](#network-link) |
 | `vm.lease.acquire` | `name`, `owner?`, `ttl?` s (default 300), `lease?` (to renew) | `{lease, expiresIn}` — see [Leases and read-only ops](#leases-and-read-only-ops) |
 | `vm.lease.release` | `name`, `lease` | `{}` |
-| `vm.set_resolution` | `name`, `width`, `height` | `{width, height}` — see [Resolution](#resolution) |
+| `vm.set_resolution` | `name`, `width`, `height` | `{width, height, warning?}` — see [Resolution](#resolution) |
 | `vm.set_environment` | `name`, any of `theme`, `timeZone`, `clock`, `locale`, `keyboardLayouts`, `dpiScale` | `{applied: [{setting, ok, detail, takesEffect}]}` — see [Guest environment](#guest-environment) |
 | `vm.doctor` | `name` | `{checks: [{id, ok, detail, hint?}]}` — see [Doctor](#doctor) |
 | `vm.window.list` | `name` | `{windows: [window]}` — see [Windows and UI elements](#windows-and-ui-elements) |
@@ -649,7 +649,10 @@ title bar is not covered.
   element while it exists and the helper process lives; afterwards the guest
   answers `element <ref> no longer exists; call ui.tree again`. A new helper
   process (after an agent restart, or after the agent replaced a helper that
-  did not answer) knows none of the earlier refs.
+  did not answer) knows none of the earlier refs. `vm.snapshot.restore` puts
+  back the helper as the snapshot holds it, its ref counter included, so a
+  ref from before the restore may name another element afterwards; call
+  `vm.ui.find` or `vm.ui.tree` again after a restore.
 - `selector`: an object with `window` (default `foreground`), `role`
   (case-insensitive, e.g. `Button`, `Edit`, `Document`), `name` (exact),
   `nameContains` (case-insensitive), `automationId` (exact) and `index`
@@ -1270,9 +1273,11 @@ batch.
 to `width` x `height` (320 to 7680 by 200 to 4320, otherwise `width must be
 320...7680 and height 200...4320`). It then reads the frame every 500 ms for
 up to 8 s, until its size changes or equals the request, and answers the size
-of the last frame read. A guest that does not offer the mode leaves the size
-as it was, and the result then shows the unchanged size. The op needs a running VM with connected
-guest tools.
+of the last frame read. A guest that does not offer the mode may pick another
+one or leave the size as it was. When the size changed to one other than the
+request, the result carries `warning: "the guest set <w>x<h>, not <W>x<H>; it
+does not offer that mode"`; an unchanged size gets no warning. The op needs a
+running VM with connected guest tools.
 
 ## Guest environment
 
@@ -1939,7 +1944,9 @@ capturing; call vm.http.start first` on a VM without a capture. After a
 capture that ended because its proxy ended on its own they answer `the HTTP
 capture of '<vm>' ended because <reason>; call vm.http.start to capture
 again` instead, `<reason>` being e.g. `alcove-proxy exited with status 2:
-<its last error line>`, `alcove-proxy was ended by signal 9` or
+<its last error line>`, `alcove-proxy exited with status 2: the proxy stopped
+accepting connections (<error>)` (the proxy's fatal line without its own
+next step), `alcove-proxy was ended by signal 9` or
 `alcove-proxy closed its output and gives no more answers`; the next
 `vm.http.start` or `vm.http.stop` of the VM drops that reason. Between the
 proxy's end and the moment the server notices it (checked every 2 s) they
@@ -2047,11 +2054,15 @@ a capture:
 
 ```json
 {"version": 1,
- "captures": [{"vm": "Win", "path": "/…/Win.alcovevm", "port": 49152, "thumbprint": "<40 hex>", "systemProxy": true, "since": "…"}],
+ "captures": [{"vm": "Win", "path": "/…/Win.alcovevm", "port": 49152, "thumbprint": "<40 hex>", "systemProxy": true, "since": "…", "generation": "<UUID>"}],
  "snapshots": [{"vm": "Win", "path": "/…/Win.alcovevm", "snapshot": "mid-capture", "port": 49152, "thumbprint": "…", "systemProxy": true, "since": "…"}]}
 ```
 
-Changes hold an exclusive lock on `captures.json.lock`. A file that is not a
+Every write of a capture entry gives it a new `generation`; an entry of a
+file written without one reads as having none. A restore or a cleanup that
+read an entry removes only that write of it, so an equal entry that a
+snapshot restore wrote again in the meantime stays. Changes hold an exclusive
+lock on `captures.json.lock`. A file that is not a
 readable version 1 counts as empty; the next change renames it to
 `captures.json.unreadable-<UTC time>`. A journal that cannot be written
 refuses `vm.http.start` before any guest step. An entry matches a VM by the

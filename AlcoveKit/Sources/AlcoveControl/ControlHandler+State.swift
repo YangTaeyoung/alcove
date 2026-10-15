@@ -76,7 +76,11 @@ extension ControlHandler {
             size = [now.width, now.height]
             if size != before || size == [width, height] || clock() >= deadline { break }
         }
-        return ["width": .int(Int64(size[0])), "height": .int(Int64(size[1]))]
+        var out: [String: JSON] = ["width": .int(Int64(size[0])), "height": .int(Int64(size[1]))]
+        if size != before, size != [width, height] {
+            out["warning"] = .string("the guest set \(size[0])x\(size[1]), not \(width)x\(height); it does not offer that mode")
+        }
+        return .object(out)
     }
 
     func state(op: String, params: JSON) async throws -> JSON {
@@ -185,7 +189,7 @@ extension ControlHandler {
         let capturing = captures[t.name] != nil
         await endCapture(t.name)
         let duringCapture = captureJournal.snapshotEntry(snapshot, vm: await journalVM(t))
-        if let duringCapture { try? captureJournal.record(duringCapture, now: wallClock()) }
+        if let duringCapture { _ = try? captureJournal.record(duringCapture, now: wallClock()) }
         let mark = cleanupMark(t.name)
         let agent = await t.agent(timeout: .seconds(max(0, wait)))
         let cleaning = duringCapture == nil ? nil : agent.map { cleanup(since: mark, t, $0) }

@@ -201,6 +201,16 @@ private struct Capture: Sendable {
             item.agent.sendLine(agentReply(item.request, ["code": 0, "stdout": .string(printed + "\r\n"), "stderr": "", "timed_out": false]))
         }
     }
+
+    /// Answers the held requests of the recipe `name` with exit code 2 and `sentence` on stderr.
+    func release(_ name: String, failing sentence: String) {
+        let ready = waiting.value.filter { $0.name == name }
+        waiting.value = waiting.value.filter { $0.name != name }
+        held.value = held.value.subtracting([name])
+        for item in ready {
+            item.agent.sendLine(agentReply(item.request, ["code": 2, "stdout": "", "stderr": .string(sentence + "\r\n"), "timed_out": false]))
+        }
+    }
 }
 
 final class ControlHTTPTests: XCTestCase {
@@ -553,6 +563,26 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(after, "'Win' is not capturing; call vm.http.start first")
     }
 
+    func testTheUndoOfACancelledStartRunsWhenTheRecipeThatWasRunningFails() async throws {
+        let c = try await capture()
+        c.held.value = ["recipe.setProxy(49152)"]
+        let h = c.h
+        let caller = Task { try await h.handle(op: "vm.http.start", params: ["name": "Win"]) }
+        let asked = await eventually("the start asks the guest to set its system proxy") { c.waiting.value.count == 1 }
+        XCTAssertTrue(asked)
+        caller.cancel()
+        c.release("recipe.setProxy(49152)", failing: "could not set the system proxy of the guest: Access is denied.; check that alcove-agent "
+                  + "runs elevated, or call vm.http.start with systemProxy false")
+        _ = try? await caller.value
+        let ended = await c.factory.latest.stopped()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(c.log.entries, ["proxy.start", "proxy.config", "push \(GuestRecipes.windowsProxyCAPath)", "recipe.installCA",
+                                       "recipe.setProxy(49152)", "recipe.clearProxy", "recipe.removeCA", "proxy.stop"])
+        XCTAssertNil(c.journal.entry(for: "Win"))
+        let after = await c.failure("vm.http.requests")
+        XCTAssertEqual(after, "'Win' is not capturing; call vm.http.start first")
+    }
+
     func testACopyThatFailsIsUndoneAndNamed() async throws {
         let c = try await capture()
         let files = c.agentHandler
@@ -884,12 +914,28 @@ final class ControlHTTPTests: XCTestCase {
         try c.journal.record(first, now: Date())
         let journal = c.journal
         c.onStep.value = { step in
-            if step == "recipe.removeCA" { try? journal.record(later, now: Date()) }
+            if step == "recipe.removeCA" { _ = try? journal.record(later, now: Date()) }
         }
         let agent = try await newConnection(c)
         let cleaned = await c.h.staleCleanup(c.t, agent).value
         XCTAssertTrue(cleaned)
         XCTAssertEqual(c.journal.entry(for: "Win"), later)
+    }
+
+    func testAStaleCleanupKeepsTheEntryARestoreWroteAgainWhileItRan() async throws {
+        let c = try await capture()
+        let entry = CaptureJournal.Entry(vm: "Win", port: 49152, thumbprint: caThumbprint, systemProxy: true, since: "first")
+        try c.journal.record(entry, now: Date())
+        try c.journal.noteSnapshot("mid-capture", during: entry, now: Date())
+        let journal = c.journal
+        c.onStep.value = { step in
+            guard step == "recipe.removeCA", let noted = journal.snapshotEntry("mid-capture", vm: "Win") else { return }
+            _ = try? journal.record(noted, now: Date())
+        }
+        let agent = try await newConnection(c)
+        let cleaned = await c.h.staleCleanup(c.t, agent).value
+        XCTAssertTrue(cleaned)
+        XCTAssertEqual(c.journal.entry(for: "Win"), entry)
     }
 
     func testStopWithoutACapture() async throws {
@@ -1066,10 +1112,12 @@ final class ControlHTTPTests: XCTestCase {
         XCTAssertEqual(seen.value["fs"], .some(expected))
         XCTAssertEqual(seen.value["recipe.installCA"], .some(expected))
         XCTAssertEqual(journal.entry(for: "Win"), expected)
+        let generation = try XCTUnwrap(journal.entry(for: "Win")?.generation)
         let text = try String(contentsOf: journal.url, encoding: .utf8)
         XCTAssertEqual(try JSON.parse(Data(text.utf8)), [
             "version": 1,
-            "captures": [["vm": "Win", "port": 49152, "thumbprint": .string(caThumbprint), "systemProxy": true, "since": "2027-01-15T08:00:00Z"]],
+            "captures": [["vm": "Win", "port": 49152, "thumbprint": .string(caThumbprint), "systemProxy": true, "since": "2027-01-15T08:00:00Z",
+                          "generation": .string(generation)]],
             "snapshots": [],
         ])
         XCTAssertEqual(journal.url.path, c.directory.appendingPathComponent("captures.json").path)
@@ -1711,18 +1759,20 @@ final class ControlHTTPTests: XCTestCase {
         let here = CaptureJournal.VM(name: "Win", path: "/VMs/Win.alcove")
         XCTAssertEqual(journal.entry(for: here)?.port, 49152)
         XCTAssertNil(journal.entry(for: here)?.path)
+        XCTAssertNil(journal.entry(for: here)?.generation)
         XCTAssertEqual(journal.entry(for: CaptureJournal.VM(name: "Win", path: "/Other/Win.alcove"))?.port, 49152)
         XCTAssertNil(journal.entry(for: CaptureJournal.VM(name: "Lin", path: "/VMs/Win.alcove")))
 
         let now = Date()
         let recorded = CaptureJournal.Entry(vm: "Win", port: 49153, thumbprint: caThumbprint, systemProxy: true, since: "later", path: here.path)
-        try journal.record(recorded, now: now)
+        let stored = try journal.record(recorded, now: now)
         XCTAssertEqual(journal.entry(for: here), recorded)
         XCTAssertNil(journal.entry(for: CaptureJournal.VM(name: "Win", path: "/Other/Win.alcove")))
         XCTAssertEqual(journal.entry(for: CaptureJournal.VM(name: "Renamed", path: here.path)), recorded)
         let text = try String(contentsOf: journal.url, encoding: .utf8)
         XCTAssertEqual(try JSON.parse(Data(text.utf8))["captures"], [["vm": "Win", "path": "/VMs/Win.alcove", "port": 49153,
-                                                                     "thumbprint": .string(caThumbprint), "systemProxy": true, "since": "later"]])
+                                                                     "thumbprint": .string(caThumbprint), "systemProxy": true, "since": "later",
+                                                                     "generation": .string(stored.generation ?? "")]])
         try journal.remove(vm: CaptureJournal.VM(name: "Win", path: "/Other/Win.alcove"), now: now)
         XCTAssertEqual(journal.entry(for: here), recorded)
         try journal.remove(vm: here, now: now)
@@ -1794,7 +1844,7 @@ final class ControlHTTPTests: XCTestCase {
                 group.addTask {
                     let entry = CaptureJournal.Entry(vm: "vm-\(index)", port: 50000 + index, thumbprint: caThumbprint, systemProxy: index % 2 == 0,
                                                      since: "2027-01-15T08:00:00Z")
-                    try? CaptureJournal(directory: dir).record(entry, now: now)
+                    _ = try? CaptureJournal(directory: dir).record(entry, now: now)
                 }
             }
         }
@@ -2035,6 +2085,31 @@ final class ControlHTTPTests: XCTestCase {
 
         let restarted = try await c.start()
         XCTAssertEqual(restarted["proxy"]?.stringValue, "10.0.2.2:49153")
+    }
+
+    func testACaptureWhoseProxyReportsAFatalErrorNamesOneNextStep() async throws {
+        let dir = try tempDir()
+        let script = dir.appendingPathComponent("stand-in.sh").path
+        let body = """
+            #!/bin/sh
+            printf '{"ev":"ready","port":49152,"ca":"%s/ca.pem"}\\n' "$2"
+            IFS= read -r line
+            printf '{"id":1,"ok":true}\\n'
+            printf '%s\\n' '{"ev":"fatal","error":"the proxy stopped accepting connections (boom); stop the capture and start a new one"}'
+            exit 1
+
+            """
+        XCTAssertTrue(FileManager.default.createFile(atPath: script, contents: Data(body.utf8), attributes: [.posixPermissions: 0o755]))
+        let c = try await capture(directory: dir, makeProxy: { ProxyProcess(executable: script, caDirectory: dir) })
+        _ = try await c.start()
+        let reason = "alcove-proxy exited with status 1: the proxy stopped accepting connections (boom)"
+        let ended = await eventually("the capture whose proxy ended is ended") { c.hostLog.value.count == 1 }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(c.hostLog.value, ["the HTTP capture of 'Win' ended because \(reason)"])
+        let text = await c.failure("vm.http.requests")
+        XCTAssertEqual(text, "the HTTP capture of 'Win' ended because \(reason); call vm.http.start to capture again")
+        let stop = try await c.h.handle(op: "vm.http.stop", params: ["name": "Win"])
+        XCTAssertEqual(stop["warning"]?.stringValue, "the HTTP capture of 'Win' had already ended because \(reason)")
     }
 
     func testAStartAfterALostCaptureDropsItsReason() async throws {

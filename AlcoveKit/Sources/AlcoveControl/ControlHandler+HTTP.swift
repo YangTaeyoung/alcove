@@ -54,6 +54,8 @@ struct HTTPCapture {
     let since: String
     /// Whether the capture has an entry in the capture journal: its guest steps were begun.
     var guestChanged = false
+    /// The generation the capture journal gave the capture's entry.
+    var journalGeneration: String?
     /// Where the CA certificate is in the guest; nil when it was not copied there.
     var guestCAPath: String?
     var caInstalled = false
@@ -65,7 +67,8 @@ struct HTTPCapture {
 
     /// The capture's entry in the capture journal.
     var journalEntry: CaptureJournal.Entry {
-        CaptureJournal.Entry(vm: owner.name, port: port, thumbprint: thumbprint, systemProxy: systemProxySet, since: since, path: owner.path)
+        CaptureJournal.Entry(vm: owner.name, port: port, thumbprint: thumbprint, systemProxy: systemProxySet, since: since, path: owner.path,
+                             generation: journalGeneration)
     }
 }
 
@@ -227,7 +230,7 @@ extension ControlHandler {
             case (.ready(let agent), let guestPath?):
                 capture.systemProxySet = request.systemProxy && os == .windows
                 do {
-                    try captureJournal.record(capture.journalEntry, now: wallClock())
+                    capture.journalGeneration = try captureJournal.record(capture.journalEntry, now: wallClock()).generation
                 } catch {
                     throw ControlError.failed(ControlHandler.failureReason(error, fallback: "the record of captures to restore could not be written; "
                         + "make \(captureJournal.url.deletingLastPathComponent().path) writable and call vm.http.start again"))
@@ -557,7 +560,7 @@ extension ControlHandler {
         await t.dropAgent(nil)
         await endCapture(vm)
         let owner = await journalVM(t)
-        if let noted = captureJournal.snapshotEntry(snapshot, vm: owner) { try? captureJournal.record(noted, now: wallClock()) }
+        if let noted = captureJournal.snapshotEntry(snapshot, vm: owner) { _ = try? captureJournal.record(noted, now: wallClock()) }
         await connectForCleanup(t)
         if captures[vm] == nil, captureJournal.entry(for: owner) != nil {
             let wait = httpTiming.toolsWait

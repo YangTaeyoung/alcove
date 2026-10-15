@@ -444,7 +444,7 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             return
         }
         if fields["ev"]?.stringValue == "fatal" {
-            fatalText = fields["error"]?.stringValue
+            fatalText = fields["error"]?.stringValue.map(ProxyProcess.fatalReason)
             return
         }
         guard let id = fields["id"]?.intValue, let call = pending.removeValue(forKey: id) else { return }
@@ -456,6 +456,12 @@ public final class ProxyProcess: ProxyControlling, @unchecked Sendable {
             let text = fields["error"]?.stringValue ?? "alcove-proxy refused \(call.op) without a reason; \(ProxyProcess.restart)"
             call.continuation.resume(throwing: ProxyError.remote(text))
         }
+    }
+
+    /// The reason of a fatal line of the proxy: its text before the last `; `, where the proxy's own next step begins.
+    static func fatalReason(_ text: String) -> String {
+        guard let step = text.range(of: "; ", options: .backwards) else { return text }
+        return String(text[..<step.lowerBound])
     }
 
     private static let unreadableStart = "alcove-proxy printed a first line Alcove cannot read; build it again with scripts/test/all.sh"

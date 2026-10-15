@@ -131,6 +131,20 @@ final class ProxyProcessTests: XCTestCase {
         await proxy.stop()
     }
 
+    func testAFatalLineOfTheProxyIsNamedWithOneNextStep() async throws {
+        let fatal = #"{"ev":"fatal","error":"the proxy stopped accepting connections (accept tcp 127.0.0.1:4321: use of closed network connection; boom); stop the capture and start a new one"}"#
+        let script = try standIn(Self.ready + "\nIFS= read -r line\nprintf '%s\\n' '\(fatal)'\nexit 1")
+        let proxy = ProxyProcess(executable: script.path, caDirectory: script.dir)
+        _ = try await proxy.start()
+        let pending = await proxyFailure { _ = try await proxy.call("list", [:]) }
+        XCTAssertEqual(pending, "alcove-proxy is not running (it exited with status 1: the proxy stopped accepting connections (accept tcp "
+                       + "127.0.0.1:4321: use of closed network connection; boom)); call vm.http.stop, then vm.http.start to capture again")
+        let reason = await proxy.exitReason()
+        XCTAssertEqual(reason, "alcove-proxy exited with status 1: the proxy stopped accepting connections (accept tcp 127.0.0.1:4321: use of "
+                       + "closed network connection; boom)")
+        await proxy.stop()
+    }
+
     func testProxyProcessFailsEveryPendingCallWhenTheChildExits() async throws {
         let script = try standIn(Self.ready + "\nIFS= read -r one\nIFS= read -r two\nexit 0")
         let proxy = ProxyProcess(executable: script.path, caDirectory: script.dir)

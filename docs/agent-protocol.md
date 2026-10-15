@@ -720,6 +720,9 @@ than being hung, is not reported as not responding.
 
 - `ref` matches `^e\d+$` and names the element while it exists; each helper
   process numbers its refs from `<number of earlier helpers> × 1000000 + 1`.
+  A snapshot restore of the VM puts back the helper's ref counter with the
+  guest memory, so a ref from before the restore may name another element
+  afterwards; call `ui.find` or `ui.tree` again after a restore.
   A ref whose element is gone answers
   `element <ref> no longer exists; call ui.tree again`; other text answers
   `ref "<text>" is not a ref; refs look like e12 and come from ui.tree or ui.find`.

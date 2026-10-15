@@ -215,7 +215,8 @@ enum GuestRecipes {
             return """
             dns=false; getent hosts example.com >/dev/null 2>&1 && dns=true
             free=$(df -Pk / | awk 'NR==2 { printf "%.0f", $4 * 1024 }')
-            printf '{"user":"%s","freeBytes":%s,"utc":"%s","dns":%s}\\n' "$(id -un)" "${free:-null}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dns"
+            user=$(id -un | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
+            printf '{"user":"%s","freeBytes":%s,"utc":"%s","dns":%s}\\n' "$user" "${free:-null}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dns"
             """
         case .other:
             return nil

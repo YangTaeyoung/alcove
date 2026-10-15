@@ -197,6 +197,29 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertTrue(probe.contains("GetDpiForSystem"), probe)
     }
 
+    func testTheLinuxProbeEscapesTheUserName() throws {
+        let probe = try XCTUnwrap(GuestRecipes.doctorProbe(os: .linux))
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("linux-probe-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let id = dir.appendingPathComponent("id").path
+        XCTAssertTrue(FileManager.default.createFile(atPath: id, contents: Data("#!/bin/sh\nprintf '%s\\n' 'a\"b\\c'\n".utf8),
+                                                     attributes: [.posixPermissions: 0o755]))
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", probe]
+        process.environment = ["PATH": "\(dir.path):/usr/bin:/bin:/usr/sbin:/sbin"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let printed = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let line = try XCTUnwrap(String(decoding: printed, as: UTF8.self).split(whereSeparator: \.isNewline).last)
+        let reply = try JSON.parse(Data(line.utf8))
+        XCTAssertEqual(reply["user"]?.stringValue, "a\"b\\c")
+    }
+
     // MARK: - vm.set_environment
 
     func testSetEnvironmentRunsOneScriptPerSetting() async throws {
