@@ -124,6 +124,34 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertEqual(VMBundle.list(in: tmp).map(\.url.lastPathComponent), ["Fedora.alcovevm"])
     }
 
+    func testListingThroughASymbolicLinkToTheFolderSpellsTheBundlesUnderTheLink() throws {
+        let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
+        let folder = tmp.appendingPathComponent("vms")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        _ = try VMBundle.create(VMConfig.defaults(name: "Fedora", guestOS: .linux), in: folder, engine: engine)
+        let link = tmp.appendingPathComponent("vms-link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: folder)
+        let chain = tmp.appendingPathComponent("vms-link-link")
+        try FileManager.default.createSymbolicLink(at: chain, withDestinationURL: link)
+        for given in [link, chain] {
+            let listed = VMBundle.list(in: given)
+            XCTAssertEqual(listed.map(\.url.path), [given.appendingPathComponent("Fedora.alcovevm").path], given.path)
+            XCTAssertEqual(VMBundle.named("Fedora", in: given)?.url.path, given.appendingPathComponent("Fedora.alcovevm").path)
+        }
+    }
+
+    func testABundleThatIsASymbolicLinkIsListedUnderItsOwnName() throws {
+        let engine = try EngineLocator(roots: [try fakeEngineRoot(withVarsTemplate: true)]).locate()
+        let elsewhere = tmp.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        let real = try VMBundle.create(VMConfig.defaults(name: "Fedora", guestOS: .linux), in: elsewhere, engine: engine)
+        let folder = tmp.appendingPathComponent("vms")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let linked = folder.appendingPathComponent("Linked.alcovevm")
+        try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: real.url)
+        XCTAssertEqual(VMBundle.list(in: folder).map(\.url.path), [linked.path])
+    }
+
     /// A config written before the agent fields existed must gain them on the
     /// first load and keep them, or the token would differ between the process
     /// that starts the VM and anyone talking to its guest agent.

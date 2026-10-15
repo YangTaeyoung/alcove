@@ -169,10 +169,12 @@ public struct VMBundle: Sendable, Equatable {
         try fm.createDirectory(atPath: socketDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     }
 
-    /// Bundles found directly inside `directory`.
+    /// Bundles found directly inside `directory`, which may be or pass through a symbolic link. Each bundle's URL is
+    /// `directory` as given plus the bundle's name; a bundle that is itself a symbolic link keeps its own name.
     public static func list(in directory: URL, fileManager fm: FileManager = .default) -> [VMBundle] {
-        let items = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        return items.filter { $0.pathExtension == pathExtension && fm.fileExists(atPath: $0.appendingPathComponent("config.json").path) }
+        let names = (try? fm.contentsOfDirectory(atPath: directory.resolvingSymlinksInPath().path)) ?? []
+        return names.map { directory.appendingPathComponent($0) }
+            .filter { $0.pathExtension == pathExtension && fm.fileExists(atPath: $0.appendingPathComponent("config.json").path) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             .map(VMBundle.init(url:))
     }
