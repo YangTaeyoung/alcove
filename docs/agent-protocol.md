@@ -513,12 +513,16 @@ starts with an environment the agent builds when the request arrives:
 - The machine's variables: the `REG_SZ` and `REG_EXPAND_SZ` values under
   `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, such
   as `PATHEXT`, `ComSpec`, `OS`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_*` and
-  `PSModulePath`. A `REG_EXPAND_SZ` value is expanded only from the system
-  folders that [App launch](#app-launch-applaunch) names (`%SystemRoot%`,
-  `%SystemDrive%`, `%windir%`, `%ProgramFiles%` and the like); a value that
-  names any other variable is left out. `Path` keeps, in order, the folders
-  that expand that way and start with a drive, the folders `app.launch`
-  searches.
+  `PSModulePath`. A `REG_EXPAND_SZ` value is expanded only from the machine,
+  as [App launch](#app-launch-applaunch) describes: the system folders
+  (`%SystemRoot%`, `%SystemDrive%`, `%windir%`, `%ProgramFiles%` and the
+  like) and, one level deep, the `REG_SZ` values of the same key other than
+  the account's variables listed below (a machine `JAVA_HOME` of `C:\java`
+  turns `%JAVA_HOME%\bin` into `C:\java\bin`; a `%` in the text of
+  `JAVA_HOME` itself is not expanded again). A value that names any other
+  variable, such as `%USERPROFILE%`, `%TEMP%` or a `REG_EXPAND_SZ` value, is
+  left out. `Path` keeps, in order, the folders that expand that way and
+  start with a drive, the folders `app.launch` searches.
 - Values the account cannot change as variables, which replace a machine
   value of the same name: `USERNAME` and `USERDOMAIN` of the account of the
   agent's token, `COMPUTERNAME` (`GetComputerNameW`); `USERPROFILE`,
@@ -731,8 +735,12 @@ the same way:
   (`GetSystemWindowsDirectoryW`), and `%ProgramFiles%`, `%ProgramFiles(x86)%`,
   `%ProgramW6432%`, `%CommonProgramFiles%`, `%CommonProgramFiles(x86)%` and
   `%CommonProgramW6432%` from their `…Dir` values under
-  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion`. A folder or program that
-  names any other variable, or does not start with a drive, is skipped. When
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion`, and any other name, one
+  level deep, from a `REG_SZ` value of that `Session Manager\Environment` key
+  that is not one of the account's variables of
+  [Environment of a command on Windows](#environment-of-a-command-on-windows).
+  A folder or program that names any other variable, or does not start with
+  a drive, is skipped. When
   the system's Windows folder cannot be read the answer is
   `the system folders could not be read (<system error>); pass the full path of the program`.
   A name found in none of them answers

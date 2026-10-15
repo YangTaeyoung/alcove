@@ -245,18 +245,25 @@ const sessionEnvironmentKey = `SYSTEM\CurrentControlSet\Control\Session Manager\
 
 // resolveProgram returns systemProgramPath of path with machinePathFolders
 // of the machine's PATH, read from the registry, and the HKLM App Paths keys.
-// Their values are expanded with sysfolder.MachineVars; a folder or program
-// that names any other variable is left out.
+// Their values are expanded with machineExpansionVars of the values of
+// sessionEnvironmentKey and sysfolder.MachineVars; a folder or program that
+// names any other variable is left out.
 func resolveProgram(path string) (string, error) {
 	if strings.ContainsAny(path, `\/:`) {
 		return path, nil
 	}
-	vars, err := sysfolder.MachineVars()
+	folders, err := sysfolder.MachineVars()
 	if err != nil {
 		return "", fmt.Errorf("the system folders could not be read (%v); pass the full path of the program", err)
 	}
-	raw, _ := sysfolder.MachineString(sessionEnvironmentKey, "Path")
-	dirs := machinePathFolders(raw, vars)
+	machine, _ := sysfolder.MachineValues(sessionEnvironmentKey)
+	vars := machineExpansionVars(machine, folders)
+	var dirs []string
+	for _, v := range machine {
+		if strings.EqualFold(v.Name, "Path") {
+			dirs = machinePathFolders(v.Text, vars)
+		}
+	}
 	exists := func(p string) bool {
 		fi, err := os.Stat(p)
 		return err == nil && fi.Mode().IsRegular()

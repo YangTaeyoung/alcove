@@ -40,9 +40,9 @@ var sessionVariables = map[string]bool{"USERNAME": true, "USERDOMAIN": true, "CO
 // starts on Windows, sorted by the upper-case names:
 //   - each machine value whose name is not empty, has no '=' and is not one
 //     of sessionVariables: a REG_SZ value as stored, a REG_EXPAND_SZ value
-//     expanded from folders by sysfolder.ExpandText and left out when it
-//     names another variable; Path holds the folders machinePathFolders
-//     keeps;
+//     expanded from machineExpansionVars by sysfolder.ExpandText and left out
+//     when it names another variable; Path holds the folders
+//     machinePathFolders keeps with those variables;
 //   - USERNAME, USERDOMAIN and COMPUTERNAME; USERPROFILE, HOMEDRIVE and
 //     HOMEPATH of the profile, APPDATA (its AppData\Roaming), LOCALAPPDATA
 //     (its AppData\Local), TEMP and TMP (LOCALAPPDATA\Temp); ProgramData;
@@ -50,18 +50,19 @@ var sessionVariables = map[string]bool{"USERNAME": true, "USERDOMAIN": true, "CO
 //   - the systemFolderVariables that folders holds, replacing a machine
 //     value of the same name without regard to case.
 func windowsChildEnv(in windowsEnvInputs) []string {
+	expand := machineExpansionVars(in.machine, in.folders)
 	vars := map[string]string{}
 	set := func(name, value string) { vars[strings.ToUpper(name)] = name + "=" + value }
 	for _, v := range in.machine {
-		if v.Name == "" || strings.Contains(v.Name, "=") || sessionVariables[strings.ToUpper(v.Name)] {
+		if !machineVariable(v.Name) {
 			continue
 		}
 		text := v.Text
 		switch {
 		case strings.EqualFold(v.Name, "Path"):
-			text = strings.Join(machinePathFolders(v.Text, in.folders), ";")
+			text = strings.Join(machinePathFolders(v.Text, expand), ";")
 		case v.Expand:
-			expanded, err := sysfolder.ExpandText(v.Text, in.folders)
+			expanded, err := sysfolder.ExpandText(v.Text, expand)
 			if err != nil {
 				continue
 			}
@@ -101,6 +102,31 @@ func windowsChildEnv(in windowsEnvInputs) []string {
 		env[i] = vars[name]
 	}
 	return env
+}
+
+// machineVariable reports whether name can be the name of a machine value
+// in the environment: not empty, without '=' and not one of
+// sessionVariables.
+func machineVariable(name string) bool {
+	return name != "" && !strings.Contains(name, "=") && !sessionVariables[strings.ToUpper(name)]
+}
+
+// machineExpansionVars returns the variables that expand the machine's
+// values: the system folders of folders, and the REG_SZ values of machine
+// whose names machineVariable accepts and folders does not hold, each as
+// stored, under lower-case names. A REG_EXPAND_SZ value is never one of
+// them.
+func machineExpansionVars(machine []sysfolder.Value, folders map[string]string) map[string]string {
+	vars := make(map[string]string, len(folders)+len(machine))
+	for _, v := range machine {
+		if !v.Expand && machineVariable(v.Name) {
+			vars[strings.ToLower(v.Name)] = v.Text
+		}
+	}
+	for name, dir := range folders {
+		vars[name] = dir
+	}
+	return vars
 }
 
 // machinePathFolders returns the folders of the machine's Path value raw,

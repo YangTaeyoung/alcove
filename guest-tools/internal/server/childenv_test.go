@@ -99,6 +99,38 @@ func TestTheWindowsChildEnvironmentIsBuiltFromTheMachineAndTheProfile(t *testing
 	}
 }
 
+func TestAMachineValueExpandsTheMachinesOwnTextValuesOneLevel(t *testing.T) {
+	in := testEnvInputs(t)
+	for i, v := range in.machine {
+		if v.Name == "Path" {
+			in.machine[i].Text += `;%JAVA_HOME%\bin;%TOOLS%;%EXPANDED%\bin;%TEMP%\bin;%USERNAME%;%windir%\extra`
+		}
+	}
+	in.machine = append(in.machine,
+		sysfolder.Value{Name: "JAVA_HOME", Text: `C:\java`},
+		sysfolder.Value{Name: "TOOLS", Text: `%SystemRoot%\tools`},
+		sysfolder.Value{Name: "EXPANDED", Text: `C:\e`, Expand: true},
+		sysfolder.Value{Name: "SystemRoot", Text: `C:\elsewhere`},
+		sysfolder.Value{Name: "JAVA_LIB", Text: `%JAVA_HOME%\lib`, Expand: true},
+		sysfolder.Value{Name: "FROM_TOOLS", Text: `%TOOLS%\x`, Expand: true},
+		sysfolder.Value{Name: "FROM_EXPANDED", Text: `%EXPANDED%\x`, Expand: true},
+		sysfolder.Value{Name: "FROM_USERNAME", Text: `%USERNAME%\x`, Expand: true},
+	)
+	env := windowsChildEnv(in)
+	for name, want := range map[string]string{
+		"Path":          `D:\WINDOWS\system32;D:\WINDOWS;C:\Tools;D:\WINDOWS\System32\OpenSSH\;C:\java\bin;D:\WINDOWS\extra`,
+		"JAVA_LIB":      `C:\java\lib`,
+		"FROM_TOOLS":    `%SystemRoot%\tools\x`,
+		"FROM_EXPANDED": "",
+		"FROM_USERNAME": "",
+		"SystemRoot":    `D:\WINDOWS`,
+	} {
+		if got := envValue(env, name); got != want {
+			t.Errorf("%s is %q; expected %q", name, got, want)
+		}
+	}
+}
+
 func TestTheWindowsChildEnvironmentLeavesOutWhatTheAccountDoesNotName(t *testing.T) {
 	in := testEnvInputs(t)
 	in.user, in.domain, in.computer, in.programData = "", "", "", ""
