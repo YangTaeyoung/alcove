@@ -1151,6 +1151,8 @@ Refusals of `vm.clone`:
 
 ```
 '<vm>' is running; stop it before cloning it
+'<vm>' is running in another Alcove host (<process name> pid <ppid>); stop the VM there or quit that host, then clone it here
+an engine left by an earlier session (pid <pid>) still holds '<vm>'; call vm.start of '<vm>', which ends that engine, then vm.stop and vm.clone, or quit process <pid> and call vm.clone again
 '<vm>' has a suspended session; resume and shut it down, or discard the suspended state, before cloning it
 '<vm>' is a clone of '<template>'; clone '<template>' instead
 cannot clone a VM with a TPM
@@ -1161,9 +1163,12 @@ every guest-tools port from 17000 to 17999 is used by a VM in <folder>; delete a
 '<vm>' still holds the proxy settings and the CA certificate of an earlier HTTP capture in its guest; start it, wait until vm.status shows tools so that Alcove removes them, stop it and call vm.clone again
 ```
 
-The last one is answered while the capture journal (see [Cleanup after an
-earlier capture](#cleanup-after-an-earlier-capture)) holds an entry for the
-template.
+`is running; stop it` is answered while this host runs the template. The
+next two are answered while this host does not run it (`vm.status` says
+`stopped`) and an engine process holds the template's `run/qemu.pid` lock (see
+**Engine of an earlier session** below). The last
+one is answered while the capture journal (see [Cleanup after an earlier
+capture](#cleanup-after-an-earlier-capture)) holds an entry for the template.
 
 **The template guard.** A clone reads every block it has not written from the
 template's disk, so the template must not change while a clone exists. For as
@@ -1193,7 +1198,22 @@ template starts again. Refusals:
 ```
 '<vm>' is not a clone; delete it in the Alcove app
 '<vm>' is running; stop it before deleting it
+'<vm>' is running in another Alcove host (<process name> pid <ppid>); stop the VM there or quit that host, then delete it here
+an engine left by an earlier session (pid <pid>) still holds '<vm>'; call vm.start of '<vm>', which ends that engine, then vm.stop and vm.delete, or quit process <pid> and call vm.delete again
 ```
+
+**Engine of an earlier session.** `is running; stop it` is answered while
+this host runs the VM; `vm.stop` ends that session. The other two sentences of
+`vm.clone` and `vm.delete` are answered while this host does not run the VM
+and an engine process holds its `run/qemu.pid` lock. When that engine is the
+child of another live process (the Alcove app or another `alcovectl serve`),
+the sentence names that host, as a refused `vm.start` does. Otherwise the
+engine was left by a host that has exited (its parent is launchd, for example
+after a `kill -9` of `alcovectl serve`): `vm.status` says `stopped` and
+`vm.stop` does not end that engine, while `vm.start` of the VM stops it before
+it launches its own engine, once the checks under [Starting](#starting) pass.
+`<pid>` is that engine process; when `vm.start` refuses the VM, end that
+process instead.
 
 `vm.delete` also drops the VM's lease, its runtime forwards and its cached
 frame size. Both ops answer `no VM named '<vm>'; call vm.list` for an unknown

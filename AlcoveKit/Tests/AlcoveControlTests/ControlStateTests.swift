@@ -639,6 +639,44 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(gone, "no VM named 'Copy'; call vm.list")
     }
 
+    /// Starts python3 as a child of this process holding a write lock on `bundle`'s pidfile and returns its pid once
+    /// the lock is held; the child is killed on teardown.
+    private func holdPidfile(of bundle: VMBundle) async throws -> pid_t {
+        let script = "import fcntl, sys, time\npf = open(sys.argv[1], 'a')\nfcntl.lockf(pf, fcntl.LOCK_EX)\ntime.sleep(600)\n"
+        let holder = Process()
+        holder.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        holder.arguments = ["python3", "-c", script, bundle.pidFileURL.path]
+        try holder.run()
+        let pid = holder.processIdentifier
+        addTeardownBlock { if kill(pid, 0) == 0 { kill(pid, SIGKILL) } }
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !bundle.isRunning, holder.isRunning, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(bundle.isRunning, "python3 did not take the pidfile lock")
+        return pid
+    }
+
+    func testHeadlessDeleteAndCloneOfABundleHeldByAnEngineOfAnEarlierSessionNameThatEngine() async throws {
+        let (h, vms) = try headless()
+        let template = try writeBundle(VMConfig.defaults(name: "Base", guestOS: .linux), in: vms)
+        _ = try await h.handle(op: "vm.clone", params: ["name": "Base", "newName": "Copy"])
+        let copy = VMBundle(url: vms.appendingPathComponent("Copy.alcovevm"))
+        let cloneEngine = try await holdPidfile(of: copy)
+        let status = try await h.handle(op: "vm.status", params: ["name": "Copy"])
+        XCTAssertEqual(status["state"]?.stringValue, "stopped")
+        let delete = await failure(h, "vm.delete", ["name": "Copy"])
+        XCTAssertEqual(delete, "an engine left by an earlier session (pid \(cloneEngine)) still holds 'Copy'; call vm.start of 'Copy', "
+                       + "which ends that engine, then vm.stop and vm.delete, or quit process \(cloneEngine) and call vm.delete again")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: copy.configURL.path))
+
+        let other = try writeBundle(VMConfig.defaults(name: "Other", guestOS: .linux), in: vms)
+        let templateEngine = try await holdPidfile(of: other)
+        let clone = await failure(h, "vm.clone", ["name": "Other", "newName": "Third"])
+        XCTAssertEqual(clone, "an engine left by an earlier session (pid \(templateEngine)) still holds 'Other'; call vm.start of 'Other', "
+                       + "which ends that engine, then vm.stop and vm.clone, or quit process \(templateEngine) and call vm.clone again")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vms.appendingPathComponent("Third.alcovevm").path))
+        XCTAssertEqual(template.liveClones().map(\.lastPathComponent), ["Copy.alcovevm"])
+    }
+
     func testStartDiscardChangesReportsEphemeral() async throws {
         let (h, t) = setup(state: .stopped)
         let started = try await h.handle(op: "vm.start", params: ["name": "Win", "discardChanges": true])

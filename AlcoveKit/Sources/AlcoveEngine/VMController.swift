@@ -420,13 +420,15 @@ public actor VMController {
 
     // MARK: - linked clones
 
-    /// Creates a linked clone of this VM's bundle (`VMBundle.cloneLinked`); refused while the engine is active.
+    /// Creates a linked clone of this VM's bundle (`VMBundle.cloneLinked`); refused with `sourceRunning` while the engine is
+    /// active, and by `VMBundle.cloneLinked` while an engine process of another host or an earlier session holds the bundle.
     public func cloneLinked(named newName: String) throws -> VMBundle {
         guard !state.isActive else { throw VMBundle.CloneError.sourceRunning(config.name) }
         return try bundle.cloneLinked(named: newName, engine: engine)
     }
 
-    /// Deletes this VM's bundle when it is a clone (`VMBundle.deleteClone`); refused while the engine is active.
+    /// Deletes this VM's bundle when it is a clone (`VMBundle.deleteClone`); refused with `cloneRunning` while the engine is
+    /// active, and by `VMBundle.deleteClone` while an engine process of another host or an earlier session holds the bundle.
     public func deleteClone() throws {
         guard !state.isActive else { throw VMBundle.CloneError.cloneRunning(config.name) }
         try bundle.deleteClone()

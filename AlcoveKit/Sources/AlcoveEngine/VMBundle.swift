@@ -185,6 +185,8 @@ public struct VMBundle: Sendable, Equatable {
 extension VMBundle {
     public enum CloneError: Error, Equatable, Sendable, CustomStringConvertible {
         case sourceRunning(String)
+        case sourceRunsInAnotherHost(String, host: String)
+        case sourceHeldByEarlierEngine(String, pid: pid_t)
         case sourceSuspended(String)
         case sourceIsClone(String, template: String)
         case sourceHasTPM
@@ -192,6 +194,8 @@ extension VMBundle {
         case nameExists(String)
         case notAClone(String)
         case cloneRunning(String)
+        case cloneRunsInAnotherHost(String, host: String)
+        case cloneHeldByEarlierEngine(String, pid: pid_t)
         case overlayFailed(String)
         case noFreeAgentPort(String)
 
@@ -203,6 +207,8 @@ extension VMBundle {
             case .overlayFailed(let m):
                 return "qemu-img could not create the clone's disk (\(m)); check the template's disk images and the free space, then clone again"
             case .sourceRunning(let n): return "'\(n)' is running; stop it before cloning it"
+            case .sourceRunsInAnotherHost(let n, let host): return VMBundle.anotherHostRefusal(n, host: host, then: "clone it here")
+            case .sourceHeldByEarlierEngine(let n, let pid): return VMBundle.earlierEngineRefusal(n, pid: pid, op: "vm.clone")
             case .sourceSuspended(let n): return "'\(n)' has a suspended session; resume and shut it down, or discard the suspended state, before cloning it"
             case .sourceIsClone(let n, let template): return "'\(n)' is a clone of '\(template)'; clone '\(template)' instead"
             case .sourceHasTPM: return "cannot clone a VM with a TPM"
@@ -210,8 +216,23 @@ extension VMBundle {
             case .nameExists(let n): return "a VM named '\(n)' already exists; choose another name"
             case .notAClone(let n): return "'\(n)' is not a clone; delete it in the Alcove app"
             case .cloneRunning(let n): return "'\(n)' is running; stop it before deleting it"
+            case .cloneRunsInAnotherHost(let n, let host): return VMBundle.anotherHostRefusal(n, host: host, then: "delete it here")
+            case .cloneHeldByEarlierEngine(let n, let pid): return VMBundle.earlierEngineRefusal(n, pid: pid, op: "vm.delete")
             }
         }
+    }
+
+    /// The refusal for the VM `name` whose engine runs under the live host `host` ("<process name> pid <ppid>"),
+    /// ending with the step `then` that follows once that host has let go of it.
+    private static func anotherHostRefusal(_ name: String, host: String, then: String) -> String {
+        "'\(name)' is running in another Alcove host (\(host)); stop the VM there or quit that host, then \(then)"
+    }
+
+    /// The refusal of the control op `op` for the VM `name` whose pidfile lock the engine process `pid` holds while no
+    /// live host other than this process is its parent: `vm.start` of `name` ends that engine.
+    private static func earlierEngineRefusal(_ name: String, pid: pid_t, op: String) -> String {
+        "an engine left by an earlier session (pid \(pid)) still holds '\(name)'; call vm.start of '\(name)', which ends that engine, "
+            + "then vm.stop and \(op), or quit process \(pid) and call \(op) again"
     }
 
     /// JSON array of the absolute paths of the bundles cloned from this one.
@@ -284,13 +305,14 @@ extension VMBundle {
     /// string as `diskID`, before anything of the clone is created.
     /// The clone records the template's `diskEpoch` as `templateEpoch`, its `diskID` as
     /// `templateDiskID` and this bundle's standardized path as `templatePath`.
+    /// Refused while an engine process holds this bundle's pidfile lock (`refuseHeldBundle`).
     public func cloneLinked(named newName: String, engine: EngineLocator.Engine, fileManager fm: FileManager = .default) throws -> VMBundle {
         let newName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         let directory = url.deletingLastPathComponent()
         var source = try loadConfig()
         if let template = source.cloneOf { throw CloneError.sourceIsClone(source.name, template: template) }
         guard !source.tpm else { throw CloneError.sourceHasTPM }
-        guard !isRunning else { throw CloneError.sourceRunning(source.name) }
+        try refuseHeldBundle(source.name, anotherHost: CloneError.sourceRunsInAnotherHost, earlierEngine: CloneError.sourceHeldByEarlierEngine)
         guard !isSuspended else { throw CloneError.sourceSuspended(source.name) }
         let epoch = source.diskEpoch ?? 0
         let diskID = source.diskEpoch == nil ? (source.diskID ?? UUID().uuidString.lowercased()) : source.diskID
@@ -342,16 +364,27 @@ extension VMBundle {
         return clone
     }
 
+    /// Throws `anotherHost(name, "<process name> pid <ppid>")` when the engine process that holds this bundle's pidfile
+    /// lock has a host that `VMController.otherHost(ofEngine:)` names, and `earlierEngine(name, <holder pid>)` when
+    /// another process holds it; returns when no process holds the lock.
+    private func refuseHeldBundle(_ name: String, anotherHost: (String, String) -> CloneError,
+                                  earlierEngine: (String, pid_t) -> CloneError) throws {
+        guard let holder = VMController.pidfileLockHolder(pidFileURL.path) else { return }
+        if let host = VMController.otherHost(ofEngine: holder) { throw anotherHost(name, "\(host.name) pid \(host.pid)") }
+        throw earlierEngine(name, holder)
+    }
+
     /// Tokens tried by `cloneLinked` to find an agent port no bundle in the directory uses.
     private static let tokenAttempts = 100_000
 
     /// Removes this clone's bundle directory, its socket directory and its entry in the template's `clones.json`.
     /// The template is the bundle at the clone's `templatePath` when its config is named `cloneOf`, otherwise
     /// the bundle named `cloneOf` in this bundle's directory.
+    /// Refused while an engine process holds this bundle's pidfile lock (`refuseHeldBundle`).
     public func deleteClone(fileManager fm: FileManager = .default) throws {
         let config = try loadConfig()
         guard let template = config.cloneOf else { throw CloneError.notAClone(config.name) }
-        guard !isRunning else { throw CloneError.cloneRunning(config.name) }
+        try refuseHeldBundle(config.name, anotherHost: CloneError.cloneRunsInAnotherHost, earlierEngine: CloneError.cloneHeldByEarlierEngine)
         try fm.removeItem(at: url)
         try? fm.removeItem(atPath: socketDirectory)
         let recorded = config.templatePath.map { VMBundle(url: URL(fileURLWithPath: $0)) }

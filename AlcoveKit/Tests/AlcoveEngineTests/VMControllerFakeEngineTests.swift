@@ -741,6 +741,87 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertEqual(vm.bundle.liveClones(), [])
     }
 
+    /// Asserts that `operation` throws `expected` and that its description is `sentence`.
+    private func assertCloneRefusal(_ operation: () async throws -> Void, _ expected: VMBundle.CloneError, _ sentence: String,
+                                    file: StaticString = #filePath, line: UInt = #line) async {
+        do {
+            try await operation()
+            XCTFail("the operation was not refused", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? VMBundle.CloneError, expected, file: file, line: line)
+            XCTAssertEqual("\(error)", sentence, file: file, line: line)
+        }
+    }
+
+    func testCloneDeletionWhileAnEngineOfAnEarlierControllerHoldsTheCloneNamesThatEngineAndVMStartEndsIt() async throws {
+        let vm = try makeVM()
+        let bundle = try await vm.cloneLinked(named: "Clone")
+        let earlier = try controller(for: bundle, engine: vm.engine)
+        try await earlier.start()
+        let engine = try XCTUnwrap(VMController.pidfileLockHolder(bundle.pidFileURL.path), "the fake engine holds no pidfile lock")
+        let fresh = try controller(for: bundle, engine: vm.engine)
+        let s = await fresh.state; XCTAssertEqual(s, .stopped)
+        await assertCloneRefusal({ try await fresh.deleteClone() }, .cloneHeldByEarlierEngine("Clone", pid: engine),
+                                 "an engine left by an earlier session (pid \(engine)) still holds 'Clone'; call vm.start of 'Clone', "
+                                 + "which ends that engine, then vm.stop and vm.delete, or quit process \(engine) and call vm.delete again")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bundle.configURL.path))
+
+        try await fresh.start()
+        let ended = await waitUntil { kill(engine, 0) != 0 }
+        XCTAssertTrue(ended, "the earlier engine pid \(engine) is gone")
+        try await fresh.shutdown(force: true)
+        try await fresh.deleteClone()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.url.path))
+        XCTAssertEqual(vm.bundle.liveClones(), [])
+    }
+
+    func testCloneDeletionNamesTheOtherHostOrTheOrphanThatHoldsTheClone() async throws {
+        let vm = try makeVM()
+        let bundle = try await vm.cloneLinked(named: "Clone")
+        let clone = try controller(for: bundle, engine: vm.engine)
+        let (shell, holder) = try await holdPidfileFromAGrandchild(clone)
+        let host = "\(VMController.processName(shell.processIdentifier)) pid \(shell.processIdentifier)"
+        await assertCloneRefusal({ try await clone.deleteClone() }, .cloneRunsInAnotherHost("Clone", host: host),
+                                 "'Clone' is running in another Alcove host (\(host)); stop the VM there or quit that host, then delete it here")
+
+        kill(shell.processIdentifier, SIGKILL)
+        let orphaned = await waitUntil { VMController.parentPID(of: holder) == 1 }
+        XCTAssertTrue(orphaned, "the lock holder was not re-parented to launchd")
+        await assertCloneRefusal({ try await clone.deleteClone() }, .cloneHeldByEarlierEngine("Clone", pid: holder),
+                                 "an engine left by an earlier session (pid \(holder)) still holds 'Clone'; call vm.start of 'Clone', "
+                                 + "which ends that engine, then vm.stop and vm.delete, or quit process \(holder) and call vm.delete again")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bundle.configURL.path))
+
+        kill(holder, SIGKILL)
+        let released = await waitUntil { VMController.pidfileLockHolder(bundle.pidFileURL.path) == nil }
+        XCTAssertTrue(released, "the pidfile lock of pid \(holder) was not released")
+        try await clone.deleteClone()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.url.path))
+    }
+
+    func testCloningNamesTheOtherHostOrTheOrphanThatHoldsTheTemplateAndVMStartEndsTheOrphan() async throws {
+        let vm = try makeVM()
+        let (shell, holder) = try await holdPidfileFromAGrandchild(vm)
+        let host = "\(VMController.processName(shell.processIdentifier)) pid \(shell.processIdentifier)"
+        await assertCloneRefusal({ _ = try await vm.cloneLinked(named: "Clone") }, .sourceRunsInAnotherHost("Fake", host: host),
+                                 "'Fake' is running in another Alcove host (\(host)); stop the VM there or quit that host, then clone it here")
+
+        kill(shell.processIdentifier, SIGKILL)
+        let orphaned = await waitUntil { VMController.parentPID(of: holder) == 1 }
+        XCTAssertTrue(orphaned, "the lock holder was not re-parented to launchd")
+        await assertCloneRefusal({ _ = try await vm.cloneLinked(named: "Clone") }, .sourceHeldByEarlierEngine("Fake", pid: holder),
+                                 "an engine left by an earlier session (pid \(holder)) still holds 'Fake'; call vm.start of 'Fake', "
+                                 + "which ends that engine, then vm.stop and vm.clone, or quit process \(holder) and call vm.clone again")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vm.bundle.url.deletingLastPathComponent().appendingPathComponent("Clone.alcovevm").path))
+
+        try await vm.start()
+        let ended = await waitUntil { kill(holder, 0) != 0 }
+        XCTAssertTrue(ended, "the orphaned lock holder pid \(holder) is gone")
+        try await vm.shutdown(force: true)
+        let clone = try await vm.cloneLinked(named: "Clone")
+        XCTAssertEqual(clone.url.lastPathComponent, "Clone.alcovevm")
+    }
+
     func testTemplateGuardNamesClonesByTheirConfigName() async throws {
         let vm = try makeVM()
         let clone = try await vm.cloneLinked(named: "Clone")
