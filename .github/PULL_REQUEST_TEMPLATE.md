@@ -17,8 +17,8 @@ by this list. Tick what you ran, delete what does not apply.
       `install-windows.py --selftest`, `swift build --product alcovectl && swift test`,
       `go vet ./... && go test ./...` plus the agent cross-builds, `xcodegen generate` and `xcodebuild`)
 - [ ] Swift only: `(cd AlcoveKit && swift test)`
-- [ ] Go only: `(cd guest-tools && go vet ./... && go test ./...)`
-- [ ] MCP: `(cd mcp && npm install && npm run build)` and `python3 scripts/test/mcp-smoke.py --list-only`
+- [ ] Go only: `(cd guest-tools && go vet ./... && go test ./...)`, and `go test -race` for the packages you changed
+- [ ] MCP: `(cd mcp && npm install && npm run build && npm test)` and `python3 scripts/test/mcp-smoke.py --list-only`
 - [ ] Guest tools against a real VM: `python3 scripts/test/agent-rpc-windows.py` (after `python3 scripts/test/install-agent.py`) and/or `python3 scripts/test/agent-linux.py`
 - [ ] Automation against a real VM: `python3 scripts/test/mcp-smoke.py --vm "<name>"`
 - [ ] Guest boot: `scripts/test/boot-ubuntu.sh` and/or `python3 scripts/test/install-windows.py` (`--fresh` for a full install)

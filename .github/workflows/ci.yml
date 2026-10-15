@@ -90,6 +90,11 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # The packages whose tests start goroutines against shared state: the
+      # proxy, the agent server and what it drives.
+      - name: Test (race detector)
+        run: go test -race ./internal/mitm ./internal/server ./internal/clipboard ./internal/logfile ./internal/session
+
       # Compile-only check of the two shipped guest targets (no output written
       # when building several packages at once).
       - name: Cross-compile guest agents
@@ -116,6 +121,10 @@ jobs:
       - name: Build
         working-directory: mcp
         run: npm run build
+
+      - name: Unit tests
+        working-directory: mcp
+        run: npm test
 
       # Starts the built server over stdio and checks initialize + tools/list.
       # --list-only needs no VM, no control socket and no third-party Python
