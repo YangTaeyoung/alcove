@@ -198,7 +198,7 @@ public final class FakeFS: @unchecked Sendable {
             let from = m["from"]?.stringValue ?? "", to = m["to"]?.stringValue ?? ""
             guard let data = store[key(for: from)] else { return fail(m, "'\(from)' does not exist") }
             let existing = key(for: to)
-            if store[existing] != nil, m["overwrite"]?.boolValue != true { return fail(m, "'\(to)' exists; pass overwrite") }
+            if store[existing] != nil, m["overwrite"]?.boolValue != true { return fail(m, "'\(to)' exists; pass overwrite to replace it") }
             store[existing] = nil; store[key(for: from)] = nil
             store[to] = data
             return reply(m, ["path": .string(to)])

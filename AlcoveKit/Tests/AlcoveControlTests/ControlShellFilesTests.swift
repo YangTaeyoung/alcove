@@ -601,6 +601,45 @@ final class ControlShellFilesTests: XCTestCase {
         }
     }
 
+    func testAgentSentencesNameControlOps() async throws {
+        let sentences: [String: String] = [
+            "exec.read": "no job 'j9'; call exec.list",
+            "exec.write": "cannot write to job 'j1': broken pipe; call exec.list to check its state",
+            "exec.start": "16 jobs are running; stop one with exec.kill",
+            "proc.kill": "cannot kill pid 4: access denied; call proc.list to check it",
+            "fs.delete": "refusing to delete 'C:\\Users\\me': it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended",
+            "fs.list": "'C:\\data\\fs.list' is a directory; use fs.list",
+            "win.list": "window 0x2a is not responding; wait and retry, or end its process with proc.kill when win.list still shows responding false after 10 s",
+            "ui.find": "no element matches {\"name\":\"ui.tree\"}; call ui.tree to see what exists",
+            "ui.text": "an element disappeared while the text was read; call ui.text again, or vm.ui.text, 'exec.list' or C:\\exec.list.",
+        ]
+        let agent = FakeAgent()
+        agent.caps = ["clipboard", "files", "exec", "ui"]
+        agent.handler = { m, _ in
+            guard m["t"]?.stringValue == "req", let sentence = sentences[m["op"]?.stringValue ?? ""] else { return [] }
+            return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": .string(sentence)]]
+        }
+        let (h, _) = try await handlerWithAgent(agent, in: self)
+        let expected: [(String, JSON, String)] = [
+            ("vm.exec.read", ["name": "Win", "job": "j9"], "no job 'j9'; call vm.exec.list"),
+            ("vm.exec.write", ["name": "Win", "job": "j1", "data": "x"], "cannot write to job 'j1': broken pipe; call vm.exec.list to check its state"),
+            ("vm.exec.start", ["name": "Win", "command": "dir"], "16 jobs are running; stop one with vm.exec.kill"),
+            ("vm.process.kill", ["name": "Win", "pid": 4], "cannot kill pid 4: access denied; call vm.process.list to check it"),
+            ("vm.fs.delete", ["name": "Win", "path": "C:\\Users\\me"],
+             "refusing to delete 'C:\\Users\\me': it is the home directory or contains it; delete its contents instead, or use vm.exec if this is intended"),
+            ("vm.fs.list", ["name": "Win", "path": "C:\\data\\fs.list"], "'C:\\data\\fs.list' is a directory; use vm.fs.list"),
+            ("vm.window.list", ["name": "Win"],
+             "window 0x2a is not responding; wait and retry, or end its process with vm.process.kill when vm.window.list still shows responding false after 10 s"),
+            ("vm.ui.find", ["name": "Win", "selector": ["name": "ui.tree"]], "no element matches {\"name\":\"ui.tree\"}; call vm.ui.tree to see what exists"),
+            ("vm.ui.text", ["name": "Win", "ref": "e5"],
+             "an element disappeared while the text was read; call vm.ui.text again, or vm.ui.text, 'exec.list' or C:\\exec.list."),
+        ]
+        for (op, params, sentence) in expected {
+            let text = await failure(h, op, params)
+            XCTAssertEqual(text, sentence, op)
+        }
+    }
+
     func testShellAndFileOpsNeedARunningVMWithTools() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
         let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
@@ -643,6 +682,19 @@ final class GuestTextTests: XCTestCase {
         XCTAssertEqual(GuestText.decode(Data(), utf16: true), "")
         XCTAssertEqual(GuestText.decode(Data([0x41, 0x00, 0x42]), utf16: true), "A\u{FFFD}")
         XCTAssertEqual(GuestText.decode(Data("plain".utf8), utf16: false), "plain")
+    }
+
+    func testAUTF32LEMarkIsNotReadAsUTF16() {
+        var data = Data([0xFF, 0xFE, 0x00, 0x00])
+        for scalar in "A 한글 😀\n".unicodeScalars {
+            let value = scalar.value
+            data.append(contentsOf: [UInt8(value & 0xFF), UInt8(value >> 8 & 0xFF), UInt8(value >> 16 & 0xFF), UInt8(value >> 24)])
+        }
+        XCTAssertEqual(GuestText.decode(data), "A 한글 😀\n")
+        XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE, 0x00, 0x00])), "")
+        XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x42])), "A\u{FFFD}")
+        XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE, 0x00, 0x00, 0x00, 0xD8, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00])), "\u{FFFD}A")
+        XCTAssertEqual(GuestText.decode(Data([0xFF, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00])), "\u{FFFD}")
     }
 
     func testUTF8WithBOMIsStripped() {

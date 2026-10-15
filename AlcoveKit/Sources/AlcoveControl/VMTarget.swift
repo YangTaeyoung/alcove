@@ -53,16 +53,19 @@ public protocol VMTarget: Sendable {
     /// Runs one human-monitor line and returns its text output.
     func monitorCommand(_ line: String) async throws -> String
     func setNetworkLink(up: Bool) async throws
-    /// The TCP port forwards of the VM's user-network configuration.
+    /// The TCP port forwards of the user network of the configuration the engine runs with; while no engine runs, of
+    /// the configuration for the next start.
     func staticForwards() async -> [VMConfig.PortForward]
     /// Identifies the engine process currently (or last) launched for the VM.
     func engineInstance() async -> Int
-    /// The host port forwarded to the guest agent.
+    /// The host port forwarded to the guest agent by the running engine; while no engine runs, the port of the
+    /// configuration for the next start.
     func agentHostPort() async -> Int
     /// The standardized file path of the VM's bundle; nil when the target has no bundle.
     func bundlePath() async -> String?
-    /// The sentence of the agent's `refused` line from the latest connection attempt that the agent refused, kept
-    /// until an attempt connects or the connection is dropped (the VM stopped); nil when there is none.
+    /// The sentence of `AgentClient.AgentError.refused` from the latest refused connection attempt (the agent's
+    /// `refused` line, or `AgentClient.agentWithoutAuth` when the host refused the guest tools), kept until an attempt
+    /// connects or the connection is dropped (the VM stopped); nil when there is none.
     func agentRefusal() async -> String?
 }
 
@@ -109,8 +112,8 @@ actor AgentLink {
     private let endpoint: @Sendable () async -> (port: Int, token: String?)
     /// The VM's agent key, read for every connection attempt.
     private let agentKey: @Sendable () async -> String?
-    /// The sentence of the agent's `refused` line from the latest refused attempt; cleared when an attempt connects
-    /// and by `drop`.
+    /// The sentence of `AgentClient.AgentError.refused` from the latest refused attempt; cleared when an attempt
+    /// connects and by `drop`.
     private var refusal: String?
     private let events: EventBuffer
     private let retryDelay: Duration
@@ -123,7 +126,7 @@ actor AgentLink {
     private var warmUp: Task<Void, Never>?
     /// How many such attempts were started.
     private(set) var warmUpCount = 0
-    /// The `ui.ping` sent after the latest adoption of a client with the `ui` capability.
+    /// The `ui.ping` of `AgentClient.startUIHelper` sent after the latest adoption of a client with the `ui` capability.
     private(set) var helperStart: Task<Void, Never>?
     /// Receives every client the link adopts.
     private var observer: (@Sendable (AgentClient) async -> Void)?
@@ -152,8 +155,8 @@ actor AgentLink {
         self.agentKey = agentKey
     }
 
-    /// The sentence of the agent's `refused` line from the latest refused attempt; nil once an attempt connected or
-    /// the link was dropped.
+    /// The sentence of `AgentClient.AgentError.refused` from the latest refused attempt; nil once an attempt connected
+    /// or the link was dropped.
     func lastRefusal() -> String? { refusal }
 
     /// The connected agent client; nil when the VM is not running or the agent is not reachable within `timeout`.
@@ -275,13 +278,14 @@ actor AgentLink {
     }
 
     /// Makes `candidate` the cached client and the one source of guest events. With `startsHelper` it gets one `ui.ping`
-    /// that nobody waits for, which starts the agent's UI helper. The observer is called in a task of its own.
+    /// (`AgentClient.startUIHelper`), which starts the agent's UI helper; helper calls wait for its end before their turn.
+    /// The observer is called in a task of its own.
     private func adopt(_ candidate: AgentClient, startsHelper: Bool) {
         feed?.cancel()
         feed = events.follow(candidate)
         client = candidate
         lastAttemptFailed = false
-        helperStart = startsHelper ? Task { _ = try? await candidate.call("ui.ping", [:], timeout: UITiming.callTimeout) } : nil
+        helperStart = startsHelper ? candidate.startUIHelper(timeout: UITiming.callTimeout) : nil
         observerCall = observer.map { notify in Task { await notify(candidate) } }
     }
 
@@ -329,9 +333,15 @@ public actor ControllerTarget: VMTarget {
             let state = await controller.state
             return state == .running || state == .paused
         }, endpoint: {
-            let config = await controller.config
+            let config = await ControllerTarget.engineConfig(of: controller)
             return (config.agentHostPort, config.agentToken)
-        }, agentKey: { await controller.config.agentKey })
+        }, agentKey: { await ControllerTarget.engineConfig(of: controller).agentKey })
+    }
+
+    /// The configuration the engine of `controller` runs with; the configuration for its next start while none runs.
+    private static func engineConfig(of controller: VMController) async -> VMConfig {
+        if let running = await controller.runningConfig { return running }
+        return await controller.config
     }
 
     public func agentRefusal() async -> String? { await link.lastRefusal() }
@@ -393,13 +403,13 @@ public actor ControllerTarget: VMTarget {
     }
 
     public func engineInstance() async -> Int { await controller.engineInstance }
-    public func agentHostPort() async -> Int { await controller.config.agentHostPort }
+    public func agentHostPort() async -> Int { await ControllerTarget.engineConfig(of: controller).agentHostPort }
     public func bundlePath() async -> String? { controller.bundle.url.standardizedFileURL.path }
     public func deleteSnapshot(named name: String) async throws { try await controller.deleteSnapshot(named: name) }
     public func monitorCommand(_ line: String) async throws -> String { try await controller.monitorCommand(line) }
     public func setNetworkLink(up: Bool) async throws { try await controller.setNetworkLink(up: up) }
     public func staticForwards() async -> [VMConfig.PortForward] {
-        guard case .user(let forwards) = await controller.config.network else { return [] }
+        guard case .user(let forwards) = await ControllerTarget.engineConfig(of: controller).network else { return [] }
         return forwards.filter { $0.proto == .tcp }
     }
 

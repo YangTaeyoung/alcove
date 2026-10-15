@@ -94,7 +94,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 |---|---|---|
 | `hello` | — | `{version: 1, host: "app"|"headless"}` |
 | `vm.list` | — | `{vms: [{name, guestOS, state, suspended, width?, height?, error?, leasedBy?, cloneOf?, ephemeral?}]}` — see [VM rows](#vm-rows) |
-| `vm.status` | `name` | the VM's row plus, while it is running or paused, `tools: bool`, with tools `agentCaps: [...]`, and without them `toolsRefused` when the guest tools refused the host |
+| `vm.status` | `name` | the VM's row plus, while it is running or paused, `tools: bool`, with tools `agentCaps: [...]`, and without them `toolsRefused` when the guest tools refused the host or the host refused them |
 | `vm.start` | `name`, `discardChanges?`, `waitTools?` | `{state, ephemeral}` after the guest is running; `{state, ephemeral, resumed, tools, clockSynced}` when it resumed a session saved to disk — see [Starting](#starting) |
 | `vm.stop` | `name`, `force?` | `{state, captureEnded?, warning?}` after the engine exited (graceful ACPI first); see [Stopping a capture](#stopping-a-capture) for the capture fields |
 | `vm.clone` | `name` (the template), `newName` | `{name}` — see [Linked clones](#linked-clones) |
@@ -609,9 +609,11 @@ layer answer `guest tools in '<vm>' are too old for <op>; update alcove-agent
 in the guest`. The ops map onto the agent's `win.*` and `ui.*` operations in
 [`agent-protocol.md`](agent-protocol.md), which has the exact rules for
 windows, nodes, roles and every action. A sentence of the agent is passed on
-unchanged, so it can name an agent operation: `ui.tree`, `ui.find`,
-`win.list`, `win.action` and `proc.kill` are `vm.ui.tree`, `vm.ui.find`,
-`vm.window.list`, `vm.window.action` and `vm.process.kill` here.
+with the agent operations it names replaced by the ops of this protocol, as
+[Shell, processes and files](#shell-processes-and-files) describes:
+`ui.tree`, `ui.find`, `ui.text`, `ui.act`, `win.list`, `win.action` and
+`proc.kill` become `vm.ui.tree`, `vm.ui.find`, `vm.ui.text`, `vm.ui.action`,
+`vm.window.list`, `vm.window.action` and `vm.process.kill`.
 
 **One request at a time.** One helper process in the guest serves every
 window and element request, one after another. The server therefore sends one
@@ -631,7 +633,13 @@ with `window` or `marks` and of a recording take their turn in the same line.
   `vm.ui.find` without a match in the Services console (about 1,650 elements)
   takes 7 s to 8 s on the test guest.
 - A request of a closed connection that still waits for its turn is not sent.
-- The agent's own sentences about the helper reach the caller unchanged, among
+- When guest tools with the `ui` capability connect, the server sends them one
+  `ui.ping`, which starts the helper. A request whose turn comes before that
+  ping was answered (or failed, or 215 s passed) is sent after it, and its
+  time as a sent request starts then; the question of a recording about the
+  element an action is aimed at is not asked meanwhile.
+- The agent's own sentences about the helper reach the caller as the agent
+  wrote them, apart from the agent operations they name, among
   them `UI helper did not answer '<op>' within <n> s; it was restarted` (every
   ref is forgotten), `UI helper exited; retry` and the start failures listed
   in `agent-protocol.md`.
@@ -669,7 +677,7 @@ title bar is not covered.
 
 - `ref`: a ref such as `e12` from `vm.ui.tree` or `vm.ui.find`. It names the
   element while it exists and the helper process lives; afterwards the guest
-  answers `element <ref> no longer exists; call ui.tree again`. A new helper
+  answers `element <ref> no longer exists; call vm.ui.tree again`. A new helper
   process (after an agent restart, or after the agent replaced a helper that
   did not answer) knows none of the earlier refs. `vm.snapshot.restore` puts
   back the helper as the snapshot holds it, its ref counter included, so a
@@ -690,10 +698,10 @@ index`, `selector field '<k>' must be a string`, `selector field 'index' must
 be an integer of 0 or more`, `selector needs at least one of role, name,
 nameContains, automationId`. A selector that matches nothing answers `no
 element matches {"window":"0xd0368","role":"Button","name":"Nope"}; call
-ui.tree to see what exists` (`vm.ui.find` returns an empty list instead); a
+vm.ui.tree to see what exists` (`vm.ui.find` returns an empty list instead); a
 `window` that does not exist answers `no window has "<text>" in its title;
-call win.list to see the open windows` or `window <id> no longer exists; call
-win.list again`.
+call vm.window.list to see the open windows` or `window <id> no longer exists;
+call vm.window.list again`.
 
 **`vm.ui.tree`** reads the elements of `window` (default `foreground`) or
 below the element `root` (a ref). `depth` is the number of levels (0 or more,
@@ -750,7 +758,7 @@ result is `{x, y, node}`: the point and the element. An element whose centre
 cannot be clicked answers `element <ref> has no clickable point: <reason>; or
 act on it with vm.ui.action`, with the guest's reason, such as `window
 0x501fa "Alcove Fixture" covers the centre of the element; focus the
-element's window with win.action`; without a reason from the guest it
+element's window with vm.window.action`; without a reason from the guest it
 answers `element <ref> has no clickable point (off screen or covered); use
 vm.ui.action or scroll it into view`. A window that an app or `vm.app.launch`
 just opened is often behind another one; `vm.window.action` with `focus`
@@ -799,8 +807,8 @@ token (high integrity) and reads windows of elevated processes: an app the
 agent started is elevated itself. A window of a higher integrity level than
 the agent's was not present on the test guest. The ops addressed to a window
 that does not handle messages answer `window <id> "<title>" is not
-responding; wait and retry, or end its process with proc.kill when win.list
-still shows responding false after 10 s`.
+responding; wait and retry, or end its process with vm.process.kill when
+vm.window.list still shows responding false after 10 s`.
 
 ## Launching and deploying apps
 
@@ -1026,12 +1034,14 @@ events: events of an earlier session are in `vm.events` only.
 the guest tools) and `agentCaps` when they are connected. When they are not
 connected because the agent refused the host's latest connection attempt,
 or the host refused guest tools whose hello does not ask for the VM's key
-(docs/agent-protocol.md, Host key), it adds `toolsRefused`: the sentence,
-which names the fix, for example
-`this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later`
-or
-`the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)`.
-The sentence is kept until an attempt connects or the VM stops.
+(docs/agent-protocol.md, Host key), it adds `toolsRefused`, which names the
+fix: the agent's sentence, for example
+`this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later`,
+or the host's refusal
+`the guest tools in '<vm>' cannot be used: the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)`.
+It is kept until an attempt connects or the VM stops. An op that needs the
+guest tools answers `the guest tools in '<vm>' refused the connection:
+<sentence>` for a refusal by the agent and the host's refusal as above.
 
 ## Starting
 
@@ -1369,7 +1379,7 @@ that makes the later ones impossible:
 | `host` | `app` or `headless` | never | |
 | `state` | the VM's state | not `running` (hint `call vm.start`; `call vm.resume` when paused; `wait until vm.status shows running, then retry` while starting; `wait until vm.status shows stopped, then call vm.start` while stopping or suspending) | when not running |
 | `display` | `<W>x<H>` of the current frame | no frame can be read | |
-| `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s: `guest tools are not connected` (hint `install alcove-agent in the guest with scripts/test/install-agent.py`), or, when the agent refused the host or the host refused guest tools that do not ask for the VM's key, `the guest tools refused the connection: <the sentence>` with the sentence's next step (the text after its first `; `) as hint | when not ok |
+| `tools` | `alcove-agent <version>` | the guest tools do not connect within 5 s: `guest tools are not connected` (hint `install alcove-agent in the guest with scripts/test/install-agent.py`), or, when the agent refused the host, `the guest tools refused the connection: <the sentence>`, or, when the host refused guest tools that do not ask for the VM's key, `the guest tools in '<vm>' cannot be used: <the sentence>`, each with the sentence's next step (the text after its first `; `) as hint | when not ok |
 | `rpc` | `proto <n>` | below 2 | when `rpc` or `exec` is not ok |
 | `exec` | `enabled` or `disabled` | the tools were started without `--allow-exec` | |
 | `probe` | why the guest probe gave nothing | present only on failure: the guest OS has no probe script, the script failed or printed no JSON | always |
@@ -2465,8 +2475,8 @@ failed after <s> s`:
 variables: PASSWORD=<hidden>, button=Sned
 ok   1 vm.ui.type Edit "Message" 600 ms
 FAIL 2 vm.ui.click Button "Send" 0 ms
-     no element matches {"window":"Alcove Fixture","role":"Button","name":"Sned"}; call ui.tree to see what exists
-error: step 2 (vm.ui.click Button "Send") failed: no element matches {"window":"Alcove Fixture","role":"Button","name":"Sned"}; call ui.tree to see what exists
+     no element matches {"window":"Alcove Fixture","role":"Button","name":"Sned"}; call vm.ui.tree to see what exists
+error: step 2 (vm.ui.click Button "Send") failed: no element matches {"window":"Alcove Fixture","role":"Button","name":"Sned"}; call vm.ui.tree to see what exists
 FAILED: step 2 failed after 0.7 s
 ```
 
@@ -2535,8 +2545,17 @@ the run uses it. The client waits up to 7,925,000 ms for a run.
 These ops need the guest tools started with `--allow-exec`
 (`vm.status` → `agentCaps` contains `rpc`, `jobs`, `proc`, `fs`). They map onto
 the agent operations of [`agent-protocol.md`](agent-protocol.md), which has
-the exact rules; an error of the agent is passed on unchanged, so it can name
-an agent operation such as `exec.list` (here `vm.exec.list`).
+the exact rules. An error sentence of the agent is passed on with each agent
+operation it names as a word (after a space or `(`, before a space, `,`, `;`,
+`:`, `)`, a final `.` or the end) replaced by the op of this protocol that
+stands for it: `exec.run` → `vm.exec`, `exec.start`, `exec.read`,
+`exec.write`, `exec.kill`, `exec.list` → `vm.exec.*`, `proc.list` →
+`vm.process.list`, `proc.kill` → `vm.process.kill`, `fs.list`, `fs.read`,
+`fs.write`, `fs.delete` → `vm.fs.*`, `app.launch` → `vm.app.launch`,
+`win.list` → `vm.window.list`, `win.action` → `vm.window.action`, `ui.tree`,
+`ui.find`, `ui.text` → `vm.ui.*`, `ui.act` → `vm.ui.action`. A name inside a
+path or a quoted value is kept, and so is an agent operation without an op of
+its own here, such as `fs.stat`.
 
 **Commands** (`vm.exec`, `vm.exec.start`)
 
@@ -2618,10 +2637,12 @@ an agent operation such as `exec.list` (here `vm.exec.list`).
   262144 bytes; `offset` and `length` are not used) and `eof` is true. `size`
   is the file size in bytes.
 - Text is decoded as UTF-16LE when the file begins with the bytes `FF FE`
-  (what Windows PowerShell writes with `>` and `Out-File`), otherwise as
+  but not `FF FE 00 00` (what Windows PowerShell writes with `>` and
+  `Out-File`), as UTF-32LE when it begins with `FF FE 00 00`, otherwise as
   UTF-8; a byte order mark at the start is left out and invalid sequences
   become U+FFFD. A range is cut by bytes, so a character that straddles two
-  ranges reads as U+FFFD in both; use even offsets in a UTF-16 file.
+  ranges reads as U+FFFD in both; use even offsets in a UTF-16 file. A range
+  from a later offset has no mark and is read as UTF-8.
 - `vm.fs.write` writes `text` as UTF-8 without a byte order mark, creates
   missing folders and replaces the file unless `append` is true.
 - `vm.fs.list` reports `mtime` as RFC 3339 in UTC and `name` relative to
@@ -2637,12 +2658,13 @@ Errors are plain strings that say what to do next:
 VM 'Win' is stopped; call vm.start first
 guest tools are not connected in 'Win'; install alcove-agent in the guest
 the guest tools in 'Win' refused the connection: this alcove-agent serves nothing because the VM's SMBIOS strings lack alcove-hostkey or alcove-token; start the VM with Alcove 0.2 or later
+the guest tools in 'Win' cannot be used: the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)
 missing parameter; pass 'command' or 'argv'
 missing or invalid parameter 'env'
 parameter 'append' must be a boolean
 parameter 'offset' must be an integer
 timeout must be between 1 and 86400 seconds
-no job 'j9'; call exec.list
+no job 'j9'; call vm.exec.list
 'C:\out\app.exe' exists in the guest; pass overwrite
 guest tools in 'Win' did not answer vm.fs.read in time; check vm.status and retry
 VM 'Win' is leased by ci-agent for another 240 s; pass its lease token, wait, or ask the owner to release it
@@ -2651,8 +2673,8 @@ host port 8080 is taken; pass hostPort: 0 to let Alcove choose
 start failed: 'Win' is a template with clones (Win clone); delete the clones first or start a clone
 the UI helper is busy with other requests; retry
 pass ref or selector
-element e12 no longer exists; call ui.tree again
-element e14 has no clickable point: window 0x501fa "Alcove Fixture" covers the centre of the element; focus the element's window with win.action; or act on it with vm.ui.action
+element e12 no longer exists; call vm.ui.tree again
+element e14 has no clickable point: window 0x501fa "Alcove Fixture" covers the centre of the element; focus the element's window with vm.window.action; or act on it with vm.ui.action
 cannot start 'C:\apps\tool.exe': The system cannot find the file specified.; check the path with vm.fs.list
 'C:\alcove-e2e\junction' is a link in the guest; pass the folder it points to
 the request line is not JSON that can be read (broken syntax, or a \u escape of half a surrogate pair); send one JSON object per line

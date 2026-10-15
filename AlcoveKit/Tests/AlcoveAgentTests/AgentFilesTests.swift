@@ -411,17 +411,35 @@ final class AgentFilesTests: XCTestCase {
     }
 
     func testSyncWindowsRejectsLocalNamesDifferingOnlyByCase() async throws {
-        let root = try caseTree(["a.txt": "1", "A.txt": "2"])
-        try XCTSkipUnless(FileManager.default.contentsOfDirectory(atPath: root.path).count == 2, "case-insensitive local volume")
+        let root = try caseTree(["a.txt": "1"])
+        let listing = listSyncFiles
+        listSyncFiles = { dir in [("A.txt", dir.appendingPathComponent("A.txt")), ("a.txt", dir.appendingPathComponent("a.txt"))] }
+        defer { listSyncFiles = listing }
+        XCTAssertThrowsError(try AgentClient.checkSyncSource(root, toGuestPath: "C:\\g")) { error in
+            XCTAssertEqual(error as? AgentClient.AgentError,
+                           .remote("'A.txt' and 'a.txt' differ only by case and cannot both exist in a Windows guest folder"))
+        }
         let fs = FakeFS()
         let (agent, client) = try await connected(fs)
-        let before = agent.receivedCount()
         do { _ = try await client.syncDirectory(root, toGuestPath: "C:\\g", deleteExtras: false); XCTFail("expected error") }
         catch AgentClient.AgentError.remote(let text) {
             XCTAssertEqual(text, "'A.txt' and 'a.txt' differ only by case and cannot both exist in a Windows guest folder")
         }
-        XCTAssertEqual(agent.receivedCount(), before)
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "req" })
         XCTAssertEqual(fs.paths(), [])
+    }
+
+    func testSyncSendsAFileOfTheSameSizeWithOtherContent() async throws {
+        let root = try caseTree(["a.txt": "new", "b.txt": "same"])
+        let fs = FakeFS()
+        fs["/g/a.txt"] = Data("old".utf8)
+        fs["/g/b.txt"] = Data("same".utf8)
+        let (_, client) = try await connected(fs)
+        let r = try await client.syncDirectory(root, toGuestPath: "/g", deleteExtras: false)
+        XCTAssertEqual(r.sent, ["a.txt"])
+        XCTAssertEqual(r.skipped, 1)
+        XCTAssertEqual(r.bytes, 3)
+        XCTAssertEqual(fs["/g/a.txt"], Data("new".utf8))
     }
 
     func testSyncNonWindowsPathKeepsCaseSensitiveNames() async throws {
@@ -466,6 +484,22 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertEqual(fs["/data/blob.bin"], Data("original".utf8))
         XCTAssertNil(fs["/data/blob.bin.alcove-part"])
         XCTAssertEqual(fs.paths(), ["/data/blob.bin"])
+    }
+
+    func testAPushRenameRefusedForAnotherReasonKeepsTheAgentSentence() async throws {
+        let fs = FakeFS()
+        let (agent, client) = try await connected(fs)
+        let inner = agent.handler
+        let refusal = "cannot rename '/data/exists/blob.bin.alcove-part' to '/data/exists/blob.bin': Access is denied."
+        agent.handler = { m, a in
+            if m["op"]?.stringValue == "fs.rename" { return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": .string(refusal)]] }
+            return inner?(m, a) ?? []
+        }
+        let local = try tempDir().appendingPathComponent("blob.bin")
+        try randomData(3000).write(to: local)
+        do { _ = try await client.pushFile(local, toGuestPath: "/data/exists/blob.bin", overwrite: false); XCTFail("expected refusal") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, refusal) }
+        XCTAssertEqual(fs.paths(), [])
     }
 
     func testACancelledPushRemovesItsPartFile() async throws {

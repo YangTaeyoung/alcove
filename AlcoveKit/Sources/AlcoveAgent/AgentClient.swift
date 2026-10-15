@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import AlcoveQMP
 
 /// Host side of the guest agent protocol (docs/agent-protocol.md): connects
@@ -34,6 +35,9 @@ public actor AgentClient {
     public static let noAgentToken = "the VM's config.json has no agentToken to sign; restore config.json from a backup"
     /// The refusal of a hello without `auth` by a `connect` that was given the VM's agent key.
     public static let agentWithoutAuth = "the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)"
+    /// Whether `sentence`, the text of `.refused`, is a refusal by the host (`agentWithoutAuth`) rather than one the
+    /// agent sent.
+    public static func isHostRefusal(_ sentence: String) -> Bool { sentence == agentWithoutAuth }
     /// The handshake reason when the given agent key is not 64 hexadecimal digits.
     public static let badAgentKey = "the agentKey in the VM's config.json is not 64 hexadecimal digits; restore config.json from a backup"
     /// The handshake reason when the agent asks for a signature without a nonce of 64 hexadecimal digits.
@@ -74,6 +78,14 @@ public actor AgentClient {
     private var nextWaiterID = 1
     public private(set) var hello: Hello?
     public private(set) var isConnected = false
+
+    /// Where the `ui.ping` of `startUIHelper` stands on this connection.
+    private enum HelperStart: Sendable {
+        case notSent
+        case waiting(Task<Void, Never>)
+        case ended(Task<Void, Never>)
+    }
+    private nonisolated let helperStart = Mutex(HelperStart.notSent)
 
     public init() {
         var c: AsyncStream<Event>.Continuation!
@@ -320,6 +332,47 @@ public actor AgentClient {
         return res
     }
 
+    /// Sends one `ui.ping` in a task of its own, which starts the agent's UI helper, and returns that task; a later call
+    /// returns the task of the first and sends nothing. The ping ends when the agent answers it, when it fails or after
+    /// `timeout`.
+    @discardableResult
+    public nonisolated func startUIHelper(timeout: Duration) -> Task<Void, Never> {
+        helperStart.withLock { state in
+            switch state {
+            case .waiting(let task), .ended(let task):
+                return task
+            case .notSent:
+                let task = Task {
+                    _ = try? await self.call("ui.ping", [:], timeout: timeout)
+                    self.helperStart.withLock { state in
+                        if case .waiting(let task) = state { state = .ended(task) }
+                    }
+                }
+                state = .waiting(task)
+                return task
+            }
+        }
+    }
+
+    /// Whether the `ui.ping` of `startUIHelper` was sent and has not ended.
+    public nonisolated var isStartingUIHelper: Bool {
+        helperStart.withLock { state in
+            if case .waiting = state { return true }
+            return false
+        }
+    }
+
+    /// Returns once the `ui.ping` of `startUIHelper` has ended; at once when none was sent.
+    public nonisolated func uiHelperStarted() async {
+        let task: Task<Void, Never>? = helperStart.withLock { state in
+            switch state {
+            case .waiting(let task), .ended(let task): return task
+            case .notSent: return nil
+            }
+        }
+        await task?.value
+    }
+
     // MARK: - internals
 
     /// Whether `message` serialized stays below `maxRequestBytes`, the longest line the agent reads.
@@ -426,9 +479,13 @@ public actor AgentClient {
 }
 
 extension AgentClient.AgentError: LocalizedError {
-    /// The agent's sentence for `.refused`; nil for the other cases.
+    /// For `.refused`: its sentence after `the guest tools cannot be used: ` for a refusal by the host
+    /// (`AgentClient.isHostRefusal`), after `the guest tools refused the connection: ` for one the agent sent; nil for
+    /// the other cases.
     public var errorDescription: String? {
-        refusal.map { "the guest tools refused the connection: \($0)" }
+        refusal.map {
+            AgentClient.isHostRefusal($0) ? "the guest tools cannot be used: \($0)" : "the guest tools refused the connection: \($0)"
+        }
     }
 
     /// The sentence of the agent's `refused` line for `.refused`; nil for the other cases.

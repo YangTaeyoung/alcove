@@ -1,7 +1,7 @@
 import XCTest
 @testable import AlcoveControl
 import AlcoveEngine
-import AlcoveAgent
+@testable import AlcoveAgent
 import AlcoveQMP
 import AlcoveDisplayProtocol
 import AlcoveTestSupport
@@ -460,7 +460,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(typed, "element e8 has no clickable point (off screen or covered); use vm.ui.action or scroll it into view")
 
         let stale = await failure(h, "vm.ui.click", ["name": "Win", "ref": "e3"])
-        XCTAssertEqual(stale, "element e3 no longer exists; call ui.tree again")
+        XCTAssertEqual(stale, "element e3 no longer exists; call vm.ui.tree again")
         let sent = await t.sent
         XCTAssertEqual(sent, [])
     }
@@ -659,6 +659,9 @@ final class ControlUITests: XCTestCase {
         let hung = "window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait and retry, or end its process with proc.kill "
             + "when win.list still shows responding false after 10 s"
         let crowded = "9 earlier ui.act calls are still running in the app; wait for them or end its process with proc.kill"
+        let hungNamed = "window 0x400b8 \"Alcove Fixture (Not Responding)\" is not responding; wait and retry, or end its process with "
+            + "vm.process.kill when vm.window.list still shows responding false after 10 s"
+        let crowdedNamed = "9 earlier vm.ui.action calls are still running in the app; wait for them or end its process with vm.process.kill"
         let unlocked = "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
             + "(SetNamedSecurityInfo(C:\\ProgramData\\Alcove\\uia): Access is denied.); fix its owner and access list, then retry"
         let reparse = "could not start the UI helper through PowerShell: the UI helper folder C:\\ProgramData\\Alcove\\uia could not be locked "
@@ -693,7 +696,7 @@ final class ControlUITests: XCTestCase {
         let focused = try await h.handle(op: "vm.window.action", params: ["name": "Win", "window": "0x2a", "action": "focus"])
         XCTAssertEqual(focused, ["window": fixtureWindow, "eventSeq": 0])
         let notMinimized = await failure(h, "vm.window.action", ["name": "Win", "window": "0x400b8", "action": "minimize"])
-        XCTAssertEqual(notMinimized, hung)
+        XCTAssertEqual(notMinimized, hungNamed)
 
         let unresponsive = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e1", "action": "invoke"])
         XCTAssertEqual(unresponsive, ["node": sendButton, "unresponsive": true, "eventSeq": 0])
@@ -704,7 +707,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(gone["observation"]?["settled"]?.boolValue, true)
         let pending = try await h.handle(op: "vm.ui.action", params: ["name": "Win", "ref": "e9", "action": "invoke"])
         XCTAssertEqual(pending, ["node": sendButton, "pending": true, "eventSeq": 0])
-        for (ref, sentence) in [("e3", disabled), ("e4", unsupported), ("e7", hung), ("e8", crowded)] {
+        for (ref, sentence) in [("e3", disabled), ("e4", unsupported), ("e7", hungNamed), ("e8", crowdedNamed)] {
             let text = await failure(h, "vm.ui.action", ["name": "Win", "ref": .string(ref), "action": "toggle"])
             XCTAssertEqual(text, sentence)
         }
@@ -1475,8 +1478,9 @@ final class ControlUITests: XCTestCase {
     func testDeployRefusesHostNamesThatDifferOnlyByCaseBeforeItStopsOrWritesAnything() async throws {
         let dir = try tempDir("cased")
         try Data("1".utf8).write(to: dir.appendingPathComponent("a.txt"))
-        try Data("2".utf8).write(to: dir.appendingPathComponent("A.txt"))
-        try XCTSkipUnless(FileManager.default.contentsOfDirectory(atPath: dir.path).count == 2, "case-insensitive local volume")
+        let listing = listSyncFiles
+        listSyncFiles = { folder in [("A.txt", folder.appendingPathComponent("A.txt")), ("a.txt", folder.appendingPathComponent("a.txt"))] }
+        defer { listSyncFiles = listing }
         let guestDir = "C:\\alcove-apps\\cased"
         let fs = FakeFS()
         fs[guestDir + "\\app.exe"] = Data("old".utf8)
@@ -2058,7 +2062,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(agent, "ui.find").count, searchErrors.count + 1)
 
         let notResponding = try await unmatched(["type": "ui_gone", "window": "File", "name": "Hung"])
-        XCTAssertEqual(notResponding["problems"]?[0]?["error"]?.stringValue, hung)
+        XCTAssertEqual(notResponding["problems"]?[0]?["error"]?.stringValue, ControlHandler.namingControlOps(hung))
         XCTAssertEqual(notResponding["problems"]?.arrayValue?.count, 1)
 
         let unknown = try await unmatched(["type": "ui_gone", "name": "Other"])
@@ -2083,7 +2087,7 @@ final class ControlUITests: XCTestCase {
         }
 
         let noForeground = try await unmatched(["type": "ui_gone", "name": "Front"])
-        XCTAssertEqual(noForeground["problems"]?[0]?["error"]?.stringValue, "no window is in the foreground; pass a window id from win.list")
+        XCTAssertEqual(noForeground["problems"]?[0]?["error"]?.stringValue, "no window is in the foreground; pass a window id from vm.window.list")
 
         let exists = try await unmatched(["type": "ui_exists", "name": "Other"])
         XCTAssertEqual(exists["problems"]?[0]?["error"]?.stringValue, "UI helper exited; retry")
@@ -2206,12 +2210,12 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(neverRead["matched"]?.intValue, -1)
         XCTAssertNil(neverRead["type"])
         XCTAssertNil(neverRead["detail"])
-        XCTAssertEqual(neverRead["problems"]?[0]?["error"]?.stringValue, noMatch)
+        XCTAssertEqual(neverRead["problems"]?[0]?["error"]?.stringValue, ControlHandler.namingControlOps(noMatch))
 
         let otherRef = try await waitFor(other, [["type": "ui_text_stable", "ref": "e9"]], timeout: 1)
         XCTAssertEqual(otherRef["matched"]?.intValue, -1)
         XCTAssertNil(otherRef["detail"])
-        XCTAssertEqual(otherRef["problems"]?[0]?["error"]?.stringValue, noMatch)
+        XCTAssertEqual(otherRef["problems"]?[0]?["error"]?.stringValue, ControlHandler.namingControlOps(noMatch))
 
         let closed = "no window has \"Chat\" in its title; call win.list to see the open windows"
         let (third, _, thirdAgent) = try await rig(["ui.text": { m, n in
@@ -2224,7 +2228,7 @@ final class ControlUITests: XCTestCase {
         XCTAssertEqual(agentRequests(thirdAgent, "ui.text").count, 2)
         let notOpened = try await waitFor(third, [["type": "ui_text_stable", "window": "Chat", "name": "Later"]], timeout: 1)
         XCTAssertNil(notOpened["type"])
-        XCTAssertEqual(notOpened["problems"]?[0]?["error"]?.stringValue, closed)
+        XCTAssertEqual(notOpened["problems"]?[0]?["error"]?.stringValue, ControlHandler.namingControlOps(closed))
     }
 
     func testTextStableOnAPasswordFieldFailsTheWait() async throws {
@@ -2659,6 +2663,42 @@ final class ControlUITests: XCTestCase {
         let waitResult = try await wait.value
         XCTAssertEqual(waitResult["matched"]?.intValue, 0)
         XCTAssertEqual(requestOps(agent), ["ui.tree", "win.list", "ui.find"])
+    }
+
+    func testAHelperCallWaitsForTheAdoptionPingBeforeItsTurnStarts() async throws {
+        let (h, t, agent) = try await rig([
+            "ui.ping": { _, _ in .silent },
+            "ui.at": { _, _ in .ok(["node": sendButton]) },
+            "win.list": { _, _ in .ok(["windows": [fixtureWindow]]) },
+            "fs.stat": { _, _ in .ok(["exists": false]) },
+        ])
+        let connected = await t.agent(timeout: .zero)
+        let client = try XCTUnwrap(connected)
+        client.startUIHelper(timeout: .seconds(60))
+        let pinged = await eventually { agentRequests(agent, "ui.ping").count == 1 }
+        XCTAssertTrue(pinged)
+        XCTAssertTrue(client.isStartingUIHelper)
+
+        let fact = await h.factAtOnce(client, "ui.at", [:], vm: "Win", patience: .seconds(20))
+        guard case .late = fact else { return XCTFail("a call made only when the helper is free got \(fact)") }
+
+        let probe = h.startHelperCall(client, "win.list", [:], vm: "Win", turnBy: .now + .seconds(60))
+        let list = Task { try await h.handle(op: "vm.window.list", params: ["name": "Win"]) }
+        let queued = await eventually { await h.helperGate.waiterCount(for: "Win") == 1 }
+        XCTAssertTrue(queued)
+        _ = try await client.call("fs.stat", ["path": "C:\\x"], timeout: .seconds(20))
+        let phase = await probe.answer.phase
+        guard case .queued = phase else { return XCTFail("the turn started while the adoption ping was unanswered: \(phase)") }
+        XCTAssertEqual(requestOps(agent), ["ui.ping", "fs.stat"])
+
+        agent.sendLine(agentReply(try XCTUnwrap(agentRequests(agent, "ui.ping").first), ["pong": true]))
+        let listed = try await completed(list)
+        XCTAssertEqual(listed["windows"], [fixtureWindow])
+        let outcome = await probe.answer.outcome(until: .now + .seconds(20))
+        let reply = try XCTUnwrap(outcome).result.get()
+        XCTAssertEqual(reply["windows"], [fixtureWindow])
+        XCTAssertEqual(requestOps(agent), ["ui.ping", "fs.stat", "win.list", "win.list"])
+        XCTAssertFalse(client.isStartingUIHelper)
     }
 
     func testAWaitSendsNoSecondProbeBeforeTheFirstIsAnsweredAndCollectsTheLateReply() async throws {

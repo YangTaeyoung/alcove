@@ -94,12 +94,16 @@ private func localFiles(in directory: URL) throws -> [(name: String, url: URL)] 
     return result.sorted { $0.name < $1.name }
 }
 
+/// Lists the files of a host folder for a sync: each regular file below it, symbolic links left out, by its path below
+/// the folder with `/` separators, sorted by that path.
+nonisolated(unsafe) var listSyncFiles: @Sendable (URL) throws -> [(name: String, url: URL)] = { try localFiles(in: $0) }
+
 /// The files of `directory` that a sync to the guest path `path` compares and uploads, without those whose path below
 /// the directory is in `preserving`. Throws when two of them differ only by case and `path` is a Windows path.
 private func syncSource(_ directory: URL, toGuestPath path: String, preserving: Set<String>) throws -> [(name: String, url: URL)] {
     let windows = path.contains("\\")
     let kept = Set(preserving.map { windows ? foldedName($0) : $0 })
-    let local = try localFiles(in: directory).filter { !kept.contains(windows ? foldedName($0.name) : $0.name) }
+    let local = try listSyncFiles(directory).filter { !kept.contains(windows ? foldedName($0.name) : $0.name) }
     if windows, let (a, b) = windowsCaseConflict(in: local.map(\.name)) {
         throw AgentClient.AgentError.remote("'\(a)' and '\(b)' differ only by case and cannot both exist in a Windows guest folder")
     }
@@ -107,6 +111,9 @@ private func syncSource(_ directory: URL, toGuestPath path: String, preserving: 
 }
 
 extension AgentClient {
+    /// The end of the agent's sentence for an `fs.rename` without `overwrite` whose target exists.
+    static let renameTargetExists = "' exists; pass overwrite to replace it"
+
     /// The sentence of a pull of `guestPath` whose received bytes do not match the digest the guest reported.
     public static func downloadMismatch(_ guestPath: String) -> String {
         "'\(guestPath)' changed in the guest while it was pulled, so the copy does not match; pull the file again"
@@ -152,7 +159,7 @@ extension AgentClient {
             }
             do {
                 renamed = try await call("fs.rename", ["from": .string(part), "to": .string(path), "overwrite": .bool(overwrite)], timeout: timeout)
-            } catch AgentError.remote(let text) where !overwrite && text.contains("exists") {
+            } catch AgentError.remote(let text) where !overwrite && text.hasSuffix(AgentClient.renameTargetExists) {
                 throw AgentError.remote("'\(path)' exists in the guest; pass overwrite")
             }
         } catch {
@@ -171,10 +178,16 @@ extension AgentClient {
     /// due after `deadline` throws `AgentError.timeout` without being sent. With `maxBytes`, a file that holds more bytes
     /// throws `TransferTooLarge`: before any piece is read when `fs.stat` reports the size, otherwise once more bytes
     /// arrived. A task cancelled before the file is moved to `url` throws `CancellationError` and leaves no
-    /// `<url>.alcove-part`; a file already at `url` stays as it is. `now` is the clock `deadline` is read on.
+    /// `<url>.alcove-part`; a file already at `url` stays as it is.
     public func pullFile(guestPath: String, to url: URL, timeout: Duration = .seconds(1800),
-                         deadline: ContinuousClock.Instant? = nil, maxBytes: Int? = nil,
-                         now: @Sendable () -> ContinuousClock.Instant = { .now }) async throws -> TransferResult {
+                         deadline: ContinuousClock.Instant? = nil, maxBytes: Int? = nil) async throws -> TransferResult {
+        try await pullFile(guestPath: guestPath, to: url, timeout: timeout, deadline: deadline, maxBytes: maxBytes, now: { .now })
+    }
+
+    /// `pullFile(guestPath:to:timeout:deadline:maxBytes:)` with `now` as the clock `deadline` is read on.
+    func pullFile(guestPath: String, to url: URL, timeout: Duration = .seconds(1800),
+                  deadline: ContinuousClock.Instant? = nil, maxBytes: Int? = nil,
+                  now: @Sendable () -> ContinuousClock.Instant) async throws -> TransferResult {
         func wait(for op: String) throws -> Duration {
             guard let deadline else { return timeout }
             let left = now().duration(to: deadline)

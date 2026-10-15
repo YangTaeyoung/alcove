@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import AlcoveEngine
+import AlcoveAgent
 
 /// Root of a VM window. Resolves the session id carried by the window scene;
 /// the id changes when the VM is renamed from the Settings sheet.
@@ -274,17 +275,19 @@ private struct VMContentView: View {
             }
             Spacer()
             if session.state.isActive, !session.toolsConnected, let refusal = session.toolsRefusal {
+                let byHost = AgentClient.isHostRefusal(refusal)
+                let heading = byHost ? "The guest tools cannot be used" : "The guest tools refused the connection"
                 Button {
                     showsToolsRefusal.toggle()
                 } label: {
-                    Label("Tools refused", systemImage: "exclamationmark.triangle.fill")
+                    Label(byHost ? "Tools not used" : "Tools refused", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                 }
                 .buttonStyle(.borderless)
-                .help("The guest tools refused the connection: \(refusal)")
+                .help("\(heading): \(refusal)")
                 .popover(isPresented: $showsToolsRefusal, arrowEdge: .top) {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("The guest tools refused the connection").font(.headline)
+                        Text(heading).font(.headline)
                         Text(refusal).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(12)

@@ -1341,7 +1341,7 @@ final class ScriptBuilderTests: XCTestCase {
         answers.value["ui.rect"] = .fail(noMatch)
         let bare = try await run(h, "{\"op\": \"vm.ui.click\", \"params\": {\(selector)}}")
         XCTAssertFalse(bare.passed)
-        XCTAssertEqual(bare.error, "step 1 failed: \(noMatch)")
+        XCTAssertEqual(bare.error, "step 1 failed: \(ControlHandler.namingControlOps(noMatch))")
         sent = await t.sent
         XCTAssertEqual(sent.count, 15)
     }
@@ -1423,7 +1423,7 @@ final class ScriptBuilderTests: XCTestCase {
         answers.value["ui.rect"] = bySelector(byID: .fail(noAidMatch), byName: .fail("the UI helper is shut down; reconnect the guest tools"))
         let down = try await run(h, click)
         XCTAssertFalse(down.passed)
-        XCTAssertEqual(down.error, "step 1 failed: the selector matched no element (\(noAidMatch)) and the retry with altSelector failed: "
+        XCTAssertEqual(down.error, "step 1 failed: the selector matched no element (\(ControlHandler.namingControlOps(noAidMatch))) and the retry with altSelector failed: "
             + "the UI helper is shut down; reconnect the guest tools")
         XCTAssertEqual(down.stepResults[0]["usedAltSelector"], true)
         XCTAssertNil(down.stepResults[0]["usedFallback"])
@@ -1488,12 +1488,13 @@ final class ScriptBuilderTests: XCTestCase {
         answers.value["ui.act"] = bySelector(byID: .fail(noAidMatch), byName: .fail(noNameMatch))
         let neither = try await run(h, step)
         XCTAssertFalse(neither.passed)
-        XCTAssertEqual(neither.error, "step 1 failed: the selector matched no element (\(noAidMatch)) and the retry with altSelector failed: \(noNameMatch)")
+        XCTAssertEqual(neither.error, "step 1 failed: the selector matched no element (\(ControlHandler.namingControlOps(noAidMatch))) "
+            + "and the retry with altSelector failed: \(ControlHandler.namingControlOps(noNameMatch))")
         XCTAssertEqual(neither.stepResults[0]["usedAltSelector"], true)
 
         let bare = try await run(h, "{\"op\": \"vm.ui.action\", \"params\": {\(aidSelector), \"action\": \"invoke\"}}")
         XCTAssertFalse(bare.passed)
-        XCTAssertEqual(bare.error, "step 1 failed: \(noAidMatch)")
+        XCTAssertEqual(bare.error, "step 1 failed: \(ControlHandler.namingControlOps(noAidMatch))")
         XCTAssertNil(bare.stepResults[0]["usedAltSelector"])
     }
 

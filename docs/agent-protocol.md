@@ -151,8 +151,9 @@ The host refuses a hello without `auth: "key"`. Such an agent was built
 before this version and does not check the host; the host sends nothing to
 it, closes the connection and reports
 `the guest tools do not ask the host for the VM's key, so the host does not use them; reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)`
-as the refusal of the guest tools (vm.status `toolsRefused`, the app's
-"Tools refused" label). The scripts that speak the protocol refuse it with
+as a refusal by the host (`the guest tools in '<vm>' cannot be used:
+<sentence>` in control replies and vm.status `toolsRefused`, the app's
+"Tools not used" label). The scripts that speak the protocol refuse it with
 the same sentence.
 
 Scripts that speak the protocol sign through the host's `alcovectl`:

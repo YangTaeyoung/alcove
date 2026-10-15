@@ -324,9 +324,10 @@ extension ControlHandler {
 
     /// One `ui.*` or `win.*` agent call as the only helper call of `vm` in flight: waits for its turn until `turnBy`, sends,
     /// and keeps the turn until the agent answered, failed, timed out after `UITiming.callTimeout` or disconnected.
-    /// `sent` runs once the turn is taken, `answered` with the outcome of a turn that was taken, before the turn is
-    /// given to the next caller. Throws `HelperBusy` when the turn did not come by `turnBy`, and `CancellationError`
-    /// without sending when the task was cancelled before the call went out.
+    /// A taken turn starts once the `ui.ping` of `AgentClient.startUIHelper` on `agent` has ended. `sent` runs when the
+    /// turn starts, `answered` with the outcome of a turn that was taken, before the turn is given to the next caller.
+    /// Throws `HelperBusy` when the turn did not come by `turnBy`, and `CancellationError` without sending when the task
+    /// was cancelled before the call went out.
     nonisolated func helperTurn(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
                                 turnBy: ContinuousClock.Instant, sent: (@Sendable () async -> Void)? = nil,
                                 answered: (@Sendable (Result<JSON, Error>) async -> Void)? = nil) async throws -> JSON {
@@ -334,13 +335,15 @@ extension ControlHandler {
         return try await takenTurn(agent, agentOp, fields, vm: vm, sent: sent, answered: answered)
     }
 
-    /// The part of `helperTurn` that follows the taking of the turn: sends the call and keeps the turn until the agent
-    /// answered, failed, timed out after `UITiming.callTimeout` or disconnected, then gives it to the next caller.
+    /// The part of `helperTurn` that follows the taking of the turn: waits for the end of the `ui.ping` of
+    /// `AgentClient.startUIHelper` on `agent`, sends the call and keeps the turn until the agent answered, failed, timed
+    /// out after `UITiming.callTimeout` or disconnected, then gives it to the next caller.
     private nonisolated func takenTurn(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String,
                                        sent: (@Sendable () async -> Void)? = nil,
                                        answered: (@Sendable (Result<JSON, Error>) async -> Void)? = nil) async throws -> JSON {
         let result: Result<JSON, Error>
         do {
+            await agent.uiHelperStarted()
             await sent?()
             try Task.checkCancellation()
             let call = Task { try await agent.call(agentOp, fields, timeout: UITiming.callTimeout) }
@@ -714,13 +717,14 @@ extension ControlHandler {
     }
 
     /// One helper call that is made only when the UI helper of `vm` is free at this moment: `.late`, with nothing
-    /// sent, when another call has the helper or the task is cancelled. The call runs in a task of its own and keeps
-    /// the helper until the agent answered; `answered` runs with its outcome before the helper is given to the next
-    /// caller. The caller stops waiting `patience` after the helper was taken.
+    /// sent, when another call has the helper, when the `ui.ping` of `AgentClient.startUIHelper` on `agent` has not
+    /// ended, or when the task is cancelled. The call runs in a task of its own and keeps the helper until the agent
+    /// answered; `answered` runs with its outcome before the helper is given to the next caller. The caller stops
+    /// waiting `patience` after the helper was taken.
     nonisolated func factAtOnce(_ agent: AgentClient, _ agentOp: String, _ fields: [String: JSON], vm: String, patience: Duration,
                                 answered: (@Sendable (Result<JSON, Error>) async -> Void)? = nil) async -> Fact {
         guard (try? await helperGate.acquire(vm, until: .now)) == true else { return .late }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled, !agent.isStartingUIHelper else {
             await helperGate.release(vm)
             return .late
         }

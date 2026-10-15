@@ -102,6 +102,40 @@ final class AgentKeyLinkTests: XCTestCase {
                        "start the VM with Alcove 0.2 or later")
     }
 
+    func testAHelloWithoutAuthIsNamedAsRefusedByTheHost() async throws {
+        let byHost = AgentClient.agentWithoutAuth
+        XCTAssertTrue(AgentClient.isHostRefusal(byHost))
+        XCTAssertFalse(AgentClient.isHostRefusal(sentence))
+        XCTAssertEqual(AgentClient.AgentError.refused(byHost).errorDescription, "the guest tools cannot be used: \(byHost)")
+        XCTAssertEqual(AgentClient.AgentError.refused(sentence).errorDescription, "the guest tools refused the connection: \(sentence)")
+
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
+        await t.setRefusal(byHost)
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        do {
+            _ = try await h.handle(op: "vm.fs.list", params: ["name": "Win", "path": "/"])
+            XCTFail("vm.fs.list succeeded")
+        } catch let e as ControlHandler.ControlError {
+            XCTAssertEqual(e.description, "the guest tools in 'Win' cannot be used: \(byHost)")
+        }
+        let status = try await h.handle(op: "vm.status", params: ["name": "Win"])
+        XCTAssertEqual(status["tools"]?.boolValue, false)
+        XCTAssertEqual(status["toolsRefused"]?.stringValue, "the guest tools in 'Win' cannot be used: \(byHost)")
+    }
+
+    func testVMDoctorNamesAHelloWithoutAuthAsRefusedByTheHost() async throws {
+        let byHost = AgentClient.agentWithoutAuth
+        let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 8, height: 8))
+        await t.setRefusal(byHost)
+        let h = ControlHandler(registry: FakeRegistry(targets: ["Win": t]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        let doctor = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        let rows = doctor["checks"]?.arrayValue ?? []
+        XCTAssertEqual(rows.last?["id"]?.stringValue, "tools")
+        XCTAssertEqual(rows.last?["ok"]?.boolValue, false)
+        XCTAssertEqual(rows.last?["detail"]?.stringValue, "the guest tools in 'Win' cannot be used: \(byHost)")
+        XCTAssertEqual(rows.last?["hint"]?.stringValue, "reinstall the guest tools from this version of Alcove (scripts/test/install-agent.py)")
+    }
+
     func testTheFixOfARefusalIsTheTextAfterItsFirstSemicolon() {
         XCTAssertEqual(ControlHandler.refusalFix("a; b; c"), "b; c")
         XCTAssertEqual(ControlHandler.refusalFix("no next step"), ControlHandler.refusalFallbackFix)

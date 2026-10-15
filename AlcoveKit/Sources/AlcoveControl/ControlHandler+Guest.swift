@@ -217,7 +217,9 @@ extension ControlHandler {
 
         guard let agent = await t.agent(timeout: .seconds(5)), let hello = await agent.hello else {
             if let refusal = await t.agentRefusal() {
-                rows.append(check("tools", false, "the guest tools refused the connection: \(refusal)", hint: ControlHandler.refusalFix(refusal)))
+                let detail = AgentClient.isHostRefusal(refusal)
+                    ? ControlHandler.refusal(refusal, vm: t.name) : "the guest tools refused the connection: \(refusal)"
+                rows.append(check("tools", false, detail, hint: ControlHandler.refusalFix(refusal)))
             } else {
                 rows.append(check("tools", false, "guest tools are not connected",
                                   hint: "install alcove-agent in the guest with scripts/test/install-agent.py"))

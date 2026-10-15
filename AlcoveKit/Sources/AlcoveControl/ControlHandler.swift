@@ -534,16 +534,58 @@ public actor ControlHandler {
         return fix.isEmpty ? refusalFallbackFix : fix
     }
 
-    /// The agent of `t`, waiting up to 25 s for it to connect; when it does not, the agent's refusal sentence, or
-    /// `noTools` when the agent refused nothing.
+    /// `sentence`, the refusal of the latest connection attempt to the guest tools of `vm`, named by the side that
+    /// refused: `the guest tools in '<vm>' cannot be used: ` before a refusal by the host (`AgentClient.isHostRefusal`),
+    /// `the guest tools in '<vm>' refused the connection: ` before one the agent sent.
+    nonisolated static func refusal(_ sentence: String, vm: String) -> String {
+        AgentClient.isHostRefusal(sentence)
+            ? "the guest tools in '\(vm)' cannot be used: \(sentence)"
+            : "the guest tools in '\(vm)' refused the connection: \(sentence)"
+    }
+
+    /// The agent of `t`, waiting up to 25 s for it to connect; when it does not, the refusal of its latest connection
+    /// attempt (`refusal(_:vm:)`), or `noTools` when nothing was refused.
     func tools(_ t: VMTarget) async throws -> AgentClient {
         guard let a = await t.agent(timeout: .seconds(25)) else {
             if let refusal = await t.agentRefusal() {
-                throw ControlError.failed("the guest tools in '\(t.name)' refused the connection: \(refusal)")
+                throw ControlError.failed(ControlHandler.refusal(refusal, vm: t.name))
             }
             throw ControlError.noTools(t.name)
         }
         return a
+    }
+
+    /// The control op for each agent op that one control op stands for.
+    static let controlOpOfAgentOp: [String: String] = [
+        "exec.run": "vm.exec", "exec.start": "vm.exec.start", "exec.read": "vm.exec.read", "exec.write": "vm.exec.write",
+        "exec.kill": "vm.exec.kill", "exec.list": "vm.exec.list",
+        "proc.list": "vm.process.list", "proc.kill": "vm.process.kill",
+        "fs.list": "vm.fs.list", "fs.read": "vm.fs.read", "fs.write": "vm.fs.write", "fs.delete": "vm.fs.delete",
+        "app.launch": "vm.app.launch", "win.list": "vm.window.list", "win.action": "vm.window.action",
+        "ui.tree": "vm.ui.tree", "ui.find": "vm.ui.find", "ui.text": "vm.ui.text", "ui.act": "vm.ui.action",
+    ]
+
+    /// Matches a name of `controlOpOfAgentOp` that stands as a word: after the start, a space or `(`, and before the end,
+    /// a space, one of `,;:)`, or a `.` that ends a sentence.
+    private static let agentOpName: NSRegularExpression = {
+        let names = controlOpOfAgentOp.keys.sorted { $0.count > $1.count }.map(NSRegularExpression.escapedPattern(for:))
+        let pattern = "(?<![^\\s(])(" + names.joined(separator: "|") + ")(?=$|[\\s,;:)]|\\.(?![\\w.]))"
+        return try! NSRegularExpression(pattern: pattern)
+    }()
+
+    /// `sentence`, an agent's error sentence, with each agent op it names as a word (`agentOpName`) replaced by its
+    /// control op.
+    nonisolated static func namingControlOps(_ sentence: String) -> String {
+        let text = sentence as NSString
+        var result = ""
+        var at = 0
+        for match in agentOpName.matches(in: sentence, range: NSRange(location: 0, length: text.length)) {
+            let name = text.substring(with: match.range)
+            result += text.substring(with: NSRange(location: at, length: match.range.location - at))
+            result += controlOpOfAgentOp[name] ?? name
+            at = match.range.location + match.range.length
+        }
+        return result + text.substring(from: at)
     }
 
     /// The control error for a failure of `op` against the agent of `vm`.
@@ -551,7 +593,7 @@ public actor ControlHandler {
         switch error {
         case let e as ControlError: return e
         case AgentClient.AgentError.unsupported: return .toolsTooOld(vm: vm, op: op)
-        case AgentClient.AgentError.remote(let message): return .failed(message)
+        case AgentClient.AgentError.remote(let message): return .failed(ControlHandler.namingControlOps(message))
         case AgentClient.AgentError.timeout: return .failed("guest tools in '\(vm)' did not answer \(op) in time; check vm.status and retry")
         case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected:
             return .failed("guest tools in '\(vm)' disconnected during \(op); retry once the guest is back")
@@ -588,7 +630,9 @@ public actor ControlHandler {
                 obj["agentCaps"] = .array(hello.capabilities.map(JSON.string))
             } else {
                 obj["tools"] = false
-                if let refusal = await t.agentRefusal() { obj["toolsRefused"] = .string(refusal) }
+                if let refusal = await t.agentRefusal() {
+                    obj["toolsRefused"] = .string(AgentClient.isHostRefusal(refusal) ? ControlHandler.refusal(refusal, vm: t.name) : refusal)
+                }
             }
         }
         return .object(obj)
