@@ -101,21 +101,30 @@ directory and groups come from the user database. A lookup is reused for
 - The home directory of the agent's paths is that user's: `~`, `~/x`,
   relative paths, the `cwd` of `exec.*` and `app.launch`, the working
   directory of `exec.*` without `cwd`, the `Desktop` and `Downloads` folders
-  of `file.begin` and the folders `fs.delete` refuses. Without a session it is
-  the agent's own home directory (`/root`).
+  of `file.begin` and the folders `fs.delete` refuses. Without a session, and
+  for a session user whose home is not an absolute path or is `/`, it is the
+  agent's own home directory (`/root`), and the home rules below do not
+  apply. One request reads the session once and uses that home throughout.
 - What changes entries in that home — `file.begin`, `fs.write`, `fs.mkdir`,
   `fs.rename`, `fs.delete`, and so the transfers, `vm.sync_dir` and
   `vm.deploy` of the host — opens the home as one `os.Root` and works
-  relative to it. A link inside the home is followed while it leads to a
-  place inside the home; a path that leads out of it, also through a link the
-  user made (`~/Downloads` → `/etc`, `~/x` → `/etc/shadow`), fails without
-  touching the place it leads to, with
-  `the path leads out of the home folder of the desktop user through a link, which the agent does not follow there; pass the path the link leads to`
-  after the operation's own beginning (`cannot open '<path>' for writing: `,
-  …). Files and folders the agent creates there are given to the session's
-  user and its primary group through their open descriptors, with the mode
-  they were created with; entries that existed keep their owner. `fs.rename`
-  from inside the home to outside it or back answers
+  relative to it. A link with a relative target that stays inside the home is
+  followed. A link with an absolute target, even one inside the home, is not:
+  the operation fails with
+  `'<link>' is a link with the absolute target '<target>', and the agent follows only relative links inside the home folder of the desktop user; make it a relative link or pass the path it leads to`.
+  A path that leads out of the home through a relative link (`~/Downloads` →
+  `../../etc`) fails with
+  `the path leads out of the home folder of the desktop user through a link, which the agent does not follow there; pass the path the link leads to`.
+  Both come after the operation's own beginning
+  (`cannot open '<path>' for writing: `, …), and nothing outside the home is
+  touched. An existing file that has other hard links and does not belong to
+  the session's user is not written:
+  `it has other hard links and does not belong to <user>, so it may be a file outside the home folder of the desktop user; write to that file's own path`
+  (checked before it is truncated). Files the agent creates there are given to
+  the session's user and its primary group through their open descriptors,
+  folders by a chown of the folder itself that does not follow a link, each
+  with the mode it was created with; entries that existed keep their owner.
+  `fs.rename` from inside the home to outside it or back answers
   `'<from>' and '<to>' lie on different sides of the home folder of the desktop user; rename within it or outside it, or copy the file`.
   Paths outside the home are changed as root, as on other systems.
 - `app.launch` and the clipboard tools run as that user (its user id, group
@@ -128,13 +137,16 @@ directory and groups come from the user database. A lookup is reused for
   `XDG_SESSION_TYPE`, and the `LANG`, `LANGUAGE` and `LC_*` variables of
   `/etc/default/locale` (else `/etc/locale.conf`, else the agent's own). `env`
   of `app.launch` is added to that environment.
-- When the runtime folder holds `bus` and `systemd-run` exists, `app.launch`
+- When the runtime folder holds `bus` and `systemd-run` exists and reports
+  systemd 254 or later (`systemd-run --version`, read once per agent), and the
+  program is an executable file (a relative path is looked up in the
+  launch's working directory), `app.launch`
   and the clipboard writer (`wl-copy`, `xclip -i`, which keep running to hold
   the text) start through
   `systemd-run --user --scope --quiet --collect --expand-environment=no --`:
   they run in a scope of the user's service manager, keep the process id the
   agent reports, and are not ended when the agent's service stops or
-  restarts. Without it they run in the agent's service and end with it.
+  restarts. Otherwise they run in the agent's service and end with it.
 - `exec.*` keeps the agent's identity: the commands run as root with the
   agent's environment, in which `HOME` is root's home directory when systemd
   started the agent without one.
@@ -1157,7 +1169,7 @@ agent sends one event per difference, each with the window object:
   A link itself is deleted without what it leads to.
 - The host transfers a file as `fs.write` pieces to `<path>.alcove-part`,
   compares `fs.stat` with `sha256` against its own digest and then renames;
-  the first piece carries `executable` when the host file has an execute bit;
+  the first piece carries `executable`: true when the host file, or the file a host link leads to, has an execute bit, false otherwise;
   downloads use `fs.stat` with `sha256` and `fs.read` pieces.
 
 ### Limits
