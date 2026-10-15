@@ -259,6 +259,37 @@ func TestTheHelloCarriesTheCapsFoundLastAndTheirCheckFollowsTheHandshake(t *test
 	}
 }
 
+func TestTheFirstHelloCarriesTheCapsCheckedWhenServeStarted(t *testing.T) {
+	cb := &gatedClipboard{gate: make(chan struct{})}
+	cb.on.Store(true)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	s := New(Options{Clipboard: cb, HomeDir: t.TempDir(), AllowPeers: loopbackPeers, Unauthenticated: true})
+	go s.Serve(l)
+	deadline := time.Now().Add(10 * time.Second)
+	for s.lastCaps.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Serve has not checked the capabilities 10 s after it started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cb.on.Store(false)
+	cb.held.Store(true)
+	t.Cleanup(func() { close(cb.gate) })
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if !capSet(expect(t, proto.NewReader(c), "hello"))["clipboard"] {
+		t.Fatal("the first hello does not carry the caps checked when Serve started")
+	}
+}
+
 func TestResolutionIsNotACapabilityOutsideWindows(t *testing.T) {
 	_, r, _, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
 	if capSet(expect(t, r, "hello"))["resolution"] {

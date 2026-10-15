@@ -152,8 +152,10 @@ func (s *Server) Close() {
 	}
 }
 
-// Serve accepts connections on l until it is closed.
+// Serve checks the capabilities, so that a hello carries them without a
+// check of its own, and then accepts connections on l until it is closed.
 func (s *Server) Serve(l net.Listener) error {
+	s.caps()
 	for {
 		c, err := l.Accept()
 		if err != nil {

@@ -80,10 +80,11 @@ Capabilities:
 | `jobs`, `proc`, `fs` | started with `--allow-exec` | `exec.*`, `proc.*`, `fs.*`, `app.launch` and `session.info` operations |
 | `ui` | Windows agents | `win.*` and `ui.*` operations and the window events |
 
-The hello carries the list the agent found last, at an earlier connection
-or check; only the first hello after the agent starts waits for a check. On
-Linux a check looks up the desktop session, so a hello does not wait for
-`loginctl`. Right after the handshake the agent checks its capabilities and,
+The hello carries the list the agent found last. The agent checks its
+capabilities once when it starts serving, before it accepts a connection,
+so a hello does not wait for a check; a connection that arrives during that
+first check is accepted after it. On Linux a check looks up the desktop
+session, so a hello does not wait for `loginctl`. Right after the handshake the agent checks its capabilities and,
 when they differ from the hello's, sends `{"t":"caps","caps":[…]}` with the
 whole new list before any other message, which replaces the hello's. A host
 can receive that line before it has finished its own handshake steps and
