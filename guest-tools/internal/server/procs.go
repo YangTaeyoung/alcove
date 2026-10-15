@@ -111,18 +111,30 @@ var errKillDenied = errors.New("access is denied")
 type killHandle interface {
 	// creation returns the creation time, and false when it cannot be read.
 	creation() (time.Time, bool)
+	// imageName returns the base name of the program file, and false when
+	// it cannot be read.
+	imageName() (string, bool)
 	terminate() error
 	// wait waits up to d for the process to end.
 	wait(d time.Duration)
 	close()
 }
 
+// listedCreation returns created, or the zero time when created is after
+// began.
+func listedCreation(created, began time.Time) time.Time {
+	if created.After(began) {
+		return time.Time{}
+	}
+	return created
+}
+
 // killListed opens each target with open and terminates it when its creation
-// time is the listed one, then waits up to wait in all for the terminated
+// time equals the listed one and its image name equals the listed name
+// without regard to case, then waits up to wait in all for the terminated
 // processes to end. It returns how many it terminated and how many refused
-// access with errKillDenied. A target whose creation time is unknown or
-// differs, which is another process under a reused pid, or that fails for
-// another reason, is skipped.
+// access with errKillDenied. A target whose creation time or image name is
+// unknown or differs, or that fails for another reason, is skipped.
 func killListed(targets []procEntry, open func(pid int) (killHandle, error), wait time.Duration) (killed, denied int) {
 	var ending []killHandle
 	for _, t := range targets {
@@ -134,7 +146,8 @@ func killListed(targets []procEntry, open func(pid int) (killHandle, error), wai
 			continue
 		}
 		created, known := h.creation()
-		if !known || t.Created.IsZero() || !created.Equal(t.Created) {
+		image, named := h.imageName()
+		if !known || t.Created.IsZero() || !created.Equal(t.Created) || !named || !strings.EqualFold(image, t.Name) {
 			h.close()
 			continue
 		}

@@ -397,10 +397,13 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   each match and, with `tree`, its descendants, children first, then waits
   up to 5 s for them to end. A process counts as a child only when both
   creation times can be read and it was not created before its listed
-  parent, and a tree is not followed into the agent. Before it terminates a
-  process the agent opens it and compares its creation time with the listed
-  one; a process that differs (another process under a reused pid) or whose
-  time cannot be read is skipped. `killed` counts the processes that were
+  parent, and a tree is not followed into the agent. A listed creation time
+  later than the moment just before the listing is treated as unknown.
+  Before it terminates a process the agent opens it and requires that its
+  creation time equals the listed one and that the base name of its program
+  file (`QueryFullProcessImageNameW`) equals the listed name without regard
+  to case; a process that differs, or whose listed time, time or name
+  cannot be read, is skipped and not counted. `killed` counts the processes that were
   terminated. When any of them refuses access the answer is an error: from
   an agent that is not elevated
   `could not kill <n> of the <total> processes named '<name>' because access was denied (<k> were killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry`,

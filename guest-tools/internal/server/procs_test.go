@@ -161,12 +161,15 @@ func TestProcKillAnswersTheRefusalOfAKillByNameAsItIs(t *testing.T) {
 type fakeKillHandle struct {
 	created      time.Time
 	known        bool
+	image        string
 	terminateErr error
 	log          *[]string
 	pid          int
 }
 
 func (h *fakeKillHandle) creation() (time.Time, bool) { return h.created, h.known }
+
+func (h *fakeKillHandle) imageName() (string, bool) { return h.image, h.image != "" }
 
 func (h *fakeKillHandle) terminate() error {
 	if h.terminateErr == nil {
@@ -183,11 +186,13 @@ func TestKillListedTerminatesOnlyTheListedProcessesAndCountsRefusals(t *testing.
 	at := func(s int) time.Time { return time.Unix(1000+int64(s), 0) }
 	var log []string
 	running := map[int]*fakeKillHandle{
-		1: {created: at(1), known: true},
-		2: {created: at(9), known: true},
-		3: {known: false},
-		5: {created: at(5), known: true, terminateErr: errKillDenied},
-		6: {created: at(6), known: true, terminateErr: errors.New("the process is ending")},
+		1: {created: at(1), known: true, image: "VICTIM.EXE"},
+		2: {created: at(9), known: true, image: "victim.exe"},
+		3: {known: false, image: "victim.exe"},
+		5: {created: at(5), known: true, image: "victim.exe", terminateErr: errKillDenied},
+		6: {created: at(6), known: true, image: "victim.exe", terminateErr: errors.New("the process is ending")},
+		8: {created: at(8), known: true, image: "svchost.exe"},
+		9: {created: at(9), known: true},
 	}
 	open := func(pid int) (killHandle, error) {
 		switch pid {
@@ -200,21 +205,29 @@ func TestKillListedTerminatesOnlyTheListedProcessesAndCountsRefusals(t *testing.
 		h.log, h.pid = &log, pid
 		return h, nil
 	}
-	targets := []procEntry{
-		{PID: 1, Created: at(1)},
-		{PID: 2, Created: at(2)},
-		{PID: 3, Created: at(3)},
-		{PID: 4, Created: at(4)},
-		{PID: 5, Created: at(5)},
-		{PID: 6, Created: at(6)},
-		{PID: 7, Created: at(7)},
+	targets := []procEntry{}
+	for pid := 1; pid <= 9; pid++ {
+		targets = append(targets, procEntry{PID: pid, Name: "victim.exe", Created: at(pid)})
 	}
 	killed, denied := killListed(targets, open, time.Second)
 	if killed != 1 || denied != 2 {
 		t.Fatalf("killed %d, denied %d", killed, denied)
 	}
-	want := "[terminate 1 close 2 close 3 close 5 close 6 wait 1 close 1]"
+	want := "[terminate 1 close 2 close 3 close 5 close 6 close 8 close 9 wait 1 close 1]"
 	if got := fmt.Sprint(log); got != want {
 		t.Fatalf("steps %s, expected %s", got, want)
+	}
+}
+
+func TestListedCreationDropsATimeAfterTheListingBegan(t *testing.T) {
+	began := time.Unix(2000, 0)
+	if got := listedCreation(time.Unix(1999, 0), began); !got.Equal(time.Unix(1999, 0)) {
+		t.Fatalf("a time before the listing became %v", got)
+	}
+	if got := listedCreation(began, began); !got.Equal(began) {
+		t.Fatalf("the time the listing began became %v", got)
+	}
+	if got := listedCreation(time.Unix(2001, 0), began); !got.IsZero() {
+		t.Fatalf("a time after the listing began became %v", got)
 	}
 }

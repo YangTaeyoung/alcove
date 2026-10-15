@@ -37,9 +37,8 @@ func volumeRoots(path string) ([]string, error) {
 const fileReadAttributes = 0x80
 
 // platformFileID returns the volume serial number and file index of path,
-// read on a handle that asks only for its attributes and shares every
-// access, so handles others hold on the folder do not keep it from being
-// read.
+// read on a handle opened with FILE_READ_ATTRIBUTES access and read, write
+// and delete sharing.
 func platformFileID(path string, follow bool) (fileID, error) {
 	name, err := syscall.UTF16PtrFromString(path)
 	if err != nil {

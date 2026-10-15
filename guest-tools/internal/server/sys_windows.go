@@ -110,8 +110,10 @@ func killByName(name string, tree bool) (int, error) {
 const processQueryLimitedInformation = 0x1000
 
 // processEntries lists the running processes with their image names and
-// their creation times where they can be read.
+// their creation times where they can be read; a creation time after the
+// moment just before the snapshot is left zero (listedCreation).
 func processEntries() ([]procEntry, error) {
+	began := time.Now()
 	snap, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil, err
@@ -123,7 +125,9 @@ func processEntries() ([]procEntry, error) {
 	for err := syscall.Process32First(snap, &e); err == nil; err = syscall.Process32Next(snap, &e) {
 		p := procEntry{PID: int(e.ProcessID), PPID: int(e.ParentProcessID), Name: syscall.UTF16ToString(e.ExeFile[:])}
 		if h, err := syscall.OpenProcess(processQueryLimitedInformation, false, e.ProcessID); err == nil {
-			p.Created, _ = processCreation(h)
+			if created, ok := processCreation(h); ok {
+				p.Created = listedCreation(created, began)
+			}
 			syscall.CloseHandle(h)
 		}
 		procs = append(procs, p)
@@ -142,7 +146,7 @@ func processCreation(h syscall.Handle) (time.Time, bool) {
 }
 
 // windowsKillHandle is a process opened for termination, waiting and reading
-// its creation time.
+// its creation time and image name.
 type windowsKillHandle struct{ h syscall.Handle }
 
 // openForKill opens pid for killListed; a refusal of access is errKillDenied.
@@ -163,6 +167,17 @@ func killError(err error) error {
 }
 
 func (w windowsKillHandle) creation() (time.Time, bool) { return processCreation(w.h) }
+
+var procQueryFullProcessImageName = syscall.NewLazyDLL("kernel32.dll").NewProc("QueryFullProcessImageNameW")
+
+func (w windowsKillHandle) imageName() (string, bool) {
+	buf := make([]uint16, 32768)
+	size := uint32(len(buf))
+	if r, _, _ := procQueryFullProcessImageName.Call(uintptr(w.h), 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size))); r == 0 {
+		return "", false
+	}
+	return filepath.Base(syscall.UTF16ToString(buf[:size])), true
+}
 
 func (w windowsKillHandle) terminate() error {
 	if err := syscall.TerminateProcess(w.h, 1); err != nil {
