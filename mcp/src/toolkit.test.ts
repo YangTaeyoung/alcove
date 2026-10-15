@@ -61,6 +61,7 @@ test("fail names tools and tool parameters in server sentences", () => {
   assert.equal(said("parameter 'keyboardLayouts' must be an array"), "parameter 'keyboard_layouts' must be an array");
   assert.equal(said("missing or invalid parameter 'name'"), "missing or invalid parameter 'name'");
   assert.equal(said("vm.unknown failed; see C:\\vm.list and my-vm.status"), "vm.unknown failed; see C:\\vm.list and my-vm.status");
+  assert.equal(said("typed vm.start2024, vm.list-of-things and vm.exec.start-x"), "typed vm.start2024, vm.list-of-things and vm.exec.start-x");
   assert.equal(textOf(fail(new Error("vm.list broke"))), "unexpected error: Error: vm.list broke");
 });
 

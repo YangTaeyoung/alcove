@@ -106,18 +106,23 @@ export const OP_TOOLS: Readonly<Record<string, string>> = {
 
 /**
  * `sentence` with each op name of `OP_TOOLS` replaced by its tool and each `parameter '<camelCase>'` by the snake_case
- * name; an op name that follows a letter, digit, `.`, `-`, `/` or `\` is part of another word and stays.
+ * name; an op name that follows a letter, digit, `.`, `-`, `/` or `\`, or that a letter, digit, `-` or `.` and a
+ * letter follow, is part of another word and stays.
  */
 export function toolSentence(sentence: string): string {
   return sentence
-    .replace(/(?<![\w./\\-])(?:vm|script)(?:\.[a-z_]+)+/g, (op) => OP_TOOLS[op] ?? op)
+    .replace(/(?<![\w./\\-])(?:vm|script)(?:\.[a-z_]+)+(?![\w-]|\.[a-z_])/g, (op) => OP_TOOLS[op] ?? op)
     .replace(/\bparameter '([a-z][A-Za-z0-9]*)'/g, (_, name: string) => `parameter '${name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)}'`);
 }
 
 /** An error result: a ControlError's sentence with tool and parameter names (`toolSentence`), anything else as an unexpected error. */
 export function fail(e: unknown): ToolResult {
-  const msg = e instanceof ControlError ? toolSentence(e.message) : `unexpected error: ${String(e)}`;
-  return { content: [{ type: "text", text: msg }], isError: true };
+  return failText(e instanceof ControlError ? toolSentence(e.message) : `unexpected error: ${String(e)}`);
+}
+
+/** An error result with `sentence` as its text. */
+export function failText(sentence: string): ToolResult {
+  return { content: [{ type: "text", text: sentence }], isError: true };
 }
 
 /** A control reply without the envelope fields `ok` and `id`. */

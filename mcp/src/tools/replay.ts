@@ -1,8 +1,8 @@
 // The replay toolset: scripts saved from a recording and replayed without a model.
 import fs from "node:fs";
 import { z } from "zod";
-import { type ControlClient } from "../control.js";
-import { fail, text, SCRIPT_RUN_TIMEOUT_MS, SCRIPT_SAVE_TIMEOUT_MS, MODEL_IMAGE_MAX_WIDTH, type Registrar, type ToolResult } from "../toolkit.js";
+import { ControlError, type ControlClient } from "../control.js";
+import { failText, text, toolSentence, SCRIPT_RUN_TIMEOUT_MS, SCRIPT_SAVE_TIMEOUT_MS, MODEL_IMAGE_MAX_WIDTH, type Registrar, type ToolResult } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -121,6 +121,19 @@ export function withoutImages<T>(value: T): T {
   return walk(value) as T;
 }
 
+/** The control client's own sentences about a `script.*` call: its timeout and the closed connection. */
+const CLIENT_SENTENCE = /^(?:script\.(?:run|save) timed out after |the connection to the Alcove control server closed before script\.(?:run|save) )/;
+
+/**
+ * The text of a failed script tool call with secret values hidden first: the control client's own sentences name
+ * tools (`toolSentence`); a control server sentence stays as written, since it names ops as the script format does.
+ */
+export function scriptFailure(e: unknown, variables: Record<string, string>): string {
+  if (!(e instanceof ControlError)) return maskSecrets(`unexpected error: ${String(e)}`, variables);
+  const sentence = maskSecrets(e.message, variables);
+  return CLIENT_SENTENCE.test(sentence) ? toolSentence(sentence) : sentence;
+}
+
 export function register(r: Registrar, client: ControlClient): void {
   r.tool("replay", "alcove_script_save", {
     title: "Save a recording as a script",
@@ -148,7 +161,7 @@ export function register(r: Registrar, client: ControlClient): void {
       }, SCRIPT_SAVE_TIMEOUT_MS);
       return text(saveLines(reply).join("\n"), { path: reply.path, steps: reply.steps, skipped: reply.skipped, warnings: reply.warnings ?? [] });
     } catch (e) {
-      return fail(e);
+      return failText(scriptFailure(e, {}));
     }
   });
 
@@ -190,10 +203,9 @@ export function register(r: Registrar, client: ControlClient): void {
       if (typeof failure?.png === "string") result.content.push({ type: "image", data: failure.png, mimeType: "image/png" });
       return result;
     } catch (e) {
-      const failed = fail(e);
-      const sentence = maskSecrets((failed.content[0] as { text: string }).text, variables);
+      const sentence = scriptFailure(e, variables);
       const timedOut = /^alcove_script_run timed out after [^;]*/.exec(sentence);
-      return { ...failed, content: [{ type: "text", text: timedOut ? `${timedOut[0]}. ${RUN_TIMEOUT_ADVICE}` : sentence }] };
+      return failText(timedOut ? `${timedOut[0]}. ${RUN_TIMEOUT_ADVICE}` : sentence);
     }
   });
 }

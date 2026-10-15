@@ -169,6 +169,31 @@ test("a client timeout says that the run may still be going in the guest", async
   );
 });
 
+/** The replay tools over a client whose every call throws `error`. */
+function failingTools(error: Error) {
+  const handlers = new Map<string, ToolHandler>();
+  register({ tool: (_set, name, _config, handler) => { handlers.set(name, handler); } }, { call: async () => { throw error; } } as never);
+  return (tool: string, args: Record<string, unknown>) => handlers.get(tool)!(args);
+}
+
+test("server sentences about script contents keep the control op names of the script format", async () => {
+  const sentence = "step 1 uses unknown op 'alcove_type'; use one of the control ops such as vm.type";
+  const run = failingTools(new ControlError(sentence));
+  for (const [tool, args] of [["alcove_script_run", { path: "/x" }], ["alcove_script_save", { dir: "/d", path: "/s.json" }]] as const) {
+    const r = await run(tool, args);
+    assert.equal(r.isError, true, tool);
+    assert.equal(textOf(r), sentence, tool);
+  }
+});
+
+test("a secret that holds an op name is hidden before the client's sentence names tools", async () => {
+  const run = failingTools(new ControlError("the connection to the Alcove control server closed before script.run answered; check the VM with alcove_vm_status, then call the tool again"));
+  const r = await run("alcove_script_run", { path: "/x", variables: { token: "script.run" } });
+  assert.equal(textOf(r), "the connection to the Alcove control server closed before <hidden> answered; check the VM with alcove_vm_status, then call the tool again");
+  const plain = await run("alcove_script_run", { path: "/x" });
+  assert.equal(textOf(plain), "the connection to the Alcove control server closed before alcove_script_run answered; check the VM with alcove_vm_status, then call the tool again");
+});
+
 test("secret defaults of the script file are hidden like passed variables", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "replay-defaults-"));
   const file = path.join(dir, "flow.json");
