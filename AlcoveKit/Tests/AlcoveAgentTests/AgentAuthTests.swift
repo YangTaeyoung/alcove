@@ -97,6 +97,20 @@ final class AgentAuthTests: XCTestCase {
         XCTAssertFalse(carriesTheKey(agent), "a line carried the agentKey")
     }
 
+    func testACapsLineBeforeTheHandshakeEndsReplacesTheHelloCapabilities() async throws {
+        let agent = FakeAgent().start(); defer { agent.stop() }
+        agent.token = vectorToken
+        agent.caps = ["files", "exec"]
+        agent.helloExtra = ["auth": "key", "nonce": .string(nonce)]
+        agent.handler = { m, _ in
+            m["t"]?.stringValue == "auth" ? [["t": "caps", "caps": ["files", "clipboard", "exec"]], ["t": "authed"]] : []
+        }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: vectorToken, agentKey: key)
+        let caps = await client.hello?.capabilities
+        XCTAssertEqual(caps, ["files", "clipboard", "exec"])
+    }
+
     func testAHelloWithAnotherTokenGetsNoSignature() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         agent.token = "the token of another VM"

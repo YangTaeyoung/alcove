@@ -139,6 +139,12 @@ final class ControlStateTests: XCTestCase {
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.remote("denied"), fallback: "x"), "denied")
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.remote("exec disabled; list them with proc.list, then call fs.read 'fs.read'"), fallback: "x"),
                        "exec disabled; list them with vm.process.list, then call vm.fs.read 'fs.read'")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.timeout("fs.read"), fallback: "x"),
+                       "the guest tools did not answer vm.fs.read in time; check vm.status and retry")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.unsupported("exec.run"), fallback: "x"),
+                       "the guest tools do not support vm.exec; update alcove-agent in the guest")
+        XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.timeout("authed"), fallback: "x"),
+                       "the guest tools did not answer authed in time; check vm.status and retry")
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.tokenMismatch, fallback: "x"),
                        "the guest tools refused the connection token; reinstall alcove-agent in the guest")
         XCTAssertEqual(ControlHandler.failureReason(AgentClient.AgentError.connect("refused"), fallback: "x"),
@@ -314,7 +320,7 @@ final class ControlStateTests: XCTestCase {
         let r = try await h.handle(op: "vm.set_resolution", params: ["name": "Win", "width": 2560, "height": 1600])
         XCTAssertEqual(r["width"], 1920)
         XCTAssertEqual(r["height"], 1200)
-        XCTAssertEqual(r["warning"]?.stringValue, "the guest set 1920x1200, not 2560x1600; it does not offer that mode")
+        XCTAssertEqual(r["warning"]?.stringValue, "the guest set 1920x1200, not 2560x1600; it does not offer that mode, so call vm.set_resolution with a size the guest's display settings list")
 
         await t.setPNG(makePNG(width: 800, height: 600))
         agent.handler = { m, _ in

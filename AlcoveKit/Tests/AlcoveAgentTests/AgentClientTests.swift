@@ -293,6 +293,36 @@ final class AgentClientTests: XCTestCase {
         XCTAssertEqual(text, "kept")
     }
 
+    func testAClipboardReplyGoesToTheGetWithItsID() async throws {
+        let agent = FakeAgent(); agent.proto = nil
+        _ = agent.start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        do { _ = try await client.getClipboard(timeout: .milliseconds(150)); XCTFail("expected a timeout") }
+        catch AgentClient.AgentError.timeout(let what) { XCTAssertEqual(what, "clipboard.text") }
+        let retry = Task { try await client.getClipboard(timeout: .seconds(30)) }
+        while agent.received.filter({ $0["t"]?.stringValue == "clipboard.get" }).count < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        let ids = agent.received.filter { $0["t"]?.stringValue == "clipboard.get" }.map { $0["id"]?.stringValue }
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertNotNil(ids[0]); XCTAssertNotNil(ids[1]); XCTAssertNotEqual(ids[0], ids[1])
+        agent.sendLine(["t": "clipboard.text", "text": "late", "id": .string(ids[0] ?? "")])
+        agent.sendLine(["t": "clipboard.text", "text": "fresh", "id": .string(ids[1] ?? "")])
+        let text = try await retry.value
+        XCTAssertEqual(text, "fresh")
+    }
+
+    func testAClipboardReplyWithAnErrorFailsTheGet() async throws {
+        let agent = FakeAgent()
+        agent.handler = { m, _ in
+            m["t"]?.stringValue == "clipboard.get" ? [["t": "clipboard.text", "text": "", "id": m["id"] ?? .null, "error": "the queue is full; retry"]] : []
+        }
+        _ = agent.start(); defer { agent.stop() }
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: nil)
+        do { _ = try await client.getClipboard(); XCTFail("expected an error") }
+        catch AgentClient.AgentError.remote(let text) { XCTAssertEqual(text, "the queue is full; retry") }
+    }
+
     func testDisconnectFailsPendingCalls() async throws {
         let agent = FakeAgent().start(); defer { agent.stop() }
         let client = AgentClient()

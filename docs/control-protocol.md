@@ -120,10 +120,10 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.exec.list` | `name` | `{jobs: [{job, pid, state, code?, cmd, started}]}` |
 | `vm.process.list` | `name`, `filter?` | `{processes: [{pid, ppid, name, path, command, memoryKB}]}` — `filter` is a case-insensitive substring of the process name; on Linux `name` is the kernel's process name (`sshd` for `sshd: /usr/sbin/sshd …`) |
 | `vm.process.kill` | `name`, `pid?` or `processName?`, `tree?` | `{killed}` — `tree` also kills child processes |
-| `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` — a `text` whose message to the guest tools would reach 1 MiB answers `the clipboard text is too large for one message to the guest tools (<n> bytes of UTF-8; a message holds less than 1 MiB); set a shorter text`; guest tools without the `clipboard` capability answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), so <op> cannot run; sign in to the guest's desktop and install wl-clipboard or xclip there, then retry` and nothing is sent to them |
-| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` — `dest` puts the file into that folder of the guest user (on Linux the user of the desktop session); a relative `guestPath` lies below that user's home; in a Linux guest a file created in that home belongs to that user, a path that leads out of the home through a link fails (see [the agent protocol](agent-protocol.md#the-desktop-session-linux)), and with `guestPath` the copy is executable exactly when the host file, or the file a host link leads to, has an execute bit |
+| `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` — a `text` whose message to the guest tools would reach 1 MiB answers `the clipboard text is too large for one message to the guest tools (<n> bytes of UTF-8; a message holds less than 1 MiB); set a shorter text`; guest tools without the `clipboard` capability answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), so <op> cannot run; sign in to the guest's desktop and install wl-clipboard or xclip there, then retry` and nothing is sent to them; while 64 clipboard operations wait for a guest clipboard tool that does not answer, `vm.clipboard.get` answers the guest tools' `64 clipboard operations of this connection are waiting for the guest's clipboard tool; retry once it answers` |
+| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` — `dest` puts the file into that folder of the guest user (on Linux the user of the desktop session); a relative `guestPath` lies below that user's home; in a Linux guest a file created in that home belongs to that user, a path that leads out of the home through a link fails (see [the agent protocol](agent-protocol.md#the-desktop-session-linux)), and with `guestPath` and Linux guest tools 0.2.1 or later the copy is executable exactly when the host file, or the file a host link leads to, has an execute bit (earlier guest tools ignore the bit) |
 | `vm.pull_file` | `name`, `guestPath`, `path` (host) | `{path, bytes, sha256}` |
-| `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` — in a Linux guest a file whose execute bit differs from its host file's is sent again although its content is equal, and the copies are executable exactly when their host files are |
+| `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` — with Linux guest tools 0.2.1 or later a file whose execute bit differs from its host file's is sent again although its content is equal, and the copies are executable exactly when their host files are; earlier guest tools list no execute bit and ignore it |
 | `vm.fs.list` | `name`, `path`, `recursive?` | `{entries: [{name, dir, size, mtime}], truncated}` |
 | `vm.fs.read` | `name`, `path`, `offset?`, `length?` (≤ 262144), `tail?` (lines) | `{text, size, eof}` |
 | `vm.fs.write` | `name`, `path`, `text`, `append?` | `{size}` |
@@ -643,9 +643,11 @@ with `window` or `marks` and of a recording take their turn in the same line.
   time as a sent request starts then; the question of a recording about the
   element an action is aimed at is not asked meanwhile.
 - The agent's own sentences about the helper reach the caller as the agent
-  wrote them, apart from the agent operations they name, among
-  them `UI helper did not answer '<op>' within <n> s; it was restarted` (every
-  ref is forgotten), `UI helper exited; retry` and the start failures listed
+  wrote them, with the agent operations they name outside quotes replaced by
+  control operations, among them
+  `UI helper did not answer '<op>' within <n> s; it was restarted`, whose
+  quoted `<op>` stays the helper operation such as `'ui.find'` (every ref is
+  forgotten), `UI helper exited; retry` and the start failures listed
   in `agent-protocol.md`.
 
 **Windows.** `vm.window.list` returns the top-level windows, top-most first,
@@ -834,7 +836,7 @@ program with vm.wait_for (process_started or text_visible)"` in place of
 - On Windows the program runs with the agent's elevated token; on Linux as
   the user of the guest's desktop session, in that session's environment
   (`WAYLAND_DISPLAY` or `DISPLAY`, `XDG_RUNTIME_DIR`, the session bus),
-  in a session of its own and, through `systemd-run --user --scope`, in the user's service manager, so a restart of the guest tools does not end it; see [the agent protocol](agent-protocol.md#the-desktop-session-linux). Its
+  in a session of its own. When the guest has systemd 254 or later, the session's runtime folder holds the user bus and the program is an executable file, it starts through `systemd-run --user --scope` in the user's service manager, so a restart of the guest tools does not end it; otherwise it runs in the guest tools' service and ends with it. See [the agent protocol](agent-protocol.md#the-desktop-session-linux). Its
   standard input and output are the null device.
 - While the VM has an HTTP capture, the program's environment also holds the
   capture's proxy variables (see [Starting a capture](#starting-a-capture)); the program of
@@ -1322,7 +1324,8 @@ up to 8 s, until its size changes or equals the request, and answers the size
 of the last frame read. A guest that does not offer the mode may pick another
 one or leave the size as it was. When the size changed to one other than the
 request, the result carries `warning: "the guest set <w>x<h>, not <W>x<H>; it
-does not offer that mode"`; an unchanged size gets no warning. The op needs a
+does not offer that mode, so call vm.set_resolution with a size the guest's
+display settings list"`; an unchanged size gets no warning. The op needs a
 running VM with connected guest tools that have the `resolution` capability
 (Windows guest tools); others answer `the guest tools in '<vm>' cannot change
 the display mode of this guest; change it in the guest's display settings`
@@ -2619,8 +2622,14 @@ and the `error` of its `problems`).
   has `timedOut: true` and `code: -1`. A job of `vm.exec.start` has no time
   limit.
 - `cwd` is the working directory: without it the command runs in the home
-  folder of the user the guest tools run as, and a relative `cwd` is taken
-  below that folder. `env` is an object of extra environment variables.
+  folder of the guest user, and a relative `cwd` is taken below that folder.
+  On Windows that user is the one the guest tools run as. On Linux it is the
+  user of the guest's desktop session (the guest tools' own home, `/root`,
+  without one), while the command still runs as root with root's
+  environment (`HOME` is root's): files it creates there belong to root, so
+  a program started with `vm.app.launch` as the session user may not change
+  them (see [the agent protocol](agent-protocol.md#the-desktop-session-linux)).
+  `env` is an object of extra environment variables.
 - `stdin` (`vm.exec` only) is text the command reads from its standard input;
   without it the command reads end-of-file. A job of `vm.exec.start` gets its
   input through `vm.exec.write`.
@@ -2697,7 +2706,11 @@ and the `error` of its `problems`).
 - `vm.fs.list` reports `mtime` as RFC 3339 in UTC and `name` relative to
   `path` with `/` separators; `truncated` is true beyond 5000 entries.
 - Paths: `~`, `~/x` and relative paths resolve against the home directory of
-  the guest user the agent runs as.
+  the guest user: on Windows the user the guest tools run as, on Linux the
+  user of the guest's desktop session (`/root` without one). In a Linux
+  guest the files these ops create in that home belong to the session user,
+  unlike those a `vm.exec` command creates there, which belong to root (see
+  [the agent protocol](agent-protocol.md#the-desktop-session-linux)).
 
 ## Errors
 

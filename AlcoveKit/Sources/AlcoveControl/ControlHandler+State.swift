@@ -82,7 +82,8 @@ extension ControlHandler {
         }
         var out: [String: JSON] = ["width": .int(Int64(size[0])), "height": .int(Int64(size[1]))]
         if size != before, size != [width, height] {
-            out["warning"] = .string("the guest set \(size[0])x\(size[1]), not \(width)x\(height); it does not offer that mode")
+            out["warning"] = .string("the guest set \(size[0])x\(size[1]), not \(width)x\(height); it does not offer that mode, "
+                + "so call vm.set_resolution with a size the guest's display settings list")
         }
         return .object(out)
     }
@@ -298,7 +299,8 @@ extension ControlHandler {
     }
 
     /// A sentence for any failure: engine errors through `engineReason`, an agent's error sentence with the agent ops it
-    /// names replaced by their control ops (`namingControlOps`), errors that carry their own sentence
+    /// names replaced by their control ops (`namingControlOps`), an agent timeout or missing operation with the control op
+    /// of the agent op it names (`controlOpOfAgentOp`), errors that carry their own sentence
     /// (`ControlError`, `LocalizedError`, `CustomStringConvertible`) as they are, `fallback` for the rest.
     nonisolated static func failureReason(_ error: Error, fallback: String) -> String {
         switch error {
@@ -310,9 +312,11 @@ extension ControlHandler {
         case AgentClient.AgentError.tokenMismatch: return "the guest tools refused the connection token; reinstall alcove-agent in the guest"
         case AgentClient.AgentError.disconnected, AgentClient.AgentError.notConnected:
             return "the guest tools are not connected; check vm.status"
-        case AgentClient.AgentError.timeout(let what): return "the guest tools did not answer \(what) in time; check vm.status and retry"
+        case AgentClient.AgentError.timeout(let what):
+            return "the guest tools did not answer \(controlOpOfAgentOp[what] ?? what) in time; check vm.status and retry"
         case AgentClient.AgentError.remote(let message): return ControlHandler.namingControlOps(message)
-        case AgentClient.AgentError.unsupported(let what): return "the guest tools do not support \(what); update alcove-agent in the guest"
+        case AgentClient.AgentError.unsupported(let what):
+            return "the guest tools do not support \(controlOpOfAgentOp[what] ?? what); update alcove-agent in the guest"
         case KeyNames.KeyError.unknownKey(let key): return "unknown key '\(key)'; use a key name such as ctrl, shift, enter or a letter"
         case KeyNames.KeyError.untypableCharacter(let ch): return "cannot type '\(ch)' with the US keyboard layout"
         case let e as LocalizedError where e.errorDescription != nil: return e.errorDescription ?? fallback

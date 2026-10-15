@@ -77,6 +77,10 @@ public actor AgentClient {
     private var waiters: [String: [(id: Int, continuation: CheckedContinuation<JSON, Error>)]] = [:]
     private var nextWaiterID = 1
     public private(set) var hello: Hello?
+    /// The list of a `caps` line that arrived before `connect` set `hello`; `connect` uses it for the hello.
+    private var pendingCaps: [String]?
+    /// The number the next `clipboard.get` carries as its `id`.
+    private var nextClipboardID = 1
     public private(set) var isConnected = false
 
     /// Where the `ui.ping` of `startUIHelper` stands on this connection.
@@ -107,6 +111,7 @@ public actor AgentClient {
         guard transport == nil else { return }
         handshakeExpired = false
         refusal = nil
+        pendingCaps = nil
         let (inbound, feed) = AsyncStream<Inbound>.makeStream(bufferingPolicy: .unbounded)
         let t: TCPLineTransport
         do {
@@ -161,8 +166,9 @@ public actor AgentClient {
         }
         timeoutTask.cancel()
         hello = Hello(version: 1, os: h["os"]?.stringValue ?? "?", agentVersion: h["agent"]?.stringValue ?? "?",
-                      capabilities: h["caps"]?.arrayValue?.compactMap(\.stringValue) ?? [],
+                      capabilities: pendingCaps ?? h["caps"]?.arrayValue?.compactMap(\.stringValue) ?? [],
                       rpcVersion: h["proto"]?.intValue ?? 1, authenticated: authenticates)
+        pendingCaps = nil
         send(["t": "welcome", "v": 1])
         isConnected = true
     }
@@ -238,9 +244,14 @@ public actor AgentClient {
         return line.count < maxRequestBytes
     }
 
-    /// Read the guest clipboard text.
+    /// Read the guest clipboard text. The `clipboard.get` carries an `id`, and only the `clipboard.text` with that id
+    /// (or, from an agent that sends none, the oldest reply without one) answers it. A reply with `error` throws
+    /// `.remote` with that sentence.
     public func getClipboard(timeout: Duration = .seconds(10)) async throws -> String {
-        let r = try await request(["t": "clipboard.get"], waitFor: "clipboard.text", timeout: timeout)
+        let id = String(nextClipboardID)
+        nextClipboardID += 1
+        let r = try await request(["t": "clipboard.get", "id": .string(id)], waitFor: "clipboard.text", timeout: timeout, matchID: id)
+        if let error = r["error"]?.stringValue { throw AgentError.remote(error) }
         return r["text"]?.stringValue ?? ""
     }
 
@@ -420,9 +431,12 @@ public actor AgentClient {
         case "pong", "welcome":
             break
         case "caps":
-            if let caps = m["caps"]?.arrayValue, let h = hello {
-                hello = Hello(version: h.version, os: h.os, agentVersion: h.agentVersion, capabilities: caps.compactMap(\.stringValue),
+            guard let caps = m["caps"]?.arrayValue?.compactMap(\.stringValue) else { break }
+            if let h = hello {
+                hello = Hello(version: h.version, os: h.os, agentVersion: h.agentVersion, capabilities: caps,
                               rpcVersion: h.rpcVersion, authenticated: h.authenticated)
+            } else {
+                pendingCaps = caps
             }
         case "clipboard.changed":
             eventContinuation.yield(.clipboardChanged(text: m["text"]?.stringValue ?? ""))
@@ -438,8 +452,15 @@ public actor AgentClient {
                 let c = list.removeFirst(); waiters[idKey] = list; c.continuation.resume(returning: m)
             } else if var list = waiters[t], !list.isEmpty {
                 let c = list.removeFirst(); waiters[t] = list; c.continuation.resume(returning: m)
+            } else if idKey == nil, let key = oldestIDWaiter(of: t), var list = waiters[key] {
+                let c = list.removeFirst(); waiters[key] = list; c.continuation.resume(returning: m)
             }
         }
+    }
+
+    /// The key of the oldest caller of `request` that waits for a `type` reply with a particular id.
+    private func oldestIDWaiter(of type: String) -> String? {
+        waiters.filter { $0.key.hasPrefix(type + "#") && !$0.value.isEmpty }.min { $0.value[0].id < $1.value[0].id }?.key
     }
 
     /// Fails every waiting caller: with `.refused` and its sentence when the agent sent a `refused` line, with
