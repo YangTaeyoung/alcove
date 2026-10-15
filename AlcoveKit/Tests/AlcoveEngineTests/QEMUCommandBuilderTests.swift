@@ -153,17 +153,24 @@ final class QEMUCommandBuilderTests: XCTestCase {
         XCTAssertTrue(a.contains("usb-bot,id=cd0-bot,bus=xhci.0"))
         XCTAssertTrue(a.contains("scsi-cd,id=cd0-dev,bus=cd0-bot.0,bootindex=100"))
     }
+    /// The values of the `-drive`, `-blockdev` and `-device` options, in order.
+    private func driveAndDeviceValues(_ a: [String]) -> [String] {
+        zip(a, a.dropFirst()).compactMap { ["-drive", "-blockdev", "-device"].contains($0.0) ? $0.1 : nil }
+    }
+
     func testCDROMVirtioBusOption() {
         var l = VMConfig.defaults(name: "L", guestOS: .linux, installISO: "/i.iso")
         l.agentToken = "00000000-0000-0000-0000-000000000000"
         l.macAddress = "52:54:00:aa:bb:cc"
-        XCTAssertTrue(args(l).joined(separator: " ").contains("scsi-cd,drive=cd0"), "USB CD by default")
+        l.agentKey = String(repeating: "a5", count: 32)
+        XCTAssertTrue(driveAndDeviceValues(args(l)).contains { $0.hasPrefix("scsi-cd,drive=cd0,") }, "USB CD by default")
         var seed = l
         seed.cdroms[0].bus = .virtio
-        let sj = args(seed).joined(separator: " ")
-        XCTAssertTrue(sj.contains("virtio-blk-pci,drive=cd0,id=\(QEMUCommandBuilder.cdromDeviceID("cd0")),bootindex=100"), sj)
-        XCTAssertFalse(sj.contains("usb-bot"))
+        let devices = driveAndDeviceValues(args(seed))
+        XCTAssertTrue(devices.contains("virtio-blk-pci,drive=cd0,id=\(QEMUCommandBuilder.cdromDeviceID("cd0")),bootindex=100"), "\(devices)")
+        XCTAssertFalse(devices.contains { $0.contains("usb-bot") })
         seed.cdroms[0].path = nil
-        XCTAssertFalse(args(seed).joined(separator: " ").contains("cd0"), "an empty virtio CD is omitted")
+        let empty = driveAndDeviceValues(args(seed))
+        XCTAssertFalse(empty.contains { $0.contains("cd0") }, "an empty virtio CD is omitted: \(empty)")
     }
 }
