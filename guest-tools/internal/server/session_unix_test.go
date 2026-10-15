@@ -116,7 +116,7 @@ func TestLaunchGoesThroughTheUsersServiceManagerScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
-	c := sessionClient(t, session.Session{User: "alcove", Home: home, Env: env, ScopeRunner: runner}, true)
+	c := sessionClient(t, session.Session{User: "alcove", Home: home, Env: env, ScopeRunner: runner, ScopeVersion: 259}, true)
 	out := filepath.Join(home, "ran.txt")
 	c.ok("app.launch", proto.Message{"path": "/bin/sh", "args": []string{"-c", `printf '%s' "$1" > "$0"`, out, "$HOME literal"},
 		"wait_window_ms": 0})
@@ -136,7 +136,7 @@ func TestLaunchGoesThroughTheUsersServiceManagerScope(t *testing.T) {
 
 func TestLaunchOfAMissingProgramFailsAlsoThroughTheScope(t *testing.T) {
 	home := t.TempDir()
-	c := sessionClient(t, session.Session{User: "alcove", Home: home, Env: []string{"HOME=" + home}, ScopeRunner: "/bin/sh"}, true)
+	c := sessionClient(t, session.Session{User: "alcove", Home: home, Env: []string{"HOME=" + home}, ScopeRunner: "/bin/sh", ScopeVersion: 259}, true)
 	missing := filepath.Join(home, "missing")
 	res := c.call("app.launch", proto.Message{"path": missing, "wait_window_ms": 0})
 	if res["ok"] != false || !strings.HasPrefix(res.String("error"), "cannot start '"+missing+"': ") {

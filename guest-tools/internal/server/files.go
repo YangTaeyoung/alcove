@@ -28,12 +28,11 @@ const (
 )
 
 // resolvePath maps "~", "~/x", relative and absolute paths to an absolute
-// path; relative forms resolve against homeDir.
-func (s *Server) resolvePath(p string) (string, error) {
+// path; relative forms resolve against home.
+func resolvePath(home, p string) (string, error) {
 	if p == "" {
 		return "", errors.New("missing path; pass a file or directory path")
 	}
-	home := s.homeDir()
 	switch {
 	case p == "~":
 		return filepath.Clean(home), nil
@@ -60,12 +59,17 @@ func windowsPathFormError(p string) error {
 }
 
 func (s *Server) pathArg(req proto.Message, key string) (string, error) {
+	return pathArgIn(s.view(), req, key)
+}
+
+// pathArgIn is pathArg against the home of v.
+func pathArgIn(v homeView, req proto.Message, key string) (string, error) {
 	if runtime.GOOS == "windows" {
 		if err := windowsPathFormError(req.String(key)); err != nil {
 			return "", err
 		}
 	}
-	return s.resolvePath(req.String(key))
+	return resolvePath(v.dir, req.String(key))
 }
 
 func mtimeString(fi os.FileInfo) string {
@@ -520,7 +524,8 @@ func pastTheEnd(offset int64, path string, size int64, truncated bool) error {
 // fsWrite writes at most fsChunkMax bytes at an offset within the file or at
 // its end, or appends them.
 func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, error) {
-	path, err := s.pathArg(req, "path")
+	v := s.view()
+	path, err := pathArgIn(v, req, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +544,7 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 	if appendMode && truncate {
 		return nil, errors.New("pass append or truncate, not both")
 	}
-	fsys, name, err := s.writerFor(path)
+	fsys, name, err := s.writerIn(v, path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
 	}
@@ -562,7 +567,7 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 			return nil, err
 		}
 		if err := fsys.MkdirAll(filepath.Dir(name)); err != nil {
-			return nil, fmt.Errorf("cannot create '%s': %v", dir, homeError(err))
+			return nil, fmt.Errorf("cannot create '%s': %v", dir, fsys.explain(filepath.Dir(name), err))
 		}
 	}
 	flags := os.O_WRONLY | os.O_CREATE
@@ -574,7 +579,7 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 	}
 	f, err := fsys.OpenFile(name, flags, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open '%s' for writing: %v", path, homeError(err))
+		return nil, fmt.Errorf("cannot open '%s' for writing: %v", path, fsys.explain(name, err))
 	}
 	if appendMode {
 		_, err = f.Write(data)
@@ -618,20 +623,21 @@ func executableMode(m os.FileMode) os.FileMode {
 }
 
 func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, error) {
-	from, err := s.pathArg(req, "from")
+	v := s.view()
+	from, err := pathArgIn(v, req, "from")
 	if err != nil {
 		return nil, err
 	}
-	to, err := s.pathArg(req, "to")
+	to, err := pathArgIn(v, req, "to")
 	if err != nil {
 		return nil, err
 	}
-	fsys, fromName, err := s.writerFor(from)
+	fsys, fromName, err := s.writerIn(v, from)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
 	}
 	defer fsys.Close()
-	toName, sameSide := to, !s.inSessionHome(to)
+	toName, sameSide := to, !v.contains(to)
 	if h, ok := fsys.(homeFS); ok {
 		toName, sameSide = homeRelative(h.home, to)
 	}
@@ -642,7 +648,7 @@ func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, 
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("'%s' does not exist", from)
 		}
-		return nil, fmt.Errorf("cannot stat '%s': %v", from, homeError(err))
+		return nil, fmt.Errorf("cannot stat '%s': %v", from, fsys.explain(fromName, err))
 	}
 	if err := s.ensureDeployRoot(to); err != nil {
 		return nil, err
@@ -656,26 +662,27 @@ func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, 
 		}
 	}
 	if err := fsys.Rename(fromName, toName); err != nil {
-		return nil, fmt.Errorf("cannot rename '%s' to '%s': %v", from, to, homeError(err))
+		return nil, fmt.Errorf("cannot rename '%s' to '%s': %v", from, to, explainEither(fsys, fromName, toName, err))
 	}
 	return proto.Message{"path": to}, nil
 }
 
 func (s *Server) fsMkdir(_ context.Context, req proto.Message) (proto.Message, error) {
-	path, err := s.pathArg(req, "path")
+	v := s.view()
+	path, err := pathArgIn(v, req, "path")
 	if err != nil {
 		return nil, err
 	}
 	if err := s.ensureDeployRoot(path); err != nil {
 		return nil, err
 	}
-	fsys, name, err := s.writerFor(path)
+	fsys, name, err := s.writerIn(v, path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
 	}
 	defer fsys.Close()
 	if err := fsys.MkdirAll(name); err != nil {
-		return nil, fmt.Errorf("cannot create '%s': %v", path, homeError(err))
+		return nil, fmt.Errorf("cannot create '%s': %v", path, fsys.explain(name, err))
 	}
 	return proto.Message{"path": path}, nil
 }
@@ -705,14 +712,13 @@ func pathContains(dir, target string, sep byte, fold bool) bool {
 	return true
 }
 
-// protectedFromDelete reports whether path is a file-system root, the home
-// directory or one of its ancestors, compared with the home directory as
+// protectedFromDelete reports whether path is a file-system root, homeDir
+// or one of its ancestors, compared with homeDir as
 // given and with its links resolved.
-func (s *Server) protectedFromDelete(path string) bool {
+func protectedFromDelete(homeDir, path string) bool {
 	if isFileSystemRoot(path, filepath.VolumeName(path), filepath.Separator) {
 		return true
 	}
-	homeDir := s.homeDir()
 	if homeDir == "" {
 		return false
 	}
@@ -740,12 +746,12 @@ func homeRefusal(path string) error {
 
 // identityRefusal returns the refusal of fs.delete for path, whose Lstat is
 // fi, when it is a folder whose identity equals that of the root of its
-// volume, the home directory or one of its ancestors, the home directory
+// volume, homeDir or one of its ancestors, homeDir
 // taken as given and with its links resolved. A folder whose identity, or
 // whose volume root, cannot be read is refused, and so is every folder while
 // the identity of one of those existing folders cannot be read. Other paths
 // answer nil.
-func (s *Server) identityRefusal(path string, fi os.FileInfo) error {
+func (s *Server) identityRefusal(homeDir, path string, fi os.FileInfo) error {
 	if !fi.IsDir() {
 		return nil
 	}
@@ -758,7 +764,7 @@ func (s *Server) identityRefusal(path string, fi os.FileInfo) error {
 	if err != nil {
 		return fmt.Errorf("refusing to delete '%s': the root of its volume could not be read (%v), so it cannot be told apart from that root; %s", path, err, next)
 	}
-	if homeDir := s.homeDir(); homeDir != "" {
+	if homeDir != "" {
 		home := filepath.Clean(homeDir)
 		homes := []string{home}
 		if real, err := filepath.EvalSymlinks(home); err == nil {
@@ -804,14 +810,15 @@ func resolveParent(path string) string {
 }
 
 func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, error) {
-	path, err := s.pathArg(req, "path")
+	v := s.view()
+	path, err := pathArgIn(v, req, "path")
 	if err != nil {
 		return nil, err
 	}
-	if s.protectedFromDelete(path) || s.protectedFromDelete(resolveParent(path)) {
+	if protectedFromDelete(v.dir, path) || protectedFromDelete(v.dir, resolveParent(path)) {
 		return nil, homeRefusal(path)
 	}
-	fsys, name, err := s.writerFor(path)
+	fsys, name, err := s.writerIn(v, path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
 	}
@@ -821,22 +828,22 @@ func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, 
 		return proto.Message{"deleted": false}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("cannot stat '%s': %v", path, homeError(err))
+		return nil, fmt.Errorf("cannot stat '%s': %v", path, fsys.explain(name, err))
 	}
-	if err := s.identityRefusal(path, fi); err != nil {
+	if err := s.identityRefusal(v.dir, path, fi); err != nil {
 		return nil, err
 	}
 	if fi.IsDir() && !req.Bool("recursive") {
 		children, err := fsys.ReadDir(name)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read '%s': %v", path, homeError(err))
+			return nil, fmt.Errorf("cannot read '%s': %v", path, fsys.explain(name, err))
 		}
 		if len(children) > 0 {
 			return nil, fmt.Errorf("'%s' is not empty; pass recursive to delete it with its contents", path)
 		}
 	}
 	if err := fsys.RemoveAll(name); err != nil {
-		return nil, fmt.Errorf("cannot delete '%s': %v", path, homeError(err))
+		return nil, fmt.Errorf("cannot delete '%s': %v", path, fsys.explain(name, err))
 	}
 	return proto.Message{"deleted": true}, nil
 }

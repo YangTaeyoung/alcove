@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"slices"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -63,10 +64,30 @@ func Lookup() (Session, error) {
 	sess := New(info, a, Environment(info, a, entries, os.Getenv("PATH"), systemLocale()))
 	if slices.Contains(entries, "bus") {
 		if runner, err := exec.LookPath("systemd-run"); err == nil {
-			sess.ScopeRunner = runner
+			sess.ScopeRunner, sess.ScopeVersion = runner, scopeVersion(runner)
 		}
 	}
 	return sess, nil
+}
+
+var (
+	versionMu sync.Mutex
+	// versions holds the systemd version of each systemd-run path asked for.
+	versions = map[string]int{}
+)
+
+// scopeVersion returns the systemd version runner reports, running it once
+// per path; 0 when it cannot be read.
+func scopeVersion(runner string) int {
+	versionMu.Lock()
+	defer versionMu.Unlock()
+	if v, ok := versions[runner]; ok {
+		return v
+	}
+	out, _ := run(runner, "--version")
+	v := SystemdVersion(out)
+	versions[runner] = v
+	return v
 }
 
 // systemLocale returns the locale variables of /etc/default/locale, else of

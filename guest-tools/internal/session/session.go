@@ -48,17 +48,39 @@ type Session struct {
 	// ScopeRunner is the path of systemd-run when the user's service manager
 	// can be reached (its bus is in the runtime folder); "" otherwise.
 	ScopeRunner string
+	// ScopeVersion is the systemd version systemd-run reports; 0 when unknown.
+	ScopeVersion int
 }
+
+// scopeMinVersion is the first systemd version whose systemd-run takes
+// --expand-environment.
+const scopeMinVersion = 254
 
 // ScopePrefix returns the command line that starts a program, as the
 // session's user, in a scope of the user's service manager: systemd-run
 // --user --scope --quiet --collect --expand-environment=no --. It is nil
-// without a ScopeRunner.
+// without a ScopeRunner and for a systemd older than 254, whose systemd-run
+// does not know --expand-environment.
 func (s Session) ScopePrefix() []string {
-	if s.ScopeRunner == "" {
+	if s.ScopeRunner == "" || s.ScopeVersion < scopeMinVersion {
 		return nil
 	}
 	return []string{s.ScopeRunner, "--user", "--scope", "--quiet", "--collect", "--expand-environment=no", "--"}
+}
+
+// SystemdVersion returns the version that `systemd-run --version` prints
+// as "systemd <n> (…)" on its first line, or 0.
+func SystemdVersion(out string) int {
+	line, _, _ := strings.Cut(out, "\n")
+	f := strings.Fields(line)
+	if len(f) < 2 || f[0] != "systemd" {
+		return 0
+	}
+	n, err := strconv.Atoi(f[1])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // ShowProperties are the properties ParseShow reads.

@@ -3,7 +3,9 @@
 package server
 
 import (
+	"io/fs"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -66,8 +68,19 @@ func runInSession(c *exec.Cmd, env []string, cred *syscall.Credential, scope []s
 	}
 	c.SysProcAttr.Setsid = true
 	c.SysProcAttr.Credential = cred
-	if _, err := exec.LookPath(c.Path); len(scope) > 0 && c.Err == nil && err == nil {
+	program := c.Path
+	if !filepath.IsAbs(program) && c.Dir != "" {
+		program = filepath.Join(c.Dir, program)
+	}
+	if _, err := exec.LookPath(program); len(scope) > 0 && c.Err == nil && err == nil {
 		c.Args = append(append(append([]string{}, scope...), c.Path), c.Args[1:]...)
 		c.Path = scope[0]
 	}
+}
+
+// linkedElsewhere reports whether the file fi has more than one hard link
+// and belongs to another user than uid.
+func linkedElsewhere(fi fs.FileInfo, uid uint32) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Nlink > 1 && st.Uid != uid
 }

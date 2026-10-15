@@ -168,6 +168,38 @@ func TestEnvironmentCarriesTheLocale(t *testing.T) {
 	}
 }
 
+// systemdRun259 is systemd-run --version of Ubuntu 26.04.1, captured on the
+// guest; systemdRun249 has the same form with the version of Ubuntu 22.04.
+const (
+	systemdRun259 = "systemd 259 (259.5-0ubuntu3.4)\n+PAM +AUDIT +SELINUX +APPARMOR +IMA +IPE +SMACK +SECCOMP +GCRYPT -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +KMOD +LIBCRYPTSETUP +LIBCRYPTSETUP_PLUGINS +LIBFDISK +PCRE2 +PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD +BPF_FRAMEWORK +BTF -XKBCOMMON -UTMP +SYSVINIT +LIBARCHIVE\n"
+	systemdRun249 = "systemd 249 (249.11-0ubuntu3.12)\n+PAM +AUDIT +SELINUX\n"
+)
+
+func TestSystemdVersionIsTheNumberAfterSystemd(t *testing.T) {
+	cases := map[string]int{systemdRun259: 259, systemdRun249: 249, "systemd 254\n": 254, "": 0, "not systemd 300": 0, "systemd x (y)": 0}
+	for out, want := range cases {
+		if got := SystemdVersion(out); got != want {
+			t.Errorf("SystemdVersion(%q) = %d, want %d", out, got, want)
+		}
+	}
+}
+
+func TestTheScopeNeedsSystemd254(t *testing.T) {
+	if got := (Session{ScopeRunner: "/usr/bin/systemd-run", ScopeVersion: 259}).ScopePrefix(); len(got) == 0 || got[len(got)-2] != "--expand-environment=no" {
+		t.Fatalf("prefix with 259 %q", got)
+	}
+	for _, v := range []int{254} {
+		if got := (Session{ScopeRunner: "/usr/bin/systemd-run", ScopeVersion: v}).ScopePrefix(); len(got) == 0 {
+			t.Fatalf("no prefix with %d", v)
+		}
+	}
+	for _, v := range []int{253, 249, 0} {
+		if got := (Session{ScopeRunner: "/usr/bin/systemd-run", ScopeVersion: v}).ScopePrefix(); got != nil {
+			t.Fatalf("prefix with %d: %q", v, got)
+		}
+	}
+}
+
 func TestWaylandSocketPrefersWayland0(t *testing.T) {
 	cases := map[string][]string{
 		"wayland-0": {"wayland-1", "wayland-0", "wayland-0.lock"},

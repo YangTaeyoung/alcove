@@ -168,16 +168,9 @@ func (s *Server) session() (session.Session, bool) {
 	return s.opt.Session()
 }
 
-// homeDir returns Options.HomeDir, else the home directory of the desktop
-// session, else the agent's own home directory.
+// homeDir returns the home directory that view reads.
 func (s *Server) homeDir() string {
-	if s.opt.HomeDir != "" {
-		return s.opt.HomeDir
-	}
-	if sess, ok := s.session(); ok && sess.Home != "" {
-		return sess.Home
-	}
-	return s.ownHome
+	return s.view().dir
 }
 
 // agentHome returns the home directory of the agent's user: $HOME, else the
@@ -258,8 +251,9 @@ func (s *Server) beginDrop(dest, name string) (*fileXfer, error) {
 	if dest == "downloads" {
 		folder = "Downloads"
 	}
-	dir := filepath.Join(s.homeDir(), folder)
-	fsys, dirName, err := s.writerFor(dir)
+	v := s.view()
+	dir := filepath.Join(v.dir, folder)
+	fsys, dirName, err := s.writerIn(v, dir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
 	}
@@ -269,8 +263,9 @@ func (s *Server) beginDrop(dest, name string) (*fileXfer, error) {
 	fileName := uniqueName(fsys, filepath.Join(dirName, name))
 	f, err := fsys.OpenFile(fileName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
+		err = fsys.explain(fileName, err)
 		fsys.Close()
-		return nil, homeError(err)
+		return nil, err
 	}
 	h := sha256.New()
 	return &fileXfer{f: f, fsys: fsys, name: fileName, path: filepath.Join(dir, filepath.Base(fileName)), h: h,

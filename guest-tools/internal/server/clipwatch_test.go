@@ -71,17 +71,20 @@ func TestOneClipboardWatcherPollsLessWhileNothingChanges(t *testing.T) {
 	t.Cleanup(func() { l.Close() })
 	go New(Options{Clipboard: cb, HomeDir: t.TempDir(), AllowPeers: loopbackPeers, Unauthenticated: true}).Serve(l)
 	var wg sync.WaitGroup
-	for range 3 {
+	readers := make([]*proto.Reader, 3)
+	for i := range readers {
 		c, err := net.Dial("tcp", l.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
+		c.SetDeadline(time.Now().Add(10 * time.Second))
 		t.Cleanup(func() { c.Close() })
+		readers[i] = proto.NewReader(c)
 		wg.Add(1)
-		go func() {
+		go func(r *proto.Reader) {
 			defer wg.Done()
-			expect(t, proto.NewReader(c), "hello")
-		}()
+			expect(t, r, "hello")
+		}(readers[i])
 	}
 	wg.Wait()
 	time.Sleep(time.Second)
@@ -89,8 +92,9 @@ func TestOneClipboardWatcherPollsLessWhileNothingChanges(t *testing.T) {
 		t.Fatalf("the clipboard was polled %d times in 1 s by three connections", n)
 	}
 	cb.external("changed in the guest")
-	time.Sleep(200 * time.Millisecond)
-	if n := cb.sequences.Load(); n == 0 {
-		t.Fatal("the clipboard was not polled")
+	for i, r := range readers {
+		if m := expect(t, r, "clipboard.changed"); m.String("text") != "changed in the guest" {
+			t.Fatalf("connection %d got %v", i, m)
+		}
 	}
 }

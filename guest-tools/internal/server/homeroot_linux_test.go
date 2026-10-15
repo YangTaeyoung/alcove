@@ -65,3 +65,25 @@ func TestEntriesCreatedInTheHomeBelongToTheSessionUser(t *testing.T) {
 		t.Errorf("main.c mode %v", fi.Mode())
 	}
 }
+
+func TestAHardLinkedFileOfTheSessionUserIsWritten(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("giving files to another user needs root")
+	}
+	home := t.TempDir()
+	own := filepath.Join(home, "own.txt")
+	if err := os.WriteFile(own, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(own, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(own, filepath.Join(home, "second.txt")); err != nil {
+		t.Fatal(err)
+	}
+	c := sessionClient(t, session.Session{User: "nobody", UID: 65534, GID: 65534, Home: home}, true)
+	c.ok("fs.write", proto.Message{"path": "second.txt", "data": base64.StdEncoding.EncodeToString([]byte("new")), "truncate": true})
+	if b, _ := os.ReadFile(own); string(b) != "new" {
+		t.Fatalf("own.txt holds %q", b)
+	}
+}

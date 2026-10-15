@@ -170,13 +170,14 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 		waitMs = maxLaunchWaitMs
 	}
 
+	v := s.view()
 	program, err := resolveProgram(path)
 	if err != nil {
 		return nil, err
 	}
 	c := exec.Command(program, req.Strings("args")...)
 	if cwd := req.String("cwd"); cwd != "" {
-		c.Dir = resolveHomePath(s.homeDir(), cwd)
+		c.Dir = resolveHomePath(v.dir, cwd)
 	} else if filepath.IsAbs(c.Path) {
 		c.Dir = filepath.Dir(c.Path)
 	}
@@ -195,7 +196,7 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 		}
 	}
 	started := c.Path
-	if sess, ok := s.session(); ok {
+	if sess, ok := v.sess, v.hasSess; ok {
 		runInSession(c, append(append([]string{}, sess.Env...), extra...), sess.Credential(), sess.ScopePrefix())
 	} else if len(extra) > 0 {
 		c.Env = append(os.Environ(), extra...)
