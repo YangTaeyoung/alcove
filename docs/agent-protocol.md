@@ -464,9 +464,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   Without a candidate within `wait_window_ms` the reply has `pid` alone. When
   the windows cannot be listed before the start the program is not started:
   `'<path>' was not started because the windows could not be listed: <reason>`.
-  Measured: the fixture app answers after 0.4–0.65 s, `notepad.exe` after
-  0.9 s (window of `Notepad.exe`, another pid), `calc.exe` after 0.7 s
-  (`CalculatorApp.exe`).
+  `notepad.exe` answers with the window of `Notepad.exe`, another process,
+  and `calc.exe` with the window of `CalculatorApp.exe`.
 
 ### Windows and UI Automation (`win.*`, `ui.*`)
 
@@ -612,13 +611,9 @@ The helper's environment takes nothing from the agent's: it holds
 the Windows folder, `Wbem` and Windows PowerShell's folder, a `PSModulePath`
 of Windows PowerShell's own `Modules` folder only (`bootstrap.ps1` sets it
 again before its first command), `PSModuleAnalysisCachePath` and
-`TEMP`/`TMP` inside the locked folder, and `ALCOVE_UIA_START`. Measured on the Windows 11 ARM64 test guest: the first `ui.ping` after
-an agent start answers after 0.59–0.60 s (1.1–2.0 s for the first one after a
-boot), of which the compile takes 0.35 s; a helper that was killed is replaced
-in 0.6–1.1 s. A helper killed while it starts leaves no process behind that
-blocks the next start: of 84 kills between 0 and 1.3 s after the start, the
-compiler was running in 8 and the next start succeeded in all of those.
-The helper, and an app launched through
+`TEMP`/`TMP` inside the locked folder, and `ALCOVE_UIA_START`. A helper
+killed while it starts, the compiler included, leaves no process behind that
+blocks the next start. The helper, and an app launched through
 `app.launch`, inherit the agent's elevated token. `alcove-agent --install`
 locks the folders in the same way before it copies or registers anything and
 fails, with exit code 1 and a line on stderr that begins `install failed: `,
