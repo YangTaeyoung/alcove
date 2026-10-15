@@ -314,3 +314,61 @@ main checkout. Host as above. VMs `Windows 11` (ssh 2222) and `Ubuntu`
   folder were removed, as was an empty `/tmp/t17` made by mistake.
 - Commits: 67c1f74, 166779d, d3f6cec and the commit of this file (results
   only; no script or product change).
+
+# Re-check after Task 18 (Task 20, 2026-10-15)
+
+Tree: branch `followups-0.2.1` at e65ff3e (Task 18 integrated: 6118f1d,
+77ee587, e65ff3e), main checkout. VM `Windows 11` stopped at the start;
+nothing else ran on it.
+
+## Setup
+
+| Step | Result | Evidence |
+|---|---|---|
+| Builds | PASS | Task 18 changed only Go and docs (`git diff --stat 34d22b4 e65ff3e` outside `docs/` and `guest-tools/` is empty), so the Go part of `all.sh` ran: `go vet ./...`, `GOOS=windows go vet ./...`, `go test -count=1 ./...` (12 packages ok, `server` 11.5 s), then the Windows agent, the fixture, the Linux agent and `alcove-proxy` as `all.sh` builds them. The Swift, MCP and app parts were not run again: none of their files changed since their PASS in A of the final pass |
+| Test binaries | built | `GOOS=windows GOARCH=arm64 go test -c` of `internal/server` and `internal/sysfolder`, copied to `C:\Users\alcove\gt20` (SHA-256 checked in the guest) |
+| `alcovectl` | built | `swift build --product alcovectl --scratch-path .build-ctl`, `alcovectl serve` on the default socket |
+| `install-agent.py` (VM stopped) | PASS | `Windows 11 is stopped; starting it`, SHA-256 `6a856226…fdd8d496` (`vcs.revision=e65ff3e`, `vcs.modified=false`), `agent process 8084 started after the install`, hello `agent: '0.2.1'`, caps `files shutdown resolution clipboard exec rpc jobs proc fs ui`, authenticated (18 s) |
+| Guest before the checks | recorded | as the end state of the final pass: `HKCU\Environment` `Path`, `TEMP`, `TMP`, `OneDrive`; no `Command Processor` key; every execution policy scope `Undefined`; no `Documents\WindowsPowerShell`, no `C:\alcove-e2e`; users `alcove` only (enabled); scheduled tasks as in A of the final pass; `C:\alcove-apps` empty; `C:\ProgramData\Alcove` holds `uia`, `agent.log`, `install.log` |
+| How the tests ran | — | "elevated" = over ssh as `alcove` (High Mandatory Level); "medium" = a one-off scheduled task of `alcove` with `-LogonType Interactive -RunLevel Limited` (`whoami /groups`: Medium Mandatory Level), unregistered after the run |
+
+## Checks
+
+| Check | Result | Evidence |
+|---|---|---|
+| D8 `server.test.exe -test.run "TestLaunchMissingPath$" -test.v`, elevated | PASS | `--- PASS: TestLaunchMissingPath (0.00s)`, exit 0 |
+| D8 the same, medium | PASS | `--- PASS: TestLaunchMissingPath (0.00s)`, exit 0 |
+| D9 `sysfolder.test.exe -test.v`, elevated and medium | PASS | 11 PASS at each level, among them `TestTheProgramFilesFoldersOfAnArmMachineAreRead` and `TestAProgramFilesValueThatIsMissingEmptyOrNotAFolderIsLeftOut` |
+| D9 `server.test.exe -test.run "ChildEnv\|Machine\|Prompt"`, elevated and medium | PASS | 5 PASS at each level: `TestTheWindowsChildEnvironmentIsBuiltFromTheMachineAndTheProfile`, `TestAMachineValueExpandsTheMachinesOwnTextValuesOneLevel`, `TestAMachinePromptValueReplacesTheLogonPrompt`, `TestTheWindowsChildEnvironmentLeavesOutWhatTheAccountDoesNotName`, `TestTheChildEnvironmentTakesNothingFromTheAgentsEnvironment` |
+| D9 environment compare | PASS for the `(Arm)` pair; `PROMPT`: D12 | `vm.exec` `Get-ChildItem env:` (37 variables) against the same command in a PowerShell of a `RunLevel Highest` interactive task of `alcove` (38). The `vm.exec` child now has `ProgramFiles(Arm)=C:\Program Files (Arm)`, `CommonProgramFiles(Arm)=C:\Program Files (Arm)\Common Files` and `PROMPT=$P$G`. Only in the desktop PowerShell: `LOGONSERVER`, `OneDrive`, `USERDOMAIN_ROAMINGPROFILE`; different values: `Path` (no user `WindowsApps` entry) and `PSModulePath` (the module folder only); these are the documented absences. Only in `vm.exec`: `PSExecutionPolicyPreference` (as in the final pass) and `PROMPT`, which that PowerShell did not have (next row) |
+| Where `PROMPT` comes from | recorded | The same command in three PowerShells, each from a one-off interactive task of `alcove`: started directly: no `PROMPT`; started through `cmd.exe /d /c powershell …`: `PROMPT=$P$G`, all else equal; started by the desktop shell (`explorer.exe <shortcut to powershell.exe>`; the only `explorer.exe` in the guest afterwards was the shell started at logon): no `PROMPT`, all else equal to the first. So `$P$G` is what cmd.exe puts into its own environment, not a variable of the logon environment. The desktop PowerShell of 15b-8 in the final pass had `PROMPT`; no PowerShell started without cmd.exe has it here (D12) |
+| D10 `uia-helper-check.py --only 32`, 10 times | PASS 10 of 10 | each `PASS 32 … (ui.act answered ['gone', 'node', 'ok'])`, exit 0, 1 s to 5 s; the script pushed the fixture of this build (SHA-256 `fbacacee…1967d492`) |
+| D10 `vm.ui.action` on a fixture started as a `vm.exec.start` job | PASS | `vm.push_file` of the fixture to `C:\alcove-t20`; `vm.exec.start argv=[C:\alcove-t20\alcove-fixture.exe, --log, C:\alcove-t20\fixture.log]` (job `j1`, pid 9652); `vm.ui.action selector={window: 0x60226, role: Button, name: Vanish} action=invoke` → `{gone: true, node: {name: 'Vanish', role: 'Button', …}, ok: true}`; for 6 s afterwards `vm.window.list` shows the fixture window `responding: true` and `vm.exec.read` the job `running`; `vm.ui.find` of Vanish `[]`; `vm.window.action close` → `closed: true`; the job `exited` with code 0 (no 0xC000041D, no 0xC0000374); fixture log `start pid 9652 dpi 96`, `vanish`, `exit` |
+| Full `uia-helper-check.py` | PASS 34 of 34 | 75 s, exit 0; check 1 `'alcove-uia-check.txt - Notepad'`; check 32 `['gone', 'node', 'ok']`; check 33 Ghost window 3.4 s after the Hang reply; check 34 572 messages read |
+| `agent-rpc-windows.py` | PASS 19 of 19 | 23 s, exit 0; check 12 `GUI process: charmap.exe pid 5364`; check 19 wrote `C:\Users\alcove\Desktop\alcove-e2e-rpc-1792054358.bin`, which is gone at the end |
+
+## Defects (re-check)
+
+| # | Op and input | Output | Cause | Suggested fix |
+|---|---|---|---|---|
+| D12 (minor) | `vm.exec` on the Windows guest (PowerShell), compared with a PowerShell the desktop shell starts | the child has `PROMPT=$P$G`; a PowerShell started by `explorer.exe` or directly by an interactive task of the account has no `PROMPT`, one started through `cmd.exe` has `$P$G` | `guest-tools/internal/server/childenv.go:35-36,65` sets `PROMPT=$P$G` as "the PROMPT of a Windows logon environment" for every child (`childEnvironment` is the base of `vm.exec`, `shell.go:42`, and of `vm.app.launch`, `launch.go:207`), and `docs/agent-protocol.md:528-530` calls it the prompt of a logon environment. The logon environment of this guest has no `PROMPT`; cmd.exe sets `$P$G` in its own environment when none is set, so a `shell: cmd` child has it without the agent | drop `logonPrompt` (childenv.go:35-36, the PROMPT item of the comment at 47-48, line 65), the docs sentence (agent-protocol.md:528-530) and `TestAMachinePromptValueReplacesTheLogonPrompt` (or turn it into: a machine `PROMPT` value is kept like any other machine value) |
+
+## End state (re-check)
+
+- `Windows 11` stopped through `vm.stop` (`state: stopped`, not
+  suspended); no `alcovectl`, engine or `alcove-proxy` process left; the
+  control socket file is gone.
+- Windows guest as found: `HKCU\Environment` the four values, no `Command
+  Processor` key, every execution policy scope `Undefined`, no
+  `Documents\WindowsPowerShell`, users `alcove` only, no `AlcoveT20-*`
+  scheduled task, no `C:\alcove-e2e`, `C:\alcove-t20` or
+  `C:\Users\alcove\gt20`, no `alcove-e2e-rpc-*` file on the Desktop, no
+  fixture, Notepad or charmap process, `C:\alcove-apps` empty,
+  `C:\ProgramData\Alcove` holds `uia`, `agent.log`, `install.log`, clipboard
+  empty. Changed and left so: the agent is the 0.2.1 build of e65ff3e.
+- Host: the test binaries, drivers and logs of this run are in the
+  session's scratch folder only; the `__pycache__` made in `scripts/test`
+  was removed. `build/` holds the agents, fixture and `alcove-proxy` of
+  e65ff3e.
+- Commits: the commit of this section (results only; no script or product
+  change).
