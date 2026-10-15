@@ -22,7 +22,8 @@
 //   - "Titles": changes the window title every 50 ms for 5 s and ends with
 //     "Alcove Fixture";
 //   - two buttons that are both named "Same": each appends "Same 1" or
-//     "Same 2" to the transcript.
+//     "Same 2" to the transcript;
+//   - "Vanish", right of Secret: the button destroys itself when pressed.
 //
 // With --log every action appends one line "<RFC 3339 time> <action> [detail]"
 // to the file; a change of Secret is logged as "secret <length>", without the
@@ -73,6 +74,7 @@ const (
 	idTitles
 	idSame1
 	idSame2
+	idVanish
 )
 
 const (
@@ -156,6 +158,7 @@ var (
 	procGetDpiForWindow    = user32.NewProc("GetDpiForWindow")
 	procCreateFont         = gdi32.NewProc("CreateFontW")
 	procDeleteObject       = gdi32.NewProc("DeleteObject")
+	procDestroyWindow      = user32.NewProc("DestroyWindow")
 	procGetModuleHandle    = kernel32.NewProc("GetModuleHandleW")
 	procRaiseFailFast      = kernel32.NewProc("RaiseFailFastException")
 	procGetErrorMode       = kernel32.NewProc("GetErrorMode")
@@ -203,6 +206,7 @@ type app struct {
 	labels                                  [4]uintptr
 	buttons                                 [5]uintptr
 	same                                    [2]uintptr
+	vanish                                  uintptr
 	dpi                                     int
 	font                                    uintptr
 
@@ -286,14 +290,20 @@ func (a *app) createControls() {
 	}
 	a.same[0] = a.child("BUTTON", "Same", wsTabStop, 0, idSame1)
 	a.same[1] = a.child("BUTTON", "Same", wsTabStop, 0, idSame2)
+	a.vanish = a.child("BUTTON", "Vanish", wsTabStop, 0, idVanish)
 	sendMessage(a.transcript, emSetLimitText, 0, 0)
 }
 
+// children returns the controls that exist.
 func (a *app) children() []uintptr {
 	all := []uintptr{a.message, a.send, a.secret, a.transcript}
 	all = append(all, a.labels[:]...)
 	all = append(all, a.buttons[:]...)
-	return append(all, a.same[:]...)
+	all = append(all, a.same[:]...)
+	if a.vanish != 0 {
+		all = append(all, a.vanish)
+	}
+	return all
 }
 
 // applyFont gives every control a font with Hangul glyphs at the window's DPI.
@@ -315,8 +325,8 @@ func move(hwnd uintptr, x, y, w, h int32) {
 }
 
 // layout places the controls in the client area: the two input rows on top,
-// the buttons at the bottom, above them the Korean label with the two Same
-// buttons to its right, the transcript between.
+// Vanish below Send, the buttons at the bottom, above them the Korean label
+// with the two Same buttons to its right, the transcript between.
 func (a *app) layout() {
 	var client rect
 	procGetClientRect.Call(a.main, uintptr(unsafe.Pointer(&client)))
@@ -334,6 +344,9 @@ func (a *app) layout() {
 	y += rowH + gap
 	move(a.labels[1], margin, y+a.scale(4), labelW, rowH-a.scale(4))
 	move(a.secret, margin+labelW, y, editW, rowH)
+	if a.vanish != 0 {
+		move(a.vanish, margin+labelW+editW+gap, y-a.scale(1), buttonW, rowH+a.scale(2))
+	}
 	y += rowH + gap
 	move(a.labels[2], margin, y, width-2*margin, a.scale(20))
 	y += a.scale(22)
@@ -440,6 +453,10 @@ func (a *app) onCommand(id int) {
 	case idSame2:
 		a.log("same", "2")
 		a.appendTranscript("Same 2\r\n")
+	case idVanish:
+		a.log("vanish")
+		procDestroyWindow.Call(a.vanish)
+		a.vanish = 0
 	}
 }
 

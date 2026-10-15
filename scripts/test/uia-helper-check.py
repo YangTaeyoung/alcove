@@ -282,6 +282,17 @@ class Run:
         self.fixture_pids.append(r["pid"])
         return r
 
+    def launch_another_fixture(self):
+        """Starts one more fixture through app.launch while others may run and returns its window."""
+        self.push_fixture()
+        self.a.call("fs.mkdir", path=BASE)
+        r = self.a.call("app.launch", path=FIXTURE, args=["--log", FIXTURE_LOG])
+        expect(type(r.get("pid")) is int and r["pid"] > 0, f"app.launch returned pid {r.get('pid')!r}")
+        self.fixture_pids.append(r["pid"])
+        w = r.get("window")
+        expect(w and w["pid"] == r["pid"] and w["title"] == FIXTURE_TITLE, f"app.launch of another fixture returned {r!r}")
+        return w
+
     def fixture_log(self):
         return self.read_file(FIXTURE_LOG).decode("utf-8", "replace").splitlines()
 
@@ -1103,6 +1114,121 @@ def _(a, run):
     a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}")
     run.fixture = None
     return ", ".join(f"{what} after {t * 1000:.0f} ms" for what, t in took.items())
+
+
+def gone_sentence(ref):
+    return f"element {ref} no longer exists; call ui.tree again"
+
+
+@check("ui.at in the second of two windows with the same title answers null counts, and a ref of it answers gone after its process was killed")
+def _(a, run):
+    first = fixture_in_front(a, run)
+    second = run.launch_another_fixture()
+    sid = second["id"]
+    expect(sid != first, f"app.launch returned the window {sid} of the running fixture")
+    a.call("win.action", window=first, action="focus")
+    titled = [w["id"] for w in run.windows() if FIXTURE_TITLE in w["title"]]
+    expect(titled[:1] == [first] and sid in titled, f"win.list shows the fixture windows {titled!r}; {first} must come first and {sid} must be listed")
+    one = {"matches": 1, "index": 0}
+    in_first = send_button(a, first)["node"]["ref"]
+    in_second = a.call("ui.rect", window=sid, role="Button", name="Send")["node"]["ref"]
+    r = a.call("ui.at", ref=in_first)
+    at_node(r, "ui.at in the first fixture", ref=in_first)
+    expect(r["window"] == {"id": first, "title": FIXTURE_TITLE} and r.get("byAutomationId") == one and r.get("byName") == one,
+           f"ui.at in the first fixture answered window {r['window']!r}, byAutomationId {r.get('byAutomationId')!r}, byName {r.get('byName')!r}")
+    r = a.call("ui.at", ref=in_second)
+    n = at_node(r, "ui.at in the second fixture", ref=in_second)
+    expect(n["role"] == "Button" and n["name"] == "Send" and r["window"] == {"id": sid, "title": FIXTURE_TITLE},
+           f"ui.at in the second fixture answered {n!r} in {r['window']!r}")
+    expect("byAutomationId" in r and r["byAutomationId"] is None and "byName" in r and r["byName"] is None,
+           f"ui.at in the second fixture answered byAutomationId {r.get('byAutomationId', 'absent')!r}, byName {r.get('byName', 'absent')!r}; both must be null")
+    seen = len(a.events)
+    expect(a.call("proc.kill", pid=second["pid"])["killed"] == 1, "proc.kill did not report one killed process")
+    a.event("window.closed", lambda e: e in a.events[seen:] and e["window"]["id"] == sid, f"for window {sid}")
+    gone = a.ask("ui.at", ref=in_second)
+    expect(gone.get("ok") is False and gone.get("error") == gone_sentence(in_second), f"ui.at with the ref of the killed fixture answered {gone!r}")
+    return f"fixtures {first} and {sid}; {gone['error']}"
+
+
+@check("ui.at with the ref of the text in a closed dialog answers that the element no longer exists")
+def _(a, run):
+    fixture_in_front(a, run)
+    seen = len(a.events)
+    act(a, run, "invoke", role="Button", name="Dialog")
+    did = a.event("dialog.opened", lambda e: e in a.events[seen:] and e["window"]["title"] == "Fixture Dialog", "titled Fixture Dialog")["window"]["id"]
+    body = a.call("ui.find", window=did, role="Text", name="Dialog body")["nodes"]
+    expect(len(body) == 1, f"the dialog has {len(body)} Text elements named Dialog body")
+    ref = body[0]["ref"]
+    live = a.call("ui.at", ref=ref)
+    expect(live["window"] == {"id": did, "title": "Fixture Dialog"}, f"ui.at in the open dialog answered the window {live['window']!r}")
+    closed = a.call("win.action", window=did, action="close")
+    expect(closed.get("closed") is True, f"win.action close answered {closed!r}")
+    gone = a.ask("ui.at", ref=ref)
+    expect(gone.get("ok") is False and gone.get("error") == gone_sentence(ref), f"ui.at with the ref of the closed dialog answered {gone!r}")
+    return gone["error"]
+
+
+@check("ui.at with the ref of the title bar, an element without a window handle of its own, answers the fixture window")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    bars = a.call("ui.find", window=wid, role="TitleBar")["nodes"]
+    expect(len(bars) == 1, f"the fixture has {len(bars)} TitleBar elements: {bars!r}")
+    ref = bars[0]["ref"]
+    r = a.call("ui.at", ref=ref)
+    n = at_node(r, "ui.at title bar", ref=ref)
+    expect(n["role"] == "TitleBar" and r["window"] == {"id": wid, "title": FIXTURE_TITLE}, f"ui.at answered {n!r} in {r['window']!r}")
+    return f"{ref} {n['name']!r} in {wid}"
+
+
+@check("ui.act invoke on Vanish, a button that destroys itself, answers gone while the fixture window stays and responds")
+def _(a, run):
+    wid = fixture_in_front(a, run)
+    found = a.call("ui.find", window=wid, role="Button", name="Vanish")["nodes"]
+    if not found:
+        run.end_fixtures()
+        wid = fixture_in_front(a, run)
+        found = a.call("ui.find", window=wid, role="Button", name="Vanish")["nodes"]
+    expect(len(found) == 1, f"the fixture has {len(found)} buttons named Vanish")
+    r = a.ask("ui.act", ref=found[0]["ref"], action="invoke")
+    expect(r.get("ok") is True and r.get("gone") is True and r.get("node", {}).get("name") == "Vanish",
+           f"ui.act invoke on Vanish answered {r!r}")
+    w = same_window(a, wid)
+    expect(w is not None and w["responding"] is True, f"after Vanish win.list shows the fixture as {w!r}")
+    left = a.call("ui.find", window=wid, role="Button", name="Vanish")["nodes"]
+    expect(left == [], f"ui.find still finds Vanish after it was pressed: {left!r}")
+    expect(any(l.endswith(" vanish") for l in run.fixture_log()), "the fixture log has no vanish line")
+    return f"ui.act answered {sorted(k for k in r if k not in ('t', 'id'))!r}"
+
+
+@check("ui.at on the Ghost window of the hung fixture answers the timeout sentence within its budget")
+def _(a, run):
+    run.end_fixtures()
+    wid = fixture_in_front(a, run)
+    pid = run.fixture["pid"]
+    send = send_button(a, wid)
+    r = act(a, run, "invoke", role="Button", name="Hang")
+    expect(r.get("unresponsive") is True, f"ui.act invoke on Hang answered {r!r}")
+    t0 = time.time()
+    while True:
+        ghosts = [w for w in run.windows() if w["class"] == "Ghost" and w["pid"] == pid]
+        if ghosts:
+            break
+        expect(time.time() - t0 < 20, f"no Ghost window of the hung fixture {pid} appeared in win.list within 20 s")
+        time.sleep(0.3)
+    g = ghosts[0]
+    expect(g["x"] <= send["cx"] < g["x"] + g["w"] and g["y"] <= send["cy"] < g["y"] + g["h"],
+           f"the Ghost window {g!r} does not cover the Send button at {send['cx']},{send['cy']}")
+    t1 = time.time()
+    res = a.ask("ui.at", x=send["cx"], y=send["cy"])
+    took = time.time() - t1
+    want = f"no element at ({send['cx']}, {send['cy']}): the app did not answer within {AT_BUDGET_MS} ms; retry"
+    expect(res.get("ok") is False and res.get("error") == want, f"ui.at on the Ghost window answered {res!r}")
+    expect(took <= AT_LIMIT_S, f"ui.at on the Ghost window answered after {took:.3f} s, the limit is {AT_LIMIT_S} s")
+    seen = len(a.events)
+    expect(a.call("proc.kill", pid=pid)["killed"] == 1, "proc.kill did not report one killed process")
+    a.event("process.exited", lambda e: e in a.events[seen:] and e.get("pid") == pid, f"for pid {pid}")
+    run.fixture = None
+    return f"Ghost window {g['id']} {g['title']!r} {t1 - t0:.1f} s after the Hang reply; ui.at answered after {took * 1000:.0f} ms"
 
 
 @check("the secret typed into the password edit is in no message the agent sent during the run")
