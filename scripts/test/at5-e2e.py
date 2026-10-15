@@ -410,6 +410,14 @@ class Run:
         self.dump = rows[0]["file"]
         return pid, rows[0], listed
 
+    def dated_dumps(self, files):
+        """The dumps among bundle paths `files` whose time vm.crash_dumps.list reports readably; a bundle keeps a dump
+        whose time the guest does not report readably whatever its sinceMinutes."""
+        copied = {f[len("dumps/"):] for f in files if f.startswith("dumps/")}
+        if not copied:
+            return []
+        return sorted(d["file"] for d in self.dumps() if d["file"] in copied and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z", d.get("time") or ""))
+
     def since_without_dump(self):
         """A sinceMinutes of 1 that leaves the run's dump out of a bundle: waits until the dump was listed more than 65 s ago."""
         if self.dump_listed is not None:
@@ -760,7 +768,7 @@ def _(run):
     stuck = [l for l in rows if l.startswith("window not responding: ")]
     expect(any(f'"{TITLE}" (pid {window["pid"]}, {EXE})' in l for l in stuck) and took < 115,
            f"the collection took {took:.1f} s and its summary reads:\n{r['summary']}")
-    expect(not [f for f in r["files"] if f.startswith("dumps/")], f"the bundle of sinceMinutes {since} holds dumps: {sorted(r['files'])!r}")
+    expect(not run.dated_dumps(r["files"]), f"the bundle of sinceMinutes {since} holds the dated dumps {run.dated_dumps(r['files'])!r}")
     with open(os.path.join(bundle, "windows.json"), encoding="utf-8") as f:
         listed = [w for w in json.load(f)["windows"] if w["pid"] == window["pid"]]
     expect(listed and listed[0]["responding"] is False, f"windows.json lists the fixture as {listed!r}")
@@ -789,7 +797,7 @@ def _(run):
                               timeout=400)
     rows = out.split("\n")
     expect(not err and not images and f"directory: {bundle}" in rows and "files:" in rows and "  summary.txt" in rows
-           and not [row for row in rows if row.startswith("  dumps/")], f"alcove_collect_diagnostics answered error={err} {out!r}")
+           and not run.dated_dumps([row.strip() for row in rows]), f"alcove_collect_diagnostics answered error={err} {out!r}")
     with open(os.path.join(bundle, "summary.txt"), encoding="utf-8") as f:
         summary = f.read()
     expect(out.startswith(summary.rstrip("\n") + "\ndirectory: "), "the tool text does not start with summary.txt")

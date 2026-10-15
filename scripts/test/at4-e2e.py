@@ -29,7 +29,9 @@ Check 19 stops the VM through the control server and starts it again when
 the data volume has at least 10 GiB free; check 20 takes the snapshot
 at4-events, restores and deletes it when the data volume has at least 18 GiB
 free. Each is skipped otherwise. However the run ends, a second connection
-starts the VM when the run left it stopped and waits for its guest tools,
+waits up to 300 s for a VM that the run stopped, started or restored to leave
+the starting, stopping and suspending states, starts it when it is stopped
+and waits for its guest tools,
 deletes the snapshot at4-events when the run sent vm.snapshot.create and
 vm.snapshot.list lists it, stops the recording of the run, ends the processes
 the run started (the ones that run from the two folders, the Edge processes
@@ -616,12 +618,15 @@ class Run:
                 c.close()
             except Exception:
                 pass
-        touched = self.wrote_guest or self.deployed or self.before or self.junctions or self.notepad_copy or self.recording
+        touched = (self.wrote_guest or self.deployed or self.before or self.junctions or self.notepad_copy or self.recording
+                   or self.snapshot_begun)
         by_hand = (f"end the processes that run from {APP_DIR} and {GUEST}, remove the junctions {self.junctions!r} with rmdir, "
                    f"then delete the two folders")
         if self.notepad_copy:
             by_hand += (f"; end the Notepad of this run, then make {NOTEPAD_STATE} equal to the copy in {self.notepad_copy} "
                         "(delete the files that are not in the copy" + ("" if self.notepad_names is not None else "; the folder did not exist before the run") + ")")
+        if self.snapshot_begun:
+            by_hand += f"; delete the snapshot {SNAPSHOT} with scripts/test/ctl.py vm.snapshot.delete when vm.snapshot.list lists it"
         try:
             with Client(self.c.socket_path, spawn=False) as c:
                 restored = self.restore(c, touched, by_hand)
@@ -635,7 +640,12 @@ class Run:
 
     def restore(self, c, touched, by_hand):
         """Puts the guest back; returns whether the guest could be reached."""
-        if self.vm_left_stopped and c.call("vm.status", 60, name=self.vm).get("state") == "stopped":
+        status = c.call("vm.status", 60, name=self.vm)
+        end = time.time() + (300 if self.vm_left_stopped or self.snapshot_begun else 0)
+        while status.get("state") in ("starting", "stopping", "suspending") and time.time() < end:
+            time.sleep(2)
+            status = c.call("vm.status", 60, name=self.vm)
+        if self.vm_left_stopped and status.get("state") == "stopped":
             try:
                 self.start_vm(c)
             except (ControlError, Failure) as e:
@@ -1412,7 +1422,7 @@ def _(run):
     first = run.call("vm.deploy", 600, path=source, guestDir=folder, launch=launch)
     expect(first["guestDir"] == folder and first["sent"] == [EXE] and first["skipped"] == 0 and first["bytes"] == size
            and (first.get("window") or {}).get("title") == TITLE, f"the deploy of the file {source} answered {first!r}")
-    expect(run.names(folder) == [MARKER, EXE] and run.read(folder + "\\" + MARKER) == MARKER_TEXT,
+    expect(sorted(run.names(folder)) == sorted([MARKER, EXE]) and run.read(folder + "\\" + MARKER) == MARKER_TEXT,
            f"{folder} holds {run.names(folder)!r} after the deploy of one file")
     second = run.call("vm.deploy", 600, path=source, guestDir=folder, launch=launch)
     expect(second["sent"] == [] and second["skipped"] == 1 and second["bytes"] == 0 and second["pid"] != first["pid"]
@@ -1469,11 +1479,12 @@ def _(run):
     expect(SNAPSHOT not in names, f"'{run.vm}' already has a snapshot named {SNAPSHOT}; delete it with scripts/test/ctl.py vm.snapshot.delete and run this script again")
     run.fixture()
     run.snapshot_begun = True
+    run.vm_left_stopped = True
+    run.agent_restarted = True
     run.call("vm.snapshot.create", 900, snapshot=SNAPSHOT)
     after = free_gib()
     expect(after >= START_FREE_GIB, f"{after:.1f} GiB are free after the snapshot; free disk space and run this script again")
     closed = run.open_and_close_dialog()
-    run.agent_restarted = True
     restored = run.call("vm.snapshot.restore", 900, snapshot=SNAPSHOT, waitTools=120)
     expect(restored["tools"] is True and restored["eventSeq"] >= closed,
            f"vm.snapshot.restore answered {restored!r}; the dialog's window.closed is event {closed}")
@@ -1482,6 +1493,7 @@ def _(run):
            f"after vm.snapshot.restore, vm.wait_for event window.closed of {DIALOG!r} without since answered {late!r}")
     run.call("vm.snapshot.delete", 600, snapshot=SNAPSHOT)
     run.snapshot_begun = False
+    run.vm_left_stopped = False
     return f"window.closed {closed} before the restore; vm.snapshot.restore eventSeq {restored['eventSeq']}; {free:.1f} GiB free before the snapshot"
 
 

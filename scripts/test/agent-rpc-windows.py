@@ -7,10 +7,11 @@ welcome, then req/res with ids. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py). Each check prints
 `PASS <n> <title>`; the first failing check prints `FAIL <n>: <reason>` and the
 script exits 1. Files go under C:\\alcove-e2e\\rpc, and one file pushed with
-the v1 file messages goes to the Desktop of the guest user. A check puts text
-on the guest clipboard. However the run ends, a second connection kills the
-jobs the script started, which include the Character Map windows it opened,
-and deletes that directory and the pushed file. The run refuses to
+the v1 file messages goes to the Desktop of the guest user. Two checks put
+text on the guest clipboard. However the run ends, a second connection kills
+the jobs the script started, which include the Character Map windows it
+opened, puts the clipboard text back, and deletes that directory and the
+pushed file. The run refuses to
 start when C:\\alcove-e2e exists. SIGTERM, SIGHUP and SIGINT print
 `interrupted; cleaning up...`, run the same cleanup and exit with 128 plus the
 signal's number (143, 129, 130); SIGHUP stays ignored when the script was
@@ -136,6 +137,18 @@ class Run:
         self.jobs = []
         self.markers = []
         self.pushed = []
+        self.clipboard = None
+
+    def save_clipboard(self):
+        """Notes the guest clipboard text before the first check that changes it."""
+        if self.clipboard is None:
+            self.a.send({"t": "clipboard.get"})
+            self.clipboard = self.a.v1("clipboard.text", 10).get("text", "")
+
+    def put_clipboard_back(self, a):
+        if self.clipboard is not None:
+            a.send({"t": "clipboard.set", "text": self.clipboard})
+            self.clipboard = None
 
     def start(self, **params):
         r = self.a.call("exec.start", **params)
@@ -166,7 +179,8 @@ class Run:
     def cleanup(self, port):
         """On a new connection: kills the started jobs and the PowerShell
         processes whose command line holds a registered marker, then deletes
-        the pushed files, BASE and its parent when that is empty."""
+        the pushed files, BASE and its parent when that is empty, and puts the
+        clipboard text back."""
         previous = ignore_stop_signals()
         try:
             self.cleanup_steps(port)
@@ -180,6 +194,7 @@ class Run:
         except (Failure, OSError, ValueError) as e:
             print(f"cleanup did not run: {e}; jobs {self.jobs} and {BASE} may remain in the guest", file=sys.stderr)
             return
+        self.put_clipboard_back(a)
         steps = [("exec.kill", {"job": job}) for job in self.jobs]
         if self.markers:
             try:
@@ -472,6 +487,7 @@ def _(a, run):
 @check("v1 clipboard.set and exec work on the same connection without a console window")
 def _(a, run):
     marker = f"rpc check 한글 {int(time.time())}"
+    run.save_clipboard()
     a.send({"t": "clipboard.set", "text": marker})
     a.send({"t": "exec", "cmd": "Get-Clipboard -Raw"})
     r = a.v1("exec.result")
@@ -517,6 +533,7 @@ def _(a, run):
 
 @check("v1 clipboard.changed carries text a guest program put on the clipboard")
 def _(a, run):
+    run.save_clipboard()
     time.sleep(2.5)
     marker = f"rpc guest clipboard {int(time.time())}"
     r = a.call("exec.run", cmd=f"Set-Clipboard -Value '{marker}'")
@@ -525,6 +542,7 @@ def _(a, run):
     texts = [m.get("text") for m in a.other if m.get("t") == "clipboard.changed"]
     expect(seen, f"no clipboard.changed with {marker!r} within 15 s; clipboard.changed carried {texts!r}")
     a.other = [m for m in a.other if m.get("t") != "clipboard.changed"]
+    run.put_clipboard_back(a)
 
 
 @check("a v1 file push writes the file to the Desktop of the guest user with the sent bytes")
@@ -532,20 +550,23 @@ def _(a, run):
     payload = os.urandom(300_000)
     digest = hashlib.sha256(payload).hexdigest()
     name = f"alcove-e2e-rpc-{int(time.time())}.bin"
+    planned = ntpath.join(run.home, "Desktop", name)
+    expect(a.call("fs.stat", path=planned)["exists"] is False, f"{planned} exists already; remove it and run this check again")
+    run.pushed.append(planned)
     a.send({"t": "file.begin", "id": "f1", "name": name, "size": len(payload), "dest": "desktop"})
     for i in range(0, len(payload), 200_000):
         a.send({"t": "file.chunk", "id": "f1", "data": base64.b64encode(payload[i:i + 200_000]).decode()})
     a.send({"t": "file.end", "id": "f1", "sha256": digest})
     done = a.v1("file.done", 30)
     path = done.get("path") or ""
-    if path:
+    if path and path != planned:
         run.pushed.append(path)
     expect(done.get("id") == "f1" and not done.get("error") and ntpath.dirname(path).lower() == ntpath.join(run.home, "Desktop").lower(),
            f"file.done answered {done!r}; the Desktop of the guest user is {ntpath.join(run.home, 'Desktop')}")
     r = a.call("fs.stat", path=path, sha256=True)
     expect(r["size"] == len(payload) and r["sha256"] == digest, f"fs.stat of the pushed file answered {r!r}; {len(payload)} bytes with SHA-256 {digest} were sent")
     a.call("fs.delete", path=path)
-    run.pushed.remove(path)
+    run.pushed = [p for p in run.pushed if p not in (path, planned)]
     return path
 
 
