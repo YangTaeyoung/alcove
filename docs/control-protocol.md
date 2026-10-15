@@ -1734,8 +1734,12 @@ steps that failed: none
   or `HTTP capture: ended because <reason>; call vm.http.start to capture
   again` after a capture ended on its own. While the capture journal holds an
   entry of the VM, `; the guest is not restored from the capture on port
-  <port> since <time>; call vm.http.stop to restore it` follows when no
-  capture runs, and `; journal <path of captures.json>` last.
+  <port> since <time>; <advice>` follows when no capture runs, and `; journal
+  <path of captures.json>` last. The advice fits the VM's state: `call
+  vm.http.stop to restore it` while it runs, `call vm.resume, then
+  vm.http.stop to restore it` while it is paused, `Alcove restores it when its
+  guest tools connect` while it starts, and `Alcove restores it when its guest
+  tools next connect after vm.start` otherwise.
 - `recording: <dir> (running | ended <time> | ending)`, `recording: <dir>
   (ended <time>; its folder no longer exists)`, or `recording: none in the
   last <n> minutes`.

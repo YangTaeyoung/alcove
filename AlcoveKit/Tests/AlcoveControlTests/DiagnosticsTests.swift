@@ -495,6 +495,25 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(restored, "HTTP capture: ended because the VM stopped; call vm.http.start to capture again")
     }
 
+    func testSummaryGivesTheRestoreAdviceThatWorksInTheVMsState() async throws {
+        let captureDirectory = scratch.appendingPathComponent("captures")
+        let r = try await rig(captureDirectory: captureDirectory)
+        let journal = CaptureJournal(directory: captureDirectory)
+        let since = "2026-10-14T03:00:00Z"
+        try journal.record(.init(vm: "Win", port: 49152, thumbprint: String(repeating: "A", count: 40), systemProxy: true, since: since, path: nil), now: Date())
+        let entry = "HTTP capture: the guest is not restored from the capture on port 49152 since \(since)"
+        let advice: [(VMController.State, String)] = [
+            (.running, "call vm.http.stop to restore it"),
+            (.paused, "call vm.resume, then vm.http.stop to restore it"),
+            (.stopped, "Alcove restores it when its guest tools next connect after vm.start"),
+        ]
+        for (state, sentence) in advice {
+            await r.target.setState(state)
+            let line = try summaryLines(try await collect(r.handler, dir: bundleDirectory("\(state)"))).first { $0.hasPrefix("HTTP capture: ") }
+            XCTAssertEqual(line, "\(entry); \(sentence); journal \(journal.url.path)", "\(state)")
+        }
+    }
+
     func testEventLogsAskForErrorsInTheWindowRequested() async throws {
         let r = try await rig()
         _ = try await collect(r.handler, ["sinceMinutes": 90])

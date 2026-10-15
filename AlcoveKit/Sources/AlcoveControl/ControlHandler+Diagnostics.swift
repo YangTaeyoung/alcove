@@ -850,7 +850,8 @@ extension ControlHandler {
 
     /// The HTTP capture of `t` as the summary names it: the capture that runs, with the reason its proxy ended when it
     /// did; else the reason the last capture ended; then, while the capture journal holds an entry of the VM, the
-    /// capture whose guest is not restored when none runs, and the path of the journal. `none` when there is nothing.
+    /// capture whose guest is not restored when none runs, with the step that restores it in the VM's state, and the
+    /// path of the journal. `none` when there is nothing.
     func httpCaptureState(_ t: VMTarget) async -> String {
         let owner = await journalVM(t)
         let live = captures[t.name]
@@ -867,7 +868,14 @@ extension ControlHandler {
         }
         if let entry {
             if live == nil {
-                parts.append("the guest is not restored from the capture on port \(entry.port) since \(entry.since); call vm.http.stop to restore it")
+                let advice: String
+                switch await t.state() {
+                case .running: advice = "call vm.http.stop to restore it"
+                case .paused: advice = "call vm.resume, then vm.http.stop to restore it"
+                case .starting: advice = "Alcove restores it when its guest tools connect"
+                default: advice = "Alcove restores it when its guest tools next connect after vm.start"
+                }
+                parts.append("the guest is not restored from the capture on port \(entry.port) since \(entry.since); \(advice)")
             }
             parts.append("journal \(captureJournal.url.path)")
         }
