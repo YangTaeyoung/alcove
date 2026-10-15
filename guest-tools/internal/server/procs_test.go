@@ -1,10 +1,10 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -86,6 +86,15 @@ func TestParseWindowsProcesses(t *testing.T) {
 	}
 }
 
+// targetPIDs returns the pids of targets.
+func targetPIDs(targets []procEntry) []int {
+	pids := []int{}
+	for _, p := range targets {
+		pids = append(pids, p.PID)
+	}
+	return pids
+}
+
 func TestNameKillTargetsMatchTheImageNameAndPutChildrenFirst(t *testing.T) {
 	at := func(s int) time.Time { return time.Unix(1000+int64(s), 0) }
 	procs := []procEntry{
@@ -94,6 +103,7 @@ func TestNameKillTargetsMatchTheImageNameAndPutChildrenFirst(t *testing.T) {
 		{PID: 11, PPID: 10, Name: "child.exe", Created: at(2)},
 		{PID: 12, PPID: 11, Name: "grandchild.exe", Created: at(3)},
 		{PID: 13, PPID: 10, Name: "older.exe", Created: at(0)},
+		{PID: 14, PPID: 10, Name: "unknown.exe"},
 		{PID: 20, PPID: 4, Name: "victim.exe", Created: at(1)},
 		{PID: 21, PPID: 20, Name: "victim.exe", Created: at(2)},
 		{PID: 30, PPID: 4, Name: "victim.exe.old", Created: at(1)},
@@ -110,33 +120,101 @@ func TestNameKillTargetsMatchTheImageNameAndPutChildrenFirst(t *testing.T) {
 		{"victim", true, "[12 11 10 21 20]"},
 		{"victim.exe.old", false, "[30]"},
 		{"agent", true, "[]"},
+		{"job", false, "[41]"},
 		{"none", true, "[]"},
 	}
 	for _, c := range cases {
-		if got := fmt.Sprint(nameKillTargets(procs, c.name, c.tree, 40)); got != c.want {
+		if got := fmt.Sprint(targetPIDs(nameKillTargets(procs, c.name, c.tree, 40))); got != c.want {
 			t.Errorf("%s tree %v: %s, expected %s", c.name, c.tree, got, c.want)
 		}
 	}
+	if got := nameKillTargets(procs, "victim.exe.old", false, 40); len(got) != 1 || !got[0].Created.Equal(at(1)) {
+		t.Fatalf("the target does not carry its listed creation time: %+v", got)
+	}
 }
 
-func TestTheRefusalOfAKillByNameNamesElevation(t *testing.T) {
-	got := killRefusal("svc", 1, 2).Error()
+func TestTheRefusalOfAKillByNameNamesTheNextStepForTheAgentsToken(t *testing.T) {
+	got := killRefusal("svc", 1, 2, false).Error()
 	want := "could not kill 2 of the 3 processes named 'svc' because access was denied (1 was killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry"
 	if got != want {
-		t.Fatalf("refusal %q", got)
+		t.Fatalf("refusal of an agent that is not elevated %q", got)
 	}
-	if got := killRefusal("svc", 0, 1).Error(); !strings.HasPrefix(got, "could not kill 1 of the 1 processes named 'svc' because access was denied (0 were killed); ") {
-		t.Fatalf("refusal %q", got)
+	got = killRefusal("svc", 0, 1, true).Error()
+	want = "could not kill 1 of the 1 processes named 'svc' because Windows denied access to the elevated agent (0 were killed); such a process is protected or needs more than administrator rights, so stop it through its service (sc stop <service>) or leave it running"
+	if got != want {
+		t.Fatalf("refusal of an elevated agent %q", got)
 	}
 }
 
 func TestProcKillAnswersTheRefusalOfAKillByNameAsItIs(t *testing.T) {
 	kill := killNamed
-	killNamed = func(string, bool) (int, error) { return 0, killRefusal("svc", 0, 1) }
+	killNamed = func(string, bool) (int, error) { return 0, killRefusal("svc", 0, 1, false) }
 	t.Cleanup(func() { killNamed = kill })
 	c, _ := newRPCClient(t, Options{})
 	res := c.call("proc.kill", proto.Message{"name": "svc"})
-	if res["ok"] != false || res.String("error") != killRefusal("svc", 0, 1).Error() {
+	if res["ok"] != false || res.String("error") != killRefusal("svc", 0, 1, false).Error() {
 		t.Fatalf("res %v", res)
+	}
+}
+
+// fakeKillHandle is a process opened by killListed in a test.
+type fakeKillHandle struct {
+	created      time.Time
+	known        bool
+	terminateErr error
+	log          *[]string
+	pid          int
+}
+
+func (h *fakeKillHandle) creation() (time.Time, bool) { return h.created, h.known }
+
+func (h *fakeKillHandle) terminate() error {
+	if h.terminateErr == nil {
+		*h.log = append(*h.log, fmt.Sprintf("terminate %d", h.pid))
+	}
+	return h.terminateErr
+}
+
+func (h *fakeKillHandle) wait(time.Duration) { *h.log = append(*h.log, fmt.Sprintf("wait %d", h.pid)) }
+
+func (h *fakeKillHandle) close() { *h.log = append(*h.log, fmt.Sprintf("close %d", h.pid)) }
+
+func TestKillListedTerminatesOnlyTheListedProcessesAndCountsRefusals(t *testing.T) {
+	at := func(s int) time.Time { return time.Unix(1000+int64(s), 0) }
+	var log []string
+	running := map[int]*fakeKillHandle{
+		1: {created: at(1), known: true},
+		2: {created: at(9), known: true},
+		3: {known: false},
+		5: {created: at(5), known: true, terminateErr: errKillDenied},
+		6: {created: at(6), known: true, terminateErr: errors.New("the process is ending")},
+	}
+	open := func(pid int) (killHandle, error) {
+		switch pid {
+		case 4:
+			return nil, errKillDenied
+		case 7:
+			return nil, errors.New("the process is gone")
+		}
+		h := running[pid]
+		h.log, h.pid = &log, pid
+		return h, nil
+	}
+	targets := []procEntry{
+		{PID: 1, Created: at(1)},
+		{PID: 2, Created: at(2)},
+		{PID: 3, Created: at(3)},
+		{PID: 4, Created: at(4)},
+		{PID: 5, Created: at(5)},
+		{PID: 6, Created: at(6)},
+		{PID: 7, Created: at(7)},
+	}
+	killed, denied := killListed(targets, open, time.Second)
+	if killed != 1 || denied != 2 {
+		t.Fatalf("killed %d, denied %d", killed, denied)
+	}
+	want := "[terminate 1 close 2 close 3 close 5 close 6 wait 1 close 1]"
+	if got := fmt.Sprint(log); got != want {
+		t.Fatalf("steps %s, expected %s", got, want)
 	}
 }

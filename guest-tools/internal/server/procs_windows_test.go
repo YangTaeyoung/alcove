@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
@@ -92,7 +93,7 @@ func TestProcKillByNameWithTreeEndsTheChildren(t *testing.T) {
 	child := 0
 	deadline := time.Now().Add(10 * time.Second)
 	for child == 0 {
-		running, err := processEntries(false)
+		running, err := processEntries()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -114,4 +115,56 @@ func TestProcKillByNameWithTreeEndsTheChildren(t *testing.T) {
 	}
 	expectEnded(t, childWait, child)
 	expectEnded(t, parentWait, parent.Process.Pid)
+}
+
+var (
+	advapi32                      = syscall.NewLazyDLL("advapi32.dll")
+	procConvertStringSDToSD       = advapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
+	procGetSecurityDescriptorDacl = advapi32.NewProc("GetSecurityDescriptorDacl")
+	procSetSecurityInfo           = advapi32.NewProc("SetSecurityInfo")
+)
+
+// setProcessDACL gives the process pid the access list of the SDDL string sddl.
+func setProcessDACL(t *testing.T, pid int, sddl string) {
+	t.Helper()
+	const writeDAC = 0x00040000
+	h, err := syscall.OpenProcess(writeDAC, false, uint32(pid))
+	if err != nil {
+		t.Fatalf("open process %d for its access list: %v", pid, err)
+	}
+	defer syscall.CloseHandle(h)
+	text, err := syscall.UTF16PtrFromString(sddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sd uintptr
+	if r, _, err := procConvertStringSDToSD.Call(uintptr(unsafe.Pointer(text)), 1, uintptr(unsafe.Pointer(&sd)), 0); r == 0 {
+		t.Fatalf("convert %s: %v", sddl, err)
+	}
+	defer syscall.LocalFree(syscall.Handle(sd))
+	var present, defaulted int32
+	var dacl uintptr
+	if r, _, err := procGetSecurityDescriptorDacl.Call(sd, uintptr(unsafe.Pointer(&present)), uintptr(unsafe.Pointer(&dacl)), uintptr(unsafe.Pointer(&defaulted))); r == 0 {
+		t.Fatalf("read the access list of %s: %v", sddl, err)
+	}
+	const seKernelObject, daclSecurityInformation = 6, 4
+	if r, _, _ := procSetSecurityInfo.Call(uintptr(h), seKernelObject, daclSecurityInformation, 0, 0, dacl, 0); r != 0 {
+		t.Fatalf("set the access list of process %d: error %d", pid, r)
+	}
+}
+
+func TestProcKillByNameAnswersTheRefusalWhenAProcessDeniesTermination(t *testing.T) {
+	victim := startHidden(t, copySystemProgram(t, "PING.EXE", "alcove-guarded.exe"), "-n", "60", "127.0.0.1")
+	setProcessDACL(t, victim.Process.Pid, "D:(D;;0x1;;;WD)(A;;0x1fffff;;;WD)")
+	c, _ := newRPCClient(t, Options{})
+	res := c.call("proc.kill", proto.Message{"name": "alcove-guarded"})
+	if want := killRefusal("alcove-guarded", 0, 1, tokenElevated()).Error(); res["ok"] != false || res.String("error") != want {
+		t.Fatalf("res %v, expected the refusal %q", res, want)
+	}
+	setProcessDACL(t, victim.Process.Pid, "D:(A;;0x1fffff;;;WD)")
+	wait := openForWait(t, victim.Process.Pid)
+	if res := c.ok("proc.kill", proto.Message{"name": "alcove-guarded"}); res.Int("killed") != 1 {
+		t.Fatalf("after the access list allowed termination: %v", res)
+	}
+	expectEnded(t, wait, victim.Process.Pid)
 }

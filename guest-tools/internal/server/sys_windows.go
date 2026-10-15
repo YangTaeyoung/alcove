@@ -91,36 +91,17 @@ func listProcesses() ([]procInfo, error) {
 // to end.
 const killEndWait = 5 * time.Second
 
-// killByName terminates the nameKillTargets of the running processes, waits
-// up to killEndWait for them to end and returns how many it terminated.
-// Processes that refuse access make it answer killRefusal; other failures,
-// such as a process that ended meanwhile, are not counted.
+// killByName terminates the nameKillTargets of the running processes through
+// killListed and returns how many it terminated. Processes that refuse access
+// make it answer killRefusal for the agent's token.
 func killByName(name string, tree bool) (int, error) {
-	procs, err := processEntries(tree)
+	procs, err := processEntries()
 	if err != nil {
 		return 0, err
 	}
-	killed, denied := 0, 0
-	var ending []syscall.Handle
-	for _, pid := range nameKillTargets(procs, name, tree, os.Getpid()) {
-		h, err := terminateProcess(pid)
-		switch {
-		case err == nil:
-			killed++
-			ending = append(ending, h)
-		case errors.Is(err, syscall.ERROR_ACCESS_DENIED):
-			denied++
-		}
-	}
-	deadline := time.Now().Add(killEndWait)
-	for _, h := range ending {
-		if left := time.Until(deadline); left > 0 {
-			_, _ = syscall.WaitForSingleObject(h, uint32(left.Milliseconds()))
-		}
-		syscall.CloseHandle(h)
-	}
+	killed, denied := killListed(nameKillTargets(procs, name, tree, os.Getpid()), openForKill, killEndWait)
 	if denied > 0 {
-		return 0, killRefusal(name, killed, denied)
+		return 0, killRefusal(name, killed, denied, tokenElevated())
 	}
 	return killed, nil
 }
@@ -128,9 +109,9 @@ func killByName(name string, tree bool) (int, error) {
 // processQueryLimitedInformation is PROCESS_QUERY_LIMITED_INFORMATION.
 const processQueryLimitedInformation = 0x1000
 
-// processEntries lists the running processes with their image names and,
-// when created is set, their creation times where they can be read.
-func processEntries(created bool) ([]procEntry, error) {
+// processEntries lists the running processes with their image names and
+// their creation times where they can be read.
+func processEntries() ([]procEntry, error) {
 	snap, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil, err
@@ -141,41 +122,76 @@ func processEntries(created bool) ([]procEntry, error) {
 	var procs []procEntry
 	for err := syscall.Process32First(snap, &e); err == nil; err = syscall.Process32Next(snap, &e) {
 		p := procEntry{PID: int(e.ProcessID), PPID: int(e.ParentProcessID), Name: syscall.UTF16ToString(e.ExeFile[:])}
-		if created {
-			p.Created = processCreated(p.PID)
+		if h, err := syscall.OpenProcess(processQueryLimitedInformation, false, e.ProcessID); err == nil {
+			p.Created, _ = processCreation(h)
+			syscall.CloseHandle(h)
 		}
 		procs = append(procs, p)
 	}
 	return procs, nil
 }
 
-// processCreated returns the creation time of pid, or the zero time when it
-// cannot be read.
-func processCreated(pid int) time.Time {
-	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
-	if err != nil {
-		return time.Time{}
-	}
-	defer syscall.CloseHandle(h)
+// processCreation returns the creation time of the process of h, and false
+// when it cannot be read.
+func processCreation(h syscall.Handle) (time.Time, bool) {
 	var creation, exit, kernel, user syscall.Filetime
 	if syscall.GetProcessTimes(h, &creation, &exit, &kernel, &user) != nil {
-		return time.Time{}
+		return time.Time{}, false
 	}
-	return time.Unix(0, creation.Nanoseconds())
+	return time.Unix(0, creation.Nanoseconds()), true
 }
 
-// terminateProcess ends pid with exit code 1 and returns a handle to wait on
-// its end, which the caller closes.
-func terminateProcess(pid int) (syscall.Handle, error) {
-	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE|syscall.SYNCHRONIZE, false, uint32(pid))
+// windowsKillHandle is a process opened for termination, waiting and reading
+// its creation time.
+type windowsKillHandle struct{ h syscall.Handle }
+
+// openForKill opens pid for killListed; a refusal of access is errKillDenied.
+func openForKill(pid int) (killHandle, error) {
+	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE|syscall.SYNCHRONIZE|processQueryLimitedInformation, false, uint32(pid))
 	if err != nil {
-		return 0, err
+		return nil, killError(err)
 	}
-	if err := syscall.TerminateProcess(h, 1); err != nil {
-		syscall.CloseHandle(h)
-		return 0, err
+	return windowsKillHandle{h}, nil
+}
+
+// killError returns errKillDenied for ERROR_ACCESS_DENIED and err otherwise.
+func killError(err error) error {
+	if errors.Is(err, syscall.ERROR_ACCESS_DENIED) {
+		return errKillDenied
 	}
-	return h, nil
+	return err
+}
+
+func (w windowsKillHandle) creation() (time.Time, bool) { return processCreation(w.h) }
+
+func (w windowsKillHandle) terminate() error {
+	if err := syscall.TerminateProcess(w.h, 1); err != nil {
+		return killError(err)
+	}
+	return nil
+}
+
+func (w windowsKillHandle) wait(d time.Duration) {
+	_, _ = syscall.WaitForSingleObject(w.h, uint32(d.Milliseconds()))
+}
+
+func (w windowsKillHandle) close() { syscall.CloseHandle(w.h) }
+
+// tokenElevation is TokenElevation of TOKEN_INFORMATION_CLASS.
+const tokenElevation = 20
+
+// tokenElevated reports whether the agent's token is elevated.
+func tokenElevated() bool {
+	t, err := syscall.OpenCurrentProcessToken()
+	if err != nil {
+		return false
+	}
+	defer t.Close()
+	var elevated, n uint32
+	if syscall.GetTokenInformation(t, tokenElevation, (*byte)(unsafe.Pointer(&elevated)), uint32(unsafe.Sizeof(elevated)), &n) != nil {
+		return false
+	}
+	return elevated != 0
 }
 
 // sessionEnvironmentKey holds the machine's PATH.

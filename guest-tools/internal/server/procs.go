@@ -88,14 +88,74 @@ type killRefusedError struct{ text string }
 func (e *killRefusedError) Error() string { return e.text }
 
 // killRefusal is the error of a kill by name of which denied processes
-// refused access and killed processes ended.
-func killRefusal(name string, killed, denied int) error {
+// refused access and killed processes ended; elevated tells whether the
+// agent's token is elevated.
+func killRefusal(name string, killed, denied int, elevated bool) error {
 	verb := "were"
 	if killed == 1 {
 		verb = "was"
 	}
+	if elevated {
+		return &killRefusedError{fmt.Sprintf("could not kill %d of the %d processes named '%s' because Windows denied access to the elevated agent (%d %s killed); such a process is protected or needs more than administrator rights, so stop it through its service (sc stop <service>) or leave it running",
+			denied, killed+denied, name, killed, verb)}
+	}
 	return &killRefusedError{fmt.Sprintf("could not kill %d of the %d processes named '%s' because access was denied (%d %s killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry",
 		denied, killed+denied, name, killed, verb)}
+}
+
+// errKillDenied is the error of a killHandle opener or terminate that the
+// process refused access.
+var errKillDenied = errors.New("access is denied")
+
+// killHandle is a process opened for a kill by name.
+type killHandle interface {
+	// creation returns the creation time, and false when it cannot be read.
+	creation() (time.Time, bool)
+	terminate() error
+	// wait waits up to d for the process to end.
+	wait(d time.Duration)
+	close()
+}
+
+// killListed opens each target with open and terminates it when its creation
+// time is the listed one, then waits up to wait in all for the terminated
+// processes to end. It returns how many it terminated and how many refused
+// access with errKillDenied. A target whose creation time is unknown or
+// differs, which is another process under a reused pid, or that fails for
+// another reason, is skipped.
+func killListed(targets []procEntry, open func(pid int) (killHandle, error), wait time.Duration) (killed, denied int) {
+	var ending []killHandle
+	for _, t := range targets {
+		h, err := open(t.PID)
+		if err != nil {
+			if errors.Is(err, errKillDenied) {
+				denied++
+			}
+			continue
+		}
+		created, known := h.creation()
+		if !known || t.Created.IsZero() || !created.Equal(t.Created) {
+			h.close()
+			continue
+		}
+		if err := h.terminate(); err != nil {
+			if errors.Is(err, errKillDenied) {
+				denied++
+			}
+			h.close()
+			continue
+		}
+		killed++
+		ending = append(ending, h)
+	}
+	deadline := time.Now().Add(wait)
+	for _, h := range ending {
+		if left := time.Until(deadline); left > 0 {
+			h.wait(left)
+		}
+		h.close()
+	}
+	return killed, denied
 }
 
 // procEntry is a running process as a kill by name on Windows sees it.
@@ -109,10 +169,10 @@ type procEntry struct {
 // nameKillTargets returns the processes a kill by name on Windows ends: those
 // whose name equals name without regard to case, with ".exe" added to a name
 // without an extension, and with tree their descendants, each child before
-// its parent. A process counts as a child of its parent only when it was not
-// created before the parent. self and the processes below it are never
-// targets.
-func nameKillTargets(procs []procEntry, name string, tree bool, self int) []int {
+// its parent. A process counts as a child of its parent only when both
+// creation times are known and the child was not created before the parent.
+// self is never a target, and a tree is not followed into self.
+func nameKillTargets(procs []procEntry, name string, tree bool, self int) []procEntry {
 	if filepath.Ext(name) == "" {
 		name += ".exe"
 	}
@@ -126,13 +186,13 @@ func nameKillTargets(procs []procEntry, name string, tree bool, self int) []int 
 		if !ok || p.PPID == p.PID {
 			continue
 		}
-		if !p.Created.IsZero() && !parent.Created.IsZero() && p.Created.Before(parent.Created) {
+		if p.Created.IsZero() || parent.Created.IsZero() || p.Created.Before(parent.Created) {
 			continue
 		}
 		children[p.PPID] = append(children[p.PPID], p.PID)
 	}
 	seen := map[int]bool{self: true}
-	out := []int{}
+	out := []procEntry{}
 	var visit func(pid int)
 	visit = func(pid int) {
 		if seen[pid] {
@@ -144,7 +204,7 @@ func nameKillTargets(procs []procEntry, name string, tree bool, self int) []int 
 				visit(c)
 			}
 		}
-		out = append(out, pid)
+		out = append(out, byPID[pid])
 	}
 	for _, p := range procs {
 		if strings.EqualFold(p.Name, name) {

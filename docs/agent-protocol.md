@@ -393,13 +393,19 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - `proc.kill` with `pid` answers `killed: 1` or an error. With `name` it kills
   every process of that name, compared without regard to case, except the
   agent itself. On Windows `.exe` is added to a name without an extension;
-  the agent lists the processes and terminates each match and, with `tree`,
-  its descendants, children first (a process created before its listed
-  parent does not count as that parent's child, and the agent and the
-  processes below it are left out), then waits up to 5 s for them to end.
-  `killed` counts the processes that were terminated. When any of them
-  refuses access the answer is the error
-  `could not kill <n> of the <total> processes named '<name>' because access was denied (<k> were killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry`.
+  the agent lists the processes with their creation times and terminates
+  each match and, with `tree`, its descendants, children first, then waits
+  up to 5 s for them to end. A process counts as a child only when both
+  creation times can be read and it was not created before its listed
+  parent, and a tree is not followed into the agent. Before it terminates a
+  process the agent opens it and compares its creation time with the listed
+  one; a process that differs (another process under a reused pid) or whose
+  time cannot be read is skipped. `killed` counts the processes that were
+  terminated. When any of them refuses access the answer is an error: from
+  an agent that is not elevated
+  `could not kill <n> of the <total> processes named '<name>' because access was denied (<k> were killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry`,
+  and from an elevated agent
+  `could not kill <n> of the <total> processes named '<name>' because Windows denied access to the elevated agent (<k> were killed); such a process is protected or needs more than administrator rights, so stop it through its service (sc stop <service>) or leave it running`.
   Elsewhere `killed` counts the processes that were sent SIGKILL, with `tree`
   to the process group a match leads.
   No match answers `killed: 0`.
