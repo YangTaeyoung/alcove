@@ -192,7 +192,11 @@ final class VMControllerTests: XCTestCase {
         let s = await vm.state
         guard case .failed(let msg) = s else { return XCTFail("expected failed, got \(s)") }
         XCTAssertTrue(msg.contains("efi-vars.fd"), msg)
-        try await Task.sleep(for: .seconds(1))
+        let deadline = ContinuousClock.now + .seconds(10)
+        while await log.states.last != .failed(msg), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        let count = await log.states.count
+        let quiet = ContinuousClock.now + .seconds(1)
+        while await log.states.count == count, ContinuousClock.now < quiet { try await Task.sleep(for: .milliseconds(20)) }
         let states = await log.states
         XCTAssertEqual(states, [.starting, .failed(msg)], "the late exit notification must not replace the report")
     }

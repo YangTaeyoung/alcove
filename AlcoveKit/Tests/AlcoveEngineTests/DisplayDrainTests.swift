@@ -30,30 +30,42 @@ final class DisplayDrainTests: XCTestCase {
         let conn = try DisplayConnection(socketPath: path)
         let drain = VMController.drain(conn)
         let fd = try connect(to: path)
-        defer { Darwin.close(fd) }
 
         let update = "{\"t\":\"update\",\"con\":0,\"x\":0,\"y\":0,\"w\":1,\"h\":1}\n"
         send(fd, String(repeating: update, count: 10_000))
         send(fd, "{\"t\":\"switch\",\"con\":0,\"w\":4,\"h\":2,\"stride\":16,\"fmt\":\"bgra8\",\"shm\":\"/a\",\"size\":4096}\n")
         send(fd, String(repeating: update, count: 10_000))
+        // the sentinel: the last message the peer sends
+        send(fd, "{\"t\":\"switch\",\"con\":0,\"w\":8,\"h\":2,\"stride\":32,\"fmt\":\"bgra8\",\"shm\":\"/b\",\"size\":4096}\n")
 
-        let expected = FromQEMU.SurfaceSwitch(con: 0, w: 4, h: 2, stride: 16, fmt: "bgra8", shm: "/a", size: 4096)
+        let sentinel = FromQEMU.SurfaceSwitch(con: 0, w: 8, h: 2, stride: 32, fmt: "bgra8", shm: "/b", size: 4096)
         let deadline = Date().addingTimeInterval(10)
-        while conn.currentSurface != expected, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
-        XCTAssertEqual(conn.currentSurface, expected)
+        while conn.currentSurface != sentinel, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(conn.currentSurface, sentinel)
 
-        // Everything sent so far has been read; a consumer attaching after the drain stops sees none of it.
-        try await Task.sleep(for: .milliseconds(500))
-        drain.cancel()
-        await drain.value
+        // The peer hangs up after the sentinel; the drain ends once it has consumed every message up to the end.
+        Darwin.close(fd)
+        let drained = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await drain.value; return true }
+            group.addTask { try? await Task.sleep(for: .seconds(10)); return false }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        guard drained else {
+            drain.cancel()
+            conn.close()
+            return XCTFail("the drain did not reach the end of the stream")
+        }
+
+        // A consumer attaching after the drain ended sees none of the messages.
         let late = Task { () -> Int in
             var n = 0
             for await _ in conn.messages { n += 1 }
             return n
         }
-        try await Task.sleep(for: .milliseconds(200))
-        conn.close()
         let received = await late.value
+        conn.close()
         XCTAssertEqual(received, 0)
     }
 }

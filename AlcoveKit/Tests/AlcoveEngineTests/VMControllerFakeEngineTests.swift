@@ -79,6 +79,16 @@ final class VMControllerFakeEngineTests: XCTestCase {
         return await condition()
     }
 
+    /// The states `log` holds once they end with `suffix` (waiting up to 10 s) and no further state has
+    /// arrived for `quiet`.
+    private func settledStates(_ log: StateLog, endingWith suffix: [VMController.State],
+                               quiet: Duration = .milliseconds(500)) async -> [VMController.State] {
+        _ = await waitUntil { await log.states.suffix(suffix.count).elementsEqual(suffix) }
+        let count = await log.states.count
+        _ = await waitUntil(timeout: quiet) { await log.states.count != count }
+        return await log.states
+    }
+
     func testLifecycleAndStateStream() async throws {
         let vm = try makeVM()
         let log = StateLog()
@@ -174,8 +184,7 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertTrue(msg.contains("load of migration failed"), msg)
         XCTAssertTrue(msg.contains("saved session was kept"), msg)
         XCTAssertTrue(vm.bundle.isSuspended, "a failed resume must not destroy the session")
-        try await Task.sleep(for: .milliseconds(500))
-        let states = await log.states
+        let states = await settledStates(log, endingWith: [.starting, .failed(msg)])
         XCTAssertEqual(states, [.starting, .running, .suspending, .stopped, .starting, .failed(msg)], "one failure report")
         try await vm.discardSuspendState()
         XCTAssertFalse(vm.bundle.isSuspended)
@@ -196,8 +205,7 @@ final class VMControllerFakeEngineTests: XCTestCase {
         // the still-running engine is killed, and its exit must not replace the report
         let gone = await waitUntil { VMController.pidfileLockHolder(vm.bundle.pidFileURL.path) == nil }
         XCTAssertTrue(gone)
-        try await Task.sleep(for: .milliseconds(500))
-        let states = await log.states
+        let states = await settledStates(log, endingWith: [.starting, .failed(msg)])
         XCTAssertEqual(states, [.starting, .failed(msg)])
     }
 
@@ -223,8 +231,7 @@ final class VMControllerFakeEngineTests: XCTestCase {
         }
         XCTAssertTrue(vm.bundle.isSuspended)
         XCTAssertNil(VMController.pidfileLockHolder(vm.bundle.pidFileURL.path))
-        try await Task.sleep(for: .milliseconds(500))
-        let states = await log.states
+        let states = await settledStates(log, endingWith: [.starting, .stopping, .stopped])
         XCTAssertEqual(Array(states.suffix(3)), [.starting, .stopping, .stopped])
         XCTAssertFalse(states.dropFirst(4).contains(.running), "no .running after the aborted start: \(states)")
         try await vm.start()   // and the session can still be resumed
