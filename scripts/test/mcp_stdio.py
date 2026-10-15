@@ -13,6 +13,7 @@ class MCP:
     def __init__(self, env):
         self.p = subprocess.Popen(["node", SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
         self.n = 0
+        self.answers = {}
         self.lines = queue.Queue()
         self.stderr_tail = collections.deque(maxlen=40)
         threading.Thread(target=self._read_stdout, daemon=True).start()
@@ -33,14 +34,19 @@ class MCP:
         except OSError as e:
             raise MCPError(f"cannot write to the server ({e}); stderr: {''.join(self.stderr_tail)}") from None
 
-    def request(self, method, params=None, timeout=300):
+    def send(self, method, params=None):
+        """Writes one request and returns its id without waiting for the answer."""
         self.n += 1
         msg = {"jsonrpc": "2.0", "id": self.n, "method": method}
         if params is not None:
             msg["params"] = params
         self._write(msg)
+        return self.n
+
+    def answer(self, request_id, method, timeout=300):
+        """Waits for the answer to the request `request_id` and returns its result; answers to other requests are kept for their own wait."""
         end = time.time() + timeout
-        while True:
+        while request_id not in self.answers:
             try:
                 line = self.lines.get(timeout=max(0.0, end - time.time()))
             except queue.Empty:
@@ -51,10 +57,15 @@ class MCP:
                 reply = json.loads(line)
             except json.JSONDecodeError:
                 raise MCPError("non-JSON on stdout (protocol violation): " + line[:200]) from None
-            if reply.get("id") == self.n:
-                if "error" in reply:
-                    raise MCPError(f"{method}: {reply['error']}")
-                return reply["result"]
+            if "id" in reply and ("result" in reply or "error" in reply):
+                self.answers[reply["id"]] = reply
+        reply = self.answers.pop(request_id)
+        if "error" in reply:
+            raise MCPError(f"{method}: {reply['error']}")
+        return reply["result"]
+
+    def request(self, method, params=None, timeout=300):
+        return self.answer(self.send(method, params), method, timeout)
 
     def notify(self, method, params=None):
         msg = {"jsonrpc": "2.0", "method": method}
@@ -70,7 +81,15 @@ class MCP:
 
     def call(self, name, args, timeout=300):
         """Calls a tool and returns (isError, joined text content, image contents)."""
-        r = self.request("tools/call", {"name": name, "arguments": args}, timeout)
+        return self._tool_result(self.request("tools/call", {"name": name, "arguments": args}, timeout))
+
+    def call_together(self, calls, timeout=300):
+        """Sends the tool calls [(name, args), ...] back to back before reading any answer; returns their (isError, text, images) in order."""
+        ids = [self.send("tools/call", {"name": name, "arguments": args}) for name, args in calls]
+        return [self._tool_result(self.answer(i, f"tools/call {name}", timeout)) for i, (name, _) in zip(ids, calls)]
+
+    @staticmethod
+    def _tool_result(r):
         texts = [c["text"] for c in r.get("content", []) if c["type"] == "text"]
         images = [c for c in r.get("content", []) if c["type"] == "image"]
         return r.get("isError", False), "\n".join(texts), images
