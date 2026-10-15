@@ -64,11 +64,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # go.mod declares `go 1.22` as the module's minimum (still enforced as the
-      # language version by newer toolchains). CI builds with 1.25 because it is
-      # pre-cached on the runner image and because binaries linked by Go 1.22
-      # carry no LC_UUID, which macOS 26's dyld rejects ("missing LC_UUID load
-      # command") when `go test` runs them.
+      # go.mod declares `go 1.25.0` as the module's minimum toolchain; CI builds
+      # with 1.25, which is pre-cached on the runner image.
       # The module has no external dependencies and therefore no go.sum; point
       # the cache key at go.mod, otherwise setup-go fails when its default
       # **/go.sum pattern matches nothing.

@@ -5,6 +5,7 @@ package uia
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -25,6 +26,25 @@ func fileID(t *testing.T, path string) uint64 {
 	return uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
 }
 
+const fileWriteAttributes = 0x00000100
+
+// holdDir opens path itself with the rights to change its access list and its
+// attributes and the given share mode, as a standard user's handle opened
+// before the lock would be.
+func holdDir(t *testing.T, path string, share uint32) syscall.Handle {
+	t.Helper()
+	name, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := syscall.CreateFile(name, readControl|writeDAC|fileWriteAttributes, share, nil, syscall.OPEN_EXISTING,
+		syscall.FILE_FLAG_OPEN_REPARSE_POINT|syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	return h
+}
+
 // Runs elevated: secureDir sets the owner to Administrators.
 func TestSecureDirMovesAsideAFolderInsteadOfRelockingItWhileAHandleIsOpen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "uia")
@@ -33,13 +53,7 @@ func TestSecureDirMovesAsideAFolderInsteadOfRelockingItWhileAHandleIsOpen(t *tes
 	}
 	before := fileID(t, dir)
 
-	// The rights a standard user's pre-lock handle keeps: writing the DACL and
-	// the attributes. If secureDir relocked in place, this handle would still
-	// let its holder change the locked folder.
-	held, err := openDir(dir)
-	if err != nil {
-		t.Fatalf("openDir: %v", err)
-	}
+	held := holdDir(t, dir, syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE)
 	defer syscall.CloseHandle(held)
 
 	moved, err := secureDir(dir, map[string]bool{"helper.log": true, "helper.log.1": true}, nil)
@@ -62,6 +76,39 @@ func TestSecureDirMovesAsideAFolderInsteadOfRelockingItWhileAHandleIsOpen(t *tes
 	syscall.CloseHandle(hh)
 	if !isLockedSDDL(have) {
 		t.Fatalf("the new folder is not locked: %s", have)
+	}
+}
+
+// Runs elevated.
+func TestAHelperStartFailsClosedWhileAHandleWithoutDeleteSharingIsOpenOnTheFolder(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "Alcove")
+	dir := filepath.Join(parent, "uia")
+	if _, err := secureDir(parent, nil, map[string]bool{"uia": true}); err != nil {
+		t.Fatalf("locking the parent: %v", err)
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := fileID(t, dir)
+
+	held := holdDir(t, dir, syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE)
+	defer syscall.CloseHandle(held)
+
+	_, _, _, err := DefaultLauncher(dir, t.Logf)(make(chan struct{}))
+	if err == nil || !strings.Contains(err.Error(), "could not be moved aside") {
+		t.Fatalf("the helper start answered %v; expected the folder to be reported as not moved aside", err)
+	}
+	if fileID(t, dir) != before {
+		t.Fatalf("the folder at %s was replaced although the start failed", dir)
+	}
+	for _, name := range []string{"bootstrap.ps1", "helper.cs", "tmp"} {
+		if _, statErr := os.Lstat(filepath.Join(dir, name)); !os.IsNotExist(statErr) {
+			t.Errorf("%s was written into the unlocked folder (%v)", name, statErr)
+		}
+	}
+	asides, globErr := filepath.Glob(dir + ".untrusted-*")
+	if globErr != nil || len(asides) != 0 {
+		t.Errorf("moved-aside folders %v (%v) after a failed move", asides, globErr)
 	}
 }
 
