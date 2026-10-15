@@ -88,7 +88,8 @@ func TestInstallStopsWhenTheBinaryCannotBeReplaced(t *testing.T) {
 	in, calls := fakeInstall(t, "")
 	in.bin = filepath.Join(filepath.Dir(in.bin), "missing", "alcove-agent")
 	err := in.run(7645, false, nil)
-	if err == nil || !strings.HasPrefix(err.Error(), "cannot replace "+in.bin+" (") || !strings.HasSuffix(err.Error(), "); run alcove-agent --install as root") {
+	want := "); check with sudo that " + filepath.Dir(in.bin) + " is writable and that " + in.bin + " is not immutable (lsattr " + in.bin + "; chattr -i removes the flag), then run alcove-agent --install again"
+	if err == nil || !strings.HasPrefix(err.Error(), "cannot replace "+in.bin+" (") || !strings.HasSuffix(err.Error(), want) {
 		t.Fatalf("err %v", err)
 	}
 	if len(*calls) != 0 {

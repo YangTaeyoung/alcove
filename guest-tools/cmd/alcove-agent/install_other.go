@@ -123,7 +123,7 @@ func (in systemdInstall) copyBinary() error {
 		return fmt.Errorf("cannot read %s (%v); run alcove-agent --install from a copy you can read", in.exe, err)
 	}
 	if err := replaceFile(in.bin, data, 0o755); err != nil {
-		return fmt.Errorf("cannot replace %s (%v); run alcove-agent --install as root", in.bin, err)
+		return fmt.Errorf("cannot replace %s (%v); check with sudo that %s is writable and that %s is not immutable (lsattr %s; chattr -i removes the flag), then run alcove-agent --install again", in.bin, err, filepath.Dir(in.bin), in.bin, in.bin)
 	}
 	return nil
 }
