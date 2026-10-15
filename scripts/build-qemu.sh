@@ -39,16 +39,19 @@ fi
 #   patched_tree  HEAD with the patch series applied
 #   work_tree     what build/qemu-src holds right now (tracked + untracked)
 # A tree equal to patched_tree is left alone (no gratuitous rebuild); anything
-# else is reset to pristine and re-patched. In-tree edits that are not exactly
-# the patch series are saved to build/qemu-src-discarded-<time>.diff first,
-# so nothing is lost silently. (`git checkout -- .` is not enough to undo an
-# earlier `git apply --index`: it restores from the index, which still holds
-# the patch, so the next apply fails with "already exists in index".)
+# else is reset to pristine and re-patched. A tree that holds the patch series
+# of an earlier commit of this repository (one that changed qemu-patches/) is
+# named by that commit. Other in-tree edits are saved to
+# build/qemu-src-discarded-<time>.diff first, so nothing is lost silently.
+# (`git checkout -- .` is not enough to undo an earlier `git apply --index`:
+# it restores from the index, which still holds the patch, so the next apply
+# fails with "already exists in index".)
 shopt -s nullglob
 work_index="$SRC/.git/alcove-work-index"
 patch_index="$SRC/.git/alcove-patch-index"
-trap 'rm -f "$work_index" "$patch_index"' EXIT
-rm -f "$work_index" "$patch_index"
+earlier_index="$SRC/.git/alcove-earlier-index"
+trap 'rm -f "$work_index" "$patch_index" "$earlier_index"' EXIT
+rm -f "$work_index" "$patch_index" "$earlier_index"
 head_tree="$(git -C "$SRC" rev-parse 'HEAD^{tree}')"
 
 GIT_INDEX_FILE="$work_index" git -C "$SRC" read-tree HEAD
@@ -63,6 +66,24 @@ if ( for p in "$ROOT"/qemu-patches/*.patch; do
   patched_tree="$(GIT_INDEX_FILE="$patch_index" git -C "$SRC" write-tree)"
 fi
 
+# The commit of this repository, among those that changed qemu-patches/, whose
+# patch series applied to HEAD gives work_tree, as "<short hash> <subject>";
+# empty when there is none or $ROOT is not a git checkout.
+earlier_series_commit() {
+  git -C "$ROOT" rev-parse -q --verify HEAD >/dev/null 2>&1 || return 0
+  local commit name
+  for commit in $(git -C "$ROOT" log --format=%H -- qemu-patches); do
+    GIT_INDEX_FILE="$earlier_index" git -C "$SRC" read-tree HEAD
+    if ( for name in $(git -C "$ROOT" ls-tree --name-only "$commit" -- qemu-patches/ | grep '\.patch$'); do
+           git -C "$ROOT" show "$commit:$name" | GIT_INDEX_FILE="$earlier_index" git -C "$SRC" apply --cached - 2>/dev/null || exit 1
+         done ) \
+       && [ "$(GIT_INDEX_FILE="$earlier_index" git -C "$SRC" write-tree)" = "$work_tree" ]; then
+      git -C "$ROOT" log -1 --format='%h %s' "$commit"
+      return 0
+    fi
+  done
+}
+
 # Honor QEMU_TAG on an existing clone (fetch the tag if this shallow clone lacks it).
 if ! git -C "$SRC" rev-parse -q --verify "refs/tags/$QEMU_TAG^{commit}" >/dev/null; then
   git -C "$SRC" fetch -q --depth 1 origin tag "$QEMU_TAG"
@@ -74,10 +95,15 @@ if [ "$head" = "$target" ] && [ -n "$patched_tree" ] && [ "$work_tree" = "$patch
   echo "source tree already at $QEMU_TAG + patches; leaving it untouched"
 else
   if [ "$work_tree" != "$head_tree" ] && [ "$work_tree" != "$patched_tree" ]; then
-    work_diff="$ROOT/build/qemu-src-discarded-$(date +%Y%m%d-%H%M%S).diff"
-    GIT_INDEX_FILE="$work_index" git -C "$SRC" diff --cached HEAD > "$work_diff"
-    echo "build/qemu-src had edits that are not exactly qemu-patches/*.patch; saved to $work_diff:" >&2
-    git -C "$SRC" status --short >&2
+    earlier="$(earlier_series_commit)"
+    if [ -n "$earlier" ]; then
+      echo "build/qemu-src holds qemu-patches/*.patch of commit $earlier; applying the current patch series"
+    else
+      work_diff="$ROOT/build/qemu-src-discarded-$(date +%Y%m%d-%H%M%S).diff"
+      GIT_INDEX_FILE="$work_index" git -C "$SRC" diff --cached HEAD > "$work_diff"
+      echo "build/qemu-src had edits that are not exactly qemu-patches/*.patch; saved to $work_diff:" >&2
+      git -C "$SRC" status --short >&2
+    fi
   fi
   git -C "$SRC" reset -q --hard
   git -C "$SRC" clean -qfd
@@ -95,7 +121,7 @@ else
     git -C "$SRC" apply --index "$p"
   done
 fi
-rm -f "$work_index" "$patch_index"
+rm -f "$work_index" "$patch_index" "$earlier_index"
 shopt -u nullglob
 
 if [ "$CLEAN" = 1 ]; then rm -rf "$BLD"; fi
