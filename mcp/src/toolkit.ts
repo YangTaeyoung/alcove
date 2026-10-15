@@ -105,14 +105,43 @@ export const OP_TOOLS: Readonly<Record<string, string>> = {
 };
 
 /**
- * `sentence` with each op name of `OP_TOOLS` replaced by its tool and each `parameter '<camelCase>'` by the snake_case
- * name; an op name that follows a letter, digit, `.`, `-`, `/` or `\`, or that a letter, digit, `-` or `.` and a
- * letter follow, is part of another word and stays.
+ * `sentence` with each op name of `OP_TOOLS` outside a quoted value (`quotedRanges`) replaced by its tool and each
+ * `parameter '<camelCase>'` by the snake_case name; an op name that follows a letter, digit, `.`, `-`, `/` or `\`, or
+ * that a letter, digit, `-` or `.` and a letter follow, is part of another word and stays.
  */
 export function toolSentence(sentence: string): string {
+  const quoted = quotedRanges(sentence);
+  const inQuoted = (at: number): boolean => quoted.some(([start, end]) => at >= start && at < end);
   return sentence
-    .replace(/(?<![\w./\\-])(?:vm|script)(?:\.[a-z_]+)+(?![\w-]|\.[a-z_])/g, (op) => OP_TOOLS[op] ?? op)
+    .replace(/(?<![\w./\\-])(?:vm|script)(?:\.[a-z_]+)+(?![\w-]|\.[a-z_])/g, (op: string, at: number) => (inQuoted(at) ? op : (OP_TOOLS[op] ?? op)))
     .replace(/\bparameter '([a-z][A-Za-z0-9]*)'/g, (_, name: string) => `parameter '${name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)}'`);
+}
+
+/**
+ * The quoted values of `text` as [start, end) UTF-16 offsets, quotes included: from a `"` to the next `"` that no `\`
+ * precedes, and from a `'` that no letter, mark or digit precedes to the next `'` that none follows. A quote that is
+ * not closed opens no value.
+ */
+export function quotedRanges(text: string): Array<[number, number]> {
+  const isWord = (at: number): boolean => {
+    const unit = text.charCodeAt(at);
+    return (unit >= 0xd800 && unit <= 0xdfff) || /[\p{L}\p{M}\p{N}]/u.test(text[at]);
+  };
+  const ranges: Array<[number, number]> = [];
+  let open: { quote: string; at: number } | undefined;
+  for (let index = 0; index < text.length; index++) {
+    const unit = text[index];
+    if (open) {
+      if (unit !== open.quote) continue;
+      if (unit === '"' && text[index - 1] === "\\") continue;
+      if (unit === "'" && index + 1 < text.length && isWord(index + 1)) continue;
+      ranges.push([open.at, index + 1]);
+      open = undefined;
+    } else if (unit === '"' || (unit === "'" && (index === 0 || !isWord(index - 1)))) {
+      open = { quote: unit, at: index };
+    }
+  }
+  return ranges;
 }
 
 /** An error result: a ControlError's sentence with tool and parameter names (`toolSentence`), anything else as an unexpected error. */

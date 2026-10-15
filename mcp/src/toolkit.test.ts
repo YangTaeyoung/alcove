@@ -65,6 +65,17 @@ test("fail names tools and tool parameters in server sentences", () => {
   assert.equal(textOf(fail(new Error("vm.list broke"))), "unexpected error: Error: vm.list broke");
 });
 
+test("fail keeps op names inside quoted values as the server does", () => {
+  const said = (message: string): string => textOf(fail(new ControlError(message)));
+  assert.equal(said("no VM named 'vm.list'; call vm.list"), "no VM named 'vm.list'; call alcove_list_vms");
+  assert.equal(said('the step "vm.start" failed; call vm.start'), 'the step "vm.start" failed; call alcove_start_vm');
+  assert.equal(said('the step "say \\"vm.start\\"" failed; call vm.start'), 'the step "say \\"vm.start\\"" failed; call alcove_start_vm');
+  assert.equal(said("the VM's disk is busy; call vm.stop, then vm.start"), "the VM's disk is busy; call alcove_stop_vm, then alcove_start_vm");
+  assert.equal(said("UI helper did not answer 'it's vm.list' in time; call vm.status"), "UI helper did not answer 'it's vm.list' in time; call alcove_vm_status");
+  assert.equal(said("an unclosed 'vm.list"), "an unclosed 'alcove_list_vms");
+  assert.equal(said("missing or invalid parameter 'hostPort' of vm.forward.add"), "missing or invalid parameter 'host_port' of alcove_port_forward_add");
+});
+
 test("every op the control server knows maps to a registered tool", () => {
   const swift = fs.readFileSync(new URL("../../AlcoveKit/Sources/AlcoveControl/ControlHandler.swift", import.meta.url), "utf8");
   const known = /static let knownOps: \[String\] = \[([\s\S]*?)\]/.exec(swift);
