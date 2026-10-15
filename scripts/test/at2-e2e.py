@@ -10,23 +10,26 @@ tree (`alcovectl serve`; the script moves a clone's bundle on disk, so the VM
 directory must be the one that server uses) and `npm run build` in mcp/.
 Checks 8 and 9 stop and start the VM. Checks 2 and 8 need 8 GiB of free disk.
 
-Each check prints `PASS <n> <title>`; the first failing check prints
-`FAIL <n>: <reason>` and the script exits 1. However the run ends, a second
+Each check prints `PASS <n> <title>`; the first failing check prints `FAIL
+<n>: <reason>` and the script exits 1. However the run ends, a second
 connection releases the lease, moves a hidden clone back and deletes the
-clones it created, starts the VM when it is stopped, deletes the snapshot, removes the
-forwards and the firewall rule, restores theme, time zone, clock, display
-scale and resolution, kills the jobs and deletes C:\\alcove-e2e. The run refuses to start when that
-folder exists. SIGTERM, SIGHUP and SIGINT print `interrupted; restoring the
-guest...`, run the same cleanup and exit with 128 plus the signal's number
-(143, 129, 130); SIGHUP stays ignored when the script was started with it
-ignored (nohup).
+clones it created, waits up to 300 s for the VM to leave the starting,
+stopping and suspending states, starts it when it is stopped, waits for the
+answer to a snapshot save the run sent and deletes the snapshot, removes the
+forwards and the firewall rule, restores theme, time zone, clock (also after a
+snapshot save, which stops the guest's clock while it runs), display scale and
+resolution, kills the jobs and deletes C:\\alcove-e2e. The run refuses to
+start when that folder exists. SIGTERM, SIGHUP and SIGINT print `interrupted;
+restoring the guest...`, run the same cleanup and exit with 128 plus the
+signal's number (143, 129, 130); SIGHUP stays ignored when the script was
+started with it ignored (nohup).
 
 Usage: at2-e2e.py [--vm NAME] [--vm-dir DIR] [--only N[,N...]]
 """
 import argparse, base64, glob, json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time
 
 sys.dont_write_bytecode = True
-from alcove_ctl import Client, ControlError, ControlTimeout, ignore_stop_signals, stop_signal_handlers
+from alcove_ctl import STOP_SIGNALS, Client, ControlError, ControlTimeout, ignore_stop_signals, stop_signal_handlers
 from mcp_stdio import MCP, MCPError
 
 GUEST = r"C:\alcove-e2e"
@@ -125,6 +128,7 @@ class Run:
         self.clients = []
         self.mcps = []
         self.snapshot_made = False
+        self.snapshot_request = None
         self.firewall_rule = False
         self.theme = None
         self.time_zone = None
@@ -265,6 +269,11 @@ class Run:
                 signal.signal(sig, handler)
 
     def cleanup_steps(self):
+        if self.snapshot_request is not None:
+            try:
+                self.c.wait(self.snapshot_request, 660)
+            except ControlError:
+                pass
         for m in self.mcps:
             try:
                 m.close()
@@ -312,6 +321,10 @@ class Run:
                 if attempt("vm.delete", name=clone) is None:
                     self.cleanup_error(f"the clone '{clone}' was not deleted; delete it with vm.delete")
         status = c.call("vm.status", 60, name=self.vm)
+        end = time.time() + 300
+        while status.get("state") in ("starting", "stopping", "suspending") and time.time() < end:
+            time.sleep(2)
+            status = c.call("vm.status", 60, name=self.vm)
         end = time.time() + 10
         while status.get("leasedBy") and time.time() < end:
             time.sleep(1)
@@ -343,7 +356,8 @@ class Run:
                 return
             time.sleep(2)
         if self.snapshot_made:
-            attempt("vm.snapshot.delete", 660, snapshot=SNAPSHOT)
+            if SNAPSHOT in [s["name"] for s in (attempt("vm.snapshot.list") or {}).get("snapshots", [])]:
+                attempt("vm.snapshot.delete", 660, snapshot=SNAPSHOT)
         listed = {f["hostPort"] for f in (attempt("vm.forward.list") or {}).get("forwards", []) if f["kind"] == "runtime"}
         for port in self.forwards:
             if port in listed:
@@ -359,7 +373,7 @@ class Run:
             settings["theme"] = self.theme
         if self.time_zone:
             settings["timeZone"] = self.time_zone
-        if self.clock_ahead:
+        if self.clock_ahead or self.snapshot_made:
             settings["clock"] = "host"
         if self.dpi:
             settings["dpiScale"] = self.dpi
@@ -407,9 +421,16 @@ def _(run):
     run.call("vm.fs.write", path=MARKER, text="before")
     size_before = run.bundle_kib()
     taken = began = time.monotonic()
-    created = run.call("vm.snapshot.create", 660, snapshot=SNAPSHOT)
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        run.snapshot_made = True
+        run.snapshot_request = run.c.send("vm.snapshot.create", name=run.vm, snapshot=SNAPSHOT)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+    created = run.c.wait(run.snapshot_request, 660)
+    run.snapshot_request = None
+    expect(created.get("ok") is True, f"vm.snapshot.create answered {created!r}")
     create_s = time.monotonic() - began
-    run.snapshot_made = True
     expect(created["snapshot"] == SNAPSHOT, f"vm.snapshot.create answered {created!r}")
     growth_mib = (run.bundle_kib() - size_before) / 1024
 
