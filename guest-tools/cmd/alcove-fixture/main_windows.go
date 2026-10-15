@@ -23,7 +23,8 @@
 //     "Alcove Fixture";
 //   - two buttons that are both named "Same": each appends "Same 1" or
 //     "Same 2" to the transcript;
-//   - "Vanish", right of Secret: the button destroys itself when pressed.
+//   - "Vanish", right of Secret: when pressed the button hides, and the main
+//     window destroys it when the message the press posts arrives.
 //
 // With --log every action appends one line "<RFC 3339 time> <action> [detail]"
 // to the file; a change of Secret is logged as "secret <length>", without the
@@ -101,6 +102,7 @@ const (
 	wmDPIChanged    = 0x02E0
 	wmApp           = 0x8000
 	wmFetchDone     = wmApp + 1
+	wmVanish        = wmApp + 2
 
 	enChange       = 0x0300
 	emSetSel       = 0x00B1
@@ -109,6 +111,7 @@ const (
 	emScrollCaret  = 0x00B7
 
 	cwUseDefault   = 0x80000000
+	swHide         = 0
 	swShowNormal   = 1
 	colorBtnFace   = 15
 	idcArrow       = 32512
@@ -455,9 +458,18 @@ func (a *app) onCommand(id int) {
 		a.appendTranscript("Same 2\r\n")
 	case idVanish:
 		a.log("vanish")
-		procDestroyWindow.Call(a.vanish)
-		a.vanish = 0
+		procShowWindow.Call(a.vanish, swHide)
+		procPostMessage.Call(a.main, wmVanish, 0, 0)
 	}
+}
+
+// onVanish destroys the Vanish button when it still exists.
+func (a *app) onVanish() {
+	if a.vanish == 0 {
+		return
+	}
+	procDestroyWindow.Call(a.vanish)
+	a.vanish = 0
 }
 
 // onTitles starts changing the window title every 50 ms.
@@ -526,6 +538,9 @@ func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmFetchDone:
 		a.onFetchDone()
+		return 0
+	case wmVanish:
+		a.onVanish()
 		return 0
 	case wmSize:
 		if a.transcript != 0 {
