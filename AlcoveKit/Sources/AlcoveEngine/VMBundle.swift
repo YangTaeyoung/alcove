@@ -233,17 +233,19 @@ extension VMBundle {
     public var ephemeralEFIVarsURL: URL { runURL.appendingPathComponent("ephemeral-efi-vars.fd") }
 
     /// The bundles whose config names this bundle's config name as `cloneOf`: those listed in
-    /// clones.json plus those in this bundle's parent directory, once each by standardized path.
+    /// clones.json plus those in this bundle's parent directory, once each by path with symbolic links resolved, each
+    /// under its standardized path, a listed spelling before a sibling's.
     /// A bundle listed in clones.json whose config.json exists but cannot be decoded also counts.
     /// clones.json is rewritten to that set; an undecodable file counts as an empty list.
     public func liveClones(fileManager fm: FileManager = .default) -> [URL] {
-        let name = configName, own = url.standardizedFileURL.path
+        let name = configName, own = url.resolvingSymlinksInPath().path
         let listed = (try? JSONDecoder().decode([String].self, from: Data(contentsOf: clonesURL))) ?? []
         let siblings = VMBundle.list(in: url.deletingLastPathComponent(), fileManager: fm).map(\.url)
         var live: [String] = []
+        var seen: Set<String> = []
         for (index, candidate) in (listed.map({ URL(fileURLWithPath: $0) }) + siblings).enumerated() {
-            let path = candidate.standardizedFileURL.path
-            guard path != own, !live.contains(path) else { continue }
+            let path = candidate.standardizedFileURL.path, resolved = candidate.resolvingSymlinksInPath().path
+            guard resolved != own, !seen.contains(resolved) else { continue }
             let bundle = VMBundle(url: candidate)
             if let config = bundle.storedConfig() {
                 guard config.cloneOf == name else { continue }
@@ -251,6 +253,7 @@ extension VMBundle {
                 guard index < listed.count, fm.fileExists(atPath: bundle.configURL.path) else { continue }
             }
             live.append(path)
+            seen.insert(resolved)
         }
         if live != listed || (live.isEmpty && fm.fileExists(atPath: clonesURL.path)) { try? writeClones(live, fileManager: fm) }
         return live.map { URL(fileURLWithPath: $0) }

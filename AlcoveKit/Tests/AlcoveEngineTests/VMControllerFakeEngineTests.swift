@@ -77,6 +77,11 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try qmpRequests(vm).map(\.command)
     }
 
+    /// Lets a fake engine in `held-boot` or `held-incoming` mode finish its boot or load.
+    private func releaseFakeEngine(_ vm: VMController) throws {
+        try Data().write(to: vm.bundle.runURL.appendingPathComponent("fake-release"))
+    }
+
     private func waitUntil(timeout: Duration = .seconds(10), _ condition: () async -> Bool) async -> Bool {
         let deadline = ContinuousClock.now + timeout
         while ContinuousClock.now < deadline {
@@ -247,14 +252,17 @@ final class VMControllerFakeEngineTests: XCTestCase {
     }
 
     func testAStartWhoseCallerIsCancelledDuringTheQMPWaitRunsToItsEnd() async throws {
-        let vm = try makeVM(mode: "slow-boot")
+        let vm = try makeVM(mode: "held-boot")
         let log = StateLog()
         let observer = Task { for await s in vm.states { await log.append(s) } }
         defer { observer.cancel() }
         let starter = Task { try await vm.start() }
         let waiting = await waitUntil { await vm.qmp != nil }
         XCTAssertTrue(waiting, "the start did not reach the QMP wait")
+        let before = await vm.state
+        XCTAssertEqual(before, .starting)
         starter.cancel()
+        try releaseFakeEngine(vm)
         let result = await starter.result
         XCTAssertNoThrow(try result.get(), "the cancelled caller gets the result of the start")
         let state = await vm.state
@@ -268,13 +276,16 @@ final class VMControllerFakeEngineTests: XCTestCase {
     }
 
     func testAResumeWhoseCallerIsCancelledDuringTheLoadRunsToItsEnd() async throws {
-        let vm = try makeVM(mode: "slow-incoming")
+        let vm = try makeVM(mode: "held-incoming")
         try await vm.start()
         try await vm.suspendToDisk()
         let starter = Task { try await vm.start() }
         let loading = await waitUntil { await vm.qmp != nil }
         XCTAssertTrue(loading, "the resume did not reach the load")
+        let before = await vm.state
+        XCTAssertEqual(before, .starting)
         starter.cancel()
+        try releaseFakeEngine(vm)
         let result = await starter.result
         XCTAssertNoThrow(try result.get(), "the cancelled caller gets the result of the resume")
         let state = await vm.state
@@ -1202,8 +1213,9 @@ final class VMControllerFakeEngineTests: XCTestCase {
 }
 
 /// See the class comment. `FAKE_QEMU_MODE`: "" or a comma-separated list of exit-early |
-/// bad-status | migrate-fails | incoming-fails | slow-incoming | slow-boot | ignore-powerdown | slow-load | slow-stop | slow-save |
-/// slow-delete. slow-boot: a cold start reports the run state `prelaunch` for 1 s before it runs. slow-load: `snapshot-load` holds the QMP connection for 1 s before its job events,
+/// bad-status | migrate-fails | incoming-fails | slow-incoming | held-incoming | held-boot | ignore-powerdown | slow-load | slow-stop |
+/// slow-save | slow-delete. held-boot: a cold start reports the run state `prelaunch` until the file `fake-release` exists
+/// next to the pidfile. held-incoming: a resume stays `inmigrate` until that file exists. slow-load: `snapshot-load` holds the QMP connection for 1 s before its job events,
 /// and no other command is answered meanwhile. slow-stop: `stop` does the same for 0.5 s before it pauses the guest.
 /// slow-save, slow-delete: `snapshot-save` or `snapshot-delete` sends its job events 1 s after its answer, and other
 /// commands are answered meanwhile.
@@ -1259,8 +1271,16 @@ def die(code, delay):
         os._exit(code)
     threading.Thread(target=run, daemon=True).start()
 
+def wait_for_release():
+    release = os.path.join(os.path.dirname(pidfile), "fake-release")
+    while not os.path.exists(release):
+        time.sleep(0.05)
+
 def finish_incoming():
-    time.sleep(3.0 if "slow-incoming" in modes else 0.4)
+    if "held-incoming" in modes:
+        wait_for_release()
+    else:
+        time.sleep(3.0 if "slow-incoming" in modes else 0.4)
     path = incoming[len("file:"):]
     if "incoming-fails" in modes or not (os.path.exists(path) and os.path.getsize(path) > 0):
         err("load of migration failed: Invalid argument")
@@ -1269,10 +1289,10 @@ def finish_incoming():
 
 if incoming:
     threading.Thread(target=finish_incoming, daemon=True).start()
-elif "slow-boot" in modes:
+elif "held-boot" in modes:
     st.update(running=False, status="prelaunch")
     def finish_boot():
-        time.sleep(1.0)
+        wait_for_release()
         st.update(running=True, status="running")
     threading.Thread(target=finish_boot, daemon=True).start()
 

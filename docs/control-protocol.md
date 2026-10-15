@@ -1163,7 +1163,9 @@ template with clones` sentence, whether the clone is stopped or running, and
 also with `discardChanges`. The clones of a VM are the bundles in its
 directory, or listed in its `clones.json`, whose configuration names it as
 `cloneOf`, and the bundles listed in its `clones.json` whose `config.json`
-exists but cannot be read.
+exists but cannot be read. A clone is counted once, however the hosts spell
+the folder (a symbolic link to it, or the folder itself), and `clones.json`
+keeps the path it already records.
 
 **Stale clones.** When a VM is cloned for the first time, its `config.json`
 receives a `diskID` and a `diskEpoch`, and every later cold start of that VM

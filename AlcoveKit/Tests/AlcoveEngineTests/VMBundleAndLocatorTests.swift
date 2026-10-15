@@ -366,6 +366,17 @@ final class VMBundleAndLocatorTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: template.clonesURL.path))
     }
 
+    func testATemplateSeenThroughALinkToItsFolderCountsEachCloneOnceAndKeepsTheRecordedPath() throws {
+        let (template, engine) = try stubTemplate()
+        let clone = try template.cloneLinked(named: "Copy", engine: engine)
+        let link = tmp.appendingPathComponent("vms-link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: tmp)
+        let throughLink = VMBundle(url: link.appendingPathComponent(template.url.lastPathComponent))
+        XCTAssertEqual(throughLink.liveClones().map(standardPath), [standardPath(clone.url)])
+        XCTAssertEqual(try listedClones(template), [standardPath(clone.url)])
+        XCTAssertEqual(template.liveClones().map(standardPath), [standardPath(clone.url)])
+    }
+
     func testDeletingACloneUpdatesTheListOfTheTemplateAtItsRecordedPath() throws {
         let (template, engine) = try stubTemplate()
         let clone = try template.cloneLinked(named: "Copy", engine: engine)
