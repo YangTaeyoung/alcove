@@ -80,8 +80,8 @@ Capabilities:
 | `jobs`, `proc`, `fs` | started with `--allow-exec` | `exec.*`, `proc.*`, `fs.*`, `app.launch` and `session.info` operations |
 | `ui` | Windows agents | `win.*` and `ui.*` operations and the window events |
 
-The agent checks its capabilities again every 3 s while a connection is
-open. When the list differs from the one it last sent on that connection it
+While a connection is open the agent checks its capabilities again every
+5 s, once for all connections. To each connection whose last list differs it
 sends `{"t":"caps","caps":[…]}` with the whole new list, which replaces the
 hello's. On Linux this is how `clipboard` appears once a user signs in to the
 desktop after the host connected, as an autologin does a few seconds after the
@@ -92,32 +92,61 @@ agent starts at boot, and disappears when the session ends.
 The Linux agent is a root system service (`alcove-agent --install` writes the
 systemd unit `alcove-agent.service`). It finds the desktop session with
 `loginctl list-sessions` and `loginctl show-session`: of the sessions of
-class `user` that are not closing, the active session of `seat0`, else the
-only graphical one (type `wayland`, `x11` or `mir`), else the one that began
-first. The user's home directory and groups come from the user database. A
-lookup is reused for 2 s.
+class `user` that are not closing, the active graphical session (type
+`wayland`, `x11` or `mir`) of `seat0`, else the only graphical one, else the
+active session of `seat0`, else the one that began first. The user's home
+directory and groups come from the user database. A lookup is reused for
+5 s.
 
 - The home directory of the agent's paths is that user's: `~`, `~/x`,
   relative paths, the `cwd` of `exec.*` and `app.launch`, the working
   directory of `exec.*` without `cwd`, the `Desktop` and `Downloads` folders
   of `file.begin` and the folders `fs.delete` refuses. Without a session it is
   the agent's own home directory (`/root`).
+- What changes entries in that home — `file.begin`, `fs.write`, `fs.mkdir`,
+  `fs.rename`, `fs.delete`, and so the transfers, `vm.sync_dir` and
+  `vm.deploy` of the host — opens the home as one `os.Root` and works
+  relative to it. A link inside the home is followed while it leads to a
+  place inside the home; a path that leads out of it, also through a link the
+  user made (`~/Downloads` → `/etc`, `~/x` → `/etc/shadow`), fails without
+  touching the place it leads to, with
+  `the path leads out of the home folder of the desktop user through a link, which the agent does not follow there; pass the path the link leads to`
+  after the operation's own beginning (`cannot open '<path>' for writing: `,
+  …). Files and folders the agent creates there are given to the session's
+  user and its primary group through their open descriptors, with the mode
+  they were created with; entries that existed keep their owner. `fs.rename`
+  from inside the home to outside it or back answers
+  `'<from>' and '<to>' lie on different sides of the home folder of the desktop user; rename within it or outside it, or copy the file`.
+  Paths outside the home are changed as root, as on other systems.
 - `app.launch` and the clipboard tools run as that user (its user id, group
-  id and groups) with the session's environment: `HOME`, `USER`, `LOGNAME`,
-  the agent's `PATH`, `XDG_RUNTIME_DIR=/run/user/<uid>` when that folder
-  exists, `WAYLAND_DISPLAY` (the `wayland-0` socket in it, else the first
-  other `wayland-<n>`) for a Wayland session, `DISPLAY` when logind names the
+  id and groups), in a session of their own, with the session's environment:
+  `HOME`, `USER`, `LOGNAME`, the agent's `PATH`,
+  `XDG_RUNTIME_DIR=/run/user/<uid>` when that folder exists,
+  `WAYLAND_DISPLAY` (the `wayland-0` socket in it, else the first other
+  `wayland-<n>`) for a Wayland session, `DISPLAY` when logind names the
   session's display, `DBUS_SESSION_BUS_ADDRESS` when the folder holds `bus`,
-  and `XDG_SESSION_TYPE`. `env` of `app.launch` is added to that environment.
+  `XDG_SESSION_TYPE`, and the `LANG`, `LANGUAGE` and `LC_*` variables of
+  `/etc/default/locale` (else `/etc/locale.conf`, else the agent's own). `env`
+  of `app.launch` is added to that environment.
+- When the runtime folder holds `bus` and `systemd-run` exists, `app.launch`
+  and the clipboard writer (`wl-copy`, `xclip -i`, which keep running to hold
+  the text) start through
+  `systemd-run --user --scope --quiet --collect --expand-environment=no --`:
+  they run in a scope of the user's service manager, keep the process id the
+  agent reports, and are not ended when the agent's service stops or
+  restarts. Without it they run in the agent's service and end with it.
 - `exec.*` keeps the agent's identity: the commands run as root with the
   agent's environment, in which `HOME` is root's home directory when systemd
   started the agent without one.
-- A file `file.begin` creates, and the `Desktop` or `Downloads` folder it
-  creates, belong to the session's user. Files and folders the `fs.*`
-  operations create belong to root.
 - Without a session `app.launch` runs as the agent with its environment, and
   the clipboard is the one the agent's own `WAYLAND_DISPLAY` or `DISPLAY`
   names, if any.
+- A clipboard tool that has not finished after 5 s is killed with its process
+  group; a read then fails (`clipboard.text` carries `""`) and a write is
+  dropped, both logged. The agent reads at most 700000 bytes of the
+  clipboard. `clipboard.get` and `clipboard.set` of one connection run one
+  after another, apart from the connection's other messages, so a clipboard
+  that does not answer delays neither `pong` nor requests.
 
 `alcove-agent --install` on Linux writes the running program to a temporary
 file in `/usr/local/bin`, flushes it to disk and renames it over
@@ -128,7 +157,7 @@ prints `installed` only after every step succeeded. A step that fails ends
 the install with exit code 1, a line on stderr that begins
 `install failed: ` and the same line in `/var/log/alcove/install.log`:
 `cannot read <file> (<reason>); run alcove-agent --install from a copy you can read`,
-`cannot replace /usr/local/bin/alcove-agent (<reason>); run alcove-agent --install as root`,
+`cannot replace /usr/local/bin/alcove-agent (<reason>); check with sudo that /usr/local/bin is writable and that /usr/local/bin/alcove-agent is not immutable (lsattr /usr/local/bin/alcove-agent; chattr -i removes the flag), then run alcove-agent --install again`,
 `cannot write /etc/systemd/system/alcove-agent.service (<reason>); run alcove-agent --install as root` or
 `systemctl <step> failed (<error>: <output>); check journalctl -u alcove-agent, then run alcove-agent --install again`.
 Run it from ssh or a terminal: the restart also ends a command that the
@@ -294,10 +323,10 @@ between attempts, until the bind succeeds.
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
 | host → agent | `clipboard.get` | — | ask for the current text; answered with `clipboard.text` |
 | agent → host | `clipboard.text` | `text` | reply to `clipboard.get`; text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
-| agent → host | `clipboard.changed` | `text` | the guest clipboard changed (text only in v1; polled via the clipboard sequence number on Windows, `wl-paste --watch`/`xclip` polling on Linux); text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
+| agent → host | `clipboard.changed` | `text` | the guest clipboard changed (text only in v1; one watcher per agent polls while a connection is open: on Windows the clipboard sequence number every 0.4 s; on Linux it runs `wl-paste` or `xclip -o` 0.5 s after a change and then at twice the interval after each poll that found none, up to every 4 s; a change the agent made itself is not reported); text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
 | host → agent | `resolution.set` | `w`, `h` | ask the guest to switch its primary display mode (agents with the `resolution` capability; others log the request and ignore it) |
 | agent → host | `resolution` | `w`, `h` | current primary display mode (sent after hello and on change) |
-| host → agent | `file.begin` | `id`, `name`, `size`, `dest` ("desktop"/"downloads") | start a file push into the `Desktop` or `Downloads` folder of the home directory (on Linux the [desktop session](#the-desktop-session-linux)'s) |
+| host → agent | `file.begin` | `id`, `name`, `size`, `dest` ("desktop"/"downloads") | start a file push into the `Desktop` or `Downloads` folder of the home directory (on Linux the [desktop session](#the-desktop-session-linux)'s); the file of a push that the connection leaves unfinished is removed |
 | host → agent | `file.chunk` | `id`, `data` (base64, ≤ 256 KiB decoded) | file bytes |
 | host → agent | `file.end` | `id`, `sha256` | finish; the agent verifies the digest |
 | agent → host | `file.done` | `id`, `path` or `error` | result |
@@ -350,10 +379,10 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `proc.list` | `name` (case-insensitive substring of the process name) | `procs`: [{`pid`, `ppid`, `name`, `path`, `cmd`, `mem_kb`}] |
 | `proc.kill` | `pid`, or `name` (exact process name); `tree` (bool) | `killed` (int) |
 | `fs.stat` | `path`; `sha256` (bool) | `exists`, `path` (absolute); for an existing entry also `dir`, `size`, `mtime` (RFC 3339, UTC), and `sha256` when asked for a file; `link: true` when the entry at `path` is a link; `owner` on Windows; `locked` for the deploy root on Windows |
-| `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`}], `truncated` (more than 5000 entries), `skipped` (entries that could not be read, when above 0) |
+| `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`, `executable` (outside Windows, for regular files: the owner's execute bit)}], `truncated` (more than 5000 entries), `skipped` (entries that could not be read, when above 0) |
 | `fs.read` | `path`, `offset` (default 0), `length` (default and cap 262144) | `data` (base64), `size` (of the file), `eof`, `encoding` |
 | `fs.tail` | `path`, `lines` (default 200) | `data` (base64 of the last lines, taken from at most the last 262144 bytes), `size`, `encoding` |
-| `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool), `executable` (bool; outside Windows it adds the execute bit wherever the file has the read bit, Windows ignores it) | `size` (of the file afterwards) |
+| `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool), `executable` (bool; outside Windows `true` adds the execute bit wherever the file has the read bit and `false` removes every execute bit; Windows ignores it) | `size` (of the file afterwards) |
 | `fs.rename` | `from`, `to`, `overwrite` (bool) | `path` |
 | `fs.mkdir` | `path` | `path` |
 | `fs.delete` | `path`, `recursive` (bool) | `deleted` (bool) |

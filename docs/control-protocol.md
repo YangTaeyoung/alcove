@@ -121,9 +121,9 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.process.list` | `name`, `filter?` | `{processes: [{pid, ppid, name, path, command, memoryKB}]}` — `filter` is a case-insensitive substring of the process name; on Linux `name` is the kernel's process name (`sshd` for `sshd: /usr/sbin/sshd …`) |
 | `vm.process.kill` | `name`, `pid?` or `processName?`, `tree?` | `{killed}` — `tree` also kills child processes |
 | `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` — a `text` whose message to the guest tools would reach 1 MiB answers `the clipboard text is too large for one message to the guest tools (<n> bytes of UTF-8; a message holds less than 1 MiB); set a shorter text`; guest tools without the `clipboard` capability answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), so <op> cannot run; sign in to the guest's desktop and install wl-clipboard or xclip there, then retry` and nothing is sent to them |
-| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` — `dest` puts the file into that folder of the guest user (on Linux the user of the desktop session, who owns the file); a relative `guestPath` lies below that user's home; with `guestPath` a host file with an execute bit becomes executable in a Linux guest |
+| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` — `dest` puts the file into that folder of the guest user (on Linux the user of the desktop session); a relative `guestPath` lies below that user's home; in a Linux guest a file created in that home belongs to that user, a path that leads out of the home through a link fails (see [the agent protocol](agent-protocol.md#the-desktop-session-linux)), and with `guestPath` the copy is executable exactly when the host file, or the file a host link leads to, has an execute bit |
 | `vm.pull_file` | `name`, `guestPath`, `path` (host) | `{path, bytes, sha256}` |
-| `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` — files the copy sends keep the execute bit of their host file in a Linux guest |
+| `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` — in a Linux guest a file whose execute bit differs from its host file's is sent again although its content is equal, and the copies are executable exactly when their host files are |
 | `vm.fs.list` | `name`, `path`, `recursive?` | `{entries: [{name, dir, size, mtime}], truncated}` |
 | `vm.fs.read` | `name`, `path`, `offset?`, `length?` (≤ 262144), `tail?` (lines) | `{text, size, eof}` |
 | `vm.fs.write` | `name`, `path`, `text`, `append?` | `{size}` |
@@ -834,7 +834,7 @@ program with vm.wait_for (process_started or text_visible)"` in place of
 - On Windows the program runs with the agent's elevated token; on Linux as
   the user of the guest's desktop session, in that session's environment
   (`WAYLAND_DISPLAY` or `DISPLAY`, `XDG_RUNTIME_DIR`, the session bus),
-  see [the agent protocol](agent-protocol.md#the-desktop-session-linux). Its
+  in a session of its own and, through `systemd-run --user --scope`, in the user's service manager, so a restart of the guest tools does not end it; see [the agent protocol](agent-protocol.md#the-desktop-session-linux). Its
   standard input and output are the null device.
 - While the VM has an HTTP capture, the program's environment also holds the
   capture's proxy variables (see [Starting a capture](#starting-a-capture)); the program of
