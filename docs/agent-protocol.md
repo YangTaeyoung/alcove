@@ -526,8 +526,7 @@ starts with an environment the agent builds when the request arrives:
   variable, such as `%USERPROFILE%`, `%TEMP%` or a `REG_EXPAND_SZ` value, is
   left out. `Path` keeps, in order, the folders that expand that way and
   start with a drive, the folders `app.launch` searches. `PROMPT` is
-  `$P$G`, the prompt of a logon environment, unless a machine value
-  `PROMPT` is kept this way.
+  not set; a machine value `PROMPT` passes like the other machine values.
 - Values the account cannot change as variables, which replace a machine
   value of the same name: `USERNAME` and `USERDOMAIN` of the account of the
   agent's token, `COMPUTERNAME` (`GetComputerNameW`); `USERPROFILE`,
