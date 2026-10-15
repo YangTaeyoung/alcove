@@ -603,9 +603,17 @@ the same way:
   `windir`, `SystemDrive`, `ComSpec`, `PATH` of the System32 folder, the
   Windows folder, `Wbem` and Windows PowerShell's folder, and that
   `PSModulePath`.
-- A `powershell.exe` started through `argv`, through `shell: "cmd"` or by the
-  command itself gets none of this from the agent beyond the environment it
-  inherits.
+- A `powershell.exe` that a `shell: "powershell"` command starts itself
+  inherits that command's environment: the Process-scope execution policy
+  `Restricted` (`-ExecutionPolicy` sets it through
+  `PSExecutionPolicyPreference`, which applies to the session and its child
+  sessions) and the `PSModulePath` of Windows PowerShell's own module folder.
+  It gets neither `-NoProfile` nor the reset of `PSModulePath` as its first
+  statement; pass `-NoProfile` to it when its profile must not run.
+- A `powershell.exe` started through `argv` or through `shell: "cmd"` gets
+  the [environment of a command](#environment-of-a-command-on-windows), with
+  the machine's `PSModulePath`, and none of the above: no `-NoProfile`, no
+  Process-scope policy and no reset of `PSModulePath`.
 
 ### Jobs (`exec.start`, `exec.read`, `exec.write`, `exec.kill`, `exec.list`)
 
