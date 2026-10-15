@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import os from "node:os";
@@ -123,48 +123,41 @@ test("a call without an answer in time fails with a sentence that says the serve
 type Held = { request: Request; socket: net.Socket };
 const answerHeld = (h: Held, fields: Record<string, unknown>) => h.socket.write(JSON.stringify({ id: h.request.id, ...fields }) + "\n");
 
-test("a serial call's timeout counts from the answer of the serial call before it", async () => {
+/** A server that holds back every request; it is closed after the test `t`, also when the test runs out of time. */
+async function holdingServer(t: TestContext) {
   const held: Held[] = [];
   const s = await serve((request, socket) => { held.push({ request, socket }); return null; });
-  try {
-    const first = s.client.call("vm.wait_for", {}, 10000);
-    const second = s.client.call("vm.status", {}, 300);
-    await until(() => held.length === 2);
-    await new Promise((r) => setTimeout(r, 600));
-    answerHeld(held[0], { ok: true, op: "vm.wait_for" });
-    answerHeld(held[1], { ok: true, op: "vm.status" });
-    assert.deepEqual([(await first).op, (await second).op], ["vm.wait_for", "vm.status"]);
-  } finally {
-    await s.close();
-  }
+  t.after(() => s.close());
+  return { held, client: s.client };
+}
+
+test("a serial call's timeout counts from the answer of the serial call before it", { timeout: 5000 }, async (t) => {
+  const { held, client } = await holdingServer(t);
+  const first = client.call("vm.wait_for", {}, 10000);
+  const second = client.call("vm.status", {}, 300);
+  await until(() => held.length === 2);
+  await new Promise((r) => setTimeout(r, 600));
+  answerHeld(held[0], { ok: true, op: "vm.wait_for" });
+  answerHeld(held[1], { ok: true, op: "vm.status" });
+  assert.deepEqual([(await first).op, (await second).op], ["vm.wait_for", "vm.status"]);
 });
 
-test("a serial call's timeout counts from the timeout of the serial call before it", async () => {
-  const held: Held[] = [];
-  const s = await serve((request, socket) => { held.push({ request, socket }); return null; });
-  try {
-    const first = s.client.call("vm.wait_for", {}, 50);
-    const second = s.client.call("vm.status", {}, 300);
-    await assert.rejects(first, (e: Error) => e instanceof ControlError && /^vm\.wait_for timed out/.test(e.message));
-    await assert.rejects(second, (e: Error) => e instanceof ControlError && e.message.startsWith("vm.status timed out after 0.3 s"));
-    assert.equal(held.length, 2);
-  } finally {
-    await s.close();
-  }
+test("a serial call's timeout counts from the timeout of the serial call before it", { timeout: 5000 }, async (t) => {
+  const { held, client } = await holdingServer(t);
+  const first = client.call("vm.wait_for", {}, 50);
+  const second = client.call("vm.status", {}, 300);
+  await assert.rejects(first, (e: Error) => e instanceof ControlError && /^vm\.wait_for timed out/.test(e.message));
+  await assert.rejects(second, (e: Error) => e instanceof ControlError && e.message.startsWith("vm.status timed out after 0.3 s"));
+  assert.equal(held.length, 2);
 });
 
-test("a concurrent call's timeout counts from its send", async () => {
-  const held: Held[] = [];
-  const s = await serve((request, socket) => { held.push({ request, socket }); return null; });
-  try {
-    const serial = s.client.call("vm.wait_for", {}, 10000);
-    await assert.rejects(s.client.call("vm.exec", {}, 50), (e: Error) =>
-      e instanceof ControlError && e.message.startsWith("vm.exec timed out after 0.05 s"));
-    answerHeld(held[0], { ok: true });
-    await serial;
-  } finally {
-    await s.close();
-  }
+test("a concurrent call's timeout counts from its send", { timeout: 5000 }, async (t) => {
+  const { held, client } = await holdingServer(t);
+  const serial = client.call("vm.wait_for", {}, 10000);
+  await assert.rejects(client.call("vm.exec", {}, 50), (e: Error) =>
+    e instanceof ControlError && e.message.startsWith("vm.exec timed out after 0.05 s"));
+  answerHeld(held[0], { ok: true });
+  await serial;
 });
 
 test("the concurrent ops of the client are the ones ControlHandler.isConcurrent names", () => {
