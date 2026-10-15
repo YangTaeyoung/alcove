@@ -153,11 +153,10 @@ an installed guest:
 |---|---|
 | `scripts/test/boot-ubuntu.sh` | `images/noble-server-cloudimg-arm64.img`; boots it headless and waits for the serial login prompt |
 | `python3 scripts/test/install-windows.py --fresh` | the Windows 11 ARM64 ISO and `virtio-win.iso`; unattended install. Without `--fresh` it boots and re-checks the installed disk |
-| `python3 scripts/test/agent-windows.py` | the `Windows 11` bundle with forwards `2222->22` and `7646->7645`, the harness SSH key, and `build/alcove-agent-windows-arm64.exe` |
 | `python3 scripts/test/agent-linux.py` | the Ubuntu bundle with forwards `2223->22` and `7647->7645`, and `build/alcove-agent-linux-arm64` |
 | `python3 scripts/test/mcp-smoke.py --list-only` | `mcp/dist/` — run `cd mcp && npm install && npm run build` first. `--vm "Windows 11"` drives a real guest end to end |
 | `python3 scripts/test/install-agent.py` | a running `Windows 11` guest with ssh on `2222`, the harness SSH key and `build/alcove-agent-windows-arm64.exe`; installs the agent with `--allow-exec` and checks hello |
-| `python3 scripts/test/agent-rpc-windows.py` | a running guest with the agent installed with `--allow-exec`; the agent operations on the forwarded port `7646` |
+| `python3 scripts/test/agent-rpc-windows.py` | a running guest with the agent installed with `--allow-exec`; the agent operations, the guest clipboard and a file push on the forwarded port `7646` |
 | `python3 scripts/test/uia-helper-check.py` | the same guest, `build/alcove-fixture-windows-arm64.exe`, and neither Notepad nor the fixture running |
 | `python3 scripts/test/at1-e2e.py` … `at7-e2e.py` | the same guest with the agent installed with `--allow-exec`, a control server built from the tree, and `npm run build` in `mcp/`; each script header names what else it needs (at2 a headless `alcovectl serve`; at4 to at7 the fixture build) and each refuses to start when the guest holds leftovers of an earlier run |
 | `python3 scripts/test/ctl.py <op> key=value …` | not a test — a one-shot client for the control socket, handy while debugging |

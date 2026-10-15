@@ -6,9 +6,11 @@ authenticates with the agentKey of the VM's config.json (--vm), sends
 welcome, then req/res with ids. Needs the agent installed with
 --allow-exec (scripts/test/install-agent.py). Each check prints
 `PASS <n> <title>`; the first failing check prints `FAIL <n>: <reason>` and the
-script exits 1. Files go under C:\\alcove-e2e\\rpc. However the run ends, a
-second connection kills the jobs the script started, which include the
-Character Map windows it opened, and deletes that directory. The run refuses to
+script exits 1. Files go under C:\\alcove-e2e\\rpc, and one file pushed with
+the v1 file messages goes to the Desktop of the guest user. A check puts text
+on the guest clipboard. However the run ends, a second connection kills the
+jobs the script started, which include the Character Map windows it opened,
+and deletes that directory and the pushed file. The run refuses to
 start when C:\\alcove-e2e exists. SIGTERM, SIGHUP and SIGINT print
 `interrupted; cleaning up...`, run the same cleanup and exit with 128 plus the
 signal's number (143, 129, 130); SIGHUP stays ignored when the script was
@@ -133,6 +135,7 @@ class Run:
         self.user = ""
         self.jobs = []
         self.markers = []
+        self.pushed = []
 
     def start(self, **params):
         r = self.a.call("exec.start", **params)
@@ -163,7 +166,7 @@ class Run:
     def cleanup(self, port):
         """On a new connection: kills the started jobs and the PowerShell
         processes whose command line holds a registered marker, then deletes
-        BASE and its parent when that is empty."""
+        the pushed files, BASE and its parent when that is empty."""
         previous = ignore_stop_signals()
         try:
             self.cleanup_steps(port)
@@ -185,6 +188,7 @@ class Run:
                         steps.append(("proc.kill", {"pid": p["pid"], "tree": True}))
             except (Failure, OSError, ValueError, KeyError, TypeError):
                 pass
+        steps += [("fs.delete", {"path": path}) for path in self.pushed]
         steps += [("fs.delete", {"path": BASE, "recursive": True}), ("fs.delete", {"path": ntpath.dirname(BASE)})]
         for op, params in steps:
             try:
@@ -509,6 +513,40 @@ def _(a, run):
     a.send({"t": "exec", "cmd": f"'{marker}' | Out-Null; {read_line}"})
     r = a.v1("exec.result", 10)
     expect(lines(r.get("out", "")) == ["null=True"] and r.get("code") == 0, f"v1 exec ReadLine returned code {r.get('code')!r}, out {r.get('out')!r}")
+
+
+@check("v1 clipboard.changed carries text a guest program put on the clipboard")
+def _(a, run):
+    time.sleep(2.5)
+    marker = f"rpc guest clipboard {int(time.time())}"
+    r = a.call("exec.run", cmd=f"Set-Clipboard -Value '{marker}'")
+    expect(r["code"] == 0, f"Set-Clipboard exited with {r['code']}: {r['stderr'].strip()}")
+    seen = a.pump(lambda: any(m.get("t") == "clipboard.changed" and m.get("text") == marker for m in a.other), 15)
+    texts = [m.get("text") for m in a.other if m.get("t") == "clipboard.changed"]
+    expect(seen, f"no clipboard.changed with {marker!r} within 15 s; clipboard.changed carried {texts!r}")
+    a.other = [m for m in a.other if m.get("t") != "clipboard.changed"]
+
+
+@check("a v1 file push writes the file to the Desktop of the guest user with the sent bytes")
+def _(a, run):
+    payload = os.urandom(300_000)
+    digest = hashlib.sha256(payload).hexdigest()
+    name = f"alcove-e2e-rpc-{int(time.time())}.bin"
+    a.send({"t": "file.begin", "id": "f1", "name": name, "size": len(payload), "dest": "desktop"})
+    for i in range(0, len(payload), 200_000):
+        a.send({"t": "file.chunk", "id": "f1", "data": base64.b64encode(payload[i:i + 200_000]).decode()})
+    a.send({"t": "file.end", "id": "f1", "sha256": digest})
+    done = a.v1("file.done", 30)
+    path = done.get("path") or ""
+    if path:
+        run.pushed.append(path)
+    expect(done.get("id") == "f1" and not done.get("error") and ntpath.dirname(path).lower() == ntpath.join(run.home, "Desktop").lower(),
+           f"file.done answered {done!r}; the Desktop of the guest user is {ntpath.join(run.home, 'Desktop')}")
+    r = a.call("fs.stat", path=path, sha256=True)
+    expect(r["size"] == len(payload) and r["sha256"] == digest, f"fs.stat of the pushed file answered {r!r}; {len(payload)} bytes with SHA-256 {digest} were sent")
+    a.call("fs.delete", path=path)
+    run.pushed.remove(path)
+    return path
 
 
 def main():

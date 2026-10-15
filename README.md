@@ -217,10 +217,10 @@ python3 scripts/test/display-backend.py   # boots EDK2 only and drives the displ
 python3 scripts/test/mcp-smoke.py --list-only
 ```
 
-With a Windows guest available, `scripts/test/agent-windows.py` and
-`scripts/test/mcp-smoke.py --vm "Windows 11"` exercise the whole chain against
-a real desktop: clipboard round trip, file push with a checksum, typing into
-Notepad and reading it back.
+With a Windows guest available, `scripts/test/agent-rpc-windows.py` (after
+`scripts/test/install-agent.py`) and `scripts/test/mcp-smoke.py --vm "Windows 11"`
+exercise the whole chain against a real desktop: clipboard round trip, file
+push with a checksum, typing into Notepad and reading it back.
 
 The shell, process and file operations have their own run against a running
 Windows guest:
