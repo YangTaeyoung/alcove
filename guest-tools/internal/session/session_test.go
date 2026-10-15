@@ -168,8 +168,8 @@ func TestEnvironmentCarriesTheLocale(t *testing.T) {
 	}
 }
 
-// systemdRun259 is systemd-run --version of Ubuntu 26.04.1, captured on the
-// guest; systemdRun249 has the same form with the version of Ubuntu 22.04.
+// systemdRun259 and systemdRun249 are systemd-run --version outputs: a version
+// line "systemd <n> (<package version>)" followed by a feature line.
 const (
 	systemdRun259 = "systemd 259 (259.5-0ubuntu3.4)\n+PAM +AUDIT +SELINUX +APPARMOR +IMA +IPE +SMACK +SECCOMP +GCRYPT -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +KMOD +LIBCRYPTSETUP +LIBCRYPTSETUP_PLUGINS +LIBFDISK +PCRE2 +PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD +BPF_FRAMEWORK +BTF -XKBCOMMON -UTMP +SYSVINIT +LIBARCHIVE\n"
 	systemdRun249 = "systemd 249 (249.11-0ubuntu3.12)\n+PAM +AUDIT +SELINUX\n"

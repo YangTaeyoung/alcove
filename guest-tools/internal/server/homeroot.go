@@ -150,6 +150,7 @@ func (h homeFS) Close() error { return h.root.Close() }
 
 // explain returns, for the error of an os.Root name that leaves the root, a
 // sentence that names the link with an absolute target on the way to name,
+// with relink advice only when that target lies inside the home,
 // or says that the path leads out of the home; other errors are returned as
 // they are.
 func (h homeFS) explain(name string, err error) error {
@@ -169,10 +170,17 @@ func (h homeFS) explain(name string, err error) error {
 		if fi.Mode()&fs.ModeSymlink == 0 {
 			continue
 		}
-		if target, rerr := h.root.Readlink(cur); rerr == nil && filepath.IsAbs(target) {
-			return fmt.Errorf("'%s' is a link with the absolute target '%s', and the agent follows only relative links inside the home folder of the desktop user; make it a relative link or pass the path it leads to",
-				filepath.Join(h.home, cur), target)
+		target, rerr := h.root.Readlink(cur)
+		if rerr != nil || !filepath.IsAbs(target) {
+			continue
 		}
+		link := filepath.Join(h.home, cur)
+		if _, inside := homeRelative(h.home, filepath.Clean(target)); !inside {
+			return fmt.Errorf("'%s' is a link with the absolute target '%s' outside the home folder of the desktop user, which the agent does not follow there; pass the path it leads to",
+				link, target)
+		}
+		return fmt.Errorf("'%s' is a link with the absolute target '%s', and the agent follows only relative links inside the home folder of the desktop user; make it a relative link or pass the path it leads to",
+			link, target)
 	}
 	return errors.New("the path leads out of the home folder of the desktop user through a link, which the agent does not follow there; pass the path the link leads to")
 }

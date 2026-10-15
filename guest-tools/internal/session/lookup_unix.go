@@ -5,6 +5,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"os/user"
@@ -70,25 +71,58 @@ func Lookup() (Session, error) {
 	return sess, nil
 }
 
-var (
-	versionMu sync.Mutex
-	// versions holds the systemd version of each systemd-run path asked for.
-	versions = map[string]int{}
-)
+// versionRetry is the time after a failed version read before the next one.
+const versionRetry = time.Minute
 
-// scopeVersion returns the systemd version runner reports, running it once
-// per path; 0 when it cannot be read.
-func scopeVersion(runner string) int {
-	versionMu.Lock()
-	defer versionMu.Unlock()
-	if v, ok := versions[runner]; ok {
+// versionCache keeps the systemd version of each systemd-run path: a version
+// read once is kept, a failed read is tried again after versionRetry, and the
+// first failure of a path is logged.
+type versionCache struct {
+	mu      sync.Mutex
+	read    func(runner string) (string, error)
+	now     func() time.Time
+	logf    func(format string, args ...any)
+	entries map[string]versionEntry
+}
+
+type versionEntry struct {
+	version  int
+	failedAt time.Time
+}
+
+// get returns the systemd version runner reports, or 0 while it cannot be
+// read.
+func (c *versionCache) get(runner string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = map[string]versionEntry{}
+	}
+	e, seen := c.entries[runner]
+	if seen && (e.version > 0 || c.now().Sub(e.failedAt) < versionRetry) {
+		return e.version
+	}
+	out, err := c.read(runner)
+	v := SystemdVersion(out)
+	if v > 0 {
+		c.entries[runner] = versionEntry{version: v}
 		return v
 	}
-	out, _ := run(runner, "--version")
-	v := SystemdVersion(out)
-	versions[runner] = v
-	return v
+	if !seen {
+		c.logf("%s --version gave no systemd version (%v); launched programs run in the agent's service until it does", runner, err)
+	}
+	c.entries[runner] = versionEntry{failedAt: c.now()}
+	return 0
 }
+
+var versions = &versionCache{
+	read: func(runner string) (string, error) { return run(runner, "--version") },
+	now:  time.Now,
+	logf: log.Printf,
+}
+
+// scopeVersion returns the systemd version runner reports, or 0.
+func scopeVersion(runner string) int { return versions.get(runner) }
 
 // systemLocale returns the locale variables of /etc/default/locale, else of
 // /etc/locale.conf, else of the agent's environment.

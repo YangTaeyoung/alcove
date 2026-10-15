@@ -33,6 +33,19 @@ func TestAnAbsoluteLinkInTheHomeIsRefusedAsSuch(t *testing.T) {
 	}
 }
 
+func TestAnAbsoluteLinkOutOfTheHomeIsRefusedWithoutRelinkAdvice(t *testing.T) {
+	home, outside := linkedHome(t)
+	symlink(t, outside, filepath.Join(home, "out"))
+	c := sessionClient(t, session.Session{User: "alcove", Home: home}, true)
+	res := c.call("fs.write", proto.Message{"path": "out/a.txt", "data": base64.StdEncoding.EncodeToString([]byte("a")), "truncate": true})
+	want := "cannot open '" + filepath.Join(home, "out", "a.txt") + "' for writing: '" + filepath.Join(home, "out") +
+		"' is a link with the absolute target '" + outside + "' outside the home folder of the desktop user, which the agent does not follow there; pass the path it leads to"
+	if res["ok"] != false || res["error"] != want {
+		t.Fatalf("fs.write %v\nwant %s", res["error"], want)
+	}
+	untouched(t, outside)
+}
+
 func TestAWriteThroughAHardLinkOfAnotherOwnerIsRefused(t *testing.T) {
 	home, outside := linkedHome(t)
 	secret := filepath.Join(outside, "shadow")

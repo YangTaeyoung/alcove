@@ -111,7 +111,10 @@ directory and groups come from the user database. A lookup is reused for
   relative to it. A link with a relative target that stays inside the home is
   followed. A link with an absolute target, even one inside the home, is not:
   the operation fails with
-  `'<link>' is a link with the absolute target '<target>', and the agent follows only relative links inside the home folder of the desktop user; make it a relative link or pass the path it leads to`.
+  `'<link>' is a link with the absolute target '<target>', and the agent follows only relative links inside the home folder of the desktop user; make it a relative link or pass the path it leads to`
+  for a target inside the home, and with
+  `'<link>' is a link with the absolute target '<target>' outside the home folder of the desktop user, which the agent does not follow there; pass the path it leads to`
+  for one outside it.
   A path that leads out of the home through a relative link (`~/Downloads` →
   `../../etc`) fails with
   `the path leads out of the home folder of the desktop user through a link, which the agent does not follow there; pass the path the link leads to`.
@@ -138,7 +141,7 @@ directory and groups come from the user database. A lookup is reused for
   `/etc/default/locale` (else `/etc/locale.conf`, else the agent's own). `env`
   of `app.launch` is added to that environment.
 - When the runtime folder holds `bus` and `systemd-run` exists and reports
-  systemd 254 or later (`systemd-run --version`, read once per agent), and the
+  systemd 254 or later (`systemd-run --version`, kept once read; a failed read is logged once and tried again after a minute), and the
   program is an executable file (a relative path is looked up in the
   launch's working directory), `app.launch`
   and the clipboard writer (`wl-copy`, `xclip -i`, which keep running to hold
