@@ -96,7 +96,8 @@ final class ObservationTests: XCTestCase {
         XCTAssertFalse(o.settled)
         XCTAssertNotNil(o.changed)
         XCTAssertGreaterThanOrEqual(ms, 300)
-        XCTAssertLessThan(ms, 300 + 500)
+        let calls = await t.frameCalls
+        XCTAssertLessThan(calls, frames.count, "the observation sampled until the changing frames ran out")
         XCTAssertEqual(o.json()["settled"]?.boolValue, false)
     }
 

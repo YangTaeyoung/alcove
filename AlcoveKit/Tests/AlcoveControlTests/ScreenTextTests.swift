@@ -47,6 +47,17 @@ private func assertNear(_ rect: Frame.Rect, _ expected: Frame.Rect, tolerance: I
     XCTAssertLessThanOrEqual(abs(rect.h - expected.h), tolerance, "h \(rect) vs \(expected) \(message)", file: file, line: line)
 }
 
+/// `ScreenText.recognize` of `frame` with `languages`; a `recognitionFailed` is tried once more after 150 ms, as
+/// `vm.find_text` does.
+func recognizedLines(_ frame: Frame, languages: [String]) throws -> [TextMatch] {
+    do {
+        return try ScreenText.recognize(frame, languages: languages)
+    } catch ControlHandler.ControlError.recognitionFailed {
+        Thread.sleep(forTimeInterval: 0.15)
+        return try ScreenText.recognize(frame, languages: languages)
+    }
+}
+
 private func line(_ text: String, _ x: Int, _ y: Int, _ w: Int, _ h: Int, confidence: Double = 1) -> TextMatch {
     TextMatch(text: text, rect: Frame.Rect(x: x, y: y, w: w, h: h), confidence: confidence)
 }
@@ -62,7 +73,7 @@ final class ScreenTextTests: XCTestCase {
         var items: [(String, Int, Int)] = [("Send message", 100, 120)]
         if korean { items.append(("메시지 보내기", 100, 300)) }
         let drawn = drawText(items)
-        let lines = try ScreenText.recognize(drawn.frame, languages: korean ? ["ko-KR", "en-US"] : ["en-US"])
+        let lines = try recognizedLines(drawn.frame, languages: korean ? ["ko-KR", "en-US"] : ["en-US"])
 
         let english = try XCTUnwrap(lines.first { $0.text.lowercased().contains("send message") }, "\(lines)")
         assertNear(english.rect, drawn.rects[0], "english")
@@ -111,7 +122,7 @@ final class ScreenTextTests: XCTestCase {
 
     func testLinesComeTopToBottomThenLeftToRight() throws {
         let drawn = drawText([("Lower row", 100, 400), ("Upper right", 600, 100), ("Upper left", 100, 104)])
-        let lines = try ScreenText.recognize(drawn.frame, languages: ["en-US"])
+        let lines = try recognizedLines(drawn.frame, languages: ["en-US"])
         let order = lines.map { $0.text.lowercased() }
         XCTAssertEqual(order.count, 3, "\(order)")
         XCTAssertTrue(order[0].contains("upper left"), "\(order)")
@@ -394,7 +405,7 @@ final class ScreenTextTests: XCTestCase {
     func testAReadingWithoutLanguagesFinds28PixelLatinTextAndHangul() throws {
         guard try ScreenText.supportedLanguages.get().contains("ko-KR") else { throw XCTSkip("ko-KR is not a supported recognition language on this host") }
         let drawn = drawText([("Send message", 100, 120), ("메시지 보내기", 100, 300), ("저장 report.xlsx", 100, 480)])
-        let lines = try ScreenText.read(drawn.frame, languages: nil) { try ScreenText.recognize($0, languages: $1) }
+        let lines = try ScreenText.read(drawn.frame, languages: nil) { try recognizedLines($0, languages: $1) }
         XCTAssertEqual(lines.count, 3, "\(lines)")
         XCTAssertTrue(lines[0].text.lowercased().contains("send message"), "\(lines)")
         XCTAssertTrue(lines[1].text.replacingOccurrences(of: " ", with: "").contains("메시지보내기"), "\(lines)")
@@ -454,6 +465,31 @@ final class ScreenTextTests: XCTestCase {
             XCTAssertTrue(e.description.hasPrefix("language 'xx-XX' is not supported; supported: "), e.description)
         }
         XCTAssertLessThanOrEqual(calls.value, 1)
+    }
+
+    func testALanguageListThatCannotBeReadIsReportedWithASentence() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            return []
+        }
+        WaitTiming.supportedLanguages = {
+            throw NSError(domain: "Vision", code: 9, userInfo: [NSLocalizedDescriptionKey: "the language list is unavailable"])
+        }
+        addTeardownBlock {
+            WaitTiming.recognizer = { try ScreenText.recognize($0, languages: $1) }
+            WaitTiming.supportedLanguages = { try ScreenText.supportedLanguages.get() }
+        }
+        let (h, _) = textHandler(drawText([], width: 200, height: 100).frame)
+        for params: JSON in [["name": "Win", "languages": ["en-US"]], ["name": "Win"]] {
+            do {
+                _ = try await h.handle(op: "vm.find_text", params: params)
+                XCTFail("\(params) succeeded")
+            } catch let e as ControlHandler.ControlError {
+                XCTAssertEqual(e.description, "the text recognizer could not list its languages (the language list is unavailable); call vm.find_text again")
+            }
+        }
+        XCTAssertEqual(calls.value, 0)
     }
 
     func testFindTextNamesTheExpectedTypeOfLanguages() async throws {

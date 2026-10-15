@@ -1,6 +1,8 @@
 import XCTest
 @testable import AlcoveControl
 import AlcoveDisplayProtocol
+import CoreGraphics
+import ImageIO
 
 final class FrameTests: XCTestCase {
     /// A frame whose pixel (x, y) is B = x, G = y, R = x ^ y, A = 255.
@@ -33,6 +35,44 @@ final class FrameTests: XCTestCase {
         let f = gradient(37, 21)
         let back = try XCTUnwrap(Frame(png: f.encoded(.png)))
         XCTAssertEqual(back, f)
+    }
+
+    func testAPNGLargerThanTheMaximumDimensionIsRefused() throws {
+        let largest = Frame.maxDimension
+        XCTAssertNotNil(Frame(png: solid(largest, 1, 90).encoded(.png)))
+        XCTAssertNotNil(Frame(png: solid(1, largest, 90).encoded(.png)))
+        let wide = solid(largest + 1, 1, 90).encoded(.png), tall = solid(1, largest + 1, 90).encoded(.png)
+        XCTAssertFalse(wide.isEmpty)
+        XCTAssertFalse(tall.isEmpty)
+        XCTAssertNil(Frame(png: wide))
+        XCTAssertNil(Frame(png: tall))
+    }
+
+    /// The red, green, blue and alpha bytes of pixel (0, 0) of `data` decoded with ImageIO.
+    private func firstPixel(_ data: Data) throws -> [UInt8] {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        var rgba = [UInt8](repeating: 0, count: 4)
+        let drawn: Bool = rgba.withUnsafeMutableBytes { (buffer: UnsafeMutableRawBufferPointer) in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 1 - image.height, width: image.width, height: image.height))
+            return true
+        }
+        XCTAssertTrue(drawn)
+        return rgba
+    }
+
+    func testAPureRedFrameIsRedAfterEncoding() throws {
+        var bgra = Data(count: 8 * 8 * 4)
+        for i in stride(from: 0, to: bgra.count, by: 4) { bgra[i] = 0; bgra[i + 1] = 0; bgra[i + 2] = 255; bgra[i + 3] = 255 }
+        let red = Frame(width: 8, height: 8, pixels: bgra)
+        XCTAssertEqual(try firstPixel(red.encoded(.png)), [255, 0, 0, 255])
+        let jpeg = try firstPixel(red.encoded(.jpeg, quality: 1))
+        XCTAssertGreaterThan(jpeg[0], 230, "\(jpeg)")
+        XCTAssertLessThan(jpeg[1], 25, "\(jpeg)")
+        XCTAssertLessThan(jpeg[2], 25, "\(jpeg)")
     }
 
     func testCropClampsAndRefuses() {

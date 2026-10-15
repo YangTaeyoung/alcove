@@ -180,10 +180,10 @@ final class ControlServerTests: XCTestCase {
     func testTheWarmUpFrameHoldsTextForBothRecognizers() throws {
         let frame = ScreenText.warmUpFrame()
         XCTAssertEqual([frame.width, frame.height], [400, 64])
-        let latin = try ScreenText.recognize(frame, languages: ScreenText.latinLanguages)
+        let latin = try recognizedLines(frame, languages: ScreenText.latinLanguages)
         XCTAssertTrue(latin.contains { $0.text.contains("Alcove") }, "\(latin)")
         guard try ScreenText.supportedLanguages.get().contains("ko-KR") else { throw XCTSkip("ko-KR is not a supported recognition language on this host") }
-        let standard = try ScreenText.recognize(frame, languages: ScreenText.defaultLanguages)
+        let standard = try recognizedLines(frame, languages: ScreenText.defaultLanguages)
         XCTAssertTrue(standard.contains { $0.text.contains("한글") }, "\(standard)")
     }
 
@@ -211,45 +211,51 @@ final class ControlServerTests: XCTestCase {
         return (try? JSON.parse(Data(out))) ?? .null
     }
 
-    func testConcurrentOpDoesNotBlockSerialLane() async throws {
+    /// A fake agent that answers no `exec.run` request until the test sends the reply; the held requests by command.
+    private func holdingExecAgent() -> (FakeAgent, LockedBox<[String: JSON]>) {
+        let held = LockedBox<[String: JSON]>([:])
         let agent = FakeAgent()
-        agent.handler = { m, a in
-            guard m["op"]?.stringValue == "exec.run" else { return [] }
-            let reply = agentReply(m, ["code": 0, "stdout": "done", "stderr": ""])
-            DispatchQueue.global().asyncAfter(deadline: .now() + 1) { a.sendLine(reply) }
+        agent.handler = { m, _ in
+            guard m["op"]?.stringValue == "exec.run", let command = m["cmd"]?.stringValue else { return [] }
+            held.value[command] = m
             return []
         }
+        return (agent, held)
+    }
+
+    func testConcurrentOpDoesNotBlockSerialLane() async throws {
+        let (agent, held) = holdingExecAgent()
         let (handler, _) = try await handlerWithAgent(agent, in: self)
         let (_, path) = try startServer(handler)
         let fd = connectClient(path)
         defer { close(fd) }
 
         send("{\"id\":1,\"op\":\"vm.exec\",\"name\":\"Win\",\"command\":\"slow\"}\n{\"id\":2,\"op\":\"vm.status\",\"name\":\"Win\"}\n", on: fd)
-        let first = readReply(fd), second = readReply(fd)
+        guard await eventually("the guest gets the command", { held.value["slow"] != nil }) else { return }
+        let first = readReply(fd)
         XCTAssertEqual(first["id"]?.intValue, 2)
         XCTAssertEqual(first["state"]?.stringValue, "running")
+        agent.sendLine(agentReply(try XCTUnwrap(held.value["slow"]), ["code": 0, "stdout": "done", "stderr": ""]))
+        let second = readReply(fd)
         XCTAssertEqual(second["id"]?.intValue, 1)
         XCTAssertEqual(second["ok"]?.boolValue, true)
         XCTAssertEqual(second["output"]?.stringValue, "done")
     }
 
     func testConcurrentOpsAnswerInCompletionOrder() async throws {
-        let agent = FakeAgent()
-        agent.handler = { m, a in
-            guard m["op"]?.stringValue == "exec.run" else { return [] }
-            let reply = agentReply(m, ["code": 0, "stdout": m["cmd"] ?? .null, "stderr": ""])
-            let delay = m["cmd"]?.stringValue == "slow" ? 0.6 : 0.1
-            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { a.sendLine(reply) }
-            return []
-        }
+        let (agent, held) = holdingExecAgent()
         let (handler, _) = try await handlerWithAgent(agent, in: self)
         let (_, path) = try startServer(handler)
         let fd = connectClient(path)
         defer { close(fd) }
 
         send("{\"id\":1,\"op\":\"vm.exec\",\"name\":\"Win\",\"command\":\"slow\"}\n{\"id\":2,\"op\":\"vm.exec\",\"name\":\"Win\",\"command\":\"quick\"}\n", on: fd)
-        let first = readReply(fd), second = readReply(fd)
+        guard await eventually("the guest gets both commands", { held.value.count == 2 }) else { return }
+        agent.sendLine(agentReply(try XCTUnwrap(held.value["quick"]), ["code": 0, "stdout": "quick", "stderr": ""]))
+        let first = readReply(fd)
         XCTAssertEqual(first["id"]?.intValue, 2); XCTAssertEqual(first["output"]?.stringValue, "quick")
+        agent.sendLine(agentReply(try XCTUnwrap(held.value["slow"]), ["code": 0, "stdout": "slow", "stderr": ""]))
+        let second = readReply(fd)
         XCTAssertEqual(second["id"]?.intValue, 1); XCTAssertEqual(second["output"]?.stringValue, "slow")
     }
 

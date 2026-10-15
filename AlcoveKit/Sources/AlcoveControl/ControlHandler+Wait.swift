@@ -164,6 +164,10 @@ extension ControlHandler {
         } else if conditions.contains(where: \.needsAgent) {
             agent = try await tools(t)
         }
+        if let agent, let index = conditions.firstIndex(where: { $0.kind == .agent }),
+           let hello = await agent.hello, !hello.capabilities.contains("exec") {
+            throw ControlError.failed("condition \(index): guest tools in '\(t.name)' do not allow running commands, which \(conditions[index].typeName) needs; start alcove-agent with --allow-exec")
+        }
 
         var states: [WaitState] = []
         for (index, condition) in conditions.enumerated() {
@@ -276,6 +280,17 @@ extension ControlHandler {
             if clock.now >= deadline { break }
             try await Task.sleep(until: tickEnd, clock: clock)
         }
+        // After the last tick the agent and UI conditions are looked at; when none ended the wait, the text readings
+        // in flight get `recognitionGrace`, and every condition is looked at once more.
+        if !settled {
+            for (index, condition) in conditions.enumerated() where condition.text == nil {
+                guard let collected = await collect(condition, state: &states[index], until: clock.now) else { continue }
+                if try settle(collected, index) {
+                    settled = true
+                    break
+                }
+            }
+        }
         if !settled {
             var last = Tick()
             await collectTexts(&texts, into: &last, until: deadline + WaitTiming.recognitionGrace)
@@ -375,14 +390,22 @@ extension ControlHandler {
     /// One evaluation of a condition in the tick that began at `now`. A screen or event condition is read here and is
     /// due again one period after `now`. A text condition takes the reading of its recognition key (`textLines`) and
     /// is due again one period after the tick in which it began to wait for one. An agent or UI condition takes one
-    /// `step`.
+    /// `step`. `screen_idle` counts quiet time only between frames that were read: a frame that cannot be read starts
+    /// it again from the next frame that is read.
     private func evaluate(_ condition: WaitCondition, index: Int, state: inout WaitState, tick: inout Tick, texts: inout TextReadings,
                           vm t: VMTarget, now: ContinuousClock.Instant, agent: AgentClient?, clock: ContinuousClock,
                           tickEnd: ContinuousClock.Instant, deadline: ContinuousClock.Instant) async throws -> Verdict {
         if condition.kind == .screen || condition.kind == .event { state.nextDue = now + condition.period }
         switch condition {
         case .screenIdle(let seconds):
-            let frame = try await tickFrame(&tick, t)
+            let frame: Frame
+            do {
+                frame = try await tickFrame(&tick, t)
+            } catch {
+                state.previous = nil
+                state.quietSince = now
+                throw error
+            }
             let still = state.previous.map { FrameDiff.between($0, frame).fraction < ControlHandler.idleChangeFraction } ?? false
             state.previous = frame
             if !still { state.quietSince = now; return .pending }
@@ -511,7 +534,8 @@ extension ControlHandler {
     /// The reading is the one `tick` holds for the key, else the one in flight, which is not looked at here. Without
     /// either, the area of this tick's frame is cut out: when it has the pixels of the key's latest reading, that
     /// reading is taken and no recognition is asked for; otherwise, before `deadline`, a reading is started and
-    /// waited for until `tickEnd` at most. A cancelled task starts none and throws `CancellationError`.
+    /// waited for until `tickEnd` at most. A cancelled task starts none and throws `CancellationError`. A `region`
+    /// outside the frame ends the wait.
     private func textLines(_ text: WaitText, index: Int, tick: inout Tick, texts: inout TextReadings, vm t: VMTarget, clock: ContinuousClock,
                            tickEnd: ContinuousClock.Instant, deadline: ContinuousClock.Instant) async throws -> [FoundLine]? {
         let key = text.recognitionKey
@@ -519,7 +543,7 @@ extension ControlHandler {
             let frame = try await tickFrame(&tick, t)
             var area = frame.bounds
             if let region = text.region {
-                guard let clamped = frame.clamp(region) else { throw outside(index, frame) }
+                guard let clamped = frame.clamp(region) else { throw HardFailure(error: outside(index, frame)) }
                 area = clamped
             }
             let cropped = area == frame.bounds ? frame : frame.crop(area)

@@ -685,7 +685,7 @@ public actor ControlHandler {
         }
         let cropped = area == frame.bounds ? frame : frame.crop(area)
         let chosen = languages
-        try ScreenText.validate(languages: chosen ?? ScreenText.defaultLanguages + ScreenText.latinLanguages)
+        try ScreenText.validate(languages: chosen ?? ScreenText.defaultLanguages + ScreenText.latinLanguages, op: "vm.find_text")
         let turnBy = ContinuousClock.now + textTurnLimit
         let lines: [TextMatch]
         do {

@@ -37,9 +37,11 @@ struct AgentSilence {
     }
 
     /// The sentence for a wait that ends at `now`, or nil. `inFlight` is the evaluation that has not ended: the op
-    /// of its call without an answer so far and its start. The silence counts from the start of the first evaluation
-    /// in the row of unanswered ones that reaches up to `now`, and is reported from `WaitTiming.reportedSilence` on.
+    /// of its call without an answer so far (nil when it has none) and its start; while it has none, there is no
+    /// sentence. The silence counts from the start of the first evaluation in the row of unanswered ones that reaches
+    /// up to `now`, and is reported from `WaitTiming.reportedSilence` on.
     func sentence(inFlight: (openCall: String?, started: ContinuousClock.Instant)?, now: ContinuousClock.Instant) -> String? {
+        if let inFlight, inFlight.openCall == nil { return nil }
         guard let op = inFlight?.openCall ?? unanswered?.op, let since = unanswered?.since ?? inFlight?.started else { return nil }
         let silent = now - since
         guard silent >= WaitTiming.reportedSilence else { return nil }
@@ -207,7 +209,7 @@ enum WaitCondition: Sendable {
                 }
                 languages = items.compactMap(\.stringValue)
             }
-            do { try ScreenText.validate(languages: languages ?? ScreenText.defaultLanguages + ScreenText.latinLanguages) }
+            do { try ScreenText.validate(languages: languages ?? ScreenText.defaultLanguages + ScreenText.latinLanguages, op: "vm.wait_for") }
             catch { throw fail(ControlHandler.failureReason(error, fallback: "the recognition languages cannot be checked")) }
             return WaitText(query: query, expression: expression, region: try region(), languages: languages)
         }

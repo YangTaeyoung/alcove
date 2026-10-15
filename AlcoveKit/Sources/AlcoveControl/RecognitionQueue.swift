@@ -9,8 +9,9 @@ import Synchronization
 /// has lost every caller before its turn is not started; the running one ends and its result goes to the callers
 /// that still wait.
 ///
-/// The reading of a caller runs at user-initiated quality of service and the warm-up at utility. While the reading
-/// of a caller waits behind the warm-up, the thread of the warm-up has the priority of a caller's reading.
+/// The reading of a caller runs at user-initiated quality of service and the warm-up at utility. From the moment the
+/// reading of a caller comes to wait behind the running warm-up, the thread of the warm-up has the priority of a
+/// caller's reading until the warm-up ends.
 final class RecognitionQueue: Sendable {
     typealias Recognizer = @Sendable (Frame, [String]) throws -> [TextMatch]
     typealias Outcome = Result<[TextMatch], Error>

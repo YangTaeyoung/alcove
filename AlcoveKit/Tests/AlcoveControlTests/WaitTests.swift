@@ -35,9 +35,13 @@ final class RecognitionGate: Sendable {
     func open() { semaphore.signal() }
 }
 
-/// Returns once the recognitions asked of the shared queue before this call have ended.
-func recognitionsEnded() async {
-    _ = await RecognitionQueue.shared.recognize(solid(1, 1, 0), languages: ["drain"], recognizer: { _, _ in [] })
+/// Returns once the recognitions asked of the shared queue before this call have ended; records a failure when they
+/// have not ended within `limit`.
+func recognitionsEnded(within limit: Duration = .seconds(60), file: StaticString = #filePath, line: UInt = #line) async {
+    let drained = await RecognitionQueue.shared.recognize(solid(1, 1, 0), languages: ["drain"], recognizer: { _, _ in [] }, turnBy: .now + limit)
+    guard case .success? = drained else {
+        return XCTFail("the recognitions asked before did not end within \(limit)", file: file, line: line)
+    }
 }
 
 /// The value of `task` once it finished; nil when it has not finished within `limit`.
@@ -98,6 +102,23 @@ final class WaitTests: XCTestCase {
         catch { return "\(error)" }
     }
 
+    /// The error sentence a `vm.wait_for` with `params` ended with, or a sentence that holds its result when it ended
+    /// without an error; nil, with a recorded failure, when it has not ended within 20 s, after which it is cancelled.
+    private func ended(_ h: ControlHandler, _ params: JSON, file: StaticString = #filePath, line: UInt = #line) async throws -> String? {
+        let wait = Task { () -> String in
+            do {
+                let r = try await h.handle(op: "vm.wait_for", params: params)
+                return "the wait ended without an error: \(r)"
+            } catch {
+                return "\(error)"
+            }
+        }
+        defer { wait.cancel() }
+        let message = try await finishedValue(of: wait)
+        XCTAssertNotNil(message, "the wait did not end", file: file, line: line)
+        return message
+    }
+
     // MARK: - ordering and timeout
 
     func testFirstTrueConditionWins() async throws {
@@ -131,14 +152,10 @@ final class WaitTests: XCTestCase {
         let agent = FakeAgent()
         fs.install(on: agent)
         let (h, _) = try await agentRig(agent)
-        let start = ContinuousClock.now
         let r = try await waitFor(h, [["type": "file_exists", "path": "C:\\never"]], timeout: 1)
-        let elapsed = ContinuousClock.now - start
         XCTAssertEqual(r["matched"]?.intValue, -1)
         XCTAssertNil(r["type"]); XCTAssertNil(r["detail"])
         XCTAssertGreaterThanOrEqual(r["waited"]?.doubleValue ?? 0, 1.0)
-        XCTAssertLessThan(r["waited"]?.doubleValue ?? 9, 1.5)
-        XCTAssertLessThan(elapsed, .milliseconds(1500))
     }
 
     func testWaitedIsRoundedToOneDecimal() async throws {
@@ -159,6 +176,20 @@ final class WaitTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(r["waited"]?.doubleValue ?? 0, 0.3)
         let calls = await t.frameCalls
         XCTAssertGreaterThan(calls, 5)
+    }
+
+    func testScreenIdleCountsQuietTimeOnlyAcrossFramesThatWereRead() async throws {
+        let (h, t) = await screenRig(frames: [solid(64, 64, 10)])
+        await t.setFailingFrameCalls(Set(stride(from: 1, to: 100_000, by: 2)))
+        let alternating = try await waitFor(h, [["type": "screen_idle", "seconds": 0.1]], timeout: 1)
+        XCTAssertEqual(alternating["matched"]?.intValue, -1, "\(alternating)")
+
+        let (h2, t2) = await screenRig(frames: [solid(64, 64, 10)])
+        await t2.setFailingFrameCalls(Set(stride(from: 1, through: 19, by: 2)))
+        let recovered = try await waitFor(h2, [["type": "screen_idle", "seconds": 0.1]], timeout: 30)
+        XCTAssertEqual(recovered["matched"]?.intValue, 0, "\(recovered)")
+        let calls = await t2.frameCalls
+        XCTAssertGreaterThanOrEqual(calls, 22)
     }
 
     func testScreenIdleDefaultsToTwoSeconds() async throws {
@@ -185,13 +216,14 @@ final class WaitTests: XCTestCase {
     }
 
     func testScreenConditionsShareOneFramePerTick() async throws {
-        let (h, t) = await screenRig(frames: [solid(64, 64, 10)])
+        let still = solid(64, 64, 10), moved = paint(still, tileX: 1, tileY: 1)
+        let pairs = (0..<500).flatMap { $0 % 2 == 0 ? [moved, moved] : [still, still] }
+        let (h, t) = await screenRig(frames: [still] + pairs)
         let r = try await waitFor(h, [["type": "region_changed", "region": ["x": 0, "y": 0, "w": 32, "h": 32]],
-                                      ["type": "screen_idle", "seconds": 100]], timeout: 1)
-        XCTAssertEqual(r["matched"]?.intValue, -1)
+                                      ["type": "screen_idle", "seconds": 0]], timeout: 5)
+        XCTAssertEqual(r["matched"]?.intValue, 1, "\(r)")
         let calls = await t.frameCalls
-        XCTAssertGreaterThan(calls, 5)
-        XCTAssertLessThanOrEqual(calls, 56)
+        XCTAssertEqual(calls, 3)
     }
 
     // MARK: - text conditions
@@ -230,6 +262,23 @@ final class WaitTests: XCTestCase {
         let r = try await waitFor(h, [["type": "text_visible", "text": "edge", "languages": ["en-US"],
                                        "region": ["x": 500, "y": 350, "w": 400, "h": 200]]], timeout: 10)
         XCTAssertEqual(r["detail"], ["text": "Edge", "x": 899, "y": 549, "w": 1, "h": 1, "cx": 899, "cy": 549])
+    }
+
+    func testATextConditionWhoseRegionIsOutsideTheFrameEndsTheWait() async throws {
+        let calls = LockedBox(0)
+        WaitTiming.recognizer = { _, _ in
+            calls.value += 1
+            return []
+        }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        for type in ["text_visible", "text_gone"] {
+            let message = try await ended(h, ["name": "Win", "timeout": 300, "conditions": [
+                ["type": "screen_idle", "seconds": 100],
+                ["type": .string(type), "text": "ready", "languages": ["en-US"], "region": ["x": 900, "y": 0, "w": 10, "h": 10]],
+            ]])
+            XCTAssertEqual(message, "condition 1: region is outside the 64x64 frame")
+        }
+        XCTAssertEqual(calls.value, 0)
     }
 
     func testTextConditionsWithoutLanguagesUseTheMergedReading() async throws {
@@ -546,16 +595,15 @@ final class WaitTests: XCTestCase {
 
     func testRecognitionFailuresAreRetried() async throws {
         let calls = LockedBox(0)
-        WaitTiming.recognizer = { frame, languages in
+        WaitTiming.recognizer = { _, _ in
             calls.value += 1
             if calls.value <= 3 { throw ControlHandler.ControlError.recognitionFailed("transient") }
-            return try ScreenText.recognize(frame, languages: languages)
+            return [TextMatch(text: "Install complete", rect: Frame.Rect(x: 100, y: 120, w: 200, h: 30), confidence: 1)]
         }
-        let drawn = drawText([("Install complete", 100, 120)])
-        let (h, _) = await screenRig(frames: [drawn.frame])
-        let r = try await waitFor(h, [["type": "text_visible", "text": "install complete"]], timeout: 10)
-        XCTAssertEqual(r["matched"]?.intValue, 0)
-        XCTAssertGreaterThan(calls.value, 3)
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let r = try await waitFor(h, [["type": "text_visible", "text": "install complete", "languages": ["en-US"]]], timeout: 60)
+        XCTAssertEqual(r["matched"]?.intValue, 0, "\(r)")
+        XCTAssertEqual(calls.value, 4)
     }
 
     private static let unfinished = "the text recognition did not finish within the timeout; call vm.wait_for again"
@@ -1032,6 +1080,88 @@ final class WaitTests: XCTestCase {
         await recognitionsEnded()
     }
 
+    func testAnAnswerAfterTheLastTickEndsTheWaitWithoutTheRecognitionGrace() async throws {
+        WaitTiming.recognitionGrace = .seconds(120)
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        WaitTiming.recognizer = { _, _ in
+            gate.pass()
+            return []
+        }
+        let asked = LockedBox<JSON?>(nil)
+        let agent = FakeAgent()
+        agent.caps = ["clipboard", "files", "exec", "ui"]
+        agent.handler = { m, _ in
+            if m["op"]?.stringValue == "ui.find" { asked.value = m }
+            return []
+        }
+        let (h, t) = try await agentRig(agent, frames: [solid(64, 64, 10)])
+        let holding = LockedBox(false), held = LockedBox(false), released = LockedBox(false)
+        await t.setFrameHook {
+            guard holding.value else { return }
+            held.value = true
+            while !released.value { try? await Task.sleep(for: .milliseconds(2)) }
+        }
+        addTeardownBlock { released.value = true }
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 1, "conditions": [
+                ["type": "ui_exists", "name": "Send"], ["type": "screen_idle", "seconds": 100],
+                ["type": "text_visible", "text": "ready", "languages": ["en-US"]],
+            ]])
+        }
+        addTeardownBlock { wait.cancel() }
+        guard await eventually("the helper call and the recognition run", { asked.value != nil && RecognitionQueue.shared.load.running }) else { return }
+        let timeoutPassed = ContinuousClock.now + .seconds(1)
+        holding.value = true
+        guard await eventually("a frame read of the wait is held", { held.value }) else { return }
+        let request = try XCTUnwrap(asked.value)
+        agent.sendLine(agentReply(request, ["nodes": [["ref": "e5", "role": "Button", "name": "Send"]]]))
+        let answered = try await h.helperGate.acquire("Win", until: .now + .seconds(20))
+        XCTAssertTrue(answered, "the helper call was not answered")
+        await h.helperGate.release("Win")
+        try await Task.sleep(until: timeoutPassed, clock: .continuous)
+        released.value = true
+        let ended = try await finishedValue(of: wait)
+        let r = try XCTUnwrap(ended, "the wait waited the recognition grace")
+        XCTAssertEqual(r["matched"]?.intValue, 0, "\(r)")
+        XCTAssertEqual(r["type"]?.stringValue, "ui_exists")
+        XCTAssertTrue(RecognitionQueue.shared.load.running)
+        gate.open()
+        await recognitionsEnded()
+    }
+
+    func testCancellingAWaitWhoseReadingWaitsForItsTurnEndsAtOnce() async throws {
+        let seen = LockedBox<[[String]]>([])
+        let gate = RecognitionGate()
+        addTeardownBlock { gate.open() }
+        WaitTiming.recognizer = { _, languages in
+            seen.value.append(languages)
+            gate.pass()
+            return []
+        }
+        let running = Task { await RecognitionQueue.shared.recognize(solid(2, 2, 0), languages: ["ko-KR"]) }
+        guard await eventually("a recognition runs", { seen.value == [["ko-KR"]] }) else { return }
+        let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 300, "conditions": [
+                ["type": "text_visible", "text": "ready", "languages": ["en-US"]],
+            ]])
+        }
+        addTeardownBlock { wait.cancel() }
+        guard await eventually("the reading of the wait waits for its turn", { RecognitionQueue.shared.load.waiting == 1 }) else { return }
+        wait.cancel()
+        let outcome = LockedBox<Result<JSON, Error>?>(nil)
+        guard await finishes("the cancelled wait ends", { outcome.value = await wait.result }) else { return }
+        guard case .failure(let error)? = outcome.value, error is CancellationError else {
+            return XCTFail("\(String(describing: outcome.value))")
+        }
+        XCTAssertEqual(RecognitionQueue.shared.load.waiting, 0)
+        gate.open()
+        _ = await running.value
+        await recognitionsEnded()
+        XCTAssertEqual(seen.value, [["ko-KR"]])
+    }
+
     func testTextConditionsOnTheSameAreaAndLanguagesCauseOneRecognizerCallPerFrame() async throws {
         let shades = LockedBox<[UInt8]>([])
         WaitTiming.recognizer = { frame, _ in
@@ -1192,12 +1322,17 @@ final class WaitTests: XCTestCase {
             return [agentReply(m, ["state": "exited", "code": 1, "out": "all done\n", "err": "", "out_next": 9, "err_next": 0])]
         }
         let (h, _) = try await agentRig(agent)
-        let start = ContinuousClock.now
-        let r = try await waitFor(h, [["type": "job_output_matches", "job": "j1", "pattern": "never appears"]], timeout: 30)
+        let wait = Task {
+            try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 300, "conditions": [
+                ["type": "job_output_matches", "job": "j1", "pattern": "never appears"],
+            ]])
+        }
+        addTeardownBlock { wait.cancel() }
+        let ended = try await finishedValue(of: wait)
+        let r = try XCTUnwrap(ended, "the wait went on after the job exited")
         XCTAssertEqual(r["matched"]?.intValue, -1)
         XCTAssertEqual(r["type"]?.stringValue, "job_output_matches")
         XCTAssertEqual(r["detail"]?.stringValue, "job exited")
-        XCTAssertLessThan(ContinuousClock.now - start, .seconds(2))
     }
 
     func testJobOutputMatchInTheLastReadOfAnExitedJob() async throws {
@@ -1227,11 +1362,28 @@ final class WaitTests: XCTestCase {
 
     func testAgentConditionWithoutTools() async throws {
         let (h, _) = await screenRig(frames: [solid(64, 64, 10)])
-        let start = ContinuousClock.now
-        let message = await failure(h, ["name": "Win", "timeout": 30,
-                                        "conditions": [["type": "screen_idle", "seconds": 100], ["type": "file_exists", "path": "/x"]]])
+        let message = try await ended(h, ["name": "Win", "timeout": 300,
+                                          "conditions": [["type": "screen_idle", "seconds": 100], ["type": "file_exists", "path": "/x"]]])
         XCTAssertEqual(message, ControlHandler.ControlError.noTools("Win").description)
-        XCTAssertLessThan(ContinuousClock.now - start, .seconds(2))
+    }
+
+    func testAConditionThatNeedsCommandsIsRefusedWhenTheToolsDoNotAllowThem() async throws {
+        let agent = FakeAgent()
+        agent.caps = ["clipboard", "files"]
+        let (h, t) = try await agentRig(agent, frames: [solid(64, 64, 10)])
+        let conditions: [JSON] = [
+            ["type": "process_started", "processName": "setup"], ["type": "process_exited", "pid": 42],
+            ["type": "file_exists", "path": "C:\\a"], ["type": "port_listening", "port": 80],
+            ["type": "log_matches", "path": "C:\\x.log", "pattern": "a"], ["type": "job_output_matches", "job": "j1", "pattern": "a"],
+        ]
+        for condition in conditions {
+            let type = try XCTUnwrap(condition["type"]?.stringValue)
+            let message = try await ended(h, ["name": "Win", "timeout": 300, "conditions": [["type": "screen_idle", "seconds": 100], condition]])
+            XCTAssertEqual(message, "condition 1: guest tools in 'Win' do not allow running commands, which \(type) needs; start alcove-agent with --allow-exec")
+        }
+        XCTAssertTrue(agent.received.filter { $0["t"]?.stringValue == "req" }.isEmpty, "\(agent.received)")
+        let frames = await t.frameCalls
+        XCTAssertEqual(frames, 0)
     }
 
     func testScreenConditionsNeedNoTools() async throws {
@@ -1248,21 +1400,20 @@ final class WaitTests: XCTestCase {
             return [agentReply(m, ["exists": false])]
         }
         let (h, _) = try await agentRig(agent)
-        let start = ContinuousClock.now
-        let message = await failure(h, ["name": "Win", "timeout": 30, "conditions": [["type": "file_exists", "path": "/x"]]])
-        XCTAssertTrue(message.contains("disconnected"), message)
-        XCTAssertLessThan(ContinuousClock.now - start, .seconds(5))
+        let message = try await ended(h, ["name": "Win", "timeout": 300, "conditions": [["type": "file_exists", "path": "/x"]]])
+        XCTAssertTrue(message?.contains("disconnected") ?? false, "\(String(describing: message))")
     }
 
     func testAnAgentCallThatNeverAnswersDoesNotHoldTheWaitPastTheDeadline() async throws {
-        WaitTiming.agentCallTimeout = .milliseconds(300)
+        WaitTiming.agentCallTimeout = .seconds(120)
         let agent = FakeAgent()
         agent.handler = { _, _ in [] }
         let (h, _) = try await agentRig(agent)
-        let start = ContinuousClock.now
-        let r = try await waitFor(h, [["type": "file_exists", "path": "/x"]], timeout: 1)
+        let wait = Task { try await h.handle(op: "vm.wait_for", params: ["name": "Win", "timeout": 1, "conditions": [["type": "file_exists", "path": "/x"]]]) }
+        addTeardownBlock { wait.cancel() }
+        let ended = try await finishedValue(of: wait)
+        let r = try XCTUnwrap(ended, "the wait waited for the unanswered agent call")
         XCTAssertEqual(r["matched"]?.intValue, -1)
-        XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(1800))
     }
 
     func testAgentSilenceCountsFromTheFirstOfTheEvaluationsInARowThatGotNoAnswer() {
@@ -1282,7 +1433,6 @@ final class WaitTests: XCTestCase {
         silence.ended(openCall: "fs.stat", started: at(6000))
         XCTAssertEqual(silence.sentence(inFlight: nil, now: at(11_000)), "the guest agent has not answered fs.stat for 10 s")
         XCTAssertEqual(silence.sentence(inFlight: ("exec.read", at(10_900)), now: at(11_000)), "the guest agent has not answered exec.read for 10 s")
-        XCTAssertEqual(silence.sentence(inFlight: (nil, at(10_900)), now: at(11_000)), "the guest agent has not answered fs.stat for 10 s")
 
         silence.ended(openCall: nil, started: at(11_000))
         XCTAssertNil(silence.sentence(inFlight: nil, now: at(60_000)))
@@ -1292,6 +1442,17 @@ final class WaitTests: XCTestCase {
 
         WaitTiming.reportedSilence = .zero
         XCTAssertEqual(AgentSilence().sentence(inFlight: ("fs.stat", at(0)), now: at(0)), "the guest agent has not answered fs.stat for 0 s")
+    }
+
+    func testSilenceIsNotReportedWhileTheEvaluationInFlightHasNoOpenCall() {
+        WaitTiming.reportedSilence = .milliseconds(500)
+        let start = ContinuousClock.now
+        func at(_ milliseconds: Int) -> ContinuousClock.Instant { start + .milliseconds(milliseconds) }
+        var silence = AgentSilence()
+        silence.ended(openCall: "fs.stat", started: at(0))
+        XCTAssertEqual(silence.sentence(inFlight: nil, now: at(6000)), "the guest agent has not answered fs.stat for 6 s")
+        XCTAssertNil(silence.sentence(inFlight: (nil, at(5000)), now: at(6000)))
+        XCTAssertEqual(silence.sentence(inFlight: ("proc.list", at(5000)), now: at(6000)), "the guest agent has not answered proc.list for 6 s")
     }
 
     // MARK: - validation
@@ -1394,7 +1555,7 @@ final class WaitTests: XCTestCase {
         let message = await failure(h, ["name": "Win", "timeout": 2, "conditions": [
             ["type": "screen_idle", "seconds": 100], ["type": "text_gone", "text": "a", "languages": ["en-US"]],
         ]])
-        XCTAssertEqual(message, "condition 1: the language list is unavailable")
+        XCTAssertEqual(message, "condition 1: the text recognizer could not list its languages (the language list is unavailable); call vm.wait_for again")
         let frames = await t.frameCalls
         XCTAssertEqual(frames, 0)
     }

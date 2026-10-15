@@ -128,9 +128,16 @@ enum ScreenText {
         return try request.supportedRecognitionLanguages()
     }
 
-    /// Throws when Vision does not support one of `languages`.
-    static func validate(languages: [String]) throws {
-        let supported = try WaitTiming.supportedLanguages()
+    /// Throws when Vision does not support one of `languages`, or when its languages cannot be listed; that sentence
+    /// names calling `op` again as the next step.
+    static func validate(languages: [String], op: String) throws {
+        let supported: [String]
+        do {
+            supported = try WaitTiming.supportedLanguages()
+        } catch {
+            let reason = ControlHandler.failureReason(error, fallback: "Vision gave no reason")
+            throw ControlHandler.ControlError.failed("the text recognizer could not list its languages (\(reason)); call \(op) again")
+        }
         for language in languages where !supported.contains(language) {
             throw ControlHandler.ControlError.failed("language '\(language)' is not supported; supported: \(supported.joined(separator: ", "))")
         }
@@ -141,7 +148,7 @@ enum ScreenText {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
-        try validate(languages: languages)
+        try validate(languages: languages, op: "vm.find_text or vm.wait_for")
         request.recognitionLanguages = languages
 
         guard var image = frame.cgImage() else { throw ControlHandler.ControlError.failed("the frame cannot be read for text recognition") }

@@ -386,7 +386,7 @@ batch whose steps all ran leaves them as its steps left them.
   no rectangle spans two lines. In a line that mixes both scripts the Latin
   letters are the Korean recognizer's reading. A symbol outside ASCII can come
   back as a similar ASCII character: in a line without Hangul, `✓ Done` was
-  read as `v Done` and `±0.5 µm` as `+0.5 um` (system font at 15 and 20
+  read as `v Done` and `±0.5 µm` as `+0.5 um` (system font at 14.67 and 20
   pixels).
 - With `languages` the area is recognized once with exactly that list. Pass
   `["en-US"]` when the screen has no Hangul you need: it is one recognition
@@ -423,11 +423,15 @@ batch whose steps all ran leaves them as its steps left them.
   background, which loads them; a recognizer that fails to read the image does
   not keep the other from being loaded. Loading takes a fraction of a second,
   and tens of seconds the first time a server binary runs from a path where it
-  has not read text before. It runs at utility priority, and at the priority
-  of a request for as long as a request waits behind it. A `vm.find_text` that
+  has not read text before. It runs at utility priority; from the moment a
+  request comes to wait behind it, it runs at the priority of a request until
+  it ends. A `vm.find_text` that
   arrives meanwhile waits behind it; a text condition of `vm.wait_for` waits
   behind it too, and is listed in `problems` when the loading outlasts its
   timeout (see [Waiting for conditions](#waiting-for-conditions)).
+- When Vision cannot list its languages, the op answers `the text recognizer
+  could not list its languages (<reason>); call vm.find_text again` before
+  any recognition.
 - When the Vision request itself fails (`text recognition failed: <reason>`),
   the op waits 150 ms and tries once more on the same frame; a second failure
   answers `text recognition failed twice; call vm.find_text again or use
@@ -499,11 +503,16 @@ reply`.
 
 `languages` of `text_visible` and `text_gone` is as for `vm.find_text`; an
 unsupported language is refused before the wait starts
-(`condition <i>: language '<l>' is not supported; supported: ...`).
+(`condition <i>: language '<l>' is not supported; supported: ...`), and so is
+a wait for text while Vision cannot list its languages (`condition <i>: the
+text recognizer could not list its languages (<reason>); call vm.wait_for
+again`).
 
 `process_exited` with a `pid` that does not exist holds at once, because the
 condition is "no such process". `screen_idle` compares each sample with the
-previous sample, not with the frame at the start. The conditions that read the
+previous sample, not with the frame at the start, and counts quiet time only
+between samples that were read: a frame that cannot be read starts the quiet
+time again from the next frame that is read. The conditions that read the
 screen take the screen at the start of the wait as their reference
 (`region_changed`) or first sample (`screen_idle`).
 
@@ -517,11 +526,18 @@ conditions are judged on every tick meanwhile. Text conditions with the same
 `region` and `languages` share one recognition, and no new one is asked for
 while it runs. While the pixels of a text condition's area do not change, the
 area is not recognized again: the lines of its last recognition are used. A
+text condition is judged on the frame the wait read when it asked for the
+recognition; while recognitions wait for their turn, that frame can be
+seconds older than the moment the condition is judged. A
 condition that needs guest tools
 (`process_*`, `file_exists`, `port_listening`, `log_matches`,
 `job_output_matches`) answers `guest tools are not connected in '<vm>'; ...`
-when they are not connected after a wait of up to 25 s. If several conditions hold on the same tick, the
-one with the lowest index wins.
+when they are not connected after a wait of up to 25 s. These conditions run
+guest commands, which the guest tools allow only when `alcove-agent` was
+started with `--allow-exec`: without it the wait is refused before it starts
+with `condition <i>: guest tools in '<vm>' do not allow running commands,
+which <type> needs; start alcove-agent with --allow-exec`. If several
+conditions hold on the same tick, the one with the lowest index wins.
 
 The result is `{matched, waited, type?, detail?, problems?, observation?}`:
 
@@ -530,7 +546,9 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   as in the table. Running out of time is a success with `matched: -1`.
   `waited` can exceed `timeout` by up to one second plus one tick: at the
   timeout the wait gives the text recognitions that have not finished one
-  second, all of them together, whatever their number. Without a text
+  second, all of them together, whatever their number. An answer to a guest
+  tools or UI condition that arrived by the end of the last tick is judged
+  before that second and ends the wait without it. Without a text
   condition the bound is `timeout` plus one tick: an element condition that
   never held returned after 3.0 s with `timeout: 3`.
 - `job exited`: when a `job_output_matches` condition sees the job exited and
@@ -541,7 +559,9 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   out) does not end the wait: the condition is tried again at its next period.
   `problems` appears only when `matched` is `-1` and lists
   `{condition, type, error, failures}` for each condition whose latest
-  evaluations failed, `failures` being the number in a row. A text recognition
+  evaluations failed, `failures` being the number in a row; such a condition
+  is listed this way also when a recognition or guest call of it is still
+  unanswered. A text recognition
   that has not finished one second after the timeout is given up: the wait
   ends, leaves the line of recognitions, and each condition that waited for it
   is listed, without `failures`, with `the text recognition did not finish
@@ -565,7 +585,9 @@ The result is `{matched, waited, type?, detail?, problems?, observation?}`:
   s`. Errors that make the
   condition meaningless end the wait with an error instead: a guest-tools
   connection that is lost or too old, a `region` outside the frame
-  (`condition <i>: region is outside the <W>x<H> frame`), an unknown job, a
+  (`condition <i>: region is outside the <W>x<H> frame`; for `region_changed`
+  at the start of the wait, for a text condition in the first tick that reads
+  such a frame), an unknown job, a
   `port_listening` on a guest OS that is not supported, and a screen that
   cannot be read when the wait begins (`the screen could not be read when
   vm.wait_for began: <reason>; call vm.screenshot to check the display, then
