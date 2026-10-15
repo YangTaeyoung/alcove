@@ -13,14 +13,17 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/clipboard"
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/session"
 )
 
 const AgentVersion = "0.2.1"
@@ -30,8 +33,14 @@ type Options struct {
 	Token     string
 	AllowExec bool
 	Clipboard clipboard.Clipboard
-	// HomeDir overrides the user profile directory used for file drops.
+	// HomeDir is the home directory of home-relative paths, file drops and
+	// the default working directory; empty means the home directory of the
+	// desktop session, or the agent's own without a session.
 	HomeDir string
+	// Session returns the desktop session whose user runs app.launch and the
+	// clipboard tools; nil means the platform default (loginctl outside
+	// Windows, none on Windows).
+	Session func() (session.Session, bool)
 	// Shutdown runs an OS shutdown; nil uses the platform default.
 	Shutdown func() error
 	Logger   *log.Logger
@@ -99,19 +108,23 @@ type Server struct {
 
 	// refusals writes the refused connections to the log.
 	refusals refusalLog
+
+	// ownHome is the agent's own home directory, used without HomeDir and
+	// without a session.
+	ownHome string
 }
 
 func New(opt Options) *Server {
 	if opt.Logger == nil {
 		opt.Logger = log.Default()
 	}
+	if opt.Session == nil {
+		opt.Session = defaultSessionSource()
+	}
 	if opt.Clipboard == nil {
-		opt.Clipboard = clipboard.New()
+		opt.Clipboard = newClipboard(opt.Session)
 	}
-	if opt.HomeDir == "" {
-		opt.HomeDir, _ = os.UserHomeDir()
-	}
-	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable()}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable(), ownHome: agentHome()}
 	s.registerBuiltins()
 	return s
 }
@@ -134,8 +147,47 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 }
 
+// session returns the desktop session, when there is one.
+func (s *Server) session() (session.Session, bool) {
+	if s.opt.Session == nil {
+		return session.Session{}, false
+	}
+	return s.opt.Session()
+}
+
+// homeDir returns Options.HomeDir, else the home directory of the desktop
+// session, else the agent's own home directory.
+func (s *Server) homeDir() string {
+	if s.opt.HomeDir != "" {
+		return s.opt.HomeDir
+	}
+	if sess, ok := s.session(); ok && sess.Home != "" {
+		return sess.Home
+	}
+	return s.ownHome
+}
+
+// agentHome returns the home directory of the agent's user: $HOME, else the
+// one in the user database.
+func agentHome() string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h
+	}
+	if u, err := user.Current(); err == nil {
+		return u.HomeDir
+	}
+	return ""
+}
+
+// capsCheckInterval is the time between two checks of the capabilities of
+// an open connection.
+var capsCheckInterval = 3 * time.Second
+
 func (s *Server) caps() []string {
-	caps := []string{"files", "shutdown", "resolution"}
+	caps := []string{"files", "shutdown"}
+	if resolutionSupported {
+		caps = append(caps, "resolution")
+	}
 	if s.opt.Clipboard.Available() {
 		caps = append(caps, "clipboard")
 	}
@@ -213,7 +265,8 @@ func (s *Server) handle(c net.Conn) {
 	}
 	limit := &lineLimit{r: c, max: preAuthLineMax}
 	r := proto.NewReader(limit)
-	if !s.handshake(c, r, limit) {
+	sentCaps := s.caps()
+	if !s.handshakeWith(c, r, limit, sentCaps) {
 		return
 	}
 	lg.Printf("connection from %s", c.RemoteAddr())
@@ -229,9 +282,8 @@ func (s *Server) handle(c net.Conn) {
 
 	quit := make(chan struct{})
 	defer close(quit)
-	if s.opt.Clipboard.Available() {
-		go s.watchClipboard(send, quit)
-	}
+	go s.watchClipboard(send, quit)
+	go s.watchCaps(send, quit, sentCaps)
 	go func() { // keepalive
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
@@ -290,22 +342,28 @@ func (s *Server) handle(c net.Conn) {
 			}
 		case "file.begin":
 			id := m.String("id")
-			dir := filepath.Join(s.opt.HomeDir, "Desktop")
+			home := s.homeDir()
+			dir := filepath.Join(home, "Desktop")
 			if m.String("dest") == "downloads" {
-				dir = filepath.Join(s.opt.HomeDir, "Downloads")
+				dir = filepath.Join(home, "Downloads")
 			}
 			name := filepath.Base(m.String("name"))
 			if name == "." || name == "" || name == ".." {
 				send(proto.Message{"t": "file.done", "id": id, "error": "bad name"})
 				continue
 			}
-			_ = os.MkdirAll(dir, 0o755)
+			owner := s.dropOwner()
+			if _, err := os.Lstat(dir); err != nil {
+				_ = os.MkdirAll(dir, 0o755)
+				owner.give(dir)
+			}
 			path := uniquePath(filepath.Join(dir, name))
 			f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 			if err != nil {
 				send(proto.Message{"t": "file.done", "id": id, "error": err.Error()})
 				continue
 			}
+			owner.give(path)
 			h := sha256.New()
 			xfers[id] = &fileXfer{f: f, path: path, size: m.Int("size"), h: h, sum: func() []byte { return h.Sum(nil) }}
 		case "file.chunk":
@@ -374,6 +432,54 @@ func uniquePath(p string) string {
 		if _, err := os.Stat(q); err != nil {
 			return q
 		}
+	}
+}
+
+// watchCaps checks the capabilities every capsCheckInterval and sends
+// {"t":"caps"} with the new list when it differs from the one sent last,
+// starting with sent, the hello's list.
+func (s *Server) watchCaps(send func(proto.Message), done chan struct{}, sent []string) {
+	t := time.NewTicker(capsCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+		}
+		caps := s.caps()
+		if slices.Equal(caps, sent) {
+			continue
+		}
+		sent = caps
+		send(proto.Message{"t": "caps", "caps": caps})
+	}
+}
+
+// dropOwner returns the owner that the files and folders a file push creates
+// are given: the desktop session's user while the agent runs as root and
+// HomeDir is not set, otherwise nobody.
+func (s *Server) dropOwner() fileOwner {
+	if s.opt.HomeDir != "" || os.Geteuid() != 0 {
+		return fileOwner{}
+	}
+	sess, ok := s.session()
+	if !ok || sess.UID == 0 {
+		return fileOwner{}
+	}
+	return fileOwner{set: true, uid: int(sess.UID), gid: int(sess.GID)}
+}
+
+// fileOwner is a user and group that give hands entries to when set is true.
+type fileOwner struct {
+	set      bool
+	uid, gid int
+}
+
+// give makes the owner own path, without following a link at its end.
+func (o fileOwner) give(path string) {
+	if o.set {
+		_ = os.Lchown(path, o.uid, o.gid)
 	}
 }
 

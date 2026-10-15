@@ -176,10 +176,11 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 	}
 	c := exec.Command(program, req.Strings("args")...)
 	if cwd := req.String("cwd"); cwd != "" {
-		c.Dir = resolveHomePath(s.opt.HomeDir, cwd)
+		c.Dir = resolveHomePath(s.homeDir(), cwd)
 	} else if filepath.IsAbs(c.Path) {
 		c.Dir = filepath.Dir(c.Path)
 	}
+	var extra []string
 	if env := req.StringMap("env"); len(env) > 0 {
 		keys := make([]string, 0, len(env))
 		for k := range env {
@@ -189,10 +190,14 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		c.Env = os.Environ()
 		for _, k := range keys {
-			c.Env = append(c.Env, k+"="+env[k])
+			extra = append(extra, k+"="+env[k])
 		}
+	}
+	if sess, ok := s.session(); ok {
+		runInSession(c, append(append([]string{}, sess.Env...), extra...), sess.Credential())
+	} else if len(extra) > 0 {
+		c.Env = append(os.Environ(), extra...)
 	}
 
 	watch := waitMs > 0 && s.opt.UI != nil

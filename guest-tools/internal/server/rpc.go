@@ -274,4 +274,18 @@ func (s *Server) registerBuiltins() {
 	s.registerFiles()
 	s.registerUI()
 	s.registerLaunch()
+	if s.opt.Session != nil {
+		s.register("session.info", true, s.sessionInfo)
+	}
+}
+
+// sessionInfo describes the desktop session; without one the reply has no
+// fields.
+func (s *Server) sessionInfo(context.Context, proto.Message) (proto.Message, error) {
+	sess, ok := s.session()
+	if !ok {
+		return proto.Message{}, nil
+	}
+	return proto.Message{"session": sess.ID, "user": sess.User, "uid": sess.UID, "home": sess.Home,
+		"type": sess.Type, "locked": sess.Locked}, nil
 }

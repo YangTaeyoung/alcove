@@ -179,6 +179,11 @@ func (q *handshakeQueue) leave(p *pendingHandshake) bool {
 // a message is refused as unauthenticated. limit is lifted once the
 // connection is served.
 func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
+	return s.handshakeWith(c, r, limit, s.caps())
+}
+
+// handshakeWith is handshake with caps as the hello's capabilities.
+func (s *Server) handshakeWith(c net.Conn, r *proto.Reader, limit *lineLimit, caps []string) bool {
 	w := proto.NewWriter(c)
 	write := func(m proto.Message) bool {
 		_ = c.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
@@ -190,7 +195,7 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 		return false
 	}
 	hello := proto.Message{"t": "hello", "v": proto.Version, "proto": proto.RPCVersion, "os": runtime.GOOS, "agent": AgentVersion,
-		"token": s.opt.Token, "caps": s.caps()}
+		"token": s.opt.Token, "caps": caps}
 	if s.opt.Unauthenticated {
 		limit.lift()
 		return write(hello)

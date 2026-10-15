@@ -123,9 +123,9 @@ func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
 		return nil, err
 	}
 	if c.Dir != "" {
-		c.Dir = resolveHomePath(s.opt.HomeDir, c.Dir)
+		c.Dir = resolveHomePath(s.homeDir(), c.Dir)
 	} else {
-		c.Dir = s.opt.HomeDir
+		c.Dir = s.homeDir()
 	}
 	hideWindow(c)
 	prepareTree(c)

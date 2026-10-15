@@ -16,6 +16,9 @@ func platformShutdown() error {
 	return exec.Command("shutdown", "-h", "now").Run()
 }
 
+// resolutionSupported says whether setResolution can change the display mode.
+const resolutionSupported = false
+
 func currentResolution() (int, int, bool) { return 0, 0, false }
 
 func setResolution(w, h int) error {

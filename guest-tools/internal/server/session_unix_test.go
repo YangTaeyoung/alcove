@@ -1,0 +1,171 @@
+//go:build !windows
+
+package server
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
+	"github.com/YangTaeyoung/alcove/guest-tools/internal/session"
+)
+
+// sessionClient connects to a server without a HomeDir whose session source
+// answers sess and found.
+func sessionClient(t *testing.T, sess session.Session, found bool) *rpcClient {
+	t.Helper()
+	_, r, w, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, AllowExec: true,
+		Session: func() (session.Session, bool) { return sess, found }})
+	expect(t, r, "hello")
+	return &rpcClient{t: t, r: r, w: w}
+}
+
+func realPath(t *testing.T, p string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func TestHomeRelativePathsResolveAgainstTheSessionHome(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := sessionClient(t, session.Session{User: "alcove", Home: home}, true)
+
+	if got := c.ok("fs.stat", proto.Message{"path": "~"}).String("path"); got != home {
+		t.Fatalf("fs.stat ~ = %q, want %q", got, home)
+	}
+	if got := c.ok("fs.stat", proto.Message{"path": "Desktop/big.bin"}).String("path"); got != filepath.Join(home, "Desktop", "big.bin") {
+		t.Fatalf("fs.stat of a relative path = %q", got)
+	}
+	out := c.ok("exec.run", proto.Message{"cmd": "pwd"}).String("stdout")
+	if got := realPath(t, strings.TrimSpace(out)); got != realPath(t, home) {
+		t.Fatalf("exec.run without cwd ran in %q", out)
+	}
+	out = c.ok("exec.run", proto.Message{"cmd": "pwd", "cwd": "sub"}).String("stdout")
+	if got := realPath(t, strings.TrimSpace(out)); got != realPath(t, filepath.Join(home, "sub")) {
+		t.Fatalf("exec.run with cwd sub ran in %q", out)
+	}
+	res := c.call("fs.delete", proto.Message{"path": home, "recursive": true})
+	if res["ok"] != false {
+		t.Fatalf("fs.delete of the session home %v", res)
+	}
+}
+
+func TestFileDropsGoToTheSessionHome(t *testing.T) {
+	home := t.TempDir()
+	c := sessionClient(t, session.Session{User: "alcove", Home: home}, true)
+	payload := []byte("drop")
+	sum := sha256.Sum256(payload)
+	send(t, c.w, proto.Message{"t": "file.begin", "id": "d1", "name": "drop.bin", "size": len(payload), "dest": "downloads"})
+	send(t, c.w, proto.Message{"t": "file.chunk", "id": "d1", "data": base64.StdEncoding.EncodeToString(payload)})
+	send(t, c.w, proto.Message{"t": "file.end", "id": "d1", "sha256": hex.EncodeToString(sum[:])})
+	done := expect(t, c.r, "file.done")
+	if want := filepath.Join(home, "Downloads", "drop.bin"); done.String("path") != want {
+		t.Fatalf("file.done %v, want path %s", done, want)
+	}
+}
+
+func TestWithoutASessionPathsResolveAgainstTheAgentHome(t *testing.T) {
+	want, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("this user has no home directory")
+	}
+	c := sessionClient(t, session.Session{}, false)
+	if got := c.ok("fs.stat", proto.Message{"path": "~"}).String("path"); got != filepath.Clean(want) {
+		t.Fatalf("fs.stat ~ = %q, want %q", got, want)
+	}
+}
+
+func TestLaunchRunsInTheSessionEnvironment(t *testing.T) {
+	home := t.TempDir()
+	out := filepath.Join(home, "env.txt")
+	env := []string{"HOME=" + home, "USER=alcove", "PATH=/usr/bin:/bin", "WAYLAND_DISPLAY=wayland-0"}
+	c := sessionClient(t, session.Session{User: "alcove", Home: home, Env: env}, true)
+	script := `printf '%s|%s|%s|%s' "$HOME" "$USER" "$WAYLAND_DISPLAY" "$EXTRA" > "$0"`
+	c.ok("app.launch", proto.Message{"path": "/bin/sh", "args": []string{"-c", script, out},
+		"env": map[string]any{"EXTRA": "x", "USER": "replaced"}, "wait_window_ms": 0})
+	c.event("process.exited")
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := home + "|replaced|wayland-0|x"; string(got) != want {
+		t.Fatalf("the program saw %q, want %q", got, want)
+	}
+}
+
+func TestSessionCommandsRunAsTheSessionUser(t *testing.T) {
+	c := exec.Command("/bin/true")
+	prepareTree(c)
+	cred := &syscall.Credential{Uid: 1000, Gid: 1000, Groups: []uint32{4, 27}}
+	runInSession(c, []string{"HOME=/home/alcove"}, cred)
+	if c.SysProcAttr.Credential != cred || !c.SysProcAttr.Setpgid || len(c.Env) != 1 {
+		t.Fatalf("attr %+v env %q", c.SysProcAttr, c.Env)
+	}
+	plain := exec.Command("/bin/true")
+	runInSession(plain, []string{"HOME=/root"}, nil)
+	if plain.SysProcAttr != nil && plain.SysProcAttr.Credential != nil {
+		t.Fatalf("a nil credential set %+v", plain.SysProcAttr)
+	}
+}
+
+func TestSessionInfoReportsTheDesktopUser(t *testing.T) {
+	c := sessionClient(t, session.Session{ID: "1", User: "alcove", UID: 1000, Home: "/home/alcove", Type: "wayland", Locked: true}, true)
+	got := c.ok("session.info", nil)
+	if got.String("user") != "alcove" || got.Int("uid") != 1000 || got.String("home") != "/home/alcove" ||
+		got.String("type") != "wayland" || got.String("session") != "1" || got["locked"] != true {
+		t.Fatalf("session.info %v", got)
+	}
+	none := sessionClient(t, session.Session{}, false)
+	if got := none.ok("session.info", nil); got.Has("user") {
+		t.Fatalf("session.info without a session %v", got)
+	}
+}
+
+// toggleClipboard is a fakeClipboard whose availability can change.
+type toggleClipboard struct {
+	fakeClipboard
+	on atomic.Bool
+}
+
+func (c *toggleClipboard) Available() bool { return c.on.Load() }
+
+func TestCapsAreSentAgainWhenTheClipboardAppears(t *testing.T) {
+	old := capsCheckInterval
+	capsCheckInterval = 20 * time.Millisecond
+	t.Cleanup(func() { capsCheckInterval = old })
+	cb := &toggleClipboard{}
+	_, r, _, _ := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
+	if capSet(expect(t, r, "hello"))["clipboard"] {
+		t.Fatal("hello lists a clipboard that is not there")
+	}
+	cb.on.Store(true)
+	if !capSet(expect(t, r, "caps"))["clipboard"] {
+		t.Fatal("the caps update lacks the clipboard")
+	}
+	cb.on.Store(false)
+	if capSet(expect(t, r, "caps"))["clipboard"] {
+		t.Fatal("the caps update keeps a clipboard that is gone")
+	}
+}
+
+func TestResolutionIsNotACapabilityOutsideWindows(t *testing.T) {
+	_, r, _, _ := startServerS(t, Options{Clipboard: &fakeClipboard{}, HomeDir: t.TempDir()})
+	if capSet(expect(t, r, "hello"))["resolution"] {
+		t.Fatal("the hello lists resolution, which this agent cannot change")
+	}
+}

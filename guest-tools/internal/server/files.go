@@ -28,12 +28,12 @@ const (
 )
 
 // resolvePath maps "~", "~/x", relative and absolute paths to an absolute
-// path; relative forms resolve against Options.HomeDir.
+// path; relative forms resolve against homeDir.
 func (s *Server) resolvePath(p string) (string, error) {
 	if p == "" {
 		return "", errors.New("missing path; pass a file or directory path")
 	}
-	home := s.opt.HomeDir
+	home := s.homeDir()
 	switch {
 	case p == "~":
 		return filepath.Clean(home), nil
@@ -577,6 +577,15 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 		f.Close()
 		return nil, fmt.Errorf("cannot write '%s': %v", path, err)
 	}
+	if req.Bool("executable") && runtime.GOOS != "windows" {
+		if fi, err := f.Stat(); err == nil {
+			err = f.Chmod(executableMode(fi.Mode().Perm()))
+		}
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("cannot make '%s' executable: %v", path, err)
+		}
+	}
 	fi, statErr := f.Stat()
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("cannot write '%s': %v", path, err)
@@ -585,6 +594,12 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 		return nil, fmt.Errorf("cannot stat '%s': %v", path, statErr)
 	}
 	return proto.Message{"size": fi.Size()}, nil
+}
+
+// executableMode adds the execute bit for each of owner, group and others
+// that has the read bit.
+func executableMode(m os.FileMode) os.FileMode {
+	return m | (m&0o444)>>2
 }
 
 func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, error) {
@@ -665,11 +680,12 @@ func (s *Server) protectedFromDelete(path string) bool {
 	if isFileSystemRoot(path, filepath.VolumeName(path), filepath.Separator) {
 		return true
 	}
-	if s.opt.HomeDir == "" {
+	homeDir := s.homeDir()
+	if homeDir == "" {
 		return false
 	}
 	fold := runtime.GOOS == "windows"
-	home := filepath.Clean(s.opt.HomeDir)
+	home := filepath.Clean(homeDir)
 	if pathContains(path, home, filepath.Separator, fold) {
 		return true
 	}
@@ -710,8 +726,8 @@ func (s *Server) identityRefusal(path string, fi os.FileInfo) error {
 	if err != nil {
 		return fmt.Errorf("refusing to delete '%s': the root of its volume could not be read (%v), so it cannot be told apart from that root; %s", path, err, next)
 	}
-	if s.opt.HomeDir != "" {
-		home := filepath.Clean(s.opt.HomeDir)
+	if homeDir := s.homeDir(); homeDir != "" {
+		home := filepath.Clean(homeDir)
 		homes := []string{home}
 		if real, err := filepath.EvalSymlinks(home); err == nil {
 			homes = append(homes, real)
