@@ -839,8 +839,9 @@ view first when it has a scroll-item pattern.
   was before and `gone: true`. The same reply is given when the element's
   window no longer exists after the call, and when the pattern call failed
   with a UI Automation or COM error and the window stopped existing within
-  0.5 s of it. A pattern call that failed that way while the window stays
-  answers
+  0.5 s of it or the element can no longer be read (a button that removes
+  itself). A pattern call that failed that way while the window and the
+  element stay answers
   `the element's app did not complete <action> (<hresult>); read the element again with ui.find and retry`
   (`<hresult>` as `0x80004005`).
 - A disabled element is refused before the call:
@@ -884,20 +885,28 @@ range.
   by the outermost password field above it when it lies below one. For a ref
   it is that element itself.
 - `window` is the top-level window that contains the element: `id` as in
-  `win.list` and `title`, which is `""` for a popup or a menu.
+  `win.list` and `title`, which is `""` for a popup or a menu. For a ref
+  whose element and parents give no window handle it is the window found
+  through the element's parents, else the window the ref was taken in while
+  that window exists.
 - `byAutomationId` is present when the node has an `aid`: `matches` counts the
   elements of that window which the selector `{role, automationId}` matches,
   and `index` is the node's place among them in the order a selector search
   visits them, so `{window, role, automationId, index}` names the node.
   `byName` is the same for `{role, name}` and present when `name` is not
   empty, so never for a password field or a node below one. Either is `null`
-  when the count did not finish within the time, and when the walk did not
+  when the count did not finish within the time, when the walk did not
   meet the element (an element outside the control view, or below a password
-  field, named by a ref).
+  field, named by a ref), and when the window's `title` given as a selector's
+  `window` names another window: the title is empty, or a window listed
+  before it in `win.list` has the title in its own (two windows titled
+  `Untitled - Notepad`).
 - Errors: `no element at (<x>, <y>); take a screenshot to see what is there`
   (a point outside every screen, on the desktop window itself, or in a window
   that refuses UI Automation), `no element has the keyboard focus; click the field first`,
-  `element <ref> no longer exists; call ui.tree again`. A point on the
+  `element <ref> no longer exists; call ui.tree again` (also when reading
+  the element fails with a system error and the window the ref was taken in
+  closes within the time limit). A point on the
   wallpaper or on a desktop icon lies in the shell's `Progman`/`WorkerW`
   window and answers its element (a `List` named `Desktop`, or the icon),
   not this error.
@@ -908,7 +917,8 @@ range.
   `the focused element was not read: the app did not answer within <n> ms; retry` or
   `element <ref> was not read: the app did not answer within <n> ms; retry`.
   The same sentence is given at once for a window the system reports as not
-  responding and while eight earlier `ui.at` calls into that app are still
+  responding, for the `Ghost` window the system shows in place of such a
+  window, and while eight earlier `ui.at` calls into that app are still
   waiting.
 - Measured on the test guest: 50 calls on a button of the fixture app took
   12–14 ms in the median and 15–26 ms at most; on the fixture made to hang, a

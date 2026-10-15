@@ -1056,6 +1056,19 @@ namespace Alcove
             throw new HelperException("no window has " + Json.Write(window) + " in its title; call win.list to see the open windows");
         }
 
+        // True when ResolveWindow gives hwnd for the title.
+        static bool TitleResolvesTo(string title, IntPtr hwnd)
+        {
+            try
+            {
+                return ResolveWindow(title) == hwnd;
+            }
+            catch (HelperException)
+            {
+                return false;
+            }
+        }
+
         // The top-level window that contains the element, or zero.
         static IntPtr TopWindow(AutomationElement element)
         {
@@ -1071,6 +1084,34 @@ namespace Alcove
                 current = TreeWalker.RawViewWalker.GetParent(current);
             }
             return IntPtr.Zero;
+        }
+
+        // TopWindow of the element, or zero when the element or a parent cannot be read.
+        static IntPtr TopWindowOrZero(AutomationElement element)
+        {
+            try
+            {
+                return TopWindow(element);
+            }
+            catch (ElementNotAvailableException) { }
+            catch (InvalidOperationException) { }
+            catch (COMException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            catch (UnauthorizedAccessException) { }
+            return IntPtr.Zero;
+        }
+
+        // True for the window the system shows in place of a window that stopped responding.
+        static bool IsGhostOfHungWindow(IntPtr hwnd)
+        {
+            try
+            {
+                return Native.HungWindowFromGhostWindow(hwnd) != IntPtr.Zero;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
         }
 
         static object WindowObjectOrNull(IntPtr hwnd)
@@ -1442,7 +1483,7 @@ namespace Alcove
                 throw new HelperException("set_value needs value");
             }
             AutomationElement element = Target(req);
-            IntPtr hwnd = scopeWindow;
+            IntPtr hwnd = scopeWindow != IntPtr.Zero ? scopeWindow : TopWindowOrZero(element);
             bool belowPassword = HasPasswordAncestor(element);
             Dictionary<string, object> before = Node(element, 0);
             if (belowPassword)
@@ -1516,8 +1557,9 @@ namespace Alcove
                 if (failure is ElementNotAvailableException || failure is COMException)
                 {
                     UiaHelper.Log("'ui.act' " + action + " ended with " + failure.GetType().Name + ": " + failure.Message);
-                    // The element counts as gone when its window stops existing within RefGoneWaitMs.
-                    if (WaitUntil(delegate { return !Native.IsWindow(hwnd); }, RefGoneWaitMs))
+                    // The element counts as gone when its window stops existing within RefGoneWaitMs,
+                    // or when the element no longer exists while its window stays.
+                    if ((hwnd != IntPtr.Zero && WaitUntil(delegate { return !Native.IsWindow(hwnd); }, RefGoneWaitMs)) || ElementGone(element))
                     {
                         Dictionary<string, object> ended = new Dictionary<string, object>();
                         ended["node"] = before;
@@ -1582,6 +1624,21 @@ namespace Alcove
                 r["gone"] = true;
             }
             return r;
+        }
+
+        // True when the element can no longer be read or belongs to no process.
+        bool ElementGone(AutomationElement element)
+        {
+            try
+            {
+                AutomationElement fresh = element.GetUpdatedCache(nodeCacheControl);
+                object pid = fresh.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty);
+                return !(pid is int) || (int)pid == 0;
+            }
+            catch (ElementNotAvailableException) { return true; }
+            catch (COMException) { return true; }
+            catch (InvalidOperationException) { return true; }
+            catch (System.ComponentModel.Win32Exception) { return false; }
         }
 
         // ---- refs ----
@@ -2738,7 +2795,7 @@ namespace Alcove
             {
                 top = Native.ForegroundWindow();
             }
-            if (top != IntPtr.Zero && Native.IsHungAppWindow(top))
+            if (top != IntPtr.Zero && (Native.IsHungAppWindow(top) || IsGhostOfHungWindow(top)))
             {
                 throw new HelperException(late);
             }
@@ -2757,11 +2814,12 @@ namespace Alcove
 
             AtAnswer answer = new AtAnswer();
             AutomationElement known = entry != null ? entry.Element : null;
+            IntPtr refWindow = entry != null ? entry.Window : IntPtr.Zero;
             Thread worker = new Thread(delegate()
             {
                 try
                 {
-                    AtWork(answer, mode, x, y, reference, known, spent, budget);
+                    AtWork(answer, mode, x, y, reference, known, refWindow, spent, budget);
                 }
                 catch (Exception e)
                 {
@@ -2820,8 +2878,11 @@ namespace Alcove
         // the point, with the focus or of the ref, then counts the selector matches in its
         // window until budget ms of spent have passed. For a point or the focus, an element
         // below a password field is replaced by the outermost password field above it, and the
-        // result by its nearest ancestor in the control view.
-        static void AtWork(AtAnswer answer, AtMode mode, int x, int y, string reference, AutomationElement known, Stopwatch spent, int budget)
+        // result by its nearest ancestor in the control view. refWindow is the window the ref
+        // was taken in; the window of a ref whose element and parents show no window handle is
+        // TopWindow of the element, else refWindow while it exists. The counts are left out
+        // when the window's title, given as a selector's window, names another window.
+        static void AtWork(AtAnswer answer, AtMode mode, int x, int y, string reference, AutomationElement known, IntPtr refWindow, Stopwatch spent, int budget)
         {
             try { Native.SetThreadDpiAwarenessContext(new IntPtr(-4)); }
             catch (EntryPointNotFoundException) { }
@@ -2906,9 +2967,19 @@ namespace Alcove
             }
             catch (System.ComponentModel.Win32Exception)
             {
-                if (mode == AtMode.Ref) { throw; }
-                answer.Nothing = true;
-                return;
+                if (mode != AtMode.Ref)
+                {
+                    answer.Nothing = true;
+                    return;
+                }
+                // The ref is gone when the window it was taken in stops existing within the time left.
+                int left = (int)Math.Max(0, budget - spent.ElapsedMilliseconds);
+                if (refWindow != IntPtr.Zero && WaitUntil(delegate { return !Native.IsWindow(refWindow); }, Math.Min(RefGoneWaitMs, left)))
+                {
+                    answer.Gone = true;
+                    return;
+                }
+                throw;
             }
             catch (UnauthorizedAccessException)
             {
@@ -2927,7 +2998,15 @@ namespace Alcove
                     top = new IntPtr(handle);
                 }
             }
-            if (top == IntPtr.Zero || top == desktop || CachedHandle(element) == desktop.ToInt32())
+            else if (mode == AtMode.Ref)
+            {
+                top = TopWindowOrZero(element);
+                if (top == IntPtr.Zero && refWindow != IntPtr.Zero && Native.IsWindow(refWindow))
+                {
+                    top = refWindow;
+                }
+            }
+            if (top == IntPtr.Zero || top == desktop || (long)CachedHandle(element) == desktop.ToInt64())
             {
                 if (mode == AtMode.Ref) { answer.Gone = true; } else { answer.Nothing = true; }
                 return;
@@ -2956,6 +3035,10 @@ namespace Alcove
             located.HasName = name.Length > 0 && !password;
             answer.Located = located;
             if (!located.HasAutomationId && !located.HasName)
+            {
+                return;
+            }
+            if (!TitleResolvesTo((string)located.Window["title"], top))
             {
                 return;
             }
