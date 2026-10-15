@@ -128,6 +128,40 @@ func TestClientDisconnectIsNotAnUpstreamFailure(t *testing.T) {
 	}
 }
 
+// goneClientWriter is a ResponseWriter whose client is gone after the
+// headers: every body write fails.
+type goneClientWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *goneClientWriter) Header() http.Header { return w.header }
+
+func (w *goneClientWriter) WriteHeader(status int) { w.status = status }
+
+func (w *goneClientWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestClientClosingAfterTheHeadersKeepsTheBodyReadFromTheUpstream(t *testing.T) {
+	const payload = "the upstream body"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, payload)
+	}))
+	defer up.Close()
+	env := newEnv(t)
+	w := &goneClientWriter{header: http.Header{}}
+	env.proxy.handler("", "", func() {}).ServeHTTP(w, httptest.NewRequest("GET", up.URL+"/gone", nil))
+	if w.status != 200 {
+		t.Fatalf("client status %d", w.status)
+	}
+	x := env.waitExchange(func(x map[string]any) bool { return x["kind"] == "http" })
+	if x["error"] != clientClosed || x["status"] != float64(200) || x["resBytes"] != float64(len(payload)) {
+		t.Fatalf("row %v", x)
+	}
+	if got := env.get(idOf(x), "response", nil)["body"]; got != payload {
+		t.Fatalf("captured body %q", got)
+	}
+}
+
 func TestTrailersAreForwardedAndCaptured(t *testing.T) {
 	for _, h2 := range []bool{false, true} {
 		t.Run(protoName(h2), func(t *testing.T) {

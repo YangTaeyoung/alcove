@@ -410,11 +410,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, u *url.URL, ex *
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			resCap.Write(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				ex.Error = clientClosed
 				return
 			}
-			resCap.Write(buf[:n])
 			_ = rc.Flush()
 		}
 		if rerr == io.EOF {

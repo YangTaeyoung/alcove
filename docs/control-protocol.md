@@ -1842,6 +1842,10 @@ pending}`:
   `error` says why the exchange did not end normally, e.g. `the upstream
   request failed: dial tcp …: connect: no route to host` for a 502 the proxy
   answered itself, or `the client gave up during the rule delay`;
+  `resBytes` of an `http` row counts the response body bytes the proxy read
+  from the server or answered itself, also those it could not pass on
+  because the program closed the connection (`error` is then `the client
+  closed the connection`), and the kept body holds them;
 - `next` is the id to pass as `since` for the following page;
 - `pending` lists requests in flight and open tunnels (at most 200, oldest
   first) without an id.
