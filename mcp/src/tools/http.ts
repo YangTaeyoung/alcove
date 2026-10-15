@@ -34,7 +34,7 @@ export function pendingLine(e: Obj): string {
 const DETAIL_CHARS = 60000;
 const BASE64_BYTES_PER_PAGE = 45000;
 
-/** Headers, trailers as `trailer name: value`, a blank line, then the body clipped at 60000 characters; the paging hint counts bytes of the part. */
+/** A notes line, headers, trailers as `trailer name: value`, a blank line, then the body clipped at 60000 characters; the paging hint counts bytes of the part. */
 export function exchangeDetail(id: number, part: string, r: Obj, offset: number): string {
   const headers = ((r.headers as string[][]) ?? []).map(([k, v]) => `${k}: ${v}`);
   const trailers = ((r.trailers as string[][]) ?? []).map(([k, v]) => `trailer ${k}: ${v}`);
@@ -46,6 +46,7 @@ export function exchangeDetail(id: number, part: string, r: Obj, offset: number)
   if (r.encoding) notes.push(`content encoding ${r.encoding} not decoded`);
   if (r.bodyTruncated === true) notes.push("the capture kept only the first 2 MiB of this body");
   if (r.bodyDropped === true) notes.push("the capture dropped the bodies of this exchange to make room for newer ones");
+  if (r.headersTruncated === true) notes.push("the capture left out the header and trailer pairs of this exchange beyond 64 KiB");
   const returned = base64 ? Buffer.from(body, "base64").length : Buffer.byteLength(body, "utf8");
   let hint = "";
   if (body.length > DETAIL_CHARS) {
@@ -157,6 +158,7 @@ export function register(r: Registrar, client: ControlClient): void {
         }, 60000);
         return text(exchangeDetail(a.id, part, reply, offset), {
           total: reply.total, bodyTruncated: reply.bodyTruncated, base64: reply.base64, encoding: reply.encoding, bodyDropped: reply.bodyDropped,
+          headersTruncated: reply.headersTruncated,
         });
       }
       const reply = await client.call("vm.http.requests", {

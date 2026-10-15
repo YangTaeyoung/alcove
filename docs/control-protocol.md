@@ -2184,7 +2184,9 @@ and the next stop refreshes again.
 The `http` toolset has `alcove_http_capture_start` (`hosts`, `secrets`,
 `bodies`, `system_proxy`), `alcove_http_capture_stop`, `alcove_http_requests`
 (the list filters; with `id`, `part`, `offset` and `length` one exchange as
-headers, a blank line and the body clipped at 60,000 characters; `clear:
+headers, a blank line and the body clipped at 60,000 characters, after a
+first line that says when the capture left out header and trailer pairs
+beyond 64 KiB, with `headersTruncated` in the structured result; `clear:
 true` alone empties the list) and `alcove_http_rule` (`action` `add`, `list`,
 `remove`, `clear`; `match`; `response` with `status`, `headers`, `body`,
 `delay_ms`, `drop`, `times`; `rule`). List lines read `#id time METHOD url ->

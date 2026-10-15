@@ -105,7 +105,17 @@ test("alcove_http_requests with id reads one exchange part with a default length
   const t = rig(register, { headers: [["a", "b"]], body: "x", total: 1, bodyTruncated: false });
   const r = await t.run("alcove_http_requests", { name: "vm", id: 4, part: "request", offset: 5 });
   assert.deepEqual(t.calls[0], { op: "vm.http.request", params: { name: "vm", exchange: 4, part: "request", offset: 5, length: 60000 } });
-  assert.deepEqual(r.structuredContent, { total: 1, bodyTruncated: false, base64: undefined, encoding: undefined, bodyDropped: undefined });
+  assert.deepEqual(r.structuredContent, {
+    total: 1, bodyTruncated: false, base64: undefined, encoding: undefined, bodyDropped: undefined, headersTruncated: undefined,
+  });
+});
+
+test("alcove_http_requests detail names header pairs the capture left out", async () => {
+  const t = rig(register, { headers: [["a", "b"]], body: "", total: 0, bodyTruncated: false, headersTruncated: true });
+  const r = await t.run("alcove_http_requests", { name: "vm", id: 4 });
+  assert.equal(textOf(r).split("\n")[0],
+    "#4 response: 0 bytes in total, body from byte 0; the capture left out the header and trailer pairs of this exchange beyond 64 KiB");
+  assert.equal(r.structuredContent!.headersTruncated, true);
 });
 
 test("alcove_http_requests lists the requests that are still in flight", async () => {
