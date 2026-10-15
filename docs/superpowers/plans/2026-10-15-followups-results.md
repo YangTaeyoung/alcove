@@ -18,6 +18,7 @@ ARM64, user `alcove`), reached through `alcovectl serve` built from this tree
 
 | Check | Result | Evidence |
 |---|---|---|
+| `scripts/test/all.sh`, `alcovectl serve`, `install-agent.py` | PASS | see Setup above; the guest runs the agent built from this tree (`vcs.revision=5b7ee08`, reported `0.2.1`) for every check below |
 
 ## B. Pending Windows VM lists of the task reports
 
@@ -28,7 +29,7 @@ ARM64, user `alcove`), reached through `alcovectl serve` built from this tree
 | Task 1 step 3: `TestProcKillByName*`, `TestFsDeleteRefusesTheHomeDirectoryThroughTheAdminShare` | PASS (4 of 4, no SKIP) at medium integrity | over ssh (high integrity, `SeDebugPrivilege` Enabled) the refusal test got `killed:1`, as the report foresaw; a `/RL HIGHEST /IT` task has `SeDebugPrivilege` Enabled too and also got `killed:1`; a `/RL LIMITED /IT` task (Medium Mandatory Level): the three `TestProcKillByName*` PASS. The admin-share test PASS over ssh (0.12 s; `LanmanServer` running) |
 | Task 1 step 4: `TestCappedLog*`, `TestTheFileKept*` (`internal/logfile`) | PASS | 7 of 7 |
 | Task 1 step 5: `proc.kill name=spoolsv.exe` through the installed agent | refusal sentence | `could not kill 1 of the 1 processes named 'spoolsv.exe' because Windows denied access to the elevated agent (0 were killed); such a process is protected or needs more than administrator rights, so stop it through its service (sc stop <service>) or leave it running`; spooler pid 2760 before and after. The agent does not enable `SeDebugPrivilege`, so it cannot end SYSTEM services that `taskkill /F` (which enables it) could |
-| Task 2: `uia-helper-check.py` 1–34 | PASS (33 of 34 in the first full run; 32 passed alone and in two runs of 29–32) | first run: `helper pid 6468, session 1, high integrity, first answer after 0.83 s`; 1–31, 33, 34 PASS (29 `fixtures 0x502c0 and 0x2037c; element … no longer exists`, 31 `e21000015 'Alcove Fixture' in 0x502c0`, 33 `Ghost window 0x5037c … 3.4 s after the Hang reply; ui.at answered after 0 ms`); `FAIL 32: after Vanish win.list shows the fixture as None` (`ui.act` had answered ok and gone). `--only 32` PASS, `--only 29,30,31,32` PASS twice (`ui.act answered ['gone', 'node', 'ok']`). See the regression runs in D for whether it recurs |
+| Task 2: `uia-helper-check.py` 1–34 | PASS (34 of 34 in the regression; check 32 failed once in the first full run, see Observations) | first run: `helper pid 6468, session 1, high integrity, first answer after 0.83 s`; 1–31, 33, 34 PASS (29 `fixtures 0x502c0 and 0x2037c; element … no longer exists`, 31 `e21000015 'Alcove Fixture' in 0x502c0`, 33 `Ghost window 0x5037c … 3.4 s after the Hang reply; ui.at answered after 0 ms`); `FAIL 32: after Vanish win.list shows the fixture as None` (`ui.act` had answered ok and gone). `--only 32` PASS, `--only 29,30,31,32` PASS twice (`ui.act answered ['gone', 'node', 'ok']`). See the regression runs in D for whether it recurs |
 | Task 2 step 3: `TestSecureDir*`, `TestAHelperStartFailsClosed*` elevated on the guest (ssh, high integrity) | 3 PASS, 1 FAIL (D2) | `TestSecureDirMovesAsideAFolderInsteadOfRelockingItWhileAHandleIsOpen`, `TestSecureDirKeepsAnAlreadyLockedFolderInPlace`, `TestSecureDirKeepsAtMostOneMovedAsideFolder` PASS; the fail-closed test FAIL, see D2 |
 | Task 2.6 probe variant A (share 0x7) | PASS | holder as `alcove` from a `/RL LIMITED /IT` task (`BUILTIN\Administrators … Group used for deny only`), handle `FILE_WRITE_ATTRIBUTES \| FILE_WRITE_DATA \| READ_CONTROL \| WRITE_DAC \| SYNCHRONIZE`, `BACKUP_SEMANTICS \| OPEN_REPARSE_POINT`, on `uia` granted `Users:(OI)(CI)(F)` and emptied, file id `…0000aeca`. Agent start: `a data folder that was not already locked was moved to C:\ProgramData\Alcove\uia.untrusted-20261015041731; …`; new `uia` file id `…0002504c`, `O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`, owner Administrators, empty. Through the held handle: (a) DACL `Users:F` ok, (b) mount point to `C:\Users\Public\alcove-26-x` ok, (c) `NtCreateFile planted.txt` `0xc0000280`; all landed on the aside (its SDDL became `D:(A;OICI;FA;;;BU)…`, tag `0xa0000003`), the new `uia` has none of them. `C:\alcove-apps` moved aside the same way (`…was a link, belonged to another owner or let other users change it; it was moved to C:\alcove-apps.untrusted-20261015041731, …`). The next start removed that junction aside without following it (a canary file in its target stayed). An elevated `Get-ChildItem` of the junction aside answered `The path cannot be traversed because it contains an untrusted mount point` |
 | Task 2.6 probe variant B (share 0x3) | PASS (fail closed) | handle on `uia` (file id `…0002504c`) without delete sharing; agent start: no move, and no log file at all (the agent opens no log inside a folder it could not lock and logs to stderr, `agent-protocol.md` "The agent opens no log file …"), so `agent.log` has no line for this start. Through the handle: (a) DACL ok, (b) mount point ok (the live `uia` became a junction to the user's folder), (c) `0xc0000280`. `ui.ping` while held: `could not start the UI helper through PowerShell: the UI helper folder C:\ProgramData\Alcove\uia could not be locked (remove C:\ProgramData\Alcove\uia: The process cannot access the file because it is being used by another process.); fix its owner and access list, then retry`; nothing written into the junction's target (only the canary). After the handle closed, `ui.ping` started a helper (`compiled helper.cs after 288 ms`); the reparse point at `uia` was removed and the folder created again (file id `…000f…2504c`, locked SDDL), no `uia.untrusted-*`. Agent restarted afterwards to get its log back |
@@ -79,8 +80,23 @@ ARM64, user `alcove`), reached through `alcovectl serve` built from this tree
 
 ## D. Full regression on the final agent
 
+On the agent built from 5b7ee08, with the script fixes of this session (fed59bc, 8b4acb7, 514b2a0), in one pass.
+
 | Script | Result | Evidence |
 |---|---|---|
+| `agent-rpc-windows.py` under `nohup`, SIGHUP after `PASS 5` | PASS | 19 of 19 (23 s); the SIGHUP was ignored |
+| `uia-helper-check.py` under `nohup`, SIGHUP after `PASS 9` | PASS | 34 of 34 (75 s), check 32 `ui.act answered ['gone', 'node', 'ok']`, 33 `Ghost window 0x202c4 … 3.4 s after the Hang reply` |
+| `at1-e2e.py` under `nohup`, SIGHUP after `PASS 4` | PASS | 9 of 9 (26 s) |
+| `at2-e2e.py` under `nohup`, SIGHUP after `PASS 3` | PASS | 10 of 10 (209 s) |
+| `at3-e2e.py` under `nohup`, SIGHUP after `PASS 2` | PASS | 7 of 7 (37 s) |
+| `at5-e2e.py` under `nohup`, SIGHUP after `PASS 3` | PASS | 11 of 11 (354 s) |
+| `at4-e2e.py` | PASS | 20 of 20, 0 skipped (145 s); check 14 ran; `PASS 20 … 267.1 GiB free before the snapshot` |
+| `at6-e2e.py` | PASS | 13 of 13, 0 skipped (248 s) |
+| `at7-e2e.py` | PASS | 8 of 8 (19 s) |
+| `mcp-smoke.py --vm "Windows 11"` (VM stopped before) | PASS | `PASS: MCP end to end` (48 s) |
+
+The `nohup` runs are the 11.6 `nohup` check: a SIGHUP sent to each script
+started under `nohup` did not end it, and each passed in full.
 
 ## Defects
 
@@ -96,4 +112,64 @@ ARM64, user `alcove`), reached through `alcovectl serve` built from this tree
 
 ## Not run, and why
 
+- 11.3: no key login to this Mac over SSH is set up (Remote Login answers,
+  `Permission denied (publickey,password,keyboard-interactive)`); none was
+  set up, as instructed.
+- 11.5: an `--in-process` run cannot restore `--snapshot` (D7), so there is no
+  restore to interrupt.
+- 11.13: the path of a recording that ends during the video copy was not
+  reached; on this host the copy and its playability check end within a few
+  ms of the op's start (ten tries, see C).
+- 11.12 with a recommended scale other than 100 %: the engine's EDID gives
+  every resolution a recommended scale of 100 %; the check ran with the
+  guest's current scale set away from it instead.
+- 11.2 with the Alcove app as one of the two hosts: the app is not launched in
+  this session (Task 12); a second `alcovectl serve` stood in for it.
+- `install-agent.py --user` with a non-ASCII name: the Mac's ssh client
+  refuses such a user name, so 11.1 registered the agent task over ssh as
+  `alcove` instead.
+- The `taskkill` behaviour against a SYSTEM service (Task 1 step 5 asks only
+  which answer the new path gives) was not compared on the guest.
+
+## Observations
+
+- `uia-helper-check.py` check 32 failed once (`after Vanish win.list shows the
+  fixture as None`) in the first full run and passed in the five runs after
+  it (alone, twice in 29–32, in the regression and in the SIGHUP run).
+- An agent whose helper folders cannot be locked opens no log file and logs
+  to stderr, which a Windows GUI process does not show anywhere
+  (documented); variant B of the 2.6 probe left no trace of its start in the
+  guest apart from the `ui.ping` sentence.
+- `vm.snapshot.create` stops the guest for the save and does not set its
+  clock afterwards (`vm.snapshot.restore` does): after an interrupted at2 the
+  guest clock was 7 s behind and `vm.doctor` flagged it.
+- `vm.status` sent during a snapshot load or right after a save began
+  answered after 1 to 2 s.
+- Every bundle and recording of 11.10 and 11.13 kept the documented modes.
+
 ## End state
+
+- `Windows 11` stopped through `vm.stop` (by `mcp-smoke.py`, and again after
+  the final checks); no control server, `alcove-proxy`, engine or MCP process
+  left; the socket file is gone. No snapshot, no clone, an empty capture
+  journal.
+- Guest: users `alcove` only (`테스트`, `alcovet11` and their profiles
+  deleted); autologon `alcove`; the `AlcoveAgent` task runs as `alcove`
+  (re-registered by `install-agent.py`); `CurrentUser` execution policy
+  `Undefined`; no `LocalDumps` key, no `C:\alcove-dumps`, `C:\alcove-e2e`,
+  `C:\alcove-t11`, `C:\Users\alcove\gt11` (test binaries), no
+  `Documents\WindowsPowerShell`, no files of the 2.6 probe in
+  `C:\Users\Public`, no `*.untrusted-*` folder, no scheduled task other than
+  `AlcoveAgent`, no firewall rule `alcove-e2e-forward`; 1280x800 at 100 %,
+  proxy off, time zone UTC. `C:\alcove-apps` is the empty locked folder the
+  agent recreated during the 2.6 probe.
+- Changed in the guest and left so: the agent is the 0.2.1 build of this tree;
+  the `alcove` password was set again to the same value because it had
+  expired (it expires again on 2026-11-26; `Set-LocalUser alcove
+  -PasswordNeverExpires $true` would stop that); the guest clipboard holds
+  `alcove-t11-clip-before` (its text before the session was not recorded);
+  the Desktop keeps the `alcove-drop*.bin` files of earlier sessions.
+- Host: no new folder in the temporary directory; the bundles, recordings and
+  probes of this session are in the session's scratch folder only.
+- Commits: fed59bc, 8b4acb7, 514b2a0 (test scripts), ea823c6, ca6d68a,
+  bd6ae8b, 620c53a and the commit of this file (results).
