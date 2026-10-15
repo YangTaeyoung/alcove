@@ -271,6 +271,7 @@ final class ControlStateTests: XCTestCase {
 
     func testSetResolutionWaitsByTheHandlersClock() async throws {
         let agent = FakeAgent()
+        agent.caps = ["clipboard", "files", "exec", "resolution"]
         _ = agent.start()
         addTeardownBlock { agent.stop() }
         let client = AgentClient()
@@ -297,6 +298,7 @@ final class ControlStateTests: XCTestCase {
     func testSetResolutionWarnsWhenTheGuestSetsAnotherSize() async throws {
         let t = FakeTarget(name: "Win", state: .running, png: makePNG(width: 800, height: 600))
         let agent = FakeAgent()
+        agent.caps = ["clipboard", "files", "exec", "resolution"]
         agent.handler = { m, _ in
             if m["t"]?.stringValue == "resolution.set" {
                 Task { await t.setPNG(makePNG(width: 1920, height: 1200)) }

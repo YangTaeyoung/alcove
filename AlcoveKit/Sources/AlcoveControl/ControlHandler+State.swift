@@ -65,6 +65,10 @@ extension ControlHandler {
         }
         let t = try await running(params)
         let agent = try await tools(t)
+        guard let hello = await agent.hello, hello.capabilities.contains("resolution") else {
+            throw ControlError.failed("the guest tools in '\(t.name)' cannot change the display mode of this guest; "
+                + "change it in the guest's display settings")
+        }
         let first = try await screenshot(t)
         let before = [first.width, first.height]
         await agent.setResolution(width: width, height: height)

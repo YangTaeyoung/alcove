@@ -304,10 +304,12 @@ export function register(r: Registrar, client: ControlClient): void {
       const lines = [`started pid ${reply.pid}`];
       if (w) lines.push(windowLine(w));
       if (reply.windowTimedOut === true) lines.push(`no window appeared within ${wait} s; check alcove_list_windows`);
+      const noWait = typeof reply.noWindowWait === "string" ? reply.noWindowWait : undefined;
+      if (noWait) lines.push(noWait);
       const seq = eventSeqLine(reply);
       if (seq) lines.push(seq);
       return text(lines.join("\n"), { pid: reply.pid, window: w, ...(reply.windowTimedOut === true ? { windowTimedOut: true } : {}),
-        ...(seq ? { eventSeq: reply.eventSeq } : {}) });
+        ...(noWait ? { noWindowWait: noWait } : {}), ...(seq ? { eventSeq: reply.eventSeq } : {}) });
     } catch (e) {
       return fail(e);
     }
@@ -354,6 +356,7 @@ export function register(r: Registrar, client: ControlClient): void {
       const w = reply.window as Obj | undefined;
       if (w) lines.push(windowLine(w));
       if (reply.windowTimedOut === true) lines.push(`no window appeared within ${a.wait_window_s ?? DEPLOY_WAIT_WINDOW_S} s; check alcove_list_windows`);
+      if (typeof reply.noWindowWait === "string") lines.push(reply.noWindowWait);
       const seq = eventSeqLine(reply);
       if (seq) lines.push(seq);
       const structured = withoutEnvelope(reply);

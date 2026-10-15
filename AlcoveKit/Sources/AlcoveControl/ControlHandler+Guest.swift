@@ -238,10 +238,13 @@ extension ControlHandler {
         }
         let result = await runRecipe(agent, script, vm: t.name, op: "vm.doctor")
         let received = wallClock()
-        guard result.ok, let probe = Self.probeJSON(result.stdout) else {
+        guard result.ok, var probe = Self.probeJSON(result.stdout) else {
             rows.append(check("probe", false, result.ok ? "the guest probe printed no JSON object" : result.detail,
                               hint: "check that the guest shell works with vm.exec"))
             return ["checks": .array(rows)]
+        }
+        if os == .linux, let info = try? await agent.call("session.info", [:], timeout: .seconds(10)) {
+            probe = Self.withDesktopSession(probe, info)
         }
         rows += probeRows(probe, received: received)
         rows.append(await proxyCheck(t, agent: agent, os: os))
@@ -264,6 +267,15 @@ extension ControlHandler {
         case .stopping, .suspending: return "wait until vm.status shows stopped, then call vm.start"
         case .running, .stopped, .failed: return "call vm.start"
         }
+    }
+
+    /// `probe` with `user` and `locked` taken from `info`, the agent's `session.info` reply: the desktop session's user
+    /// and lock state, or neither when the reply names no user.
+    static func withDesktopSession(_ probe: JSON, _ info: JSON) -> JSON {
+        guard case .object(var fields) = probe else { return probe }
+        fields["user"] = info["user"]?.stringValue.map(JSON.string)
+        fields["locked"] = info["user"] == nil ? nil : info["locked"]?.boolValue.map(JSON.bool)
+        return .object(fields)
     }
 
     private static func probeJSON(_ output: String) -> JSON? {

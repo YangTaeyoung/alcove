@@ -4,6 +4,25 @@ import AlcoveQMP
 import AlcoveTestSupport
 
 final class AgentClientTests: XCTestCase {
+    func testCapsMessageReplacesTheHelloCapabilities() async throws {
+        let agent = FakeAgent().start()
+        defer { agent.stop() }
+        agent.caps = ["files", "exec"]
+        let client = AgentClient()
+        try await client.connect(port: agent.port, expectedToken: "tok")
+        agent.sendLine(["t": "caps", "caps": ["files", "clipboard", "exec"]])
+        let deadline = ContinuousClock.now + .seconds(10)
+        var caps = await client.hello?.capabilities
+        while caps != ["files", "clipboard", "exec"], ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+            caps = await client.hello?.capabilities
+        }
+        XCTAssertEqual(caps, ["files", "clipboard", "exec"])
+        let hello = await client.hello
+        XCTAssertEqual(hello?.os, "windows")
+        XCTAssertEqual(hello?.rpcVersion, 2)
+    }
+
     func testHandshakeTokenAndCommands() async throws {
         let agent = FakeAgent().start()
         defer { agent.stop() }

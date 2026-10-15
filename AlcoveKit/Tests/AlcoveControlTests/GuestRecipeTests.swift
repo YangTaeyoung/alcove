@@ -92,7 +92,7 @@ final class GuestRecipeTests: XCTestCase {
         let windows = try XCTUnwrap(GuestRecipes.setClock(unixSeconds: 1_800_000_123, os: .windows))
         XCTAssertTrue(windows.contains("1800000123"))
         XCTAssertTrue(windows.contains("Set-Date"))
-        XCTAssertEqual(GuestRecipes.setClock(unixSeconds: 1_800_000_123, os: .linux), "date -u -s @1800000123")
+        XCTAssertEqual(GuestRecipes.setClock(unixSeconds: 1_800_000_123, os: .linux), "date -u -s @1800000123 >/dev/null && date -u +%Y-%m-%dT%H:%M:%SZ")
     }
 
     func testRecipesQuoteInterpolatedValues() throws {
@@ -102,7 +102,7 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertTrue(locale.contains("'a''b'"))
         let layouts = try XCTUnwrap(GuestRecipes.setKeyboardLayouts(["en-US", "x'y"], os: .windows))
         XCTAssertTrue(layouts.contains("'x''y'"))
-        XCTAssertEqual(GuestRecipes.setTimeZone("A'B", os: .linux), "timedatectl set-timezone 'A'\\''B'")
+        XCTAssertEqual(GuestRecipes.setTimeZone("A'B", os: .linux), "timedatectl set-timezone 'A'\\''B' && timedatectl show -p Timezone --value")
     }
 
     func testDPIStepIndexIsTheNearestOfferedPercentage() {
@@ -293,7 +293,7 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(rows.compactMap { $0["ok"]?.boolValue }, [true, true, false])
         XCTAssertEqual(rows[2]["detail"]?.stringValue, "not supported on linux guests")
         XCTAssertEqual(rows.compactMap { $0["takesEffect"]?.stringValue }, ["now", "now", "now"])
-        XCTAssertEqual(commands(agent), ["date -u -s @1791883800", "timedatectl set-timezone 'Asia/Seoul'"])
+        XCTAssertEqual(commands(agent), ["date -u -s @1791883800 >/dev/null && date -u +%Y-%m-%dT%H:%M:%SZ", "timedatectl set-timezone 'Asia/Seoul' && timedatectl show -p Timezone --value"])
     }
 
     func testSetEnvironmentValidatesParameters() async throws {
@@ -359,7 +359,7 @@ final class GuestRecipeTests: XCTestCase {
             m["op"]?.stringValue == "exec.run" ? [exitReply(m)] : []
         }
         _ = try await h.handle(op: "vm.set_environment", params: ["name": "Win", "clock": "host"])
-        XCTAssertEqual(commands(agent), ["date -u -s @1800000000"])
+        XCTAssertEqual(commands(agent), ["date -u -s @1800000000 >/dev/null && date -u +%Y-%m-%dT%H:%M:%SZ"])
     }
 
     func testClockAcceptsISO8601WithAndWithoutFraction() async throws {
@@ -368,7 +368,7 @@ final class GuestRecipeTests: XCTestCase {
         }
         _ = try await h.handle(op: "vm.set_environment", params: ["name": "Win", "clock": "2026-10-13T09:30:00Z"])
         _ = try await h.handle(op: "vm.set_environment", params: ["name": "Win", "clock": "2026-10-13T09:30:00.250Z"])
-        XCTAssertEqual(commands(agent), ["date -u -s @1791883800", "date -u -s @1791883800"])
+        XCTAssertEqual(commands(agent), ["date -u -s @1791883800 >/dev/null && date -u +%Y-%m-%dT%H:%M:%SZ", "date -u -s @1791883800 >/dev/null && date -u +%Y-%m-%dT%H:%M:%SZ"])
     }
 
     func testClockRejectsInvalidText() async throws {
@@ -576,12 +576,50 @@ final class GuestRecipeTests: XCTestCase {
 
     func testDoctorOnLinuxRunsTheLinuxProbe() async throws {
         let (h, _, agent) = try await setup(os: .linux) { m, _ in
-            m["op"]?.stringValue == "exec.run" ? [exitReply(m, stdout: probeJSON(utc: hostNow, scale: 100))] : []
+            switch m["op"]?.stringValue {
+            case "exec.run": return [exitReply(m, stdout: probeJSON(utc: hostNow, user: "root", scale: 100))]
+            case "session.info": return [["t": "res", "id": m["id"] ?? .null, "ok": false, "error": "unknown op 'session.info'; update alcove-agent"]]
+            default: return []
+            }
         }
         let r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
         XCTAssertEqual(check(r, "clock")?["ok"]?.boolValue, true)
         XCTAssertEqual(commands(agent), [GuestRecipes.doctorProbe(os: .linux), GuestRecipes.readSystemProxy(os: .linux)])
         XCTAssertEqual(check(r, "proxy")?["ok"]?.boolValue, true)
+        XCTAssertEqual(check(r, "session")?["detail"]?.stringValue, "root, unlocked")
+    }
+
+    func testDoctorOnLinuxReportsTheDesktopSessionUser() async throws {
+        let session = LockedBox<[String: JSON]>(["session": "1", "user": "alcove", "uid": 1000, "type": "wayland", "locked": false])
+        let (h, _, agent) = try await setup(os: .linux) { m, _ in
+            switch m["op"]?.stringValue {
+            case "exec.run": return [exitReply(m, stdout: probeJSON(utc: hostNow, user: "root"))]
+            case "session.info": return [agentReply(m, session.value)]
+            default: return []
+            }
+        }
+        var r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(r, "session")?["detail"]?.stringValue, "alcove, unlocked")
+        XCTAssertEqual(check(r, "session")?["ok"]?.boolValue, true)
+        XCTAssertEqual(agentRequests(agent, "session.info").count, 1)
+
+        session.value["locked"] = true
+        r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(r, "session")?["detail"]?.stringValue, "alcove, locked")
+        XCTAssertEqual(check(r, "session")?["ok"]?.boolValue, false)
+
+        session.value = [:]
+        r = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertEqual(check(r, "session")?["detail"]?.stringValue, "the guest reported no user")
+        XCTAssertEqual(check(r, "session")?["ok"]?.boolValue, false)
+    }
+
+    func testDoctorOnWindowsDoesNotAskForTheDesktopSession() async throws {
+        let (h, _, agent) = try await setup { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m, stdout: probeJSON(utc: hostNow))] : []
+        }
+        _ = try await h.handle(op: "vm.doctor", params: ["name": "Win"])
+        XCTAssertTrue(agentRequests(agent, "session.info").isEmpty)
     }
 
     // MARK: - start of a suspended session

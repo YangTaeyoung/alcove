@@ -70,6 +70,12 @@ func windowsCaseConflict(in names: [String]) -> (String, String)? {
     return nil
 }
 
+/// Whether the host file at `url` has an execute bit for its owner, its group or others.
+private func isExecutable(_ url: URL) -> Bool {
+    guard let mode = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.posixPermissions] as? NSNumber else { return false }
+    return mode.intValue & 0o111 != 0
+}
+
 private func localDigest(of url: URL) throws -> String {
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
@@ -134,6 +140,7 @@ extension AgentClient {
             throw AgentError.remote("'\(path)' exists in the guest; pass overwrite")
         }
         let part = path + ".alcove-part"
+        let executable = isExecutable(url)
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let renamed: JSON
@@ -145,10 +152,12 @@ extension AgentClient {
                 let piece = try handle.read(upToCount: transferPiece) ?? Data()
                 if piece.isEmpty && offset > 0 { break }
                 hasher.update(data: piece)
-                _ = try await call("fs.write", [
+                var request: [String: JSON] = [
                     "path": .string(part), "data": .string(piece.base64EncodedString()),
                     "offset": .int(Int64(offset)), "truncate": .bool(offset == 0), "mkdirs": .bool(true),
-                ], timeout: timeout)
+                ]
+                if executable, offset == 0 { request["executable"] = true }
+                _ = try await call("fs.write", request, timeout: timeout)
                 offset += piece.count
                 if piece.isEmpty { break }
             }

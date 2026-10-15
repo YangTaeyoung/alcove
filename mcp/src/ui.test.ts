@@ -135,6 +135,16 @@ test("alcove_deploy says that no window appeared only when the reply carries win
   assert.equal(textOf(copied), "deployed to C:\\a: sent 0 file(s), skipped 2 unchanged, 0 bytes");
 });
 
+test("alcove_launch_app and alcove_deploy print the noWindowWait sentence of guest tools without ui", async () => {
+  const sentence = "the guest tools of this guest have no ui capability, so no window was waited for; wait for the program with vm.wait_for (process_started or text_visible)";
+  const launched = await rig(register, { pid: 3216, noWindowWait: sentence, eventSeq: 2 }).run("alcove_launch_app", { name: "vm", path: "/usr/bin/gnome-text-editor" });
+  assert.equal(textOf(launched), `started pid 3216\n${sentence}\neventSeq 2`);
+  assert.deepEqual(launched.structuredContent, { pid: 3216, window: undefined, noWindowWait: sentence, eventSeq: 2 });
+  const deployed = await rig(register, { guestDir: "/opt/a", sent: ["run.sh"], skipped: 0, bytes: 9, pid: 9, noWindowWait: sentence })
+    .run("alcove_deploy", { name: "vm", path: "/b", guest_dir: "/opt/a", launch: { exe: "run.sh" } });
+  assert.equal(textOf(deployed), `deployed to /opt/a: sent 1 file(s), skipped 0 unchanged, 9 bytes\nstarted pid 9\n${sentence}`);
+});
+
 test("alcove_events prints the title of window events, the code and path of exits, and a gap", async () => {
   const win = { id: "0x1", title: "Fixture Dialog", process: "p.exe", pid: 4 };
   const events = [

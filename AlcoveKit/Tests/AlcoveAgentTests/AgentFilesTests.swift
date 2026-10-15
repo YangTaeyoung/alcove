@@ -48,6 +48,27 @@ final class AgentFilesTests: XCTestCase {
         XCTAssertEqual(fs["/data/in/blob.bin"], replacement)
     }
 
+    func testPushOfAnExecutableFileAsksForAnExecutableGuestFile() async throws {
+        let fs = FakeFS()
+        let (agent, client) = try await connected(fs)
+        let dir = try tempDir()
+        let script = dir.appendingPathComponent("run.sh")
+        let plain = dir.appendingPathComponent("data.txt")
+        try Data("#!/bin/sh\n".utf8).write(to: script)
+        try randomData(300_000).write(to: plain)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: plain.path)
+
+        _ = try await client.pushFile(script, toGuestPath: "/opt/app/run.sh", overwrite: false)
+        _ = try await client.pushFile(plain, toGuestPath: "/opt/app/data.txt", overwrite: false)
+        let writes = agent.received.filter { $0["op"]?.stringValue == "fs.write" }
+        let scriptWrites = writes.filter { $0["path"]?.stringValue == "/opt/app/run.sh.alcove-part" }
+        let plainWrites = writes.filter { $0["path"]?.stringValue == "/opt/app/data.txt.alcove-part" }
+        XCTAssertEqual(scriptWrites.map { $0["executable"] }, [.bool(true)])
+        XCTAssertEqual(plainWrites.count, 2)
+        XCTAssertTrue(plainWrites.allSatisfy { $0["executable"] == nil })
+    }
+
     func testPushDigestMismatch() async throws {
         let fs = FakeFS()
         fs.corruptWrites = true

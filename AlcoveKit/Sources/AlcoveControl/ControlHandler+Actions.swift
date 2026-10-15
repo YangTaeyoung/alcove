@@ -352,8 +352,8 @@ extension ControlHandler {
     private func paste(_ text: String, into t: VMTarget, caller: String) async throws {
         guard let agent = await t.agent(timeout: .seconds(2)) else { throw ControlError.untypable("this text") }
         guard let hello = await agent.hello, hello.capabilities.contains("clipboard") else {
-            throw ControlError.failed("the guest tools in '\(t.name)' have no clipboard (a Linux guest needs wl-copy or xclip in its session), "
-                + "so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only")
+            throw ControlError.failed("the guest tools in '\(t.name)' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), "
+                + "so text outside the US layout cannot be typed; sign in to the guest's desktop and install wl-clipboard or xclip there, or type US-layout text only")
         }
         guard AgentClient.clipboardMessageFits(text) else {
             throw ControlError.failed("the text is too large for the guest clipboard (\(text.utf8.count) bytes of UTF-8; one message to the "

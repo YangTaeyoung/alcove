@@ -365,12 +365,12 @@ public actor ControlHandler {
             return try await shell(op: op, params: params)
         case "vm.clipboard.get":
             let t = try await running(params)
-            let agent = try await tools(t)
+            let agent = try await clipboardTools(t, op: op)
             do { return ["text": .string(try await agent.getClipboard())] } catch { throw agentFailure(error, vm: t.name, op: op) }
         case "vm.clipboard.set":
             let t = try await running(params)
             guard let text = params["text"]?.stringValue else { throw ControlError.missing("text") }
-            let agent = try await tools(t)
+            let agent = try await clipboardTools(t, op: op)
             do { try await agent.setClipboard(text: text) } catch { throw agentFailure(error, vm: t.name, op: op) }
             return [:]
         case "vm.push_file", "vm.pull_file", "vm.crash_dumps.pull", "vm.sync_dir", "vm.fs.list", "vm.fs.read", "vm.fs.write", "vm.fs.delete":
@@ -553,6 +553,21 @@ public actor ControlHandler {
             throw ControlError.noTools(t.name)
         }
         return a
+    }
+
+    /// The connected guest tools of `t` when their capabilities hold `clipboard`; `op` is named in the refusal.
+    func clipboardTools(_ t: VMTarget, op: String) async throws -> AgentClient {
+        let agent = try await tools(t)
+        guard let hello = await agent.hello, hello.capabilities.contains("clipboard") else {
+            throw ControlError.failed(ControlHandler.noClipboard(vm: t.name, op: op))
+        }
+        return agent
+    }
+
+    /// The refusal of `op` on guest tools without the `clipboard` capability.
+    static func noClipboard(vm: String, op: String) -> String {
+        "the guest tools in '\(vm)' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), "
+            + "so \(op) cannot run; sign in to the guest's desktop and install wl-clipboard or xclip there, then retry"
     }
 
     /// The control op for each agent op that one control op stands for.

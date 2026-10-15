@@ -157,6 +157,7 @@ final class LeaseTests: XCTestCase {
 
     func testSetResolutionReturnsNewSize() async throws {
         let agent = FakeAgent()
+        agent.caps = ["clipboard", "files", "exec", "resolution"]
         let (h, t) = try await handlerWithAgent(agent, in: self)
         let swap = Task {
             try await Task.sleep(for: .milliseconds(200))
@@ -168,6 +169,15 @@ final class LeaseTests: XCTestCase {
         let requests = agentRequestsOrEvents(agent, "resolution.set")
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?["w"]?.intValue, 1024); XCTAssertEqual(requests.first?["h"]?.intValue, 768)
+    }
+
+    func testSetResolutionRefusesGuestToolsThatCannotChangeTheMode() async throws {
+        let agent = FakeAgent()
+        agent.caps = ["files", "shutdown", "exec", "rpc"]
+        let (h, _) = try await handlerWithAgent(agent, in: self)
+        let text = await failure(h, "vm.set_resolution", ["name": "Win", "width": 1440, "height": 900])
+        XCTAssertEqual(text, "the guest tools in 'Win' cannot change the display mode of this guest; change it in the guest's display settings")
+        XCTAssertTrue(agentRequestsOrEvents(agent, "resolution.set").isEmpty)
     }
 
     func testSetResolutionValidatesAndNeedsTools() async throws {

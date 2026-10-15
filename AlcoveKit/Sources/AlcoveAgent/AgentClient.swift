@@ -419,6 +419,11 @@ public actor AgentClient {
             send(["t": "pong"])
         case "pong", "welcome":
             break
+        case "caps":
+            if let caps = m["caps"]?.arrayValue, let h = hello {
+                hello = Hello(version: h.version, os: h.os, agentVersion: h.agentVersion, capabilities: caps.compactMap(\.stringValue),
+                              rpcVersion: h.rpcVersion, authenticated: h.authenticated)
+            }
         case "clipboard.changed":
             eventContinuation.yield(.clipboardChanged(text: m["text"]?.stringValue ?? ""))
         case "resolution":

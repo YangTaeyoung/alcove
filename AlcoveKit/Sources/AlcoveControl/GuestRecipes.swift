@@ -54,7 +54,7 @@ enum GuestRecipes {
             return windowsPrelude + "[void](Set-Date -Date ([DateTimeOffset]::FromUnixTimeSeconds(\(unixSeconds)).LocalDateTime))\n"
                 + "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')"
         case .linux:
-            return "date -u -s @\(unixSeconds)"
+            return "date -u -s @\(unixSeconds) >/dev/null && date -u +%Y-%m-%dT%H:%M:%SZ"
         case .other:
             return nil
         }
@@ -63,7 +63,7 @@ enum GuestRecipes {
     static func setTimeZone(_ id: String, os: VMConfig.GuestOS) -> String? {
         switch os {
         case .windows: return windowsPrelude + "Set-TimeZone -Id \(quote(id, os: os))\n(Get-TimeZone).Id"
-        case .linux: return "timedatectl set-timezone \(quote(id, os: os))"
+        case .linux: return "timedatectl set-timezone \(quote(id, os: os)) && timedatectl show -p Timezone --value"
         case .other: return nil
         }
     }

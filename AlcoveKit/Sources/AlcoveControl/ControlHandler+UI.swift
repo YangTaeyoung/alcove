@@ -610,10 +610,17 @@ extension ControlHandler {
     static let agentLaunchHint = "; check the path with fs.stat"
     static let launchHint = "; check the path with vm.fs.list"
 
+    /// The `noWindowWait` sentence of a launch that asked for a window wait on guest tools without the `ui` capability.
+    static let noWindowWait = "the guest tools of this guest have no ui capability, so no window was waited for; "
+        + "wait for the program with vm.wait_for (process_started or text_visible)"
+
     /// `app.launch` with `request` and a window wait of `waitMs`; the agent call outlasts the wait by 30 s.
     /// The result holds `pid`, the `window` that appeared, or `windowTimedOut` when one was waited for and none appeared.
+    /// On guest tools without the `ui` capability no window is waited for, and a `waitMs` above 0 adds `noWindowWait`.
     /// An agent sentence that ends with `agentLaunchHint` is thrown with `launchHint` in its place.
-    func launch(_ agent: AgentClient, _ request: [String: JSON], waitMs: Int) async throws -> JSON {
+    func launch(_ agent: AgentClient, _ request: [String: JSON], waitMs requested: Int) async throws -> JSON {
+        let hasUI = await agent.hello?.capabilities.contains("ui") ?? false
+        let waitMs = hasUI ? requested : 0
         var fields = request
         fields["wait_window_ms"] = .int(Int64(waitMs))
         let r: JSON
@@ -628,6 +635,8 @@ extension ControlHandler {
             out["window"] = window
         } else if waitMs > 0 {
             out["windowTimedOut"] = true
+        } else if requested > 0 {
+            out["noWindowWait"] = .string(ControlHandler.noWindowWait)
         }
         return .object(out)
     }

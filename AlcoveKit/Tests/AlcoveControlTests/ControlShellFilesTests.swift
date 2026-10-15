@@ -154,6 +154,19 @@ final class ControlShellFilesTests: XCTestCase {
         XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue == "clipboard.set" })
     }
 
+    func testClipboardOpsRefuseGuestToolsWithoutAClipboard() async throws {
+        let agent = FakeAgent()
+        agent.caps = ["files", "exec", "rpc"]
+        agent.handler = { m, _ in m["t"]?.stringValue == "clipboard.get" ? [["t": "clipboard.text", "text": ""]] : [] }
+        let (h, _) = try await handlerWithAgent(agent, in: self)
+        for (op, params) in [("vm.clipboard.set", ["name": "Win", "text": "hello-linux"] as JSON), ("vm.clipboard.get", ["name": "Win"])] {
+            let text = await failure(h, op, params)
+            XCTAssertEqual(text, "the guest tools in 'Win' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), "
+                           + "so \(op) cannot run; sign in to the guest's desktop and install wl-clipboard or xclip there, then retry")
+        }
+        XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue?.hasPrefix("clipboard.") == true })
+    }
+
     func testExecStartReadWriteKillList() async throws {
         let jobs: JSON = [["job": "j1", "pid": 42, "state": "exited", "code": 0, "cmd": "ping", "started": "2026-01-01T00:00:00Z"]]
         let (h, agent) = try await setup { m, _ in

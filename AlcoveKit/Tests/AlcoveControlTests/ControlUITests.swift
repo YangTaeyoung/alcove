@@ -140,7 +140,7 @@ final class ControlUITests: XCTestCase {
     }
 
     /// A running 800x600 VM "Win" whose agent offers `caps` and answers from `script`.
-    private func rig(caps: [String] = ["clipboard", "files", "exec", "ui"], _ script: Script = [:]) async throws -> (ControlHandler, FakeTarget, FakeAgent) {
+    private func rig(caps: [String] = ["clipboard", "files", "exec", "ui", "resolution"], _ script: Script = [:]) async throws -> (ControlHandler, FakeTarget, FakeAgent) {
         let agent = FakeAgent()
         agent.caps = caps
         let counts = LockedBox<[String: Int]>([:])
@@ -578,8 +578,8 @@ final class ControlUITests: XCTestCase {
         let (h, t, agent) = try await rig(caps: ["files", "exec", "ui"])
         giveClipboard(to: agent)
         let message = await failure(h, "vm.type", ["name": "Win", "text": "한글"])
-        XCTAssertEqual(message, "the guest tools in 'Win' have no clipboard (a Linux guest needs wl-copy or xclip in its session), "
-            + "so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only")
+        XCTAssertEqual(message, "the guest tools in 'Win' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), "
+            + "so text outside the US layout cannot be typed; sign in to the guest's desktop and install wl-clipboard or xclip there, or type US-layout text only")
         XCTAssertFalse(agent.received.contains { $0["t"]?.stringValue?.hasPrefix("clipboard.") == true })
         let sent = await t.sent
         XCTAssertEqual(keys(sent), [])
@@ -809,8 +809,9 @@ final class ControlUITests: XCTestCase {
     // MARK: - deploy
 
     /// A running VM "Win" whose agent serves `fs` and answers the other ops from `script`.
-    private func deployRig(fs: FakeFS, _ script: Script) async throws -> (ControlHandler, FakeAgent) {
+    private func deployRig(fs: FakeFS, caps: [String] = ["clipboard", "files", "exec", "ui"], _ script: Script) async throws -> (ControlHandler, FakeAgent) {
         let agent = FakeAgent()
+        agent.caps = caps
         fs.caseInsensitive = true
         fs.install(on: agent)
         let files = agent.handler
@@ -1649,6 +1650,27 @@ final class ControlUITests: XCTestCase {
         let two = try await second.value
         XCTAssertEqual(two["sent"], [])
         XCTAssertEqual(two["skipped"]?.intValue, 1)
+    }
+
+    func testLaunchOnGuestToolsWithoutUIWaitsForNoWindowAndSaysSo() async throws {
+        let dir = try tempDir("nowait")
+        try Data("x".utf8).write(to: dir.appendingPathComponent("app.exe"))
+        let (h, agent) = try await deployRig(fs: FakeFS(), caps: ["files", "exec", "rpc", "jobs", "proc", "fs"], [
+            "proc.list": { _, _ in .ok(["procs": []]) },
+            "app.launch": { _, _ in .ok(["pid": 3216]) },
+        ])
+        let launched = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "/usr/bin/gnome-text-editor", "waitWindow": 3])
+        XCTAssertEqual(launched, ["pid": 3216, "noWindowWait": .string(ControlHandler.noWindowWait), "eventSeq": 0])
+        XCTAssertEqual(ControlHandler.noWindowWait, "the guest tools of this guest have no ui capability, so no window was waited for; "
+                       + "wait for the program with vm.wait_for (process_started or text_visible)")
+        XCTAssertEqual(agentRequests(agent, "app.launch").last?["wait_window_ms"]?.intValue, 0)
+        let unwaited = try await h.handle(op: "vm.app.launch", params: ["name": "Win", "path": "/usr/bin/gnome-text-editor", "waitWindow": 0])
+        XCTAssertEqual(unwaited, ["pid": 3216, "eventSeq": 0])
+
+        let deployed = try await h.handle(op: "vm.deploy", params: ["name": "Win", "path": .string(dir.path), "guestDir": "C:\\nowait",
+                                                                      "launch": ["exe": "app.exe"]])
+        XCTAssertNil(deployed["windowTimedOut"])
+        XCTAssertEqual(deployed["noWindowWait"]?.stringValue, ControlHandler.noWindowWait)
     }
 
     func testLaunchReportsAWindowThatDidNotAppear() async throws {
