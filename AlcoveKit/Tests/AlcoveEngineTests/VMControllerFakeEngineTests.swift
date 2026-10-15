@@ -246,6 +246,62 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try await vm.shutdown(force: true)
     }
 
+    func testAStartWhoseCallerIsCancelledDuringTheQMPWaitRunsToItsEnd() async throws {
+        let vm = try makeVM(mode: "slow-boot")
+        let log = StateLog()
+        let observer = Task { for await s in vm.states { await log.append(s) } }
+        defer { observer.cancel() }
+        let starter = Task { try await vm.start() }
+        let waiting = await waitUntil { await vm.qmp != nil }
+        XCTAssertTrue(waiting, "the start did not reach the QMP wait")
+        starter.cancel()
+        let result = await starter.result
+        XCTAssertNoThrow(try result.get(), "the cancelled caller gets the result of the start")
+        let state = await vm.state
+        XCTAssertEqual(state, .running)
+        let client = await vm.qmp
+        let status = try await XCTUnwrap(client, "no QMP client after the cancelled start").queryStatus()
+        XCTAssertTrue(status.running, "the engine reports \(status) after the cancelled start")
+        let states = await settledStates(log, endingWith: [.starting, .running])
+        XCTAssertEqual(states, [.starting, .running])
+        try await vm.shutdown(force: true)
+    }
+
+    func testAResumeWhoseCallerIsCancelledDuringTheLoadRunsToItsEnd() async throws {
+        let vm = try makeVM(mode: "slow-incoming")
+        try await vm.start()
+        try await vm.suspendToDisk()
+        let starter = Task { try await vm.start() }
+        let loading = await waitUntil { await vm.qmp != nil }
+        XCTAssertTrue(loading, "the resume did not reach the load")
+        starter.cancel()
+        let result = await starter.result
+        XCTAssertNoThrow(try result.get(), "the cancelled caller gets the result of the resume")
+        let state = await vm.state
+        XCTAssertEqual(state, .running)
+        XCTAssertFalse(vm.bundle.isSuspended, "the loaded session is discarded")
+        try await vm.shutdown(force: true)
+    }
+
+    func testAStartWhoseCallerIsCancelledBeforeItBeginsLaunchesNothing() async throws {
+        let vm = try makeVM()
+        let log = StateLog()
+        let observer = Task { for await s in vm.states { await log.append(s) } }
+        defer { observer.cancel() }
+        let starter = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await vm.start()
+        }
+        let result = await starter.result
+        XCTAssertThrowsError(try result.get()) { XCTAssertTrue($0 is CancellationError, "\($0)") }
+        let state = await vm.state
+        XCTAssertEqual(state, .stopped)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vm.bundle.runURL.appendingPathComponent("fake-argv.json").path),
+                       "nothing must be launched")
+        let states = await settledStates(log, endingWith: [])
+        XCTAssertEqual(states, [])
+    }
+
     /// After an app crash the engine outlives it; a new controller must stop
     /// that orphan (found through the pidfile lock) before relaunching.
     func testOrphanedEngineIsStoppedBeforeRelaunch() async throws {
@@ -1146,8 +1202,8 @@ final class VMControllerFakeEngineTests: XCTestCase {
 }
 
 /// See the class comment. `FAKE_QEMU_MODE`: "" or a comma-separated list of exit-early |
-/// bad-status | migrate-fails | incoming-fails | slow-incoming | ignore-powerdown | slow-load | slow-stop | slow-save | slow-delete.
-/// slow-load: `snapshot-load` holds the QMP connection for 1 s before its job events,
+/// bad-status | migrate-fails | incoming-fails | slow-incoming | slow-boot | ignore-powerdown | slow-load | slow-stop | slow-save |
+/// slow-delete. slow-boot: a cold start reports the run state `prelaunch` for 1 s before it runs. slow-load: `snapshot-load` holds the QMP connection for 1 s before its job events,
 /// and no other command is answered meanwhile. slow-stop: `stop` does the same for 0.5 s before it pauses the guest.
 /// slow-save, slow-delete: `snapshot-save` or `snapshot-delete` sends its job events 1 s after its answer, and other
 /// commands are answered meanwhile.
@@ -1213,6 +1269,12 @@ def finish_incoming():
 
 if incoming:
     threading.Thread(target=finish_incoming, daemon=True).start()
+elif "slow-boot" in modes:
+    st.update(running=False, status="prelaunch")
+    def finish_boot():
+        time.sleep(1.0)
+        st.update(running=True, status="running")
+    threading.Thread(target=finish_boot, daemon=True).start()
 
 def handle(req):
     global pending_powerdown

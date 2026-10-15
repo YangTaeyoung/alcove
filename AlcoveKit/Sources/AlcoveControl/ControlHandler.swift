@@ -262,6 +262,18 @@ public actor ControlHandler {
         return try await run()
     }
 
+    /// The work after `t` resumed a suspended session, which a cancelled caller does not stop: waits up to `waitTools`
+    /// seconds for the guest tools of a guest with a clock recipe and sets the guest clock. Returns the result of `vm.start`.
+    private func afterResume(_ t: VMTarget, waitTools: Int) async -> JSON {
+        let hasClockRecipe = GuestRecipes.setClock(unixSeconds: 0, os: await t.guestOS()) != nil
+        let wait = hasClockRecipe ? max(0, waitTools) : 0
+        let agent = await t.agent(timeout: .seconds(wait))
+        var clockSynced = false
+        if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.start") }
+        return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral()),
+                "resumed": true, "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced)]
+    }
+
     /// Why the lease of `vm` refuses a mutating op that passes `token`; nil when the op may run.
     private func leaseRefusal(vm: String, token: String?) -> String? {
         leases.refusal(vm: vm, token: token, now: clock())
@@ -300,13 +312,9 @@ public actor ControlHandler {
                     throw ControlError.failed("start failed: \(ControlHandler.failureReason(error, fallback: "the VM did not start; check vm.status"))")
                 }
                 if resuming {
-                    let hasClockRecipe = GuestRecipes.setClock(unixSeconds: 0, os: await t.guestOS()) != nil
-                    let wait = hasClockRecipe ? max(0, params["waitTools"]?.intValue ?? 30) : 0
-                    let agent = await t.agent(timeout: .seconds(wait))
-                    var clockSynced = false
-                    if let agent { clockSynced = await syncGuestClock(t, agent: agent, op: "vm.start") }
-                    return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral()),
-                            "resumed": true, "tools": .bool(agent != nil), "clockSynced": .bool(clockSynced)]
+                    let waitTools = params["waitTools"]?.intValue ?? 30
+                    let after = Task { await self.afterResume(t, waitTools: waitTools) }
+                    return await after.value
                 }
             }
             return ["state": .string(describe(await t.state())), "ephemeral": .bool(await t.isEphemeral())]

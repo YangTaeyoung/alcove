@@ -1090,6 +1090,14 @@ set); with `clockSynced: false`, call `vm.set_environment` with `clock:
 "host"` once the tools are connected. A start that boots the VM has none of
 the three fields and does not wait for the guest tools.
 
+A start whose client disconnects or whose request is cancelled once the
+server has begun to launch the engine still runs to its end, as if the client
+waited: the VM ends `running` (`paused` when the guest is paused), or `failed`
+with the reason of a start that fails; a resume also waits for the guest
+tools and sets the clock as above. A start cancelled before the launch begins
+leaves the VM as it was. A `vm.stop` during the start stops the VM, and the
+start ends with it.
+
 `discardChanges` (a boolean, default `false`) starts a session whose disk
 writes go to qcow2 overlays (`run/ephemeral-<disk>.qcow2` in the bundle) and
 whose UEFI variable writes go to a copy (`run/ephemeral-efi-vars.fd`). When

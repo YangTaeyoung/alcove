@@ -638,6 +638,25 @@ final class GuestRecipeTests: XCTestCase {
         XCTAssertEqual(commands(agent), [GuestRecipes.setClock(unixSeconds: 1_800_000_000, os: .windows)])
     }
 
+    func testACancelledStartOfASuspendedSessionStillWaitsForTheToolsAndSyncsTheClock() async throws {
+        let (h, t, agent) = try await setup(state: .stopped) { m, _ in
+            m["op"]?.stringValue == "exec.run" ? [exitReply(m)] : []
+        }
+        await t.setSuspended(true)
+        await t.setAgentWait(.milliseconds(300))
+        let caller = Task { try await h.handle(op: "vm.start", params: ["name": "Win", "waitTools": 5]) }
+        let waiting = await eventually("the start waits for the guest tools") { await t.agentWaits == 1 }
+        XCTAssertTrue(waiting)
+        caller.cancel()
+        let r = try await caller.value
+        XCTAssertEqual(r["resumed"]?.boolValue, true)
+        XCTAssertEqual(r["tools"]?.boolValue, true)
+        XCTAssertEqual(r["clockSynced"]?.boolValue, true)
+        let cancelled = await t.cancelledAgentWaits
+        XCTAssertEqual(cancelled, 0)
+        XCTAssertEqual(commands(agent), [GuestRecipes.setClock(unixSeconds: 1_800_000_000, os: .windows)])
+    }
+
     func testStartOfASuspendedSessionWithoutToolsDoesNotSyncTheClock() async throws {
         let (h, t, _) = try await setup(state: .stopped, connected: false)
         await t.setSuspended(true)

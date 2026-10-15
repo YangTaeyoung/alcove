@@ -156,6 +156,8 @@ public actor VMController {
     /// A VM whose `config.json` is missing or does not decode is refused, whatever kind of start is asked for.
     /// A VM whose engine runs under another live host is refused (`engineOfAnotherHost()`), and so is a VM whose
     /// `agentKey` gives no public key for the SMBIOS string `alcove-hostkey`.
+    /// A caller cancelled before the launch begins throws `CancellationError` and changes nothing. Once it begins, the
+    /// launch runs to its end in a task of its own, also when the caller is cancelled, and the caller gets its outcome.
     public func start(bootFromCDROM: Bool = false, discardChanges: Bool) async throws {
         guard !state.isActive else { throw ControllerError.alreadyRunning }
         guard bundle.storedConfig() != nil else {
@@ -181,6 +183,7 @@ public actor VMController {
                 "the agentKey in \(bundle.configURL.path) is not 64 hexadecimal digits, so the guest tools could not check the host; "
                 + "restore config.json from a backup")
         }
+        try Task.checkCancellation()
         if !discardChanges, !resuming {
             do {
                 if let epoch = try bundle.advanceDiskEpoch() { config.diskEpoch = epoch }
@@ -193,6 +196,15 @@ public actor VMController {
         generation += 1
         let gen = generation
         state = .starting
+        let job = Task {
+            try await self.launchEngine(generation: gen, resuming: resuming, bootFromCDROM: bootFromCDROM, discardChanges: discardChanges)
+        }
+        try await job.value
+    }
+
+    /// The part of `start` from `.starting` on: launches the engine of generation `gen` and waits until the guest runs
+    /// or the resume of a suspended session has loaded.
+    private func launchEngine(generation gen: Int, resuming: Bool, bootFromCDROM: Bool, discardChanges: Bool) async throws {
         var engineLaunched = false
         do {
             try config.validate()
