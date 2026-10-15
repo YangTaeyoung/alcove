@@ -1,5 +1,6 @@
 import Foundation
 import AlcoveQMP
+import AlcoveDisplayProtocol
 
 /// Turns the lines of a recording's trace into a script.
 enum ScriptBuilder {
@@ -42,6 +43,8 @@ enum ScriptBuilder {
     ///   Left out as well are a `vm.wait_for` with a condition that names its element by ref, a `vm.batch` with a step
     ///   that holds a ref, and an entry with a param the trace cut. A selector a client passed to a `vm.ui.*` op loses
     ///   a window id.
+    /// - A `vm.batch` whose result names a `failedStep` keeps the steps before it, followed by the releases of the
+    ///   buttons and keys they left pressed (`releasing`), with a warning; it is left out when none of its steps ran.
     /// - A `vm.type` step directly after a `vm.type` step with the same other params and no expectation adds its text
     ///   to that step, unless an entry between the two was left out.
     /// - A step whose entry shows a foreground window title with another stable part than the entries before it
@@ -268,10 +271,25 @@ enum ScriptBuilder {
 
             switch op {
             case "vm.batch":
-                if let steps = params["steps"]?.arrayValue {
+                if var steps = params["steps"]?.arrayValue {
                     guard !steps.contains(where: holdsRef) else {
                         leaveOut(line, "one of its steps names an element by ref; add the steps by hand with selector fields")
                         return
+                    }
+                    if let failed = entry["result"]?["failedStep"]?.intValue {
+                        let failedOp = failed >= 0 && failed < steps.count ? steps[failed]["op"]?.stringValue : nil
+                        let which = failedOp.map { "its step \(failed) (\($0))" } ?? "its step \(failed)"
+                        let ran = max(0, min(entry["result"]?["completed"]?.intValue ?? failed, failed, steps.count))
+                        guard ran > 0 else {
+                            leaveOut(line, "the batch stopped at \(which), so none of its steps ran")
+                            return
+                        }
+                        steps = ScriptBuilder.releasing(Array(steps.prefix(ran)))
+                        guard steps.count <= ControlHandler.maxBatchSteps else {
+                            leaveOut(line, "the batch stopped at \(which), and its \(ran) steps before it with the releases of what they left pressed exceed \(ControlHandler.maxBatchSteps) steps; add them by hand")
+                            return
+                        }
+                        warnings.append("\(line) stopped at \(which): the step keeps the \(ran) steps before it and then releases the buttons and keys they left pressed, as the batch did")
                     }
                     item.step.params["steps"] = .array(steps.map { step in
                         guard var fields = step.objectValue else { return step }
@@ -404,6 +422,36 @@ enum ScriptBuilder {
     static let centreRoles: Set<String> = ["Edit", "ComboBox", "SplitButton", "Spinner", "HeaderItem", "DataItem", "Text"]
     /// The least distance from the centre, in pixels, that counts as near it.
     static let centreMargin = 6.0
+
+    /// `steps`, batch steps that ran, followed by a `vm.mouse.up` for each button and a `vm.key.up` for each key that
+    /// their `vm.mouse.down` and `vm.key.down` steps pressed and no later step released: the buttons first, then the
+    /// keys, the latest pressed first of each.
+    static func releasing(_ steps: [JSON]) -> [JSON] {
+        var buttons: [(button: InputButton, name: JSON?)] = []
+        var keys: [(code: Int, name: String)] = []
+        for step in steps {
+            switch step["op"]?.stringValue {
+            case "vm.mouse.down", "vm.mouse.up":
+                guard let button = try? ControlHandler.inputButton(step["button"]?.stringValue) else { continue }
+                buttons.removeAll { $0.button == button }
+                if step["op"]?.stringValue == "vm.mouse.down" { buttons.append((button, step["button"])) }
+            case "vm.key.down", "vm.key.up":
+                guard let name = step["key"]?.stringValue, let key = try? KeyNames.key(named: name) else { continue }
+                keys.removeAll { $0.code == key.code }
+                if step["op"]?.stringValue == "vm.key.down" { keys.append((key.code, name)) }
+            default:
+                continue
+            }
+        }
+        var out = steps
+        for held in buttons.reversed() {
+            var up: [String: JSON] = ["op": "vm.mouse.up"]
+            if let name = held.name { up["button"] = name }
+            out.append(.object(up))
+        }
+        for held in keys.reversed() { out.append(.object(["op": "vm.key.up", "key": .string(held.name)])) }
+        return out
+    }
 
     /// Whether a click at (`x`, `y`) on the element a trace line describes as `target` may be replayed as a click at
     /// the element's centre: always for a role of `wholeElementRoles`; for a role of `centreRoles` when the point lies

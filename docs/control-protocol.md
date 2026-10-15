@@ -2398,6 +2398,15 @@ Which trace lines become steps:
   result. Left out, each with a warning: a `vm.wait_for` whose condition names
   a ref, a `vm.batch` with a step that holds a ref, a step with a value the
   trace cut at 2000 characters, a window id without a title.
+- A `vm.batch` that stopped at a failed step (`failedStep` in its result)
+  keeps only the steps before that step, followed by a `vm.mouse.up` or
+  `vm.key.up` for each button and key they pressed and left down (buttons
+  first, the latest pressed first), as the batch released them; the warning
+  reads `seq <n> (vm.batch) stopped at its step <i> (<op>): the step keeps the
+  <i> steps before it and then releases the buttons and keys they left
+  pressed, as the batch did`. When no step ran it is left out with `seq <n>
+  (vm.batch) is left out: the batch stopped at its step 0 (<op>), so none of
+  its steps ran`.
 - Consecutive `vm.type` lines with the same other params and no expectation
   merge into one step.
 - A step whose line shows a foreground window with another title part than the

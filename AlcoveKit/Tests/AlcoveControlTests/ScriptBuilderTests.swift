@@ -621,6 +621,29 @@ final class ScriptBuilderTests: XCTestCase {
         XCTAssertFalse(String(decoding: try draft.script.encoded(), as: UTF8.self).contains("\"ref\""))
     }
 
+    func testABatchThatStoppedAtAFailedStepKeepsTheStepsThatRanAndTheirReleases() throws {
+        let draft = ScriptBuilder.draft(trace: [
+            entry(1, "vm.batch", ["steps": [["op": "vm.key.down", "key": "shift"], ["op": "vm.mouse.down", "button": "right"],
+                                            ["op": "vm.key.down", "key": "a"], ["op": "vm.key.up", "key": "a"],
+                                            ["op": "vm.key.press", "keys": "nosuchkey"], ["op": "vm.type", "text": "x"]]],
+                  result: ["completed": 4, "results": [[:], [:], [:], [:]], "failedStep": 4, "error": "bad key spec 'nosuchkey'"]),
+            entry(2, "vm.batch", ["steps": [["op": "vm.key.press", "keys": "nosuchkey"], ["op": "vm.type", "text": "y"]]],
+                  result: ["completed": 0, "results": [], "failedStep": 0, "error": "bad key spec 'nosuchkey'"]),
+            entry(3, "vm.key.press", ["keys": "enter"]),
+        ], vm: "Win", from: nil, to: nil)
+        XCTAssertEqual(draft.script.steps.map(\.params), [
+            ["steps": [["op": "vm.key.down", "key": "shift"], ["op": "vm.mouse.down", "button": "right"],
+                       ["op": "vm.key.down", "key": "a"], ["op": "vm.key.up", "key": "a"],
+                       ["op": "vm.mouse.up", "button": "right"], ["op": "vm.key.up", "key": "shift"]]],
+            ["keys": "enter"],
+        ])
+        XCTAssertEqual(draft.sources, [1, 3])
+        XCTAssertEqual(draft.warnings, [
+            "seq 1 (vm.batch) stopped at its step 4 (vm.key.press): the step keeps the 4 steps before it and then releases the buttons and keys they left pressed, as the batch did",
+            "seq 2 (vm.batch) is left out: the batch stopped at its step 0 (vm.key.press), so none of its steps ran",
+        ])
+    }
+
     func testTypesAreNotMergedAcrossALeftOutStep() {
         let draft = ScriptBuilder.draft(trace: [
             entry(1, "vm.type", ["text": "a"]),
