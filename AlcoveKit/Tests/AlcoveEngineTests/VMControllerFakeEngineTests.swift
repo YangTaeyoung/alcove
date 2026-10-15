@@ -60,14 +60,21 @@ final class VMControllerFakeEngineTests: XCTestCase {
         try JSONDecoder().decode([String].self, from: Data(contentsOf: vm.bundle.runURL.appendingPathComponent("fake-argv.json")))
     }
 
+    /// The QMP requests the fake engine of `vm` received, in order (from the `qmp<` lines of its log): the
+    /// command name and its arguments.
+    private func qmpRequests(_ vm: VMController) throws -> [(command: String, arguments: [String: Any])] {
+        let log = try String(contentsOf: vm.bundle.qemuLogURL, encoding: .utf8)
+        return log.split(separator: "\n").compactMap { line -> (command: String, arguments: [String: Any])? in
+            guard line.hasPrefix("qmp< "),
+                  let object = try? JSONSerialization.jsonObject(with: Data(line.dropFirst(5).utf8)) as? [String: Any],
+                  let command = object["execute"] as? String else { return nil }
+            return (command, object["arguments"] as? [String: Any] ?? [:])
+        }
+    }
+
     /// The QMP commands the fake engine of `vm` received, in order (from the `qmp<` lines of its log).
     private func qmpCommands(_ vm: VMController) throws -> [String] {
-        let log = try String(contentsOf: vm.bundle.qemuLogURL, encoding: .utf8)
-        return log.split(separator: "\n").compactMap { line -> String? in
-            guard line.hasPrefix("qmp< "),
-                  let object = try? JSONSerialization.jsonObject(with: Data(line.dropFirst(5).utf8)) as? [String: Any] else { return nil }
-            return object["execute"] as? String
-        }
+        try qmpRequests(vm).map(\.command)
     }
 
     private func waitUntil(timeout: Duration = .seconds(10), _ condition: () async -> Bool) async -> Bool {
@@ -1031,6 +1038,19 @@ final class VMControllerFakeEngineTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: vm.bundle.suspendConfigURL), savedConfig)
     }
 
+    func testSuspendRaisesTheMigrationBandwidthFirst() async throws {
+        let vm = try makeVM()
+        try await vm.start()
+        try await vm.suspendToDisk()
+        let requests = try qmpRequests(vm)
+        let commands = requests.map(\.command)
+        guard let set = commands.firstIndex(of: "migrate-set-parameters") else { return XCTFail("\(commands)") }
+        XCTAssertEqual(Array(commands[set...].prefix(3)), ["migrate-set-parameters", "stop", "migrate"])
+        XCTAssertEqual(requests[set].arguments.count, 1, "\(requests[set].arguments)")
+        XCTAssertEqual((requests[set].arguments["max-bandwidth"] as? NSNumber)?.int64Value, 9_223_372_036_854_775_807)
+        XCTAssertTrue(vm.bundle.isSuspended)
+    }
+
     func testEphemeralOverlayRemovedOnStop() async throws {
         let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
         let run = vm.bundle.runURL
@@ -1229,6 +1249,8 @@ def handle(req):
         ok(); event("RESET", {"guest": False, "reason": "host-qmp-system-reset"})
     elif cmd == "quit":
         ok(); event("SHUTDOWN", {"guest": False, "reason": "host-qmp-quit"}); die(0, 0.1)
+    elif cmd == "migrate-set-parameters":
+        ok()
     elif cmd == "migrate":
         path = a["uri"][len("file:"):]
         if "migrate-fails" in modes:

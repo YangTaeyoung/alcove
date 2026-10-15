@@ -204,6 +204,13 @@ extension QMPClient {
 
     // MARK: migration to file (suspend to disk) (qapi/migration.json)
 
+    /// `migrate-set-parameters` with `max-bandwidth`: the transfer rate limit of the next outgoing migration,
+    /// `file:` included, in bytes per second (migration/migration.c `migration_start_outgoing`). QEMU accepts
+    /// 0 to SIZE_MAX (migration/options.c `migrate_params_check`) and starts at 128 MiB/s (`MAX_THROTTLE`).
+    public func setMigrationMaxBandwidth(bytesPerSecond: Int64) async throws {
+        _ = try await execute("migrate-set-parameters", arguments: ["max-bandwidth": .int(bytesPerSecond)])
+    }
+
     /// `migrate` to `uri` (e.g. `file:/path` or `exec:cat > path`) and poll
     /// `query-migrate` until completed. The VM is left stopped afterwards, also
     /// on failure. On timeout or cancellation the outgoing migration is aborted

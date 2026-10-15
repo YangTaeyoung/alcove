@@ -98,6 +98,9 @@ public actor VMController {
     public static let resumeTimeout: Duration = .seconds(600)
     /// Time limit of the `quit` command that `shutdown` and `suspendToDisk` send.
     static let quitTimeout: Duration = .seconds(10)
+    /// The migration `max-bandwidth` in bytes per second that `suspendToDisk` sets before it migrates: the
+    /// largest integer a QMP argument carries (`JSON.int`).
+    static let suspendMaxBandwidth: Int64 = .max
 
     /// `tpm-tis-device` aborts under HVF in this engine build: its 0x5000-byte MMIO
     /// region is not 16 KiB aligned and `hv_vm_unmap` fails with HV_BAD_ARGUMENT
@@ -359,6 +362,7 @@ public actor VMController {
     }
 
     /// Save all state to disk and stop the engine; the next `start()` resumes it.
+    /// The migration `max-bandwidth` is set to `suspendMaxBandwidth` before the guest is stopped.
     /// On failure (disk full, migration error, timeout) nothing is kept and the
     /// guest is left as it was.
     public func suspendToDisk() async throws {
@@ -374,6 +378,7 @@ public actor VMController {
         expectingExit = true
         try? bundle.discardSuspendState()
         do {
+            try await qmp.setMigrationMaxBandwidth(bytesPerSecond: Self.suspendMaxBandwidth)
             try launched.encoded().write(to: bundle.suspendConfigURL, options: .atomic)
             try await qmp.stop()
             try await qmp.migrate(uri: "file:\(bundle.suspendStateURL.path)")
