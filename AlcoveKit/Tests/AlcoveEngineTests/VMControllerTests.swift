@@ -160,6 +160,40 @@ final class VMControllerTests: XCTestCase {
         XCTAssertEqual(try templateFiles.map(digest), digests, "the template's disk and UEFI variables are unchanged")
     }
 
+    /// A clone moved out of the template's directory is neither in its clones.json nor a sibling; while that
+    /// clone runs, the template's engine cannot take the write lock on the disk the clone reads.
+    func testTemplateStartFailsWhileACloneOutsideItsListRuns() async throws {
+        let template = try makeVM()
+        addTeardownBlock { try? await template.shutdown(force: true) }
+        let listed = try template.bundle.cloneLinked(named: "Clone", engine: engine)
+        let elsewhere = tmp.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        let moved = VMBundle(url: elsewhere.appendingPathComponent(listed.url.lastPathComponent))
+        try FileManager.default.moveItem(at: listed.url, to: moved.url)
+        XCTAssertEqual(template.bundle.liveClones(), [])
+        let clone = VMController(bundle: moved, config: try moved.loadConfig(), engine: engine)
+        addTeardownBlock { try? await clone.shutdown(force: true) }
+        try await clone.start()
+        let disk = await template.bundle.diskURL(template.config.disks[0])
+        let before = try digest(disk)
+
+        do {
+            try await template.start()
+            XCTFail("the template started while its clone runs")
+        } catch {
+            guard case .engineDidNotStart(let message)? = error as? VMController.ControllerError else { return XCTFail("\(error)") }
+            XCTAssertTrue(message.contains("Failed to get \"write\" lock"), message)
+        }
+        let templateState = await template.state
+        guard case .failed = templateState else { return XCTFail("\(templateState)") }
+        let cloneState = await clone.state
+        XCTAssertEqual(cloneState, .running)
+        try await clone.shutdown(force: true)
+        XCTAssertEqual(try digest(disk), before)
+        // the refused start raised the template's diskEpoch, so the clone is stale
+        XCTAssertNotNil(VMBundle.templateMismatch(for: try moved.loadConfig()))
+    }
+
     /// The SHA-256 of the file at `url`, in hex.
     private func digest(_ url: URL) throws -> String {
         SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()

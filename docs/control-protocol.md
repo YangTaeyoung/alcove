@@ -2672,6 +2672,13 @@ alcove-proxy was not found; build it with scripts/test/all.sh or set ALCOVE_PROX
   of a start. A clone that another process creates between the moment a
   template's `diskEpoch` is raised and the moment its engine takes over the
   disks is not detected.
+- A clone that is neither in its template's directory nor in the template's
+  `clones.json` is not seen by the template guard. While that clone runs, the
+  template's engine cannot take the write lock on the disk the clone reads,
+  and `vm.start` of the template answers `start failed:` with the engine's
+  `Failed to get "write" lock`. That start has already raised the template's
+  `diskEpoch`, so the clone is refused as stale afterwards (see
+  [Linked clones](#linked-clones)).
 - A linked clone references its template's disk files by absolute path: a
   template bundle that is moved or renamed on disk leaves its clones without
   their backing files.
