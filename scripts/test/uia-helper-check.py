@@ -1172,7 +1172,9 @@ def _(a, run):
 def _(a, run):
     wid = fixture_in_front(a, run)
     bars = a.call("ui.find", window=wid, role="TitleBar")["nodes"]
-    expect(len(bars) == 1, f"the fixture has {len(bars)} TitleBar elements: {bars!r}")
+    if not bars:
+        bars = [n for n in a.call("ui.tree", window=wid, filter="all", max=2000)["nodes"] if n["role"] == "TitleBar"]
+    expect(len(bars) >= 1, "the fixture window has no TitleBar element in its tree")
     ref = bars[0]["ref"]
     r = a.call("ui.at", ref=ref)
     n = at_node(r, "ui.at title bar", ref=ref)

@@ -507,30 +507,38 @@ Administrators and the access list "Administrators and SYSTEM: full control"
 with inheritance removed (`icacls` reads it back as
 `BUILTIN\Administrators:(OI)(CI)(F)` and `NT AUTHORITY\SYSTEM:(OI)(CI)(F)`),
 so `agent.log`, `install.log` and `helper.log` are readable by administrators
-only. Each folder is opened without following a reparse point, and its owner
-and access list are checked and set on that handle (`SetSecurityInfo`). The
-lock is applied first thing at install and at agent start, before a log file
-is opened, and again at every helper start; the parent keeps the agent's logs
-(`agent.log` and `agent.log.1`, 1 MiB each, kept like `helper.log`),
-the uia folder keeps only its logs (every other entry is deleted at each
-start; a deletion refused because something is in use, access is denied or
-a folder is not empty yet is tried again every 50 ms for 2 s), and a
-reparse point in either folder, including one at the uia path, is removed
-rather than followed and the uia folder is created again.
+only. The lock is applied first thing at install and at agent start, before a
+log file is opened, and again at every helper start. A folder the lock creates
+is created with that owner and access list. An existing folder is opened
+without following a reparse point and kept in place only when it is a
+directory, not a reparse point, and already has exactly that owner and access
+list; its access list is never rewritten in place, so a handle a standard user
+opened on it before the lock cannot outlive the lock on a folder that was once
+theirs. A folder that exists and is anything else (a reparse point, another
+owner, or any other access list, such as the one a folder created by path
+under `C:\ProgramData` inherits) is moved aside and a new, locked folder is
+created in its place. This applies to `C:\ProgramData\Alcove` and to its `uia`
+folder. When a folder is kept in place, the parent keeps the agent's logs
+(`agent.log` and `agent.log.1`, 1 MiB each, kept like `helper.log`) and
+the uia folder keeps only its logs (every other entry is deleted at each start;
+a deletion refused because something is in use, access is denied or a folder is
+not empty yet is tried again every 50 ms for 2 s).
 
-A folder that exists and whose owner, read through that handle, is neither
-`BUILTIN\Administrators` nor `NT AUTHORITY\SYSTEM` is not adopted: it is
-renamed to `<name>.untrusted-<yyyyMMddHHmmss>` (UTC) beside it and a new,
-locked folder is created in its place, so a handle someone kept on the old
-folder names the renamed one. This applies to `C:\ProgramData\Alcove` and to
-its `uia` folder; the renamed folder is left for an administrator to remove,
-and the agent log names it
-(`a data folder of another owner was moved to <path>; remove it as an administrator`,
-or `a helper folder of another owner was moved to <path>; remove it as an administrator`
+A folder that is moved aside is renamed to `<name>.untrusted-<yyyyMMddHHmmss>`
+(UTC) beside it; a handle someone kept on the old folder names the renamed one,
+and the new folder starts empty, so `helper.log` is not carried into it. At
+most one `<name>.untrusted-*` folder is kept per data folder: an older one is
+removed first, and a reparse point among them is unlinked rather than followed.
+The renamed folder is left for an administrator to remove, and the agent log
+names it
+(`a data folder that was not already locked was moved to <path>; an administrator may remove it after checking it`,
+or `a helper folder that was not already locked was moved to <path>; an administrator may remove it after checking it`
 at a helper start).
 When the rename fails (a handle is open on something inside the folder, or on
 the folder without delete sharing) the folder is not locked, with the reason
-`<dir> belongs to <owner> and could not be moved aside (<error>); close the programs that use files in it, remove it as an administrator and restart alcove-agent`.
+`<dir> is a link, belongs to another owner or lets other users change it, and could not be moved aside (<error>); close the programs that use files in it, remove it as an administrator and restart alcove-agent`.
+A reparse point at the uia path itself is removed rather than followed and the
+uia folder is created again.
 
 **Deploy root.** At start a Windows agent also locks `C:\alcove-apps`, the
 default root of `vm.deploy`, whose files the host installs and launches with
@@ -572,9 +580,8 @@ The reasons:
 - `C:\ProgramData\Alcove is a reparse point; remove it` (a reparse point at
   the folder itself),
 - `<dir> is not a directory; remove it and restart alcove-agent`,
-- `<dir> belongs to <owner> and could not be moved aside (<error>); close the programs that use files in it, remove it as an administrator and restart alcove-agent`,
+- `<dir> is a link, belongs to another owner or lets other users change it, and could not be moved aside (<error>); close the programs that use files in it, remove it as an administrator and restart alcove-agent`,
 - `open <dir>: <system error>`,
-- `<dir>: SetSecurityInfo: <system error>`,
 - `<dir> still has the access list <sddl>; fix it with icacls and restart alcove-agent`,
 - `SetNamedSecurityInfo(<path>): <system error>` and the system error of a
   deletion, for an entry of the folder.
@@ -898,9 +905,10 @@ range.
   when the count did not finish within the time, when the walk did not
   meet the element (an element outside the control view, or below a password
   field, named by a ref), and when the window's `title` given as a selector's
-  `window` names another window: the title is empty, or a window listed
-  before it in `win.list` has the title in its own (two windows titled
-  `Untitled - Notepad`).
+  `window` would name another window: the title is empty, the window is not
+  one `win.list` shows (hidden or cloaked), or a window listed before it in
+  `win.list` has the title in its own (two windows titled `Untitled -
+  Notepad`).
 - Errors: `no element at (<x>, <y>); take a screenshot to see what is there`
   (a point outside every screen, on the desktop window itself, or in a window
   that refuses UI Automation), `no element has the keyboard focus; click the field first`,

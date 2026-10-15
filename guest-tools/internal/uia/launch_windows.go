@@ -44,7 +44,7 @@ func DefaultLauncher(dir string, logf func(format string, args ...any)) Launcher
 	prepare := func() error {
 		moved, err := LockHelperFolders(filepath.Dir(dir), dir)
 		for _, m := range moved {
-			logf("a helper folder of another owner was moved to %s; remove it as an administrator", m)
+			logf("a helper folder that was not already locked was moved to %s; an administrator may remove it after checking it", m)
 		}
 		if err != nil {
 			return fmt.Errorf("the UI helper folder %s could not be locked (%v); fix its owner and access list, then retry", dir, err)

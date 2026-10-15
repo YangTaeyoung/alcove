@@ -1484,6 +1484,7 @@ namespace Alcove
             }
             AutomationElement element = Target(req);
             IntPtr hwnd = scopeWindow != IntPtr.Zero ? scopeWindow : TopWindowOrZero(element);
+            IntPtr elementHwnd = ElementHwnd(element);
             bool belowPassword = HasPasswordAncestor(element);
             Dictionary<string, object> before = Node(element, 0);
             if (belowPassword)
@@ -1554,12 +1555,23 @@ namespace Alcove
                 {
                     throw new HelperException("the element is disabled; wait until it is enabled");
                 }
-                if (failure is ElementNotAvailableException || failure is COMException)
+                if (failure is InvalidOperationException)
+                {
+                    throw new HelperException(action + " is not possible on the element in its present state: " + failure.Message);
+                }
+                if (failure is ElementNotAvailableException || failure is COMException
+                    || failure is System.ComponentModel.Win32Exception || failure is UnauthorizedAccessException
+                    || failure is TimeoutException)
                 {
                     UiaHelper.Log("'ui.act' " + action + " ended with " + failure.GetType().Name + ": " + failure.Message);
-                    // The element counts as gone when its window stops existing within RefGoneWaitMs,
-                    // or when the element no longer exists while its window stays.
-                    if ((hwnd != IntPtr.Zero && WaitUntil(delegate { return !Native.IsWindow(hwnd); }, RefGoneWaitMs)) || ElementGone(element))
+                    // The element counts as gone when the window the action ran on, or the element's
+                    // own window, stops existing within RefGoneWaitMs, or when reading the element
+                    // again says it no longer exists. A failure the element and its windows outlive is
+                    // reported for a retry.
+                    bool windowGone = (hwnd != IntPtr.Zero && WaitUntil(delegate { return !Native.IsWindow(hwnd); }, RefGoneWaitMs))
+                        || (elementHwnd != IntPtr.Zero && !Native.IsWindow(elementHwnd))
+                        || ElementGone(element);
+                    if (windowGone)
                     {
                         Dictionary<string, object> ended = new Dictionary<string, object>();
                         ended["node"] = before;
@@ -1570,10 +1582,6 @@ namespace Alcove
                         + Marshal.GetHRForException(failure).ToString("x8", CultureInfo.InvariantCulture)
                         + "); read the element again with ui.find and retry");
                 }
-                if (failure is InvalidOperationException)
-                {
-                    throw new HelperException(action + " is not possible on the element in its present state: " + failure.Message);
-                }
                 UiaHelper.Log("'ui.act' " + action + " failed: " + failure);
                 throw new HelperException(action + " failed: " + failure.Message + "; see helper.log in the agent's uia folder");
             }
@@ -1581,6 +1589,12 @@ namespace Alcove
             Dictionary<string, object> r = new Dictionary<string, object>();
             Thread.Sleep(ActSettleMs);
             if (known && !Native.IsWindow(hwnd))
+            {
+                r["node"] = before;
+                r["gone"] = true;
+                return r;
+            }
+            if (elementHwnd != IntPtr.Zero && !Native.IsWindow(elementHwnd))
             {
                 r["node"] = before;
                 r["gone"] = true;
@@ -1626,7 +1640,22 @@ namespace Alcove
             return r;
         }
 
-        // True when the element can no longer be read or belongs to no process.
+        // The element's own window handle, or zero when the element has none or cannot be read.
+        static IntPtr ElementHwnd(AutomationElement element)
+        {
+            try
+            {
+                object handle = element.GetCurrentPropertyValue(AutomationElement.NativeWindowHandleProperty);
+                return handle is int && (int)handle != 0 ? new IntPtr((int)handle) : IntPtr.Zero;
+            }
+            catch (ElementNotAvailableException) { return IntPtr.Zero; }
+            catch (COMException) { return IntPtr.Zero; }
+            catch (InvalidOperationException) { return IntPtr.Zero; }
+            catch (System.ComponentModel.Win32Exception) { return IntPtr.Zero; }
+        }
+
+        // True when reading the element again says it no longer exists or belongs to no process.
+        // A read that fails for another reason (a busy or guarded element) is not gone.
         bool ElementGone(AutomationElement element)
         {
             try
@@ -1636,8 +1665,8 @@ namespace Alcove
                 return !(pid is int) || (int)pid == 0;
             }
             catch (ElementNotAvailableException) { return true; }
-            catch (COMException) { return true; }
-            catch (InvalidOperationException) { return true; }
+            catch (COMException) { return false; }
+            catch (InvalidOperationException) { return false; }
             catch (System.ComponentModel.Win32Exception) { return false; }
         }
 

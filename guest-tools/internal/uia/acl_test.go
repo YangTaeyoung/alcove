@@ -246,3 +246,29 @@ func TestADeployRootIsKeptOnlyAsALockedPlainDirectory(t *testing.T) {
 		}
 	}
 }
+
+func TestAHelperFolderIsKeptOnlyAsAnAlreadyLockedPlainDirectory(t *testing.T) {
+	const dir = fileAttributeDirectory
+	cases := []struct {
+		what       string
+		attributes uint32
+		sddl       string
+		want       bool
+	}{
+		{"a locked folder", dir, lockedSDDL, true},
+		{"a locked folder owned by SYSTEM", dir, "O:SYG:SYD:P(A;OICI;0x1f01ff;;;BA)(A;OICI;FA;;;SY)", true},
+		{"a locked junction", dir | fileAttributeReparse, lockedSDDL, false},
+		{"a locked file", 0x20, lockedSDDL, false},
+		{"a folder of a trusted owner that lets users change it", dir, "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;BU)", false},
+		{"a folder with the inherited access list", dir, "O:BAD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)(A;OICIID;0x1301bf;;;AU)", false},
+		{"a folder of another owner", dir, "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)", false},
+		{"a folder locked as a deploy root", dir, deployRootSDDL, false},
+		{"a folder whose access list was not read", dir, "", false},
+		{"an entry whose attributes were not read", invalidFileAttributes, lockedSDDL, false},
+	}
+	for _, c := range cases {
+		if got := keepHelperDir(c.attributes, c.sddl); got != c.want {
+			t.Errorf("%s: keepHelperDir = %v, expected %v", c.what, got, c.want)
+		}
+	}
+}

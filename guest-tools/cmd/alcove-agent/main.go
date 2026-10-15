@@ -78,7 +78,7 @@ func main() {
 		logger.Printf("the ProgramData folder could not be located (%v)", programDataErr)
 	}
 	for _, m := range movedData {
-		logger.Printf("a data folder of another owner was moved to %s; remove it as an administrator", m)
+		logger.Printf("a data folder that was not already locked was moved to %s; an administrator may remove it after checking it", m)
 	}
 	if lockErr != nil {
 		logger.Printf("the helper folders are not locked (%v); the UI helper will not start until they can be locked", lockErr)
