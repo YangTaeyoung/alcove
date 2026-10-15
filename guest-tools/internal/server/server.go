@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/netip"
@@ -16,7 +18,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +40,7 @@ type Options struct {
 	HomeDir string
 	// Session returns the desktop session whose user runs app.launch and the
 	// clipboard tools; nil means the platform default (loginctl outside
-	// Windows, none on Windows).
+	// Windows, none on Windows), or none when HomeDir is set.
 	Session func() (session.Session, bool)
 	// Shutdown runs an OS shutdown; nil uses the platform default.
 	Shutdown func() error
@@ -105,6 +106,16 @@ type Server struct {
 	ownMu   sync.Mutex
 	ownSeq  uint64
 	ownTime time.Time
+	// lastSeq is the clipboard sequence the watcher saw last.
+	lastSeq uint64
+
+	// watchOnce starts the watchers; clipKick asks the clipboard watcher to
+	// poll at its shortest interval again.
+	watchOnce sync.Once
+	// timing holds capsCheckInterval, clipboardPollMin and clipboardPollMax
+	// as they were when the server was made.
+	timing   struct{ caps, pollMin, pollMax time.Duration }
+	clipKick chan struct{}
 
 	// refusals writes the refused connections to the log.
 	refusals refusalLog
@@ -118,13 +129,15 @@ func New(opt Options) *Server {
 	if opt.Logger == nil {
 		opt.Logger = log.Default()
 	}
-	if opt.Session == nil {
+	if opt.Session == nil && opt.HomeDir == "" {
 		opt.Session = defaultSessionSource()
 	}
 	if opt.Clipboard == nil {
 		opt.Clipboard = newClipboard(opt.Session)
 	}
-	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable(), ownHome: agentHome()}
+	s := &Server{opt: opt, ops: map[string]opEntry{}, conns: map[*conn]struct{}{}, jobs: newJobTable(), ownHome: agentHome(),
+		clipKick: make(chan struct{}, 1)}
+	s.timing.caps, s.timing.pollMin, s.timing.pollMax = capsCheckInterval, clipboardPollMin, clipboardPollMax
 	s.registerBuiltins()
 	return s
 }
@@ -181,7 +194,7 @@ func agentHome() string {
 
 // capsCheckInterval is the time between two checks of the capabilities of
 // an open connection.
-var capsCheckInterval = 3 * time.Second
+var capsCheckInterval = 5 * time.Second
 
 func (s *Server) caps() []string {
 	caps := []string{"files", "shutdown"}
@@ -204,13 +217,64 @@ func (s *Server) caps() []string {
 	return caps
 }
 
+// fileXfer is a file push in progress: f is open on name in fsys, path is
+// its absolute path.
 type fileXfer struct {
 	f    *os.File
+	fsys writeFS
+	name string
 	path string
 	size int
 	got  int
 	h    interface{ Write([]byte) (int, error) }
 	sum  func() []byte
+}
+
+// discard closes the push and removes its file.
+func (x *fileXfer) discard() {
+	x.f.Close()
+	_ = x.fsys.Remove(x.name)
+	x.fsys.Close()
+}
+
+// finish closes the push and keeps its file.
+func (x *fileXfer) finish() {
+	x.f.Close()
+	x.fsys.Close()
+}
+
+// beginDrop creates the file of a file push named base(name) in the Desktop
+// folder of the home directory, or in its Downloads folder for dest
+// "downloads", creating that folder when missing. A name that is taken gets
+// " (2)", " (3)", … before its extension. In the desktop session's home the
+// folder and the file are created through an os.Root and belong to the
+// session's user.
+func (s *Server) beginDrop(dest, name string) (*fileXfer, error) {
+	name = filepath.Base(name)
+	if name == "." || name == "" || name == ".." || name == string(filepath.Separator) {
+		return nil, errors.New("bad name")
+	}
+	folder := "Desktop"
+	if dest == "downloads" {
+		folder = "Downloads"
+	}
+	dir := filepath.Join(s.homeDir(), folder)
+	fsys, dirName, err := s.writerFor(dir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+	}
+	if _, err := fsys.Stat(dirName); errors.Is(err, fs.ErrNotExist) {
+		_ = fsys.MkdirAll(dirName)
+	}
+	fileName := uniqueName(fsys, filepath.Join(dirName, name))
+	f, err := fsys.OpenFile(fileName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		fsys.Close()
+		return nil, homeError(err)
+	}
+	h := sha256.New()
+	return &fileXfer{f: f, fsys: fsys, name: fileName, path: filepath.Join(dir, filepath.Base(fileName)), h: h,
+		sum: func() []byte { return h.Sum(nil) }}, nil
 }
 
 // allowPeers returns the address ranges whose connections are served.
@@ -282,8 +346,9 @@ func (s *Server) handle(c net.Conn) {
 
 	quit := make(chan struct{})
 	defer close(quit)
-	go s.watchClipboard(send, quit)
-	go s.watchCaps(send, quit, sentCaps)
+	cn.setCaps(sentCaps)
+	s.startWatchers()
+	clipOps := newSerialQueue(quit)
 	go func() { // keepalive
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
@@ -299,6 +364,11 @@ func (s *Server) handle(c net.Conn) {
 
 	inFlight := make(chan struct{}, maxInFlight)
 	xfers := map[string]*fileXfer{}
+	defer func() {
+		for _, x := range xfers {
+			x.discard()
+		}
+	}()
 	for {
 		m, err := r.Next()
 		if err != nil {
@@ -322,17 +392,22 @@ func (s *Server) handle(c net.Conn) {
 				send(proto.Message{"t": "res", "id": m["id"], "ok": false, "error": tooManyRequests()})
 			}
 		case "clipboard.get":
-			text, err := s.opt.Clipboard.Text()
-			if err != nil {
-				lg.Printf("clipboard.get: %v", err)
-			}
-			send(proto.Message{"t": "clipboard.text", "text": cutUTF8Bytes(text, clipboardMaxBytes)})
+			clipOps.run(lg, func() {
+				text, err := s.opt.Clipboard.Text()
+				if err != nil {
+					lg.Printf("clipboard.get: %v", err)
+				}
+				send(proto.Message{"t": "clipboard.text", "text": cutUTF8Bytes(text, clipboardMaxBytes)})
+			})
 		case "clipboard.set":
-			if err := s.opt.Clipboard.SetText(m.String("text")); err != nil {
-				lg.Printf("clipboard.set: %v", err)
-			} else {
-				s.markOwnClipboard()
-			}
+			text := m.String("text")
+			clipOps.run(lg, func() {
+				if err := s.opt.Clipboard.SetText(text); err != nil {
+					lg.Printf("clipboard.set: %v", err)
+				} else {
+					s.markOwnClipboard()
+				}
+			})
 		case "resolution.set":
 			if err := setResolution(m.Int("w"), m.Int("h")); err != nil {
 				lg.Printf("resolution.set: %v", err)
@@ -342,30 +417,13 @@ func (s *Server) handle(c net.Conn) {
 			}
 		case "file.begin":
 			id := m.String("id")
-			home := s.homeDir()
-			dir := filepath.Join(home, "Desktop")
-			if m.String("dest") == "downloads" {
-				dir = filepath.Join(home, "Downloads")
-			}
-			name := filepath.Base(m.String("name"))
-			if name == "." || name == "" || name == ".." {
-				send(proto.Message{"t": "file.done", "id": id, "error": "bad name"})
-				continue
-			}
-			owner := s.dropOwner()
-			if _, err := os.Lstat(dir); err != nil {
-				_ = os.MkdirAll(dir, 0o755)
-				owner.give(dir)
-			}
-			path := uniquePath(filepath.Join(dir, name))
-			f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+			x, err := s.beginDrop(m.String("dest"), m.String("name"))
 			if err != nil {
 				send(proto.Message{"t": "file.done", "id": id, "error": err.Error()})
 				continue
 			}
-			owner.give(path)
-			h := sha256.New()
-			xfers[id] = &fileXfer{f: f, path: path, size: m.Int("size"), h: h, sum: func() []byte { return h.Sum(nil) }}
+			x.size = m.Int("size")
+			xfers[id] = x
 		case "file.chunk":
 			x := xfers[m.String("id")]
 			if x == nil {
@@ -381,8 +439,7 @@ func (s *Server) handle(c net.Conn) {
 				x.got += len(data)
 			}
 			if err != nil {
-				x.f.Close()
-				os.Remove(x.path)
+				x.discard()
 				delete(xfers, m.String("id"))
 				send(proto.Message{"t": "file.done", "id": m.String("id"), "error": err.Error()})
 			}
@@ -393,12 +450,12 @@ func (s *Server) handle(c net.Conn) {
 				continue
 			}
 			delete(xfers, id)
-			x.f.Close()
 			if want := m.String("sha256"); (want != "" && want != hex.EncodeToString(x.sum())) || (x.size > 0 && x.got != x.size) {
-				os.Remove(x.path)
+				x.discard()
 				send(proto.Message{"t": "file.done", "id": id, "error": "digest or size mismatch"})
 				continue
 			}
+			x.finish()
 			send(proto.Message{"t": "file.done", "id": id, "path": x.path})
 		case "shutdown":
 			fn := s.opt.Shutdown
@@ -421,94 +478,113 @@ func (s *Server) handle(c net.Conn) {
 	}
 }
 
-func uniquePath(p string) string {
-	if _, err := os.Stat(p); err != nil {
+// uniqueName returns p, or p with " (2)", " (3)", … before its extension,
+// whichever is the first name fsys has no entry for.
+func uniqueName(fsys writeFS, p string) string {
+	if _, err := fsys.Lstat(p); err != nil {
 		return p
 	}
 	ext := filepath.Ext(p)
 	base := p[:len(p)-len(ext)]
 	for i := 2; ; i++ {
 		q := fmt.Sprintf("%s (%d)%s", base, i, ext)
-		if _, err := os.Stat(q); err != nil {
+		if _, err := fsys.Lstat(q); err != nil {
 			return q
 		}
 	}
 }
 
-// watchCaps checks the capabilities every capsCheckInterval and sends
-// {"t":"caps"} with the new list when it differs from the one sent last,
-// starting with sent, the hello's list.
-func (s *Server) watchCaps(send func(proto.Message), done chan struct{}, sent []string) {
-	t := time.NewTicker(capsCheckInterval)
-	defer t.Stop()
+var (
+	// clipboardPollMin is the time between two clipboard polls after a
+	// change; each poll that finds no change doubles it up to
+	// clipboardPollMax.
+	clipboardPollMin = clipboardPollFastest
+	clipboardPollMax = clipboardPollSlowest
+)
+
+// startWatchers starts, once per agent, the watchers of the capabilities and
+// of the clipboard.
+func (s *Server) startWatchers() {
+	s.watchOnce.Do(func() {
+
+		go s.watchCaps()
+		go s.watchClipboard()
+	})
+}
+
+// openConns returns the open connections.
+func (s *Server) openConns() []*conn {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	conns := make([]*conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	return conns
+}
+
+// watchCaps checks the capabilities every capsCheckInterval while a
+// connection is open and sends {"t":"caps"} with the new list to each
+// connection whose last list, the hello's at first, differs.
+func (s *Server) watchCaps() {
 	for {
-		select {
-		case <-done:
-			return
-		case <-t.C:
+		time.Sleep(s.timing.caps)
+		conns := s.openConns()
+		if len(conns) == 0 {
+			continue
 		}
 		caps := s.caps()
-		if slices.Equal(caps, sent) {
-			continue
+		for _, c := range conns {
+			if c.replaceCaps(caps) {
+				c.send(proto.Message{"t": "caps", "caps": caps})
+			}
 		}
-		sent = caps
-		send(proto.Message{"t": "caps", "caps": caps})
 	}
 }
 
-// dropOwner returns the owner that the files and folders a file push creates
-// are given: the desktop session's user while the agent runs as root and
-// HomeDir is not set, otherwise nobody.
-func (s *Server) dropOwner() fileOwner {
-	if s.opt.HomeDir != "" || os.Geteuid() != 0 {
-		return fileOwner{}
-	}
-	sess, ok := s.session()
-	if !ok || sess.UID == 0 {
-		return fileOwner{}
-	}
-	return fileOwner{set: true, uid: int(sess.UID), gid: int(sess.GID)}
-}
-
-// fileOwner is a user and group that give hands entries to when set is true.
-type fileOwner struct {
-	set      bool
-	uid, gid int
-}
-
-// give makes the owner own path, without following a link at its end.
-func (o fileOwner) give(path string) {
-	if o.set {
-		_ = os.Lchown(path, o.uid, o.gid)
-	}
-}
-
+// markOwnClipboard records the clipboard after the agent set it, so that the
+// watcher does not report it as a change.
 func (s *Server) markOwnClipboard() {
+	seq := s.opt.Clipboard.Sequence()
 	s.ownMu.Lock()
-	s.ownSeq = s.opt.Clipboard.Sequence()
-	s.ownTime = time.Now()
+	s.ownSeq, s.ownTime, s.lastSeq = seq, time.Now(), seq
 	s.ownMu.Unlock()
+	select {
+	case s.clipKick <- struct{}{}:
+	default:
+	}
 }
 
-// watchClipboard polls the clipboard sequence and reports foreign changes.
-func (s *Server) watchClipboard(send func(proto.Message), done chan struct{}) {
-	last := s.opt.Clipboard.Sequence()
-	t := time.NewTicker(400 * time.Millisecond)
-	defer t.Stop()
+// watchClipboard polls the clipboard while a connection is open and the
+// clipboard is available, every clipboardPollMin after a change and up to
+// every clipboardPollMax while nothing changes, and sends a change the agent
+// did not make to every open connection as clipboard.changed.
+func (s *Server) watchClipboard() {
+	s.ownMu.Lock()
+	s.lastSeq = s.opt.Clipboard.Sequence()
+	s.ownMu.Unlock()
+	wait := s.timing.pollMin
 	for {
 		select {
-		case <-done:
-			return
-		case <-t.C:
-		}
-		seq := s.opt.Clipboard.Sequence()
-		if seq == last {
+		case <-time.After(wait):
+		case <-s.clipKick:
+			wait = s.timing.pollMin
 			continue
 		}
-		last = seq
+		wait = min(2*wait, s.timing.pollMax)
+		if len(s.openConns()) == 0 || !s.opt.Clipboard.Available() {
+			continue
+		}
+		seq := s.opt.Clipboard.Sequence()
 		s.ownMu.Lock()
+		changed := seq != s.lastSeq
+		s.lastSeq = seq
 		own := seq == s.ownSeq && time.Since(s.ownTime) < 2*time.Second
 		s.ownMu.Unlock()
+		if !changed {
+			continue
+		}
+		wait = s.timing.pollMin
 		if own {
 			continue
 		}
@@ -516,7 +592,41 @@ func (s *Server) watchClipboard(send func(proto.Message), done chan struct{}) {
 		if err != nil || text == "" {
 			continue
 		}
-		send(proto.Message{"t": "clipboard.changed", "text": cutUTF8Bytes(text, clipboardMaxBytes)})
+		msg := proto.Message{"t": "clipboard.changed", "text": cutUTF8Bytes(text, clipboardMaxBytes)}
+		for _, c := range s.openConns() {
+			c.send(msg)
+		}
+	}
+}
+
+// serialQueue runs functions one after another on a goroutine of its own
+// until done is closed.
+type serialQueue chan func()
+
+// clipboardQueueSize bounds the clipboard operations a connection holds.
+const clipboardQueueSize = 64
+
+func newSerialQueue(done chan struct{}) serialQueue {
+	q := make(serialQueue, clipboardQueueSize)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case f := <-q:
+				f()
+			}
+		}
+	}()
+	return q
+}
+
+// run queues f; when the queue is full f is dropped and logged.
+func (q serialQueue) run(lg *log.Logger, f func()) {
+	select {
+	case q <- f:
+	default:
+		lg.Printf("%d clipboard operations are waiting; one more was dropped", clipboardQueueSize)
 	}
 }
 

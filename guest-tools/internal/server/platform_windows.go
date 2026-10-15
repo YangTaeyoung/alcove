@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -67,6 +68,13 @@ func platformShutdown() error {
 
 // resolutionSupported says whether setResolution can change the display mode.
 const resolutionSupported = true
+
+// clipboardPollFastest and clipboardPollSlowest bound the time between two
+// clipboard polls, which read the clipboard sequence number here.
+const (
+	clipboardPollFastest = 400 * time.Millisecond
+	clipboardPollSlowest = 400 * time.Millisecond
+)
 
 func currentResolution() (int, int, bool) {
 	w, _, _ := procGetSystemMetrics.Call(0) // SM_CXSCREEN

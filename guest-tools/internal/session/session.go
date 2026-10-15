@@ -45,6 +45,20 @@ type Session struct {
 	Type   string
 	Locked bool
 	Env    []string
+	// ScopeRunner is the path of systemd-run when the user's service manager
+	// can be reached (its bus is in the runtime folder); "" otherwise.
+	ScopeRunner string
+}
+
+// ScopePrefix returns the command line that starts a program, as the
+// session's user, in a scope of the user's service manager: systemd-run
+// --user --scope --quiet --collect --expand-environment=no --. It is nil
+// without a ScopeRunner.
+func (s Session) ScopePrefix() []string {
+	if s.ScopeRunner == "" {
+		return nil
+	}
+	return []string{s.ScopeRunner, "--user", "--scope", "--quiet", "--collect", "--expand-environment=no", "--"}
 }
 
 // ShowProperties are the properties ParseShow reads.
@@ -111,9 +125,10 @@ func infoFrom(m map[string]string) Info {
 // graphical reports whether a session type draws a desktop.
 func graphical(t string) bool { return t == "wayland" || t == "x11" || t == "mir" }
 
-// Pick chooses the desktop session among sessions: the active session of
-// seat0, else the only graphical session, else the user session that began
-// first. Only sessions of class user that are not closing are chosen.
+// Pick chooses the desktop session among sessions: the active graphical
+// session of seat0, else the only graphical session, else the active session
+// of seat0, else the user session that began first. Only sessions of class
+// user that are not closing are chosen.
 func Pick(sessions []Info) (Info, bool) {
 	var users []Info
 	for _, s := range sessions {
@@ -122,7 +137,7 @@ func Pick(sessions []Info) (Info, bool) {
 		}
 	}
 	for _, s := range users {
-		if s.Seat == "seat0" && s.Active {
+		if s.Seat == "seat0" && s.Active && graphical(s.Type) {
 			return s, true
 		}
 	}
@@ -134,6 +149,11 @@ func Pick(sessions []Info) (Info, bool) {
 	}
 	if len(desktops) == 1 {
 		return desktops[0], true
+	}
+	for _, s := range users {
+		if s.Seat == "seat0" && s.Active {
+			return s, true
+		}
 	}
 	if len(users) == 0 {
 		return Info{}, false
@@ -148,9 +168,11 @@ const DefaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bi
 // Environment returns the environment of programs started in the session s
 // of account a. runtimeEntries are the names in the user's runtime folder
 // /run/user/<uid>, nil when that folder does not exist; path is the agent's
-// PATH. WAYLAND_DISPLAY names the wayland-0 socket, or the first other
-// wayland-<n> socket, of a wayland session; DISPLAY is the session's display.
-func Environment(s Info, a Account, runtimeEntries []string, path string) []string {
+// PATH; locale holds the LANG, LANGUAGE and LC_* entries, which end the
+// environment. WAYLAND_DISPLAY names the wayland-0 socket, or the first
+// other wayland-<n> socket, of a wayland session; DISPLAY is the session's
+// display.
+func Environment(s Info, a Account, runtimeEntries []string, path string, locale []string) []string {
 	if path == "" {
 		path = DefaultPath
 	}
@@ -176,7 +198,45 @@ func Environment(s Info, a Account, runtimeEntries []string, path string) []stri
 	if s.Type != "" {
 		env = append(env, "XDG_SESSION_TYPE="+s.Type)
 	}
-	return env
+	return append(env, locale...)
+}
+
+// localeName reports whether name is a locale variable: LANG, LANGUAGE or
+// LC_*.
+func localeName(name string) bool {
+	return name == "LANG" || name == "LANGUAGE" || strings.HasPrefix(name, "LC_")
+}
+
+// ParseLocale returns the locale variables of a system locale file
+// (/etc/default/locale, /etc/locale.conf) as NAME=value entries in file
+// order: lines of NAME=value with an optional "export " before the name and
+// optional single or double quotes around the value. Other names, comments
+// and other lines are left out.
+func ParseLocale(content string) []string {
+	var out []string
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
+		name, value, ok := strings.Cut(line, "=")
+		if !ok || !localeName(name) {
+			continue
+		}
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+			value = value[1 : len(value)-1]
+		}
+		out = append(out, name+"="+value)
+	}
+	return out
+}
+
+// LocaleFromEnv returns the locale variables of env.
+func LocaleFromEnv(env []string) []string {
+	var out []string
+	for _, e := range env {
+		if name, _, ok := strings.Cut(e, "="); ok && localeName(name) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // waylandSocket returns wayland-0 when entries hold it, else the first other

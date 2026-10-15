@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -54,6 +55,29 @@ type conn struct {
 
 	done chan struct{} // closed when the writer has stopped
 	stop chan struct{} // closed to ask the writer to stop
+
+	// caps is the capability list sent last on the connection.
+	capsMu sync.Mutex
+	caps   []string
+}
+
+// setCaps records caps as the list sent on the connection.
+func (c *conn) setCaps(caps []string) {
+	c.capsMu.Lock()
+	c.caps = caps
+	c.capsMu.Unlock()
+}
+
+// replaceCaps records caps and reports whether it differs from the list
+// sent last.
+func (c *conn) replaceCaps(caps []string) bool {
+	c.capsMu.Lock()
+	defer c.capsMu.Unlock()
+	if slices.Equal(c.caps, caps) {
+		return false
+	}
+	c.caps = caps
+	return true
 }
 
 // outgoing is a queued message; line, when set, is its encoded line, which is

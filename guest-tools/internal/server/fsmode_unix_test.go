@@ -33,6 +33,41 @@ func TestWriteWithExecutableMakesTheFileExecutable(t *testing.T) {
 	}
 }
 
+func TestWriteWithExecutableFalseClearsTheExecuteBits(t *testing.T) {
+	home := t.TempDir()
+	c, _ := newRPCClient(t, Options{HomeDir: home})
+	path := filepath.Join(home, "tool")
+	if err := os.WriteFile(path, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.ok("fs.write", proto.Message{"path": path, "data": base64.StdEncoding.EncodeToString([]byte("new")), "truncate": true, "executable": false})
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm()&0o111 != 0 {
+		t.Fatalf("mode %v, %v", fi.Mode(), err)
+	}
+}
+
+func TestListReportsTheOwnersExecuteBitOfFiles(t *testing.T) {
+	home := t.TempDir()
+	c, _ := newRPCClient(t, Options{HomeDir: home})
+	if err := os.WriteFile(filepath.Join(home, "run.sh"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "data.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(home, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]any{}
+	for _, e := range c.ok("fs.list", proto.Message{"path": home})["entries"].([]any) {
+		m := e.(map[string]any)
+		got[m["name"].(string)] = m["executable"]
+	}
+	if got["run.sh"] != true || got["data.txt"] != false || got["sub"] != nil {
+		t.Fatalf("executable fields %v", got)
+	}
+}
+
 func TestWriteWithoutExecutableKeepsTheFilePlain(t *testing.T) {
 	home := t.TempDir()
 	c, _ := newRPCClient(t, Options{HomeDir: home})

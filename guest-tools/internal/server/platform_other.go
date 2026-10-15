@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 func platformShutdown() error {
@@ -18,6 +19,13 @@ func platformShutdown() error {
 
 // resolutionSupported says whether setResolution can change the display mode.
 const resolutionSupported = false
+
+// clipboardPollFastest and clipboardPollSlowest bound the time between two
+// clipboard polls, which run a clipboard tool here.
+const (
+	clipboardPollFastest = 500 * time.Millisecond
+	clipboardPollSlowest = 4 * time.Second
+)
 
 func currentResolution() (int, int, bool) { return 0, 0, false }
 

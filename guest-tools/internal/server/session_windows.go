@@ -17,4 +17,4 @@ func defaultSessionSource() func() (session.Session, bool) { return nil }
 func newClipboard(func() (session.Session, bool)) clipboard.Clipboard { return clipboard.New() }
 
 // runInSession gives c the environment env.
-func runInSession(c *exec.Cmd, env []string, _ any) { c.Env = env }
+func runInSession(c *exec.Cmd, env []string, _ any, _ []string) { c.Env = env }

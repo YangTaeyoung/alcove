@@ -3,9 +3,14 @@
 package clipboard
 
 import (
+	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func lookPathOf(found ...string) func(string) (string, error) {
@@ -52,9 +57,80 @@ func TestToolReadsTheLastValueOfAName(t *testing.T) {
 func TestCommandsRunWithTheSessionEnvironment(t *testing.T) {
 	c := sessionClipboard{}
 	target := Target{Env: []string{"WAYLAND_DISPLAY=wayland-0", "HOME=/home/alcove"}}
-	cmd := c.command([]string{"wl-paste", "--no-newline"}, target)
-	if !reflect.DeepEqual(cmd.Env, target.Env) || cmd.SysProcAttr != nil {
+	cmd := c.command(context.Background(), []string{"wl-paste", "--no-newline"}, target)
+	if !reflect.DeepEqual(cmd.Env, target.Env) || !cmd.SysProcAttr.Setsid || cmd.SysProcAttr.Credential != nil {
 		t.Fatalf("env %q, attr %+v", cmd.Env, cmd.SysProcAttr)
+	}
+}
+
+// fakeTools puts sh scripts named after the keys of scripts into a folder
+// that becomes PATH, and returns that folder.
+func fakeTools(t *testing.T, scripts map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range scripts {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+":/usr/bin:/bin")
+	return dir
+}
+
+func waylandTarget(t *testing.T) Target {
+	return Target{Env: []string{"WAYLAND_DISPLAY=wayland-0", "PATH=" + os.Getenv("PATH")}}
+}
+
+func shortToolTimeout(t *testing.T) {
+	old := toolTimeout
+	toolTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { toolTimeout = old })
+}
+
+func TestAHungClipboardToolTimesOut(t *testing.T) {
+	shortToolTimeout(t)
+	fakeTools(t, map[string]string{"wl-paste": "sleep 30", "wl-copy": "cat >/dev/null; sleep 30"})
+	c := NewSession(func() (Target, bool) { return waylandTarget(t), true })
+	start := time.Now()
+	if _, err := c.Text(); err == nil {
+		t.Fatal("Text of a hung wl-paste succeeded")
+	}
+	if err := c.SetText("x"); err == nil {
+		t.Fatal("SetText of a hung wl-copy succeeded")
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("the calls took %v", d)
+	}
+}
+
+func TestClipboardTextIsReadUpToTheLimit(t *testing.T) {
+	fakeTools(t, map[string]string{"wl-paste": "head -c 3000000 /dev/zero | tr '\\000' a"})
+	c := NewSession(func() (Target, bool) { return waylandTarget(t), true })
+	text, err := c.Text()
+	if err != nil || len(text) != ReadLimit {
+		t.Fatalf("read %d bytes, %v", len(text), err)
+	}
+}
+
+func TestSetTextRunsTheWriterThroughTheScope(t *testing.T) {
+	dir := fakeTools(t, map[string]string{
+		"wl-paste": "true",
+		"wl-copy":  "cat > \"$CLIP_OUT\"",
+		"runner":   "echo \"$@\" > \"$RUNNER_OUT\"; shift; exec \"$@\"",
+	})
+	clip, ran := filepath.Join(dir, "clip.txt"), filepath.Join(dir, "runner.txt")
+	target := waylandTarget(t)
+	target.Env = append(target.Env, "CLIP_OUT="+clip, "RUNNER_OUT="+ran)
+	target.Scope = []string{filepath.Join(dir, "runner"), "--"}
+	c := NewSession(func() (Target, bool) { return target, true })
+	if err := c.SetText("한글 text"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(clip); string(b) != "한글 text" {
+		t.Fatalf("wl-copy got %q", b)
+	}
+	if b, _ := os.ReadFile(ran); !strings.HasPrefix(string(b), "-- ") || !strings.HasSuffix(strings.TrimSpace(string(b)), "wl-copy") {
+		t.Fatalf("runner got %q", b)
 	}
 }
 

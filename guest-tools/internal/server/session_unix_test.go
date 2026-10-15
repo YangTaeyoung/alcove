@@ -108,16 +108,51 @@ func TestLaunchRunsInTheSessionEnvironment(t *testing.T) {
 	}
 }
 
+func TestLaunchGoesThroughTheUsersServiceManagerScope(t *testing.T) {
+	home := t.TempDir()
+	runner := filepath.Join(home, "runner")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/runner-args\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n"
+	if err := os.WriteFile(runner, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	c := sessionClient(t, session.Session{User: "alcove", Home: home, Env: env, ScopeRunner: runner}, true)
+	out := filepath.Join(home, "ran.txt")
+	c.ok("app.launch", proto.Message{"path": "/bin/sh", "args": []string{"-c", `printf '%s' "$1" > "$0"`, out, "$HOME literal"},
+		"wait_window_ms": 0})
+	ev := c.event("process.exited")
+	if ev.String("path") != "/bin/sh" {
+		t.Fatalf("process.exited %v", ev)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "$HOME literal" {
+		t.Fatalf("the program wrote %q", b)
+	}
+	args, _ := os.ReadFile(filepath.Join(home, "runner-args"))
+	want := "--user\n--scope\n--quiet\n--collect\n--expand-environment=no\n--\n/bin/sh\n-c\n"
+	if !strings.HasPrefix(string(args), want) {
+		t.Fatalf("the runner got %q", args)
+	}
+}
+
+func TestLaunchOfAMissingProgramFailsAlsoThroughTheScope(t *testing.T) {
+	home := t.TempDir()
+	c := sessionClient(t, session.Session{User: "alcove", Home: home, Env: []string{"HOME=" + home}, ScopeRunner: "/bin/sh"}, true)
+	missing := filepath.Join(home, "missing")
+	res := c.call("app.launch", proto.Message{"path": missing, "wait_window_ms": 0})
+	if res["ok"] != false || !strings.HasPrefix(res.String("error"), "cannot start '"+missing+"': ") {
+		t.Fatalf("app.launch %v", res)
+	}
+}
+
 func TestSessionCommandsRunAsTheSessionUser(t *testing.T) {
 	c := exec.Command("/bin/true")
-	prepareTree(c)
 	cred := &syscall.Credential{Uid: 1000, Gid: 1000, Groups: []uint32{4, 27}}
-	runInSession(c, []string{"HOME=/home/alcove"}, cred)
-	if c.SysProcAttr.Credential != cred || !c.SysProcAttr.Setpgid || len(c.Env) != 1 {
+	runInSession(c, []string{"HOME=/home/alcove"}, cred, nil)
+	if c.SysProcAttr.Credential != cred || !c.SysProcAttr.Setsid || len(c.Env) != 1 || c.Path != "/bin/true" {
 		t.Fatalf("attr %+v env %q", c.SysProcAttr, c.Env)
 	}
 	plain := exec.Command("/bin/true")
-	runInSession(plain, []string{"HOME=/root"}, nil)
+	runInSession(plain, []string{"HOME=/root"}, nil, nil)
 	if plain.SysProcAttr != nil && plain.SysProcAttr.Credential != nil {
 		t.Fatalf("a nil credential set %+v", plain.SysProcAttr)
 	}

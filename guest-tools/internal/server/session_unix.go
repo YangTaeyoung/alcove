@@ -13,7 +13,7 @@ import (
 )
 
 // sessionCacheTime is how long a session lookup is reused.
-const sessionCacheTime = 2 * time.Second
+const sessionCacheTime = 5 * time.Second
 
 // sessionCache runs lookup at most once per sessionCacheTime.
 type sessionCache struct {
@@ -49,19 +49,25 @@ func newClipboard(source func() (session.Session, bool)) clipboard.Clipboard {
 		if !ok {
 			return clipboard.Target{}, false
 		}
-		return clipboard.Target{Env: sess.Env, Credential: sess.Credential()}, true
+		return clipboard.Target{Env: sess.Env, Credential: sess.Credential(), Scope: sess.ScopePrefix()}, true
 	})
 }
 
-// runInSession gives c the environment env and, when cred is not nil, runs
-// it as that user.
-func runInSession(c *exec.Cmd, env []string, cred *syscall.Credential) {
+// runInSession gives c the environment env and a session of its own, runs
+// it as cred's user when cred is not nil, and starts it through scope (the
+// command line of systemd-run before the program) when scope is not empty
+// and the program is an executable file, so that it runs in the user's
+// service manager rather than in the agent's service. The process keeps its
+// process id through systemd-run.
+func runInSession(c *exec.Cmd, env []string, cred *syscall.Credential, scope []string) {
 	c.Env = env
-	if cred == nil {
-		return
-	}
 	if c.SysProcAttr == nil {
 		c.SysProcAttr = &syscall.SysProcAttr{}
 	}
+	c.SysProcAttr.Setsid = true
 	c.SysProcAttr.Credential = cred
+	if _, err := exec.LookPath(c.Path); len(scope) > 0 && c.Err == nil && err == nil {
+		c.Args = append(append(append([]string{}, scope...), c.Path), c.Args[1:]...)
+		c.Path = scope[0]
+	}
 }

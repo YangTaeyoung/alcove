@@ -297,6 +297,9 @@ func (s *Server) fsList(_ context.Context, req proto.Message) (proto.Message, er
 		}
 		if !d.IsDir() {
 			e["size"] = info.Size()
+			if info.Mode().IsRegular() && runtime.GOOS != "windows" {
+				e["executable"] = info.Mode().Perm()&0o100 != 0
+			}
 			if withSum && info.Mode().IsRegular() {
 				if sum, err := fileDigest(p); err == nil {
 					e["sha256"] = sum
@@ -536,9 +539,14 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 	if appendMode && truncate {
 		return nil, errors.New("pass append or truncate, not both")
 	}
+	fsys, name, err := s.writerFor(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+	}
+	defer fsys.Close()
 	if !appendMode {
 		var size int64
-		if fi, err := os.Stat(path); err == nil && !truncate {
+		if fi, err := fsys.Stat(name); err == nil && !truncate {
 			size = fi.Size()
 		}
 		if offset > size {
@@ -546,15 +554,15 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 		}
 	}
 	dir := filepath.Dir(path)
-	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+	if _, err := fsys.Stat(filepath.Dir(name)); errors.Is(err, fs.ErrNotExist) {
 		if !req.Bool("mkdirs") {
 			return nil, fmt.Errorf("directory '%s' does not exist; pass mkdirs to create it", dir)
 		}
 		if err := s.ensureDeployRoot(dir); err != nil {
 			return nil, err
 		}
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("cannot create '%s': %v", dir, err)
+		if err := fsys.MkdirAll(filepath.Dir(name)); err != nil {
+			return nil, fmt.Errorf("cannot create '%s': %v", dir, homeError(err))
 		}
 	}
 	flags := os.O_WRONLY | os.O_CREATE
@@ -564,9 +572,9 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 	case truncate:
 		flags |= os.O_TRUNC
 	}
-	f, err := os.OpenFile(path, flags, 0o644)
+	f, err := fsys.OpenFile(name, flags, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open '%s' for writing: %v", path, err)
+		return nil, fmt.Errorf("cannot open '%s' for writing: %v", path, homeError(err))
 	}
 	if appendMode {
 		_, err = f.Write(data)
@@ -577,13 +585,20 @@ func (s *Server) fsWrite(_ context.Context, req proto.Message) (proto.Message, e
 		f.Close()
 		return nil, fmt.Errorf("cannot write '%s': %v", path, err)
 	}
-	if req.Bool("executable") && runtime.GOOS != "windows" {
-		if fi, err := f.Stat(); err == nil {
-			err = f.Chmod(executableMode(fi.Mode().Perm()))
+	if req.Has("executable") && runtime.GOOS != "windows" {
+		var fi os.FileInfo
+		if fi, err = f.Stat(); err == nil {
+			mode := fi.Mode().Perm() &^ 0o111
+			if req.Bool("executable") {
+				mode = executableMode(mode)
+			}
+			if mode != fi.Mode().Perm() {
+				err = f.Chmod(mode)
+			}
 		}
 		if err != nil {
 			f.Close()
-			return nil, fmt.Errorf("cannot make '%s' executable: %v", path, err)
+			return nil, fmt.Errorf("cannot set the execute bits of '%s': %v", path, err)
 		}
 	}
 	fi, statErr := f.Stat()
@@ -611,16 +626,28 @@ func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Lstat(from); err != nil {
+	fsys, fromName, err := s.writerFor(from)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+	}
+	defer fsys.Close()
+	toName, sameSide := to, !s.inSessionHome(to)
+	if h, ok := fsys.(homeFS); ok {
+		toName, sameSide = homeRelative(h.home, to)
+	}
+	if !sameSide {
+		return nil, fmt.Errorf("'%s' and '%s' lie on different sides of the home folder of the desktop user; rename within it or outside it, or copy the file", from, to)
+	}
+	if _, err := fsys.Lstat(fromName); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("'%s' does not exist", from)
 		}
-		return nil, fmt.Errorf("cannot stat '%s': %v", from, err)
+		return nil, fmt.Errorf("cannot stat '%s': %v", from, homeError(err))
 	}
 	if err := s.ensureDeployRoot(to); err != nil {
 		return nil, err
 	}
-	if dst, err := os.Lstat(to); err == nil {
+	if dst, err := fsys.Lstat(toName); err == nil {
 		if !req.Bool("overwrite") {
 			return nil, fmt.Errorf("'%s' exists; pass overwrite to replace it", to)
 		}
@@ -628,8 +655,8 @@ func (s *Server) fsRename(_ context.Context, req proto.Message) (proto.Message, 
 			return nil, fmt.Errorf("'%s' is a directory; delete it first with fs.delete", to)
 		}
 	}
-	if err := os.Rename(from, to); err != nil {
-		return nil, fmt.Errorf("cannot rename '%s' to '%s': %v", from, to, err)
+	if err := fsys.Rename(fromName, toName); err != nil {
+		return nil, fmt.Errorf("cannot rename '%s' to '%s': %v", from, to, homeError(err))
 	}
 	return proto.Message{"path": to}, nil
 }
@@ -642,8 +669,13 @@ func (s *Server) fsMkdir(_ context.Context, req proto.Message) (proto.Message, e
 	if err := s.ensureDeployRoot(path); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		return nil, fmt.Errorf("cannot create '%s': %v", path, err)
+	fsys, name, err := s.writerFor(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+	}
+	defer fsys.Close()
+	if err := fsys.MkdirAll(name); err != nil {
+		return nil, fmt.Errorf("cannot create '%s': %v", path, homeError(err))
 	}
 	return proto.Message{"path": path}, nil
 }
@@ -779,27 +811,32 @@ func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, 
 	if s.protectedFromDelete(path) || s.protectedFromDelete(resolveParent(path)) {
 		return nil, homeRefusal(path)
 	}
-	fi, err := os.Lstat(path)
+	fsys, name, err := s.writerFor(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the home folder of the desktop user: %v", err)
+	}
+	defer fsys.Close()
+	fi, err := fsys.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return proto.Message{"deleted": false}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("cannot stat '%s': %v", path, err)
+		return nil, fmt.Errorf("cannot stat '%s': %v", path, homeError(err))
 	}
 	if err := s.identityRefusal(path, fi); err != nil {
 		return nil, err
 	}
 	if fi.IsDir() && !req.Bool("recursive") {
-		children, err := os.ReadDir(path)
+		children, err := fsys.ReadDir(name)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read '%s': %v", path, err)
+			return nil, fmt.Errorf("cannot read '%s': %v", path, homeError(err))
 		}
 		if len(children) > 0 {
 			return nil, fmt.Errorf("'%s' is not empty; pass recursive to delete it with its contents", path)
 		}
 	}
-	if err := os.RemoveAll(path); err != nil {
-		return nil, fmt.Errorf("cannot delete '%s': %v", path, err)
+	if err := fsys.RemoveAll(name); err != nil {
+		return nil, fmt.Errorf("cannot delete '%s': %v", path, homeError(err))
 	}
 	return proto.Message{"deleted": true}, nil
 }

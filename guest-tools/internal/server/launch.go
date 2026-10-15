@@ -194,8 +194,9 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 			extra = append(extra, k+"="+env[k])
 		}
 	}
+	started := c.Path
 	if sess, ok := s.session(); ok {
-		runInSession(c, append(append([]string{}, sess.Env...), extra...), sess.Credential())
+		runInSession(c, append(append([]string{}, sess.Env...), extra...), sess.Credential(), sess.ScopePrefix())
 	} else if len(extra) > 0 {
 		c.Env = append(os.Environ(), extra...)
 	}
@@ -215,7 +216,7 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 	if err := startProgram(c); err != nil {
 		return nil, fmt.Errorf("cannot start '%s': %v; check the path with fs.stat", path, err)
 	}
-	pid, started := c.Process.Pid, c.Path
+	pid := c.Process.Pid
 	exited := make(chan struct{})
 	go func() {
 		_ = c.Wait()

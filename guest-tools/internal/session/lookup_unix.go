@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -59,7 +60,26 @@ func Lookup() (Session, error) {
 			entries = append(entries, d.Name())
 		}
 	}
-	return New(info, a, Environment(info, a, entries, os.Getenv("PATH"))), nil
+	sess := New(info, a, Environment(info, a, entries, os.Getenv("PATH"), systemLocale()))
+	if slices.Contains(entries, "bus") {
+		if runner, err := exec.LookPath("systemd-run"); err == nil {
+			sess.ScopeRunner = runner
+		}
+	}
+	return sess, nil
+}
+
+// systemLocale returns the locale variables of /etc/default/locale, else of
+// /etc/locale.conf, else of the agent's environment.
+func systemLocale() []string {
+	for _, f := range []string{"/etc/default/locale", "/etc/locale.conf"} {
+		if b, err := os.ReadFile(f); err == nil {
+			if l := ParseLocale(string(b)); len(l) > 0 {
+				return l
+			}
+		}
+	}
+	return LocaleFromEnv(os.Environ())
 }
 
 func run(name string, args ...string) (string, error) {
