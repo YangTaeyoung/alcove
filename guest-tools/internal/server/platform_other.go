@@ -20,5 +20,8 @@ func setResolution(w, h int) error {
 	return errors.New("resolution change not supported on this platform")
 }
 
+// fileSystemRoots returns the root folder.
+func fileSystemRoots() []string { return []string{"/"} }
+
 // platformEntryOwner reports no owners on this system.
 func platformEntryOwner(string) (string, bool) { return "", false }

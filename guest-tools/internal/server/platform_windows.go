@@ -17,6 +17,20 @@ var (
 	procEnumDisplaySettings   = user32.NewProc("EnumDisplaySettingsW")
 )
 
+var procGetLogicalDrives = syscall.NewLazyDLL("kernel32.dll").NewProc("GetLogicalDrives")
+
+// fileSystemRoots returns the root folder of each drive letter in use.
+func fileSystemRoots() []string {
+	mask, _, _ := procGetLogicalDrives.Call()
+	var roots []string
+	for i := 0; i < 26; i++ {
+		if mask&(1<<i) != 0 {
+			roots = append(roots, string(rune('A'+i))+`:\`)
+		}
+	}
+	return roots
+}
+
 func platformShutdown() error {
 	return exec.Command("shutdown.exe", "/s", "/t", "0").Run()
 }

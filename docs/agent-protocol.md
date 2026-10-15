@@ -1018,8 +1018,10 @@ agent sends one event per difference, each with the window object:
   directory, whether or not `recursive` is set. The path is compared as given
   and with a `\\?\` prefix removed and the links, junctions and short names of
   its parent folder resolved; the home directory as given and with its links
-  resolved. A link itself is deleted without what it leads to. Other names
-  for the same folder, such as `\\localhost\C$\…`, are not recognised.
+  resolved. A path that names the same folder (by file identity) as one of
+  those or as the root of a drive is refused as well, so other names for
+  them, such as `\\localhost\C$\…`, `\\127.0.0.1\C$\…` or
+  `\\?\UNC\localhost\C$\…`, are refused too. A link itself is deleted without what it leads to.
 - The host transfers a file as `fs.write` pieces to `<path>.alcove-part`,
   compares `fs.stat` with `sha256` against its own digest and then renames;
   downloads use `fs.stat` with `sha256` and `fs.read` pieces.

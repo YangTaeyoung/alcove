@@ -677,6 +677,39 @@ func (s *Server) protectedFromDelete(path string) bool {
 	return err == nil && pathContains(path, real, filepath.Separator, fold)
 }
 
+// sameAsProtected reports whether fi, the Lstat of a path, is a folder that is
+// the same file as the home directory, one of its ancestors or a file-system
+// root, the home directory taken as given and with its links resolved.
+func (s *Server) sameAsProtected(fi os.FileInfo) bool {
+	if !fi.IsDir() {
+		return false
+	}
+	folders := fileSystemRoots()
+	if s.opt.HomeDir != "" {
+		home := filepath.Clean(s.opt.HomeDir)
+		homes := []string{home}
+		if real, err := filepath.EvalSymlinks(home); err == nil {
+			homes = append(homes, real)
+		}
+		for _, p := range homes {
+			for {
+				folders = append(folders, p)
+				parent := filepath.Dir(p)
+				if parent == p {
+					break
+				}
+				p = parent
+			}
+		}
+	}
+	for _, p := range folders {
+		if st, err := os.Stat(p); err == nil && os.SameFile(fi, st) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveParent returns path without a \\?\ prefix before a drive letter and
 // with the links, junctions and short names of its parent folder resolved
 // and its last element kept; it returns path when the parent cannot be
@@ -704,6 +737,9 @@ func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, 
 	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot stat '%s': %v", path, err)
+	}
+	if s.sameAsProtected(fi) {
+		return nil, fmt.Errorf("refusing to delete '%s': it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended", path)
 	}
 	if fi.IsDir() && !req.Bool("recursive") {
 		children, err := os.ReadDir(path)

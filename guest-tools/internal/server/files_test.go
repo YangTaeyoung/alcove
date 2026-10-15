@@ -691,6 +691,39 @@ func TestFsDeleteRefusesHomeRootAndAncestors(t *testing.T) {
 	}
 }
 
+func TestFsDeleteRefusesTheHomeDirectoryUnderAnotherSpellingOfItsName(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	if err := os.MkdirAll(filepath.Join(home, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "HOME")
+	if a, err := os.Stat(alias); err != nil || !sameAs(a, home) {
+		t.Skip("this file system tells names apart by case")
+	}
+	c, _ := newRPCClient(t, Options{HomeDir: home})
+	parentAlias := filepath.Join(filepath.Dir(base), strings.ToUpper(filepath.Base(base)))
+	want := "it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended"
+	for _, tc := range []struct {
+		path      string
+		recursive bool
+	}{{alias, true}, {alias, false}, {parentAlias, false}} {
+		res := c.call("fs.delete", proto.Message{"path": tc.path, "recursive": tc.recursive})
+		if res["ok"] != false || res.String("error") != "refusing to delete '"+tc.path+"': "+want {
+			t.Fatalf("%q recursive=%v: %v", tc.path, tc.recursive, res)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "keep")); err != nil {
+		t.Fatalf("home content deleted: %v", err)
+	}
+}
+
+// sameAs reports whether fi is the file or folder at path.
+func sameAs(fi os.FileInfo, path string) bool {
+	other, err := os.Stat(path)
+	return err == nil && os.SameFile(fi, other)
+}
+
 func TestIsFileSystemRoot(t *testing.T) {
 	cases := []struct {
 		path, volume string
