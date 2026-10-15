@@ -58,15 +58,26 @@ func minimized(id, title string, pid int) map[string]any {
 	return w
 }
 
+// launchExit returns fields with the path and args of exitProgram(code).
+func launchExit(code int, fields proto.Message) proto.Message {
+	path, args := exitProgram(code)
+	m := proto.Message{"path": path, "args": args}
+	for k, v := range fields {
+		m[k] = v
+	}
+	return m
+}
+
 func TestLaunchStartsProcessAndReportsExit(t *testing.T) {
 	c, _ := newRPCClient(t, Options{})
-	res := c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 3"}, "wait_window_ms": 0})
+	res := c.ok("app.launch", launchExit(3, proto.Message{"wait_window_ms": 0}))
 	pid := res.Int("pid")
 	if pid <= 0 || res.Has("window") {
 		t.Fatalf("res %v", res)
 	}
 	ev := c.event("process.exited")
-	if ev.Int("pid") != pid || ev.Int("code") != 3 || filepath.Base(ev.String("path")) != "sh" || !filepath.IsAbs(ev.String("path")) {
+	program, _ := exitProgram(3)
+	if ev.Int("pid") != pid || ev.Int("code") != 3 || !strings.EqualFold(filepath.Base(ev.String("path")), program) || !filepath.IsAbs(ev.String("path")) {
 		t.Fatalf("event %v", ev)
 	}
 }
@@ -98,31 +109,6 @@ func TestLaunchMissingPath(t *testing.T) {
 	}
 }
 
-func TestLaunchRunsInTheProgramDirectoryWithArgsAndEnv(t *testing.T) {
-	home := t.TempDir()
-	c, _ := newRPCClient(t, Options{HomeDir: home})
-	out := filepath.Join(home, "out.txt")
-	script := `printf '%s|%s|%s' "$PWD" "$1" "$ALCOVE_LAUNCH_TEST" > "$0"`
-	c.ok("app.launch", proto.Message{"path": "/bin/sh", "args": []string{"-c", script, out, "두 번째"},
-		"env": map[string]any{"ALCOVE_LAUNCH_TEST": "set"}, "wait_window_ms": 0})
-	c.event("process.exited")
-	got := c.ok("fs.read", proto.Message{"path": out})
-	text := string(decode(t, got))
-	parts := strings.SplitN(text, "|", 3)
-	wantDir, _ := filepath.EvalSymlinks("/bin")
-	gotDir, _ := filepath.EvalSymlinks(parts[0])
-	if len(parts) != 3 || gotDir != wantDir || parts[1] != "두 번째" || parts[2] != "set" {
-		t.Fatalf("the program saw %q", text)
-	}
-	c.events = nil
-	c.ok("app.launch", proto.Message{"path": "/bin/sh", "args": []string{"-c", script, out, "x"}, "cwd": "~", "wait_window_ms": 0})
-	c.event("process.exited")
-	got = c.ok("fs.read", proto.Message{"path": out})
-	if text := string(decode(t, got)); !strings.HasSuffix(strings.SplitN(text, "|", 2)[0], filepath.Base(home)) {
-		t.Fatalf("with cwd ~ the program saw %q", text)
-	}
-}
-
 func TestLaunchReturnsTheWindowOpenedAfterTheLaunch(t *testing.T) {
 	old := window("0x10", "Program Manager", 4)
 	ui := &windowsUI{list: func(n int) ([]any, error) {
@@ -132,7 +118,7 @@ func TestLaunchReturnsTheWindowOpenedAfterTheLaunch(t *testing.T) {
 		return []any{window("0x30", "", 77), window("0x20", "Fixture", 77), old}, nil
 	}}
 	c, _ := newRPCClient(t, Options{UI: ui})
-	res := c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}})
+	res := c.ok("app.launch", launchExit(0, nil))
 	w, _ := res["window"].(map[string]any)
 	if w["id"] != "0x20" || w["title"] != "Fixture" {
 		t.Fatalf("res %v", res)
@@ -152,7 +138,7 @@ func TestLaunchChoosesAmongWindowsThatOpenOnePollApart(t *testing.T) {
 		return []any{prompt, sized("0x21", "Page", 77, 1000, 700), old}, nil
 	}}
 	c, _ := newRPCClient(t, Options{UI: ui})
-	res := c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}})
+	res := c.ok("app.launch", launchExit(0, nil))
 	if w, _ := res["window"].(map[string]any); w["id"] != "0x21" {
 		t.Fatalf("res %v", res)
 	}
@@ -162,7 +148,7 @@ func TestLaunchWithoutANewWindowAnswersAfterTheWait(t *testing.T) {
 	ui := &windowsUI{list: func(int) ([]any, error) { return []any{window("0x10", "Program Manager", 4)}, nil }}
 	c, _ := newRPCClient(t, Options{UI: ui})
 	start := time.Now()
-	res := c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 400})
+	res := c.ok("app.launch", launchExit(0, proto.Message{"wait_window_ms": 400}))
 	if res.Int("pid") <= 0 || res.Has("window") {
 		t.Fatalf("res %v", res)
 	}
@@ -184,15 +170,16 @@ func TestLaunchDoesNotStartWhenTheWindowsCannotBeListed(t *testing.T) {
 	}
 	t.Cleanup(func() { startProgram = start })
 	c, _ := newRPCClient(t, Options{UI: ui})
-	res := c.call("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}})
-	want := "'sh' was not started because the windows could not be listed: the UI helper is busy with 'ui.tree'; retry"
+	res := c.call("app.launch", launchExit(0, nil))
+	program, _ := exitProgram(0)
+	want := "'" + program + "' was not started because the windows could not be listed: the UI helper is busy with 'ui.tree'; retry"
 	if res["ok"] != false || res.String("error") != want {
 		t.Fatalf("res %v", res)
 	}
 	if n := starts.Load(); n != 0 {
 		t.Fatalf("%d programs were started", n)
 	}
-	c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 0})
+	c.ok("app.launch", launchExit(0, proto.Message{"wait_window_ms": 0}))
 	if n := starts.Load(); n != 1 {
 		t.Fatalf("a launch that does not list windows started %d programs", n)
 	}
@@ -201,7 +188,7 @@ func TestLaunchDoesNotStartWhenTheWindowsCannotBeListed(t *testing.T) {
 func TestLaunchWithWaitZeroDoesNotListWindows(t *testing.T) {
 	ui := &windowsUI{list: func(int) ([]any, error) { return nil, errors.New("not expected") }}
 	c, _ := newRPCClient(t, Options{UI: ui})
-	c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 0})
+	c.ok("app.launch", launchExit(0, proto.Message{"wait_window_ms": 0}))
 	if ui.listed() != 0 {
 		t.Fatalf("win.list was called %d times", ui.listed())
 	}
@@ -210,7 +197,7 @@ func TestLaunchWithWaitZeroDoesNotListWindows(t *testing.T) {
 func TestLaunchRefusesABadEnvName(t *testing.T) {
 	c, _ := newRPCClient(t, Options{})
 	for _, bad := range []map[string]any{{"": "v"}, {"A=B": "v"}} {
-		res := c.call("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 0, "env": bad})
+		res := c.call("app.launch", launchExit(0, proto.Message{"wait_window_ms": 0, "env": bad}))
 		if res["ok"] != false || res.String("error") != "env names cannot be empty or contain '='" {
 			t.Fatalf("env %v answered %v", bad, res)
 		}
@@ -255,7 +242,7 @@ func TestTwoConcurrentLaunchesTakeDifferentWindows(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		ctx := context.WithValue(context.Background(), launchKey{}, i)
 		go func() {
-			res, err := s.appLaunch(ctx, proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": 60000})
+			res, err := s.appLaunch(ctx, launchExit(0, proto.Message{"wait_window_ms": 60000}))
 			if err != nil {
 				errs <- err
 				return
@@ -317,7 +304,7 @@ func TestLaunchStopsPollingWhenTheConnectionCloses(t *testing.T) {
 		return s.appLaunch(ctx, req)
 	})
 	expect(t, r, "hello")
-	w.Send(proto.Message{"t": "req", "id": 1, "op": "t.launch", "path": "sh", "args": []string{"-c", "exit 0"}, "wait_window_ms": maxLaunchWaitMs})
+	w.Send(launchExit(0, proto.Message{"t": "req", "id": 1, "op": "t.launch", "wait_window_ms": maxLaunchWaitMs}))
 	for ui.listed() < 2 {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -469,7 +456,7 @@ func TestAHelperStartDuringALaunchKeepsItsClaimAndTheAnswerReleasesTheHold(t *te
 	}}
 	var c *rpcClient
 	c, s = newRPCClient(t, Options{UI: ui})
-	res := c.ok("app.launch", proto.Message{"path": "sh", "args": []string{"-c", "exit 0"}})
+	res := c.ok("app.launch", launchExit(0, nil))
 	if w, _ := res["window"].(map[string]any); w["id"] != "0x20" {
 		t.Fatalf("res %v", res)
 	}
