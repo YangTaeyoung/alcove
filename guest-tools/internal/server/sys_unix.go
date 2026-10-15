@@ -42,8 +42,26 @@ func listProcesses() ([]procInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseProcesses(string(out), kernelName), nil
+}
+
+// kernelName returns the name the kernel keeps for pid (/proc/<pid>/comm,
+// at most 15 bytes), or false where there is none.
+func kernelName(pid int) (string, bool) {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSuffix(string(b), "\n"), true
+}
+
+// parseProcesses reads `ps axo pid=,ppid=,rss=,args=`. A process is named by
+// comm, its kernel name; when that name is the base name of its first
+// argument, or the first 15 bytes of it, by that base name; without a
+// kernel name by that base name.
+func parseProcesses(out string, comm func(int) (string, bool)) []procInfo {
 	var procs []procInfo
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
 		if len(f) < 4 {
 			continue
@@ -54,13 +72,18 @@ func listProcesses() ([]procInfo, error) {
 		if err1 != nil || err2 != nil || err3 != nil {
 			continue
 		}
-		p := procInfo{PID: pid, PPID: ppid, MemKB: rss, Name: filepath.Base(f[3]), Cmd: strings.Join(f[3:], " ")}
+		base := filepath.Base(f[3])
+		name := base
+		if c, ok := comm(pid); ok && c != "" && c != base && !(len(c) == 15 && strings.HasPrefix(base, c)) {
+			name = c
+		}
+		p := procInfo{PID: pid, PPID: ppid, MemKB: rss, Name: name, Cmd: strings.Join(f[3:], " ")}
 		if filepath.IsAbs(f[3]) {
 			p.Path = f[3]
 		}
 		procs = append(procs, p)
 	}
-	return procs, nil
+	return procs
 }
 
 // killByName kills every process whose name equals name (case-insensitive)
