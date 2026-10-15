@@ -761,3 +761,43 @@ func TestSilentClientConnectionIsClosed(t *testing.T) {
 		t.Fatalf("expected the proxy to close a silent connection, got %v", err)
 	}
 }
+
+func TestCloseDuringFirstUpstreamRequestsIsRaceFree(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	release := make(chan struct{})
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	up.EnableHTTP2 = true
+	up.StartTLS()
+	defer up.Close()
+	defer close(release)
+	env := newEnv(t, up)
+	const clients = 16
+	var wg sync.WaitGroup
+	for i := range clients {
+		c := env.newProtoClient(i%2 == 0)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if resp, err := c.Get(fmt.Sprintf("%s/first-%d", up.URL, i)); err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}()
+	}
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no request reached the upstream")
+	}
+	env.proxy.Close()
+	wg.Wait()
+}
