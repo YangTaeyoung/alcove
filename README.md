@@ -65,6 +65,8 @@ brew install meson pkgconf ninja glib pixman dtc libslirp capstone libusb zstd s
 git clone git@github.com:YangTaeyoung/alcove.git && cd alcove
 
 scripts/build-qemu.sh              # QEMU 11.1.1 + the Alcove display backend
+(cd guest-tools && GOOS=darwin GOARCH=arm64 go build -o ../build/alcove-proxy ./cmd/alcove-proxy)
+                                   # the HTTP capture proxy the app bundles
 xcodegen generate                  # generate Alcove.xcodeproj
 xcodebuild -project Alcove.xcodeproj -scheme Alcove build
 ```
@@ -249,7 +251,10 @@ default because `tpm-tis-device` fails under HVF on Apple silicon; Windows 11
 installs without it.
 
 Next: Coherence-style windows, GPU acceleration for the guest, and a signed,
-notarised release. Plans live in [`docs/superpowers/plans/`](docs/superpowers/plans).
+notarised release. The app carries `alcove-proxy` in `Contents/MacOS` with
+the ad-hoc signature of the Go linker; a notarised release has to sign it with
+the release identity on its own. Plans live in
+[`docs/superpowers/plans/`](docs/superpowers/plans).
 
 ## Licence
 

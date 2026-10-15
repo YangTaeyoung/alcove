@@ -108,7 +108,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.mouse.down` / `vm.mouse.up` | `name`, `button?` ("left" default), `x?` and `y?` together, observe params | `{}` or `{observation}` — presses or releases the button and leaves it so; with `x`/`y` the pointer moves there first |
 | `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms (0 to 10000, default 0), observe params | `{}` or `{observation}` — presses modifiers then the key, releases in reverse |
 | `vm.key.down` / `vm.key.up` | `name`, `key`, observe params | `{}` or `{observation}` |
-| `vm.type` | `name`, `text`, `delay?` ms per key (0 to 1000, default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content (the guest reports the first 700,000 bytes of UTF-8 of a longer text, and those are compared), otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again` (`vm.ui.type` names itself). Guest tools without a clipboard answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs wl-copy or xclip in its session), so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only`; text whose message to the guest tools would reach 1 MiB answers `the text is too large for the guest clipboard (<n> bytes of UTF-8; one message to the guest tools holds less than 1 MiB); split it over several vm.type calls`. The guest clipboard holds the text afterwards |
+| `vm.type` | `name`, `text`, `delay?` ms per key (0 to 1000, default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content (the guest reports the first 700,000 bytes of UTF-8 of a longer text, and those are compared), otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again`. Guest tools without a clipboard answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs wl-copy or xclip in its session), so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only`; text whose message to the guest tools would reach 1 MiB answers `the text is too large for the guest clipboard (<n> bytes of UTF-8; one message to the guest tools holds less than 1 MiB); split it over several vm.type calls`. Each of these sentences that names an op names `vm.ui.type` when that op typed the text. The guest clipboard holds the text afterwards |
 | `vm.batch` | `name`, `steps`, observe params | `{completed, results, failedStep?, error?, observation?}` — see [Batches](#batches) |
 | `vm.find_text` | `name`, `query?`, `regex?`, `region?`, `languages?` | `{matches, lines}` — see [Finding text](#finding-text) |
 | `vm.wait_for` | `name`, `conditions`, `timeout?`, observe params | `{matched, waited, type?, detail?, problems?, observation?}` — see [Waiting for conditions](#waiting-for-conditions) |
@@ -2747,6 +2747,12 @@ alcove-proxy was not found; build it with scripts/test/all.sh or set ALCOVE_PROX
   were written, without `vm.record.stop`'s finishing, and a new server knows
   no recording. The crash dump settings live in the guest's registry and stay.
   Stopping `alcovectl serve` with SIGTERM also shuts down the VMs it runs.
-- Video was recorded with `alcovectl serve` started from a Terminal of the
-  logged-in user; a server process without a window server session (an SSH
-  login, a launchd daemon) was not tried.
+- Video was recorded with `alcovectl serve` detached from its Terminal
+  (`nohup`, standard input from `/dev/null`) in the logged-in user's session
+  (`launchctl managername` answers `Aqua`); a server process without a window
+  server session (an SSH login, a launchd daemon) was not tried.
+- A connection may have any number of requests of the concurrent lane in
+  flight, and the server takes any number of connections. The socket has mode
+  0600, so only the user and root can connect, and every client is trusted.
+- Deleting a snapshot does not shrink the disk image file; the freed space
+  inside the image is used for later writes (see [Snapshots](#snapshots)).

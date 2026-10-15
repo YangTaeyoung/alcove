@@ -1140,3 +1140,13 @@ the host close the connection. What bounds the replies before that check:
 - A connection that does not read its events loses them: the agent drops the
   overflow and reports the count with an `events.dropped` event at the place
   of the dropped events.
+- The timeout of `exec.run`, the close of its connection and `exec.kill` kill
+  a process tree by process id. In the instant between the agent reaping the
+  process and stopping its timer, or marking the job exited, that id can
+  already belong to another process, whose tree is then killed.
+- `timeout_ms` of `exec.run` has no upper bound; the command still ends when
+  its connection closes. Start a command that must outlive the connection with
+  `exec.start`.
+- On Windows the agent's port can stay taken for a moment after the agent
+  ends, so a restarted agent may log the `listen on … failed` line before a
+  later attempt binds the port (see [Listening](#listening)).
