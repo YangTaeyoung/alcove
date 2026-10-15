@@ -209,9 +209,12 @@ patches instead of leaving the tree alone, your exported patch and your tree
 disagree — fix the patch, not the tree.
 
 The script does have a safety net: before resetting a tree that is neither
-pristine nor exactly the patch series, it writes
-`build/qemu-src-discarded-<timestamp>.diff` and prints where. Treat that as a
-recovery mechanism you never wanted to use, not as a workflow.
+pristine nor exactly the patch series, it checks whether the tree holds the
+`qemu-patches/*.patch` of an earlier commit of this repository and, if so,
+names that commit and applies the current series. Any other tree is saved to
+`build/qemu-src-discarded-<timestamp>.diff` first, and the script prints
+where. Treat that diff as a recovery mechanism you never wanted to use, not as
+a workflow.
 
 Two more rules for engine work:
 
