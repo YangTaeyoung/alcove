@@ -60,13 +60,20 @@ func MachineVars() (map[string]string, error) {
 // MachineString returns a REG_SZ or REG_EXPAND_SZ value of a key of
 // HKEY_LOCAL_MACHINE without expanding it; name "" is the key's default value.
 func MachineString(key, name string) (string, error) {
+	return queryString(syscall.HKEY_LOCAL_MACHINE, "HKLM", key, name)
+}
+
+// queryString returns a REG_SZ or REG_EXPAND_SZ value of a key of root,
+// whose name in errors is rootName, without expanding it, read into a
+// buffer of stringUnits of the value's size.
+func queryString(root syscall.Handle, rootName, key, name string) (string, error) {
 	k, err := syscall.UTF16PtrFromString(key)
 	if err != nil {
 		return "", err
 	}
 	var h syscall.Handle
-	if err := syscall.RegOpenKeyEx(syscall.HKEY_LOCAL_MACHINE, k, 0, syscall.KEY_QUERY_VALUE, &h); err != nil {
-		return "", fmt.Errorf("HKLM\\%s: %v", key, err)
+	if err := syscall.RegOpenKeyEx(root, k, 0, syscall.KEY_QUERY_VALUE, &h); err != nil {
+		return "", fmt.Errorf("%s\\%s: %v", rootName, key, err)
 	}
 	defer syscall.RegCloseKey(h)
 	n, err := syscall.UTF16PtrFromString(name)
@@ -75,17 +82,18 @@ func MachineString(key, name string) (string, error) {
 	}
 	var typ, size uint32
 	if err := syscall.RegQueryValueEx(h, n, nil, &typ, nil, &size); err != nil {
-		return "", fmt.Errorf("HKLM\\%s\\%s: %v", key, name, err)
+		return "", fmt.Errorf("%s\\%s\\%s: %v", rootName, key, name, err)
 	}
 	if typ != syscall.REG_SZ && typ != syscall.REG_EXPAND_SZ {
-		return "", fmt.Errorf("HKLM\\%s\\%s is not a string", key, name)
+		return "", fmt.Errorf("%s\\%s\\%s is not a string", rootName, key, name)
 	}
 	if size < 2 {
 		return "", nil
 	}
-	buf := make([]uint16, size/2)
+	buf := make([]uint16, stringUnits(size))
+	size = uint32(2 * len(buf))
 	if err := syscall.RegQueryValueEx(h, n, nil, &typ, (*byte)(unsafe.Pointer(&buf[0])), &size); err != nil {
-		return "", fmt.Errorf("HKLM\\%s\\%s: %v", key, name, err)
+		return "", fmt.Errorf("%s\\%s\\%s: %v", rootName, key, name, err)
 	}
 	return syscall.UTF16ToString(buf), nil
 }

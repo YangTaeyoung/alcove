@@ -67,6 +67,12 @@ func ExpandText(raw string, vars map[string]string) (string, error) {
 	return b.String(), nil
 }
 
+// stringUnits returns the number of UTF-16 units that hold a registry value
+// of size bytes, an odd last byte included.
+func stringUnits(size uint32) int {
+	return int((size + 1) / 2)
+}
+
 // HasDrive reports whether s starts with a drive letter and a colon.
 func HasDrive(s string) bool {
 	if len(s) < 2 || s[1] != ':' {

@@ -61,6 +61,14 @@ func TestATextValueIsExpandedWithoutBeingAFolder(t *testing.T) {
 	}
 }
 
+func TestAStringBufferHoldsEveryByteOfTheValue(t *testing.T) {
+	for size := uint32(0); size < 9; size++ {
+		if got := stringUnits(size); 2*got < int(size) || 2*got > int(size)+1 {
+			t.Errorf("a value of %d bytes gets %d UTF-16 units", size, got)
+		}
+	}
+}
+
 func TestAddedVariablesAreExpandedByName(t *testing.T) {
 	vars := base(t)
 	vars["programfiles(x86)"] = `C:\Program Files (x86)`

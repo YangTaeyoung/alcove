@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 )
 
 // TestMain prints MachineVars as JSON and exits when ALCOVE_PRINT_VARS is 1;
@@ -59,6 +60,41 @@ func TestTheMachineVariablesAreNotTakenFromTheEnvironment(t *testing.T) {
 	got := varsOfAProcessWith(t, "SystemRoot="+dir, "windir="+dir, "SystemDrive="+dir, "ProgramFiles="+dir, "ProgramFiles(x86)="+dir)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("with the variables set to %s: %v; expected %v", dir, got, want)
+	}
+}
+
+var (
+	testAdvapi32         = syscall.NewLazyDLL("advapi32.dll")
+	procTestRegCreateKey = testAdvapi32.NewProc("RegCreateKeyExW")
+	procTestRegSetValue  = testAdvapi32.NewProc("RegSetValueExW")
+	procTestRegDeleteKey = testAdvapi32.NewProc("RegDeleteKeyW")
+)
+
+// setUserValue creates the key of HKEY_CURRENT_USER, gives it the REG_SZ
+// value name holding data as it is, and deletes the key when the test ends.
+func setUserValue(t *testing.T, key, name string, data []byte) {
+	t.Helper()
+	k, _ := syscall.UTF16PtrFromString(key)
+	n, _ := syscall.UTF16PtrFromString(name)
+	var h syscall.Handle
+	if r, _, _ := procTestRegCreateKey.Call(uintptr(syscall.HKEY_CURRENT_USER), uintptr(unsafe.Pointer(k)), 0, 0, 0,
+		uintptr(syscall.KEY_SET_VALUE), 0, uintptr(unsafe.Pointer(&h)), 0); r != 0 {
+		t.Fatalf("RegCreateKeyExW: %v", syscall.Errno(r))
+	}
+	t.Cleanup(func() { procTestRegDeleteKey.Call(uintptr(syscall.HKEY_CURRENT_USER), uintptr(unsafe.Pointer(k))) })
+	defer syscall.RegCloseKey(h)
+	if r, _, _ := procTestRegSetValue.Call(uintptr(h), uintptr(unsafe.Pointer(n)), 0, uintptr(syscall.REG_SZ),
+		uintptr(unsafe.Pointer(&data[0])), uintptr(len(data))); r != 0 {
+		t.Fatalf("RegSetValueExW: %v", syscall.Errno(r))
+	}
+}
+
+func TestAStringValueOfAnOddNumberOfBytesIsReadWhole(t *testing.T) {
+	const key = `Software\AlcoveSysfolderTest`
+	setUserValue(t, key, "Odd", []byte{'a', 0, 'b', 0, 'c'})
+	got, err := queryString(syscall.HKEY_CURRENT_USER, "HKCU", key, "Odd")
+	if err != nil || got != "abc" {
+		t.Fatalf("the value of 5 bytes reads as %q, %v; expected %q", got, err, "abc")
 	}
 }
 
