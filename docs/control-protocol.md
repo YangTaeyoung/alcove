@@ -2680,7 +2680,8 @@ and the `error` of its `problems`).
   [the agent protocol](agent-protocol.md#environment-of-a-command-on-windows)).
   Pass what a test needs with `env`. A bare `argv[0]` is looked up only in the
   `PATH` of that environment, so a program of the user's own `PATH` (such as
-  `winget.exe`) needs its full path or a `PATH` in `env`; another name answers
+  `winget.exe`) needs its full path or a `PATH` in `env`; a name found in none
+  of its folders answers
   `'<name>' is not in a folder of the command's PATH (the machine's PATH, or
   PATH of env); pass the full path of the program`. The home folder is the
   profile folder of the account (its `ProfileImagePath`), not `USERPROFILE`.

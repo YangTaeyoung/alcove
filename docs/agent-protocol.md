@@ -543,11 +543,11 @@ installer makes to the machine's variables reaches the next command without
 a restart of the agent.
 
 A bare `argv[0]` (without `\`, `/` or `:`) is looked up in the folders of
-the `PATH` of that environment, `env` included, that start with a drive or
-with `\\`, in order: the name itself when it has an extension, then the name
-with each extension of its `PATHEXT` (`.com`, `.exe`, `.bat`, `.cmd`
-without one). The working directory is not searched. A name found in none
-answers
+the `PATH` of that environment, `env` included, that start with a drive and
+a backslash or with `\\`, in order: the name itself when it has an
+extension, then the name with each extension of its `PATHEXT` (`.com`,
+`.exe`, `.bat`, `.cmd` without one). The working directory is not searched.
+A name found in none answers
 `'<name>' is not in a folder of the command's PATH (the machine's PATH, or PATH of env); pass the full path of the program`.
 `shell: "cmd"` runs `cmd.exe` of the System32 folder (with `/D`, see above)
 of the Windows folder that Windows reports (`GetSystemWindowsDirectoryW`);
