@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -668,7 +667,7 @@ func (q serialQueue) run(f func()) bool {
 }
 
 func runShell(cmd string) (string, int) {
-	c, err := buildCommand(proto.Message{"cmd": cmd}, runtime.GOOS)
+	c, err := buildCommand(proto.Message{"cmd": cmd}, agentSystem())
 	if err != nil {
 		return err.Error(), 1
 	}

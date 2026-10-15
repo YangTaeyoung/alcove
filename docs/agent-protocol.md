@@ -452,7 +452,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 
   | `shell` | Command line |
   |---|---|
-  | `powershell` (Windows only) | `powershell.exe -NoProfile -NonInteractive -Command "<prefix><cmd>"` with the prefix `[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; ` |
+  | `powershell` (Windows only) | `<System32>\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Restricted -Command "<prefix><cmd>"` with the prefix `$env:PSModulePath = $PSHOME + '\Modules'; [Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; ` (see [Windows PowerShell](#windows-powershell)) |
   | `cmd` (Windows only) | `cmd.exe /S /C "<cmd>"`, passed to the process verbatim, so `cmd.exe` removes exactly the outer quotes and runs `<cmd>` as typed |
   | `sh` | `/bin/sh -c <cmd>` |
 
@@ -478,6 +478,43 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   process ids, so on Windows a process whose parent had already exited (for
   example a server started by `cmd /c start /b`) is not part of the tree and
   keeps running; stop it with `proc.kill` by `pid` or `name`.
+
+#### Windows PowerShell
+
+The agent runs Windows PowerShell for `shell: "powershell"` (also the v1
+`exec` message) and for its own recipes (the process list of `proc.list`)
+the same way:
+
+- The program is `powershell.exe` in `WindowsPowerShell\v1.0` of the
+  System32 folder of the Windows folder that Windows reports
+  (`GetSystemWindowsDirectoryW`), not one found through `PATH`. When that
+  folder cannot be read the request answers
+  `Windows PowerShell could not be located (<reason>); restart alcove-agent and retry`.
+- `-NoProfile`: no profile script runs.
+- `-ExecutionPolicy Restricted`: commands run, script files do not, so a
+  `.ps1` file or a script module (`.psm1`) does not run whatever execution
+  policy a user of the guest set for themselves. To run a script file on
+  purpose, start `powershell.exe -ExecutionPolicy Bypass -File <path>` from
+  the command.
+- Modules load by command name only from Windows PowerShell's own module
+  folder, `<System32>\WindowsPowerShell\v1.0\Modules`: `PSModulePath` in the
+  new process's environment is that folder (or the value `env` of the request
+  gives), and the first statement of every `-Command` sets it to
+  `$PSHOME\Modules`. A module in the user's
+  `Documents\WindowsPowerShell\Modules`, in
+  `Program Files\WindowsPowerShell\Modules`, or in a folder that a
+  `PSModulePath` of the agent's environment or of `env` names is not loaded by
+  a command name. The command can load one with `Import-Module <path>` (a
+  script module only under a policy that allows scripts) or set
+  `$env:PSModulePath` itself.
+- `shell: "powershell"` keeps the rest of the agent's environment, with the
+  request's `env` added after it. A recipe of the agent gets an environment of
+  the system folders only: `SystemRoot`, `windir`, `SystemDrive`, `ComSpec`,
+  `PATH` of the System32 folder, the Windows folder, `Wbem` and Windows
+  PowerShell's folder, and that `PSModulePath`.
+- A `powershell.exe` started through `argv`, through `shell: "cmd"` or by the
+  command itself gets none of this from the agent beyond the environment it
+  inherits.
 
 ### Jobs (`exec.start`, `exec.read`, `exec.write`, `exec.kill`, `exec.list`)
 
@@ -512,8 +549,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 
 ### Processes (`proc.list`, `proc.kill`)
 
-- Windows lists `Win32_Process` (`mem_kb` is the working set) through the
-  system folder's Windows PowerShell, at most 30 s
+- Windows lists `Win32_Process` (`mem_kb` is the working set) through
+  [Windows PowerShell](#windows-powershell) as a recipe of the agent, at most 30 s
   (`listing the processes took longer than 30 s; retry`); elsewhere
   `ps axo pid=,ppid=,rss=,args=`: `name` is the kernel's name of the process
   (`/proc/<pid>/comm`, at most 15 bytes), or the base name of the first

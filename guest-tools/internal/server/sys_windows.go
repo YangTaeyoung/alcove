@@ -70,12 +70,20 @@ func killTree(pid int) error {
 	return nil
 }
 
+// windowsFolder returns the system's Windows folder.
+func windowsFolder() (string, error) { return sysfolder.WindowsFolder() }
+
+// listScript prints the running processes as JSON.
+const listScript = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,WorkingSetSize | ConvertTo-Json -Compress"
+
+// listProcesses runs listScript as a recipeCommand.
 func listProcesses() ([]procInfo, error) {
-	script := "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,WorkingSetSize | ConvertTo-Json -Compress"
 	ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
 	defer cancel()
-	c := exec.CommandContext(ctx, systemProgram(`WindowsPowerShell\v1.0\powershell.exe`),
-		"-NoProfile", "-NonInteractive", "-Command", powershellUTF8Prefix+script)
+	c, err := recipeCommand(ctx, windowsFolder, listScript)
+	if err != nil {
+		return nil, err
+	}
 	hideWindow(c)
 	out, err := c.Output()
 	if ctx.Err() != nil {

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -18,14 +19,30 @@ import (
 )
 
 const (
-	powershellUTF8Prefix = "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; "
-	runStreamBytes       = 200000
-	defaultRunTimeout    = 120 * time.Second
-	pipeWaitDelay        = 2 * time.Second
+	runStreamBytes    = 200000
+	defaultRunTimeout = 120 * time.Second
+	pipeWaitDelay     = 2 * time.Second
 )
 
-// buildCommand turns request fields into a command for the given OS.
-func buildCommand(req proto.Message, goos string) (*exec.Cmd, error) {
+// commandSystem is what buildCommand reads of the system it builds for.
+type commandSystem struct {
+	goos string
+	// environ is the agent's environment.
+	environ []string
+	// windows returns the system's Windows folder; shell powershell calls it.
+	windows func() (string, error)
+}
+
+// agentSystem returns the commandSystem of the running agent.
+func agentSystem() commandSystem {
+	return commandSystem{goos: runtime.GOOS, environ: os.Environ(), windows: windowsFolder}
+}
+
+// buildCommand turns request fields into a command for sys. Shell
+// powershell runs powershell.exe of the Windows folder with commandArgs, in
+// the agent's environment with PSModulePath set to that PowerShell's own
+// module folder; env of the request is added after it.
+func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 	cmdline := req.String("cmd")
 	argv := req.Strings("argv")
 	shell := req.String("shell")
@@ -49,18 +66,23 @@ func buildCommand(req proto.Message, goos string) (*exec.Cmd, error) {
 	default:
 		if shell == "" {
 			shell = "sh"
-			if goos == "windows" {
+			if sys.goos == "windows" {
 				shell = "powershell"
 			}
 		}
 		switch shell {
 		case "powershell":
-			if goos != "windows" {
+			if sys.goos != "windows" {
 				return nil, errors.New("shell 'powershell' exists only on Windows; use shell 'sh'")
 			}
-			c = exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershellUTF8Prefix+cmdline)
+			ps, err := windowsPowerShell(sys.windows)
+			if err != nil {
+				return nil, err
+			}
+			c = exec.Command(ps.program(), commandArgs(cmdline)...)
+			c.Env = withModulePath(sys.environ, ps.modules())
 		case "cmd":
-			if goos != "windows" {
+			if sys.goos != "windows" {
 				return nil, errors.New("shell 'cmd' exists only on Windows; use shell 'sh'")
 			}
 			c = exec.Command("cmd.exe", "/S", "/C", cmdline)
@@ -79,7 +101,9 @@ func buildCommand(req proto.Message, goos string) (*exec.Cmd, error) {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		c.Env = os.Environ()
+		if c.Env == nil {
+			c.Env = slices.Clone(sys.environ)
+		}
 		for _, k := range keys {
 			c.Env = append(c.Env, k+"="+env[k])
 		}
@@ -118,7 +142,7 @@ func resolveHomePath(home, p string) string {
 // (the home directory without cwd), no console window and its own process
 // tree.
 func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
-	c, err := buildCommand(req, runtime.GOOS)
+	c, err := buildCommand(req, agentSystem())
 	if err != nil {
 		return nil, err
 	}

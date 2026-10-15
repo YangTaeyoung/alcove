@@ -3,6 +3,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,11 @@ import (
 )
 
 func hideWindow(*exec.Cmd) {}
+
+// windowsFolder answers that this system has no Windows folder.
+func windowsFolder() (string, error) {
+	return "", errors.New("this system has no Windows folder")
+}
 
 // setRawCommandLine has no effect outside Windows.
 func setRawCommandLine(*exec.Cmd, string) {}
