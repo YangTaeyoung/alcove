@@ -105,3 +105,86 @@ func TestABatchFileRunsWithItsArgumentsAndWithoutTheAutoRunCommand(t *testing.T)
 	}
 	expectNoAutoRun(t, "app.launch of a batch file", marker)
 }
+
+func TestCmdOperatorsInBatchArgumentsReachTheBatchFileAsText(t *testing.T) {
+	marker := plantAutoRun(t)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "args.txt")
+	second := filepath.Join(dir, "second.txt")
+	script := filepath.Join(dir, "args.bat")
+	if err := os.WriteFile(script, []byte("@echo %*> \""+out+"\"\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{`a&echo x>"` + second + `"`, `"&echo x>"` + second + `"`, `&|<>^`, `"`, `!x!`, `!PATH!`, `%PATH%`, `x\`, `a b`}
+	var encoded []string
+	for _, a := range args {
+		var b strings.Builder
+		appendBatchArg(&b, a)
+		encoded = append(encoded, strings.ReplaceAll(b.String(), "%%cd:~,%", "%"))
+	}
+	want := strings.Join(encoded, " ")
+	argv := []any{script}
+	for _, a := range args {
+		argv = append(argv, a)
+	}
+	c, _ := newRPCClient(t, Options{})
+	res := c.ok("exec.run", proto.Message{"argv": argv})
+	if res.Int("code") != 0 {
+		t.Fatalf("the batch file ended with code %d, stdout %q, stderr %q", res.Int("code"), res.String("stdout"), res.String("stderr"))
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimRight(string(b), "\r\n "); got != want {
+		t.Fatalf("the batch file got\n%s\nexpected\n%s", got, want)
+	}
+	if _, err := os.Stat(second); err == nil {
+		t.Fatal("an argument ran a second command")
+	}
+	expectNoAutoRun(t, "a batch file with cmd operators in its arguments", marker)
+}
+
+func TestAProgramPathIsResolvedWithTheCommandsPATHEXTBeforeItStarts(t *testing.T) {
+	marker := plantAutoRun(t)
+	dir := t.TempDir()
+	ran := filepath.Join(dir, "ran.txt")
+	for name, body := range map[string]string{
+		"build.v2.cmd": "@echo build.v2\r\n@echo build.v2> \"" + ran + "\"\r\n",
+		"gradlew.bat":  "@echo gradlew> \"" + ran + "\"\r\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, _ := newRPCClient(t, Options{})
+
+	res := c.ok("exec.run", proto.Message{"argv": []any{filepath.Join(dir, "build.v2")}})
+	if got := strings.TrimSpace(res.String("stdout")); got != "build.v2" || res.Int("code") != 0 {
+		t.Fatalf("build.v2 printed %q, stderr %q, code %d", got, res.String("stderr"), res.Int("code"))
+	}
+	expectNoAutoRun(t, "exec.run of build.v2", marker)
+
+	c.ok("app.launch", proto.Message{"path": filepath.Join(dir, "build.v2"), "wait_window_ms": 0})
+	if ev := c.event("process.exited"); !strings.EqualFold(ev.String("path"), filepath.Join(dir, "build.v2.cmd")) || ev.Int("code") != 0 {
+		t.Fatalf("the launched build.v2 ended with %v", ev)
+	}
+	expectNoAutoRun(t, "app.launch of build.v2", marker)
+	if err := os.Remove(ran); err != nil {
+		t.Fatal(err)
+	}
+
+	gradlew := filepath.Join(dir, "gradlew")
+	res = c.call("exec.run", proto.Message{"argv": []any{gradlew}, "env": map[string]any{"PATHEXT": ".EXE"}})
+	if res["ok"] != false || !strings.Contains(res.String("error"), "'"+gradlew+"' names no file, also not with an extension of the command's PATHEXT") {
+		t.Fatalf("gradlew with PATHEXT .EXE gave %v", res)
+	}
+	res = c.call("app.launch", proto.Message{"path": gradlew, "env": map[string]any{"PATHEXT": ".EXE"}, "wait_window_ms": 0})
+	if res["ok"] != false || !strings.HasPrefix(res.String("error"), "cannot start '"+gradlew+"': ") {
+		t.Fatalf("app.launch of gradlew with PATHEXT .EXE gave %v", res)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("gradlew.bat ran")
+	}
+	expectNoAutoRun(t, "the refused gradlew", marker)
+}

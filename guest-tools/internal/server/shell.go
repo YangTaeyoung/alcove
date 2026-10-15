@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -191,7 +192,9 @@ func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
 	} else {
 		c.Dir = s.homeDir()
 	}
-	if _, err := prepareProgram(c); err != nil {
+	if _, err := prepareProgram(c); errors.Is(err, fs.ErrNotExist) {
+		return nil, startError(err)
+	} else if err != nil {
 		return nil, err
 	}
 	hideWindow(c)

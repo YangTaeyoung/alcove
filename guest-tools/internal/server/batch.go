@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"io/fs"
 	"os/exec"
 	"strings"
 	"unicode"
@@ -56,11 +57,14 @@ func appendBatchArg(b *strings.Builder, arg string) {
 // file script with args: cmd.exe /D /E:ON /V:OFF /S /C ""<script>" <args>",
 // each argument written by appendBatchArg. /D skips the AutoRun commands of
 // the registry, /V:OFF keeps '!' literal and with /S cmd.exe removes exactly
-// the outer pair of quotes. A script path that holds '"' or ends in '\', and
-// an argument with CR, LF or NUL, are errors.
+// the outer pair of quotes. A script path that holds '"' or '%' or ends in
+// '\', and an argument with CR, LF or NUL, are errors.
 func batchCommandLine(script string, args []string) (string, error) {
 	if strings.Contains(script, `"`) || strings.HasSuffix(script, `\`) {
 		return "", fmt.Errorf(`the batch file '%s' cannot be passed to cmd.exe because its path contains '"' or ends in '\'; pass the path of the file itself`, script)
+	}
+	if strings.Contains(script, "%") {
+		return "", fmt.Errorf("the batch file '%s' cannot be passed to cmd.exe because its path contains '%%', which cmd.exe would expand; move or rename it so that its path has no '%%'", script)
 	}
 	var b strings.Builder
 	b.WriteString(`cmd.exe /D /E:ON /V:OFF /S /C ""`)
@@ -148,27 +152,43 @@ func pathExts(env []string) []string {
 	return exts
 }
 
+// hasExt reports whether the last element of path has an extension: a '.'
+// after the last '\', '/' or ':'.
+func hasExt(path string) bool {
+	i := strings.LastIndex(path, ".")
+	return i >= 0 && strings.LastIndexAny(path, `\/:`) < i
+}
+
 // windowsStart prepares c for its start on Windows and returns the file the
-// process runs. A program path that has a separator and whose last element
-// has no extension gets the first extension of the PATHEXT of c.Env for
-// which isFile finds the file, joined with c.Dir as joinProgramDir does.
-// When the program, normalised by fullPath, is a batch file, file is that
-// script, c.Path becomes cmd.exe of the folder system and line is
-// batchCommandLine of the script and c.Args[1:], which the caller passes as
-// the raw command line; otherwise file is c.Path and line is empty. c.Args
-// stays as it is.
+// process runs. A program path with '\', '/' or ':' is joined with c.Dir as
+// joinProgramDir does and resolved with the PATHEXT of c.Env as Go's
+// findExecutable resolves it: the path itself when its last element has an
+// extension and isFile finds it, else the path with each extension in turn;
+// c.Path becomes the file found, which has an extension, so that Cmd.Start
+// looks up nothing more. A path that names no file is an error that wraps
+// fs.ErrNotExist, and c is left as it is. When the file, normalised by
+// fullPath, is a batch file, file is that script, c.Path becomes cmd.exe of
+// the folder system and line is batchCommandLine of the script and
+// c.Args[1:], which the caller passes as the raw command line; otherwise
+// line is empty. c.Args stays as it is.
 func windowsStart(c *exec.Cmd, system string, fullPath func(string) (string, error), isFile func(string) bool) (file, line string, err error) {
 	if strings.ContainsAny(c.Path, `\/:`) {
-		last := c.Path[strings.LastIndexAny(c.Path, `\/:`)+1:]
-		if !strings.Contains(last, ".") {
-			base := joinProgramDir(c.Dir, c.Path)
+		base := joinProgramDir(c.Dir, c.Path)
+		found := ""
+		if hasExt(base) && isFile(base) {
+			found = base
+		} else {
 			for _, e := range pathExts(c.Env) {
 				if isFile(base + e) {
-					c.Path = base + e
+					found = base + e
 					break
 				}
 			}
 		}
+		if found == "" {
+			return "", "", noProgramFile{c.Path}
+		}
+		c.Path = found
 	}
 	script, ok := batchScript(c.Path, c.Dir, fullPath)
 	if !ok {
@@ -185,3 +205,13 @@ func windowsStart(c *exec.Cmd, system string, fullPath func(string) (string, err
 	c.Path = system + `\cmd.exe`
 	return script, line, nil
 }
+
+// noProgramFile is the error of windowsStart for a program path that names
+// no file; it is fs.ErrNotExist.
+type noProgramFile struct{ path string }
+
+func (e noProgramFile) Error() string {
+	return "'" + e.path + "' names no file, also not with an extension of the command's PATHEXT"
+}
+
+func (noProgramFile) Is(target error) bool { return target == fs.ErrNotExist }

@@ -583,10 +583,17 @@ folders below, and the UI helper gets its own
 The program of `argv` (`exec.run`, `exec.start`) and of `app.launch` is read
 as a file before it starts:
 
-- A path with `\`, `/` or `:` whose last element has no extension gets the
-  first extension of the `PATHEXT` of the
-  [environment of a command](#environment-of-a-command-on-windows) for which
-  a file exists, joined with the working directory when it is relative.
+- A path with `\`, `/` or `:` is joined with the working directory when it
+  is relative and resolved with the `PATHEXT` of the
+  [environment of a command](#environment-of-a-command-on-windows): the path
+  itself when its last element has an extension and the file exists, else
+  the path with each extension of `PATHEXT` in turn, so
+  `C:\Tools\build.v2` starts `C:\Tools\build.v2.cmd` when only that file
+  exists. The agent starts exactly the file found; the agent's own `PATHEXT`
+  plays no part. A path that names no file answers
+  `cannot start the command: '<path>' names no file, also not with an extension of the command's PATHEXT; check cmd, argv, cwd and shell`
+  (`app.launch`:
+  `cannot start '<path>': '<path>' names no file, also not with an extension of the command's PATHEXT; check the path with fs.stat`).
 - When the path, joined with the working directory and made absolute by
   Windows (`GetFullPathNameW`, which also drops trailing dots and spaces),
   ends in `.bat` or `.cmd` without regard to case, the agent starts
@@ -604,6 +611,10 @@ as a file before it starts:
   the argument back, with a `"` in it as `""` and a trailing `\` doubled.
 - An argument with CR, LF or NUL answers
   `argument <n> of the batch file '<script>' holds a line break or NUL, which cmd.exe cannot pass to a batch file; pass it another way, such as in env, or run the batch file with shell 'cmd' and quote the command yourself`.
+  A script path with `"` or a trailing `\` answers
+  `the batch file '<script>' cannot be passed to cmd.exe because its path contains '"' or ends in '\'; pass the path of the file itself`,
+  and one with `%` answers
+  `the batch file '<script>' cannot be passed to cmd.exe because its path contains '%', which cmd.exe would expand; move or rename it so that its path has no '%'`.
   When the System32 folder cannot be read the answer is
   `cmd.exe could not be located to run the batch file '<script>' (<reason>); restart alcove-agent and retry`.
 - `exec.list` shows the `argv` as sent, and `process.exited` of `app.launch`
