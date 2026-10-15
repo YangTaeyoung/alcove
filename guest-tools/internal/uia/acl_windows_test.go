@@ -46,7 +46,7 @@ func holdDir(t *testing.T, path string, share uint32) syscall.Handle {
 }
 
 // Runs elevated: secureDir sets the owner to Administrators.
-func TestSecureDirMovesAsideAFolderInsteadOfRelockingItWhileAHandleIsOpen(t *testing.T) {
+func TestSecureDirMovesAsideAnUnlockedFolderWhileAHandleIsOpenOnIt(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "uia")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)

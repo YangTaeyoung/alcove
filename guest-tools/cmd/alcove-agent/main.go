@@ -30,7 +30,7 @@ func main() {
 	port := flag.Int("port", 7645, "listen port")
 	allowExec := flag.Bool("allow-exec", false, "allow the exec message (test harness)")
 	tok := flag.String("token", "", "override the SMBIOS token")
-	install := flag.Bool("install", false, "install to start at logon (Windows) and exit")
+	install := flag.Bool("install", false, "install as the scheduled task that starts at logon (Windows) or as the systemd service alcove-agent (Linux), then exit")
 	logPath := flag.String("log", "", "log file (default: stderr)")
 	var peers peerFlag
 	flag.Var(&peers, "allow-peer", "also serve connections from this address or CIDR range (repeatable; 10.0.2.2 is always served)")

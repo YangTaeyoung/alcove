@@ -67,7 +67,7 @@ func startHidden(t *testing.T, path string, args ...string) *exec.Cmd {
 	return c
 }
 
-func TestProcKillByNameCountsWithoutReadingTaskkillText(t *testing.T) {
+func TestProcKillByNameCountsTheKilledProcesses(t *testing.T) {
 	path := copySystemProgram(t, "PING.EXE", "alcove-victim.exe")
 	var waits []syscall.Handle
 	var pids []int

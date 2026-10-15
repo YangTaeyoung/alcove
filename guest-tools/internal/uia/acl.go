@@ -111,8 +111,7 @@ func keepDeployRoot(attributes uint32, sddl string) bool {
 // keepHelperDir reports whether an existing helper folder with the given
 // attribute bits and owner-and-DACL descriptor stays as it is: a directory
 // that is not a reparse point and is already locked as lockedSDDL says. Any
-// other folder is moved aside, so its access list is never rewritten in place
-// while a handle a standard user opened before the lock is still open on it.
+// other folder is moved aside; its access list is not rewritten in place.
 func keepHelperDir(attributes uint32, sddl string) bool {
 	return isPlainDirAttributes(attributes) && isLockedSDDL(sddl)
 }

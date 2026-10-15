@@ -308,10 +308,8 @@ func removeOldAsides(dir string) {
 // opened without following a reparse point and checked on that handle to be a
 // directory and not a reparse point. It is kept in place only when it is
 // already locked as lockedSDDL says, read through that handle; its access list
-// is never rewritten in place, so a handle a standard user opened before the
-// lock cannot outlive the lock on a folder that was once theirs. A directory
-// that is anything else is moved aside with moveAside and a new, locked one is
-// created in its place. The entries of a kept directory are handled as
+// is not rewritten in place. A directory that is anything else is moved aside
+// with moveAside and a new, locked one is created in its place. The entries of a kept directory are handled as
 // entryAction says; deleting one is tried up to removeAttempts times,
 // removePause apart, while isRetriedRemoveError holds for its error. An error
 // means the directory is not known to be locked.
