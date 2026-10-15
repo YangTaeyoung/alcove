@@ -1010,6 +1010,27 @@ final class VMControllerFakeEngineTests: XCTestCase {
         }
     }
 
+    func testResumeIsRefusedWhenTheAgentKeyIsNot64HexadecimalDigits() async throws {
+        let vm = try makeVM()
+        try await vm.start()
+        try await vm.suspendToDisk()
+        let stateBytes = try Data(contentsOf: vm.bundle.suspendStateURL)
+        let savedConfig = try Data(contentsOf: vm.bundle.suspendConfigURL)
+        try FileManager.default.removeItem(at: vm.bundle.runURL.appendingPathComponent("fake-argv.json"))
+        var config = try vm.bundle.loadConfig()
+        config.agentKey = String(repeating: "zz", count: 32)
+        try config.encoded().write(to: vm.bundle.configURL, options: .atomic)
+        let reopened = VMController(bundle: vm.bundle, config: try vm.bundle.loadConfig(), engine: vm.engine)
+        controllers.append(reopened)
+        let refusal = "the agentKey in \(vm.bundle.configURL.path) is not 64 hexadecimal digits, so the guest tools "
+            + "could not check the host; restore config.json from a backup"
+
+        await assertStartRefused(reopened, refusal)
+        XCTAssertTrue(vm.bundle.isSuspended)
+        XCTAssertEqual(try Data(contentsOf: vm.bundle.suspendStateURL), stateBytes)
+        XCTAssertEqual(try Data(contentsOf: vm.bundle.suspendConfigURL), savedConfig)
+    }
+
     func testEphemeralOverlayRemovedOnStop() async throws {
         let vm = try makeVM { $0.disks.append(.init(id: "disk1", fileName: "disk1.qcow2", sizeGiB: 1, bus: .virtioBlk)) }
         let run = vm.bundle.runURL
