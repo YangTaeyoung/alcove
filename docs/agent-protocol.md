@@ -83,20 +83,27 @@ Capabilities:
 The hello carries the list the agent found last. The agent checks its
 capabilities once when it starts serving, before it accepts a connection,
 so a hello does not wait for a check; a connection that arrives during that
-first check is accepted after it. On Linux a check looks up the desktop
-session, so a hello does not wait for `loginctl`.
+first check is accepted after it. From then on it checks them every 5 s,
+whether or not a connection is open, so the list of a hello is at most 5 s
+old. On Linux a check looks up the desktop session, so a hello does not wait
+for `loginctl`.
 
 When the host has sent its first message after the handshake (its
 `welcome`, or a request), the agent checks its capabilities and, when they
 differ from the hello's, sends `{"t":"caps","caps":[…]}` with the whole new
 list before it handles that message; the list replaces the hello's. Events
-can come before that line. While a connection whose host has sent that
-first message is open, the agent checks its capabilities again every 5 s,
-once for all such connections, and sends the same line to each of them
-whose last list differs. On Linux this is how `clipboard` appears once a
-user signs in to the desktop after the host connected, as an autologin does
-a few seconds after the agent starts at boot, and disappears when the
-session ends.
+can come before that line. After each check of every 5 s the agent sends
+the same line to each open connection whose host has sent that first
+message and whose last list differs. On Linux this is how `clipboard`
+appears once a user signs in to the desktop after the host connected, as an
+autologin does a few seconds after the agent starts at boot, and disappears
+when the session ends.
+
+A host of Alcove 0.2.0 ignores the `caps` line: it keeps the hello's list
+for the whole connection. With such a host, a capability that appears or
+goes after the hello (on Linux `clipboard` at a sign-in that follows the
+connection) is seen only on the next connection, whose hello is at most
+5 s old.
 
 ### The desktop session (Linux)
 

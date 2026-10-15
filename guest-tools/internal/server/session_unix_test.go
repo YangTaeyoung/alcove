@@ -303,6 +303,44 @@ func (c *countedClipboard) Available() bool {
 	return c.on.Load()
 }
 
+func TestTheCapsOfTheHelloAreCheckedEveryIntervalWithoutAConnection(t *testing.T) {
+	old := capsCheckInterval
+	capsCheckInterval = 20 * time.Millisecond
+	t.Cleanup(func() { capsCheckInterval = old })
+	cb := &countedClipboard{}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	s := New(Options{Clipboard: cb, HomeDir: t.TempDir(), AllowPeers: loopbackPeers, Unauthenticated: true})
+	go s.Serve(l)
+	deadline := time.Now().Add(10 * time.Second)
+	for s.lastCaps.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Serve has not checked the capabilities 10 s after it started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cb.on.Store(true)
+	checked := cb.calls.Load()
+	for cb.calls.Load() < checked+2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the capabilities were not checked twice within 10 s while no connection was open")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if !capSet(expect(t, proto.NewReader(c), "hello"))["clipboard"] {
+		t.Fatal("the hello lacks the clipboard that appeared while no connection was open")
+	}
+}
+
 func TestTheCapsLineWaitsForTheHostsFirstMessageAfterTheHandshake(t *testing.T) {
 	old := capsCheckInterval
 	capsCheckInterval = 20 * time.Millisecond

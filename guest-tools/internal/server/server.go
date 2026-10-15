@@ -108,8 +108,10 @@ type Server struct {
 	// lastSeq is the clipboard sequence the watcher saw last.
 	lastSeq uint64
 
-	// watchOnce starts the watchers; clipKick asks the clipboard watcher to
-	// poll at its shortest interval again.
+	// capsOnce starts the capabilities watcher and watchOnce the clipboard
+	// watcher; clipKick asks the clipboard watcher to poll at its shortest
+	// interval again.
+	capsOnce  sync.Once
 	watchOnce sync.Once
 	// timing holds capsCheckInterval, clipboardPollMin and clipboardPollMax
 	// as they were when the server was made.
@@ -152,9 +154,11 @@ func (s *Server) Close() {
 }
 
 // Serve checks the capabilities, so that a hello carries them without a
-// check of its own, and then accepts connections on l until it is closed.
+// check of its own, starts watchCaps and then accepts connections on l until
+// it is closed.
 func (s *Server) Serve(l net.Listener) error {
 	s.caps()
+	s.startCapsWatcher()
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -177,8 +181,8 @@ func (s *Server) homeDir() string {
 	return s.view().dir
 }
 
-// capsCheckInterval is the time between two checks of the capabilities of
-// an open connection.
+// capsCheckInterval is the time between two checks of the capabilities by
+// watchCaps.
 var capsCheckInterval = 5 * time.Second
 
 // caps checks the capabilities, which on Linux looks up the desktop
@@ -524,14 +528,16 @@ var (
 	clipboardPollMax = clipboardPollSlowest
 )
 
+// startCapsWatcher starts watchCaps once per agent.
+func (s *Server) startCapsWatcher() {
+	s.capsOnce.Do(func() { go s.watchCaps() })
+}
+
 // startWatchers starts, once per agent, the watchers of the capabilities and
 // of the clipboard.
 func (s *Server) startWatchers() {
-	s.watchOnce.Do(func() {
-
-		go s.watchCaps()
-		go s.watchClipboard()
-	})
+	s.startCapsWatcher()
+	s.watchOnce.Do(func() { go s.watchClipboard() })
 }
 
 // openConns returns the open connections.
@@ -556,25 +562,16 @@ func (s *Server) sendCapsUpdate(c *conn) {
 	c.followCaps()
 }
 
-// watchCaps checks the capabilities every capsCheckInterval while a
-// connection that sendCapsUpdate has followed is open, and sends
-// {"t":"caps"} with the new list to each such connection whose last list
-// differs.
+// watchCaps checks the capabilities every capsCheckInterval, also while no
+// connection is open, so that a hello carries a list at most one interval
+// old, and sends {"t":"caps"} with the new list to each open connection that
+// sendCapsUpdate has followed and whose last list differs.
 func (s *Server) watchCaps() {
 	for {
 		time.Sleep(s.timing.caps)
-		var conns []*conn
-		for _, c := range s.openConns() {
-			if c.capsFollowedYet() {
-				conns = append(conns, c)
-			}
-		}
-		if len(conns) == 0 {
-			continue
-		}
 		caps := s.caps()
-		for _, c := range conns {
-			if c.replaceCaps(caps) {
+		for _, c := range s.openConns() {
+			if c.capsFollowedYet() && c.replaceCaps(caps) {
 				c.send(proto.Message{"t": "caps", "caps": caps})
 			}
 		}
