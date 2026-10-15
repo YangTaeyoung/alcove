@@ -87,23 +87,37 @@ func listProcesses() ([]procInfo, error) {
 	return parseWindowsProcesses(out)
 }
 
-// killByName terminates the nameKillTargets of the running processes and
-// returns how many ended. Processes that refuse access make it answer
-// killRefusal; other failures, such as a process that ended meanwhile, are
-// not counted.
+// killEndWait bounds the wait of killByName for the processes it terminated
+// to end.
+const killEndWait = 5 * time.Second
+
+// killByName terminates the nameKillTargets of the running processes, waits
+// up to killEndWait for them to end and returns how many it terminated.
+// Processes that refuse access make it answer killRefusal; other failures,
+// such as a process that ended meanwhile, are not counted.
 func killByName(name string, tree bool) (int, error) {
 	procs, err := processEntries(tree)
 	if err != nil {
 		return 0, err
 	}
 	killed, denied := 0, 0
+	var ending []syscall.Handle
 	for _, pid := range nameKillTargets(procs, name, tree, os.Getpid()) {
-		switch err := terminateProcess(pid); {
+		h, err := terminateProcess(pid)
+		switch {
 		case err == nil:
 			killed++
+			ending = append(ending, h)
 		case errors.Is(err, syscall.ERROR_ACCESS_DENIED):
 			denied++
 		}
+	}
+	deadline := time.Now().Add(killEndWait)
+	for _, h := range ending {
+		if left := time.Until(deadline); left > 0 {
+			_, _ = syscall.WaitForSingleObject(h, uint32(left.Milliseconds()))
+		}
+		syscall.CloseHandle(h)
 	}
 	if denied > 0 {
 		return 0, killRefusal(name, killed, denied)
@@ -150,14 +164,18 @@ func processCreated(pid int) time.Time {
 	return time.Unix(0, creation.Nanoseconds())
 }
 
-// terminateProcess ends pid with exit code 1.
-func terminateProcess(pid int) error {
-	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE, false, uint32(pid))
+// terminateProcess ends pid with exit code 1 and returns a handle to wait on
+// its end, which the caller closes.
+func terminateProcess(pid int) (syscall.Handle, error) {
+	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE|syscall.SYNCHRONIZE, false, uint32(pid))
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer syscall.CloseHandle(h)
-	return syscall.TerminateProcess(h, 1)
+	if err := syscall.TerminateProcess(h, 1); err != nil {
+		syscall.CloseHandle(h)
+		return 0, err
+	}
+	return h, nil
 }
 
 // sessionEnvironmentKey holds the machine's PATH.

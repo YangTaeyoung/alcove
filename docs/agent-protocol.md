@@ -396,8 +396,9 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   the agent lists the processes and terminates each match and, with `tree`,
   its descendants, children first (a process created before its listed
   parent does not count as that parent's child, and the agent and the
-  processes below it are left out). `killed` counts the processes that were
-  terminated. When any of them refuses access the answer is the error
+  processes below it are left out), then waits up to 5 s for them to end.
+  `killed` counts the processes that were terminated. When any of them
+  refuses access the answer is the error
   `could not kill <n> of the <total> processes named '<name>' because access was denied (<k> were killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry`.
   Elsewhere `killed` counts the processes that were sent SIGKILL, with `tree`
   to the process group a match leads.
