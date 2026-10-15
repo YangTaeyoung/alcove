@@ -120,33 +120,42 @@ func (c sessionClipboard) Available() bool {
 }
 
 // Text runs the reader for at most toolTimeout and returns the longest
-// prefix of what it prints that is at most ReadLimit bytes and ends on a
-// character boundary; a reader that exits non-zero returns "" (the tools do
-// for an empty clipboard). A reader that cannot start or does not finish in
-// time is an error.
+// prefix of what it printed that is at most ReadLimit bytes and ends on a
+// character boundary, whatever its exit code: the tools print nothing and
+// exit non-zero for an empty clipboard, which reads as "". A reader that
+// cannot start or does not finish in time is an error.
 func (c sessionClipboard) Text() (string, error) {
+	text, _, err := c.read()
+	return text, err
+}
+
+// read returns what Text returns and whether the read was whole: the reader
+// exited with code 0, or it printed more than ReadLimit bytes and was ended
+// after those were read.
+func (c sessionClipboard) read() (string, bool, error) {
 	tl, t, ok := c.current()
 	if !ok {
-		return "", errors.New("no clipboard in this session")
+		return "", false, errors.New("no clipboard in this session")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), toolTimeout)
 	defer cancel()
 	cmd := c.command(ctx, tl.read, t)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("%s did not start: %v", tl.read[0], err)
+		return "", false, fmt.Errorf("%s did not start: %v", tl.read[0], err)
 	}
 	data, _ := io.ReadAll(io.LimitReader(out, ReadLimit+1))
 	timedOut := ctx.Err() != nil
 	cancel()
-	_ = cmd.Wait()
+	waitErr := cmd.Wait()
 	if timedOut {
-		return "", fmt.Errorf("%s did not answer within %v", tl.read[0], toolTimeout)
+		return "", false, fmt.Errorf("%s did not answer within %v", tl.read[0], toolTimeout)
 	}
-	return string(cutAtCharacter(data, ReadLimit)), nil
+	whole := waitErr == nil || len(data) > ReadLimit
+	return string(cutAtCharacter(data, ReadLimit)), whole, nil
 }
 
 // cutAtCharacter returns the longest prefix of b that is at most max bytes
@@ -179,13 +188,14 @@ func (c sessionClipboard) SetText(s string) error {
 	return err
 }
 
-// Sequence returns a hash of the text; while the reader fails it returns
-// the value it returned last (0 before the first text).
+// Sequence returns a hash of the text of a whole read; after a read that is
+// not whole (the reader exits non-zero, does not start or does not finish in
+// time) it returns the value it returned last (0 before the first text).
 func (c sessionClipboard) Sequence() uint64 {
-	t, err := c.Text()
+	t, whole, err := c.read()
 	c.last.mu.Lock()
 	defer c.last.mu.Unlock()
-	if err == nil {
+	if err == nil && whole {
 		h := fnv.New64a()
 		h.Write([]byte(t))
 		c.last.v = h.Sum64()

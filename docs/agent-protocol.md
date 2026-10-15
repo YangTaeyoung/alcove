@@ -174,9 +174,11 @@ directory and groups come from the user database. A lookup is reused for
   names, if any.
 - A clipboard tool that has not finished after 5 s is killed with its process
   group; a read then fails (`clipboard.text` carries `""`) and a write is
-  dropped, both logged. A read that fails, or a reader that does not start,
-  is not a change of the clipboard: the watcher keeps the text it read last,
-  so the next good read of the same text sends no `clipboard.changed`. The
+  dropped, both logged. A read that fails is not a change of the clipboard:
+  a reader that exits with a non-zero code (the tools do for an empty
+  clipboard; `clipboard.text` then carries what it printed, `""`), does not
+  finish or does not start leaves the watcher with the text it read last, so
+  the next good read of the same text sends no `clipboard.changed`. The
   agent keeps at most 700000 bytes of the clipboard, cut on a character
   boundary.
 

@@ -178,3 +178,45 @@ func TestSequenceKeepsTheLastValueWhileTheReaderFails(t *testing.T) {
 		t.Fatalf("the same text after a timed-out read changed the sequence from %x to %x", before, got)
 	}
 }
+
+func TestSequenceKeepsTheLastValueWhileTheReaderExitsNonZero(t *testing.T) {
+	dir := fakeTools(t, map[string]string{"wl-paste": `if [ -e "$FAIL" ]; then echo 'Nothing is copied' >&2; exit 1; fi; printf 'guest text'`})
+	fail := filepath.Join(dir, "fail")
+	target := waylandTarget(t)
+	target.Env = append(target.Env, "FAIL="+fail)
+	c := NewSession(func() (Target, bool) { return target, true })
+	before := c.Sequence()
+	if err := os.WriteFile(fail, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if text, err := c.Text(); text != "" || err != nil {
+		t.Fatalf("Text of a reader that exits 1 gave %q, %v", text, err)
+	}
+	if got := c.Sequence(); got != before {
+		t.Fatalf("a reader that exits 1 changed the sequence from %x to %x", before, got)
+	}
+	if err := os.Remove(fail); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Sequence(); got != before {
+		t.Fatalf("the same text after a reader that exited 1 changed the sequence from %x to %x", before, got)
+	}
+}
+
+func TestSequenceFollowsATextLongerThanTheReadLimit(t *testing.T) {
+	dir := fakeTools(t, map[string]string{"wl-paste": `head -c 3000000 /dev/zero | tr '\000' "$(cat "$LETTER")"`})
+	letter := filepath.Join(dir, "letter")
+	target := waylandTarget(t)
+	target.Env = append(target.Env, "LETTER="+letter)
+	c := NewSession(func() (Target, bool) { return target, true })
+	if err := os.WriteFile(letter, []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := c.Sequence()
+	if err := os.WriteFile(letter, []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Sequence(); got == first {
+		t.Fatalf("a text longer than %d bytes that changed kept the sequence %x", ReadLimit, got)
+	}
+}
