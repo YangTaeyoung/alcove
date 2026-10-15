@@ -30,8 +30,9 @@ the data volume has at least 10 GiB free; check 20 takes the snapshot
 at4-events, restores and deletes it when the data volume has at least 18 GiB
 free. Each is skipped otherwise. However the run ends, a second connection
 waits up to 300 s for a VM that the run stopped, started or restored to leave
-the starting, stopping and suspending states, starts it when it is stopped
-and waits for its guest tools,
+the starting, stopping and suspending states (and paused, after the run's
+snapshot steps; a VM still paused then is resumed), starts it when it is
+stopped and waits for its guest tools,
 deletes the snapshot at4-events when the run sent vm.snapshot.create and
 vm.snapshot.list lists it, stops the recording of the run, ends the processes
 the run started (the ones that run from the two folders, the Edge processes
@@ -642,8 +643,17 @@ class Run:
         """Puts the guest back; returns whether the guest could be reached."""
         status = c.call("vm.status", 60, name=self.vm)
         end = time.time() + (300 if self.vm_left_stopped or self.snapshot_begun else 0)
-        while status.get("state") in ("starting", "stopping", "suspending") and time.time() < end:
+        passing = ("starting", "stopping", "suspending") + (("paused",) if self.snapshot_begun else ())
+        while status.get("state") in passing and time.time() < end:
             time.sleep(2)
+            status = c.call("vm.status", 60, name=self.vm)
+        if self.snapshot_begun and status.get("state") == "paused":
+            try:
+                c.call("vm.resume", 60, name=self.vm)
+            except ControlError as e:
+                self.cleanup_error(f"'{self.vm}' is still paused 300 s after this run's snapshot step and vm.resume answered {e}; "
+                                   f"resume it with scripts/test/ctl.py vm.resume, then {by_hand}")
+                return False
             status = c.call("vm.status", 60, name=self.vm)
         if self.vm_left_stopped and status.get("state") == "stopped":
             try:

@@ -194,7 +194,10 @@ class Run:
         except (Failure, OSError, ValueError) as e:
             print(f"cleanup did not run: {e}; jobs {self.jobs} and {BASE} may remain in the guest", file=sys.stderr)
             return
-        self.put_clipboard_back(a)
+        try:
+            self.put_clipboard_back(a)
+        except (OSError, ValueError):
+            pass
         steps = [("exec.kill", {"job": job}) for job in self.jobs]
         if self.markers:
             try:
