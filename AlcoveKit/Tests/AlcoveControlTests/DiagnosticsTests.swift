@@ -505,6 +505,7 @@ final class DiagnosticsTests: XCTestCase {
         let advice: [(VMController.State, String)] = [
             (.running, "call vm.http.stop to restore it"),
             (.paused, "call vm.resume, then vm.http.stop to restore it"),
+            (.starting, "Alcove restores it when its guest tools connect"),
             (.stopped, "Alcove restores it when its guest tools next connect after vm.start"),
         ]
         for (state, sentence) in advice {
