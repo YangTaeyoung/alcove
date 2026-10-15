@@ -124,3 +124,45 @@ The control ops of those scripts that have a Linux meaning were run by hand.
 - `--allow-peer` on Linux, the agent restart loop after a crash
   (`Restart=always`), several agent connections at the 16-handshake cap.
 - Other distributions (X11 sessions with `xclip`, systems without systemd).
+
+## After the fixes (2026-10-15)
+
+Task 13 of the follow-up plan fixed D1 to D9. The reproductions were run
+again on the same VM `Ubuntu` (Ubuntu 26.04.1, GNOME 50 on Wayland,
+autologin of `alcove`, systemd 259) through an `alcovectl serve` of the fixed
+tree on a private socket, with `alcove-agent` 0.2.1 of the fixed tree
+installed over the running 0.2.0 by `sudo alcove-agent --install
+--allow-exec` over ssh. Every check ran twice: on the tree first, then on
+the tree rebased onto `followups-0.2.1` at 321df59 (agent and `alcovectl`
+rebuilt, agent installed again by `agent-linux.py`); both runs gave the
+results below. The failed install of D3 and the MCP calls ran in the first
+run only. `loginctl` of that guest, captured for the unit
+tests: sessions `1 1000 alcove seat0 1247 user tty2` (type `wayland`, active)
+and `2 1000 alcove - 1255 manager`; `/run/user/1000` holds `wayland-0` and
+`bus`.
+
+| # | Before | After |
+|---|---|---|
+| D1 | `HOME=` and `/`; `dest: desktop` written to `/Desktop` (root); `fs.list ~` lists `/`; `cwd: "sub"` fails; GUI programs start without a display; no clipboard | `vm.exec` `echo HOME=$HOME; pwd; id -un` → `HOME=/root`, `/home/alcove`, `root`; `cwd: "sub"` → `/home/alcove/sub`; `push_file` `dest: desktop` → `/home/alcove/Desktop/big.bin`, `dest: downloads` → `/home/alcove/Downloads/big.bin`, both `alcove:alcove 644`; `guestPath: "Desktop/big2.bin"` → `/home/alcove/Desktop/big2.bin` (`root:root`, as `fs.*` documents); `fs.list ~` lists `Desktop`, `Documents`, … of `/home/alcove`; `agentCaps` include `clipboard`; `vm.clipboard.set` `hello-linux 한글` → `vm.clipboard.get` the same text, and `wl-paste` as `alcove` in the session prints it; `vm.app.launch /usr/bin/gnome-text-editor` → the editor runs as `alcove` with `HOME=/home/alcove`, `WAYLAND_DISPLAY=wayland-0`, `XDG_RUNTIME_DIR=/run/user/1000`, `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`; `vm.type` `안녕 alcove 한글` pasted into it and `vm.find_text` reads `안녕 alcove 한글` there (in the second run the read came before the editor drew the text; the editor's next start restored that document with the text in it). After a boot the first hello lacked `clipboard` (no session yet); a `caps` message added it 12 s and, in the second boot, 15 s later, when the autologin session appeared |
+| D2 | `{ok: true}` / `{ok: true, text: ""}`; MCP `clipboard set (1 characters)` | with `wl-paste` made not executable the agent sent `caps` without `clipboard` within 5 s; `vm.clipboard.set` and `.get` → `the guest tools in 'Ubuntu' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), so vm.clipboard.set cannot run; sign in to the guest's desktop and install wl-clipboard or xclip there, then retry` (and `vm.clipboard.get`); MCP `alcove_set_clipboard` → the same sentence naming `alcove_set_clipboard`, `isError`; with the mode restored `clipboard` came back and set/get round-tripped |
+| D3 | `installed`, exit 0, old digest and pid kept | over the running 0.2.0 (`f6869bfa…`, pid 1128): `installed`, exit 0, `/usr/local/bin/alcove-agent` `a2998765…`, new pid 2668, journal `Stopped … Started …`, `alcove-agent 0.2.1 listening …`; with the binary made immutable (`chattr +i`): exit 1, `install failed: cannot replace /usr/local/bin/alcove-agent (rename /usr/local/bin/.alcove-agent-1946673028 /usr/local/bin/alcove-agent: operation not permitted); run alcove-agent --install as root`, the same line in `install.log`, no temporary file left |
+| D4 | `run.sh` `-rw-r--r--`, launch `permission denied` | `vm.deploy` of a folder with `run.sh` (755) and `data.txt` (644) to `/opt/alcove-deploy-test` with `launch {exe: run.sh, args: [a1]}` → `pid`, `run.sh` `-rwxr-xr-x`, `data.txt` `-rw-r--r--`, the script wrote `ran a1 as alcove in /opt/alcove-deploy-test`; `vm.sync_dir` and `vm.push_file guestPath` give the same modes |
+| D5 | `{pid, windowTimedOut: true}` in 0.03 s | `waitWindow: 3` → `{pid, noWindowWait: "the guest tools of this guest have no ui capability, so no window was waited for; wait for the program with vm.wait_for (process_started or text_visible)"}` at once; `waitWindow: 0` → `{pid}`; `vm.deploy` carries the same field; MCP `alcove_launch_app` prints the sentence |
+| D6 | `{width: 1280, height: 800}`, ok | `agentCaps` without `resolution`; `vm.set_resolution 1440x900` → `the guest tools in 'Ubuntu' cannot change the display mode of this guest; change it in the guest's display settings`, the screen stays 1280x800 |
+| D7 | `detail: ""` | `clock=host timeZone=Etc/UTC` → `clock` `2026-10-15T01:48:50Z`, `timeZone` `Etc/UTC`; `timeZone=Asia/Seoul` → `Asia/Seoul` (`timedatectl` agrees), then back to `Etc/UTC` |
+| D8 | `session: root, lock state not checked on this guest` | `session: alcove, unlocked`; after `loginctl lock-sessions` (second run: `lock-session 1`) `alcove, locked` (not ok, hint `unlock the guest session; …`); after `loginctl unlock-sessions` `alcove, unlocked` and the desktop is back; MCP `alcove_doctor` prints `session: alcove, unlocked` |
+| D9 | `sshd:` | `vm.process.list filter=sshd` → `1257 sshd` (second run `3081 sshd`) with command `sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups`; `vm.wait_for process_started processName=sshd` matched at once. sshd runs only while ssh is in use (`ssh.socket` activation), so the listing is empty after a boot without an ssh login |
+
+`agent-linux.py --vm Ubuntu` (VM started by the script, agent installed
+seconds after ssh came up): `install: 0 installed / active / 1`; `hello:
+{'os': 'linux', 'agent': '0.2.1', 'caps': ['files', 'shutdown', 'exec',
+'rpc', 'jobs', 'proc', 'fs'], …}` (before the autologin session, so no
+`clipboard`); `exec: 0 root | aarch64`; `file push OK -> /root/Downloads/drop.bin`
+(no session yet, so the agent's own home); `PASS: guest agent verified in Ubuntu`.
+The second run gave the same lines with `drop (2).bin`, the first file still
+being there; both were removed afterwards.
+
+Not changed: files and folders the `fs.*` operations create, and `vm.exec`
+commands, belong to root; a `vm.sync_dir` skips a guest file whose content
+equals the host's, so a copy made before the fix keeps its mode until its
+content changes or it is deleted.
