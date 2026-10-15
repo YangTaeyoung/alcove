@@ -17,9 +17,10 @@ you change the document in the same commit.
 
 CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull
 request, and covers only what needs no VM: the Swift package (`swift build
---build-tests` and `swift test`), the Go guest tools (`go vet` and `go test`
-plus the Windows and Linux ARM64 cross-builds), and the MCP server (`npm ci &&
-npm run build`, then `mcp-smoke.py --list-only`). It never builds the QEMU
+--build-tests` and `swift test`), the Go guest tools (`go vet`, `go test`,
+`go test -race` on the agent and proxy packages, and the Windows and Linux
+ARM64 cross-builds), and the MCP server (`npm ci && npm run build && npm
+test`, then `mcp-smoke.py --list-only`). It never builds the QEMU
 engine, so the engine build, `display-backend.py`, the real-engine
 `VMControllerTests`, the `xcodegen`/`xcodebuild` app build and every guest
 suite are covered by the checklists below and by nothing else. Run them
@@ -153,7 +154,7 @@ an installed guest:
 |---|---|
 | `scripts/test/boot-ubuntu.sh` | `images/noble-server-cloudimg-arm64.img`; boots it headless and waits for the serial login prompt |
 | `python3 scripts/test/install-windows.py --fresh` | the Windows 11 ARM64 ISO and `virtio-win.iso`; unattended install. Without `--fresh` it boots and re-checks the installed disk |
-| `python3 scripts/test/agent-linux.py` | the Ubuntu bundle with forwards `2223->22` and `7647->7645`, and `build/alcove-agent-linux-arm64` |
+| `python3 scripts/test/agent-linux.py [--vm NAME]` | an Ubuntu desktop bundle (default name `Ubuntu`; verified with Ubuntu 26.04.1) with a desktop session that signs in by itself (autologin) and `wl-clipboard` (or `xclip` on X11) installed, the test SSH key for the user `alcove`, forwards `2223->22` and `7647->7645`, and `build/alcove-agent-linux-arm64`; the server cloud image of `boot-ubuntu.sh` has no desktop and fails the script |
 | `python3 scripts/test/mcp-smoke.py --list-only` | `mcp/dist/` — run `cd mcp && npm install && npm run build` first. `--vm "Windows 11"` drives a real guest end to end |
 | `python3 scripts/test/install-agent.py` | a running `Windows 11` guest with ssh on `2222`, the harness SSH key and `build/alcove-agent-windows-arm64.exe`; installs the agent with `--allow-exec` and checks hello |
 | `python3 scripts/test/agent-rpc-windows.py` | a running guest with the agent installed with `--allow-exec`; the agent operations, the guest clipboard and a file push on the forwarded port `7646` |

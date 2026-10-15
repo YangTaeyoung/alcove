@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end test of the guest agent inside the Ubuntu 24.04 bundle
-(ssh forward 2223->22 with the test key, agent forward 7647->7645). The host
+"""End-to-end test of the guest agent inside an Ubuntu desktop bundle
+(Ubuntu 26.04.1 with a desktop, autologin of the user alcove and wl-clipboard;
+ssh forward 2223->22 with the test key, agent forward 7647->7645). The host
 side authenticates with the agentKey of the bundle's config.json. The file
 drop is checked after the agent listed clipboard, i.e. once it found the
-desktop session: it must land in the desktop user's home, owned by that user.
+desktop session: it must land in the home that session.info reports for the
+desktop user, owned by that user.
 
-Usage: agent-linux.py [--vm NAME]
+Usage: agent-linux.py [--vm NAME]   (default VM name: Ubuntu)
 """
 import argparse, base64, hashlib, json, os, socket, subprocess, sys, time
 
@@ -19,7 +21,7 @@ KEY = os.path.expanduser("~/Library/Application Support/Alcove/test_id_ed25519")
 SSH = ["ssh", "-i", KEY, "-p", "2223", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR", "alcove@127.0.0.1"]
 AGENT_PORT = 7647
-VM = "Ubuntu 24.04"
+VM = "Ubuntu"
 SESSION_WAIT_S = 120
 
 
@@ -36,7 +38,7 @@ class Agent:
         line = self.f.readline()
         if not line: fail("agent closed")
         return json.loads(line)
-    def recv(self, typ, timeout=30):
+    def recv(self, typ, timeout=30, on_timeout=None):
         end = time.time() + timeout
         while time.time() < end:
             line = self.f.readline()
@@ -45,7 +47,7 @@ class Agent:
             if m.get("t") == typ: return m
             if m.get("t") == "refused": fail(f"the agent refused the connection: {m.get('error')}")
             if m.get("t") == "ping": self.send({"t": "pong"})
-        fail(f"timeout waiting for {typ}")
+        fail(on_timeout or f"timeout waiting for {typ}")
     def exec(self, cmd):
         self.send({"t": "exec", "cmd": cmd}); r = self.recv("exec.result", 60); return r.get("code"), r.get("out", "")
 
@@ -84,15 +86,23 @@ def main():
         except AgentKeyError as e:
             fail(str(e))
         agent.send({"t": "welcome", "v": 1})
-        if "clipboard" not in (hello.get("caps") or []):
+        caps = hello.get("caps") or []
+        if "clipboard" not in caps:
             log("waiting for the desktop session (clipboard in a caps message)")
+            no_session = (f"no desktop session within {SESSION_WAIT_S} s: the agent never listed clipboard; "
+                          "check the autologin and wl-clipboard")
             end = time.time() + SESSION_WAIT_S
-            while time.time() < end:
-                caps = agent.recv("caps", max(1, end - time.time())).get("caps") or []
-                if "clipboard" in caps: break
-            else:
-                fail(f"no desktop session within {SESSION_WAIT_S} s: the agent never listed clipboard; check the autologin and wl-clipboard")
+            while "clipboard" not in caps:
+                left = end - time.time()
+                if left <= 0: fail(no_session)
+                caps = agent.recv("caps", left, on_timeout=no_session).get("caps") or []
             log("caps:", caps)
+        agent.send({"t": "req", "id": 1, "op": "session.info"})
+        info = agent.recv("res")
+        home = info.get("home")
+        if not info.get("ok") or not home:
+            fail(f"session.info named no home of a desktop user: {info}; check the autologin")
+        log("session:", info.get("user"), home)
         code, out = agent.exec("id -un; uname -m")
         log("exec:", code, out.strip().replace("\n", " | "))
         if "aarch64" not in out: fail("exec output unexpected")
@@ -106,7 +116,7 @@ def main():
         code, out = agent.exec(f"sha256sum '{done['path']}'")
         if digest not in out: fail(f"digest mismatch: {out!r}")
         code, owner = agent.exec(f"stat -c %U '{done['path']}'; rm -f '{done['path']}'")
-        if not done["path"].startswith("/home/"): fail(f"the drop landed outside the desktop user's home: {done['path']}")
+        if not done["path"].startswith(home.rstrip("/") + "/"): fail(f"the drop landed outside the desktop user's home {home}: {done['path']}")
         if owner.strip() == "root": fail(f"the drop {done['path']} belongs to root, not to the desktop user")
         log("file push OK ->", done["path"], "owner", owner.strip())
         print("PASS: guest agent verified in Ubuntu")

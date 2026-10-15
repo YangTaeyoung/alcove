@@ -22,7 +22,7 @@
 - App target (`Alcove/`): `xcodegen generate && xcodebuild -project Alcove.xcodeproj -scheme Alcove build` after `build/alcove-proxy` exists (`scripts/test/all.sh` builds it).
 - MCP (`mcp/`): `npm run build && npm test`; `python3 scripts/test/mcp-smoke.py --list-only`.
 - Python scripts: `python3 -m py_compile` on each changed script; delete `__pycache__/` afterwards.
-- Tasks marked **Windows VM** use the Windows 11 test VM (one task at a time on the VM; leave it stopped and clean, as the e2e scripts do). No task touches the Linux VM.
+- Tasks marked **Windows VM** use the Windows 11 test VM (one task at a time on the VM; leave it stopped and clean, as the e2e scripts do). Only Task 13 uses the Ubuntu test VM ("Ubuntu"); no other task touches it.
 - Test first: write the test that fails on the current code, see it fail, then fix.
 
 ## Task order and ownership
@@ -41,8 +41,10 @@
 | 10 | e2e scripts and repository docs | 11 | Windows VM for 10.1–10.3, 10.9 |
 | 11 | Windows VM check session | 13 | Windows VM |
 | 12 | App checks with a person | 6 | Windows VM + a person (or computer use) |
+| 13 | Linux guest defects D1–D9 | 9 | Ubuntu VM |
+| 14 | Integration follow-ups | 9 | none |
 
-Tasks 1–9 own disjoint source files and can run in parallel worktrees. Task 10 follows Tasks 1–9 (it documents the known limits and reruns scripts against the new code). Task 11 runs on the integrated tree after Task 10. Task 12 runs last.
+Tasks 1–9 own disjoint source files and can run in parallel worktrees. Task 10 follows Tasks 1–9 (it documents the known limits and reruns scripts against the new code). Tasks 13 and 14 were added after the Linux guest verification and the task reviews; they run on the integrated tree of Tasks 1–9. Task 11 runs on the integrated tree after Tasks 10, 13 and 14. Task 12 runs last.
 
 ---
 
@@ -389,6 +391,36 @@ The app has no test target; each is a manual check, recorded in the results doc 
 - [ ] **12.4** `vm.http.start` with the app as host, using `Contents/MacOS/alcove-proxy`.
 - [ ] **12.5** Rename of a VM with a capture journal entry (`AppControlServer.swift:98-107`); then the next tools connection restores the guest.
 - [ ] **12.6** The app's window paths during a capture: boot, restore, Suspend All, Reset, the snapshot sheet [at7-results "Not run"]; the app as one of the two hosts of at6 checks 10 and 13 [at6-results].
+
+### Task 13: Linux guest defects D1–D9 — **Ubuntu VM**
+
+The Linux guest verification (`docs/superpowers/plans/2026-10-15-linux-results.md`, "Defects" D1–D9) found nine defects; that doc holds each reproduction, cause and the before/after per defect ("After the fixes").
+
+- [ ] **13.1** (D1) The Linux agent stays a root system service and finds the desktop session with `loginctl`: `~`, relative paths and the default `cwd` use the session user's home; `app.launch` and the clipboard tools run as that user in the session's environment; `exec.*` keeps running as root; `clipboard` is advertised only with a session and a clipboard tool, re-checked while connected.
+- [ ] **13.2** (D2) `vm.clipboard.*` on guest tools without `clipboard` answer a refusal sentence (host and MCP).
+- [ ] **13.3** (D3) `--install` while the service runs replaces the binary atomically, restarts the unit, and fails with a sentence when a step fails.
+- [ ] **13.4** (D4) Transferred files keep the execute bit (`executable` of `fs.write` and `fs.list`).
+- [ ] **13.5** (D5) `app.launch` without the `ui` capability answers without a window wait.
+- [ ] **13.6** (D6) The Linux agent does not advertise `resolution`.
+- [ ] **13.7** (D7) The clock and time-zone rows of `vm.doctor` print on Ubuntu 26.04.
+- [ ] **13.8** (D8) `vm.doctor` reports the session user (`session.info`).
+- [ ] **13.9** (D9) `proc.list` takes the process name from `/proc/<pid>/comm`.
+
+Tests: unit tests for every change; the guest re-verification re-runs each reproduction and `python3 scripts/test/agent-linux.py --vm Ubuntu` and is recorded in the Linux results doc.
+
+### Task 14: Integration follow-ups
+
+Deferred findings of the task reviews that change behaviour or CI stability, each with a test that fails first where testable.
+
+- [ ] **14.1** `WaitTests` has no wall-clock upper bound.
+- [ ] **14.2** The `vm.wait_for` exec gate names `fs.stat` / `fs.tail` instead of "run commands" (code, comment, docs).
+- [ ] **14.3** A script step whose op acted but whose `expect` failed, and a `vm.batch` cancelled during its observation, release the input they hold (code, docs).
+- [ ] **14.4** A `vm.batch` script step whose batch stopped at a failed step fails the run and names that step.
+- [ ] **14.5** `vm.collect_diagnostics` gives capture-journal advice that works in the VM's state.
+- [ ] **14.6** `videoSeconds` reports the length of the file.
+- [ ] **14.7** Agent sentences of `.remote` failures name control ops (`failureReason` → `namingControlOps`).
+- [ ] **14.8** MCP rewrites op names in capture and recording warnings, and the agent-refusal line names the VM once.
+- [ ] **14.9** `CONTRIBUTING.md` describes the current `build-qemu.sh` safeguard.
 
 ---
 

@@ -56,7 +56,7 @@ clipboard and file sharing.
 | **No black boxes** | The engine is a pinned QEMU tag plus three readable patches (`qemu-patches/`). Build it yourself in one command. |
 
 Tested on an M3 Pro and an M5 Pro running macOS 27 with Windows 11 Pro ARM 25H2
-and Ubuntu 24.04 arm64 guests.
+and Ubuntu 26.04.1 arm64 (desktop) guests.
 
 ## Quick start
 
