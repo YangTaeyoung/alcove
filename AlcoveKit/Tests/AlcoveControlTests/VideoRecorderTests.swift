@@ -512,7 +512,7 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertEqual(info.size, CGSize(width: 320, height: 240))
         XCTAssertEqual(info.seconds, 1.5, accuracy: 0.5)
         let videoSeconds = try XCTUnwrap(summary.videoSeconds)
-        XCTAssertEqual(videoSeconds, 1.5, accuracy: 0.5)
+        XCTAssertEqual(videoSeconds, (info.seconds * 10).rounded() / 10)
         XCTAssertNotNil(summary.droppedFrames)
         XCTAssertEqual(summary.writeErrors, 0)
         XCTAssertEqual(summary.json["video"]?.stringValue, path)

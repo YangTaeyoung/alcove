@@ -82,6 +82,12 @@ final class VideoRecorder: VideoSink, @unchecked Sendable {
         lock.withLock { firstTime.isValid && lastTime.isValid ? CMTimeGetSeconds(CMTimeSubtract(lastTime, firstTime)) : 0 }
     }
 
+    /// The duration of the file at `url`, read from the file; nil when it does not open as a movie.
+    func playedSeconds() async -> Double? {
+        guard let duration = try? await AVURLAsset(url: url).load(.duration), duration.isNumeric else { return nil }
+        return CMTimeGetSeconds(duration)
+    }
+
     /// A sentence describing why the video could not be written; nil while it can.
     var errorMessage: String? {
         lock.withLock {

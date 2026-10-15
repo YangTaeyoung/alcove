@@ -1,4 +1,5 @@
 import XCTest
+import AVFoundation
 @testable import AlcoveControl
 import AlcoveEngine
 import AlcoveQMP
@@ -289,7 +290,9 @@ final class TraceTests: XCTestCase {
         clock.advance(.milliseconds(500))
         let stop = try await h.handle(op: "vm.record.stop", params: ["name": "Win"])
         XCTAssertEqual(stop["video"]?.stringValue, dir.appendingPathComponent("video.mp4").path)
-        XCTAssertEqual(try XCTUnwrap(stop["videoSeconds"]?.doubleValue), 0.5, accuracy: 0.1)
+        let played = try await AVURLAsset(url: dir.appendingPathComponent("video.mp4")).load(.duration)
+        XCTAssertEqual(try XCTUnwrap(stop["videoSeconds"]?.doubleValue), (CMTimeGetSeconds(played) * 10).rounded() / 10)
+        XCTAssertEqual(try XCTUnwrap(stop["videoSeconds"]?.doubleValue), 0.7, accuracy: 0.1)
         XCTAssertNotNil(stop["droppedFrames"]?.intValue)
         XCTAssertEqual(stop["writeErrors"]?.intValue, 0)
     }

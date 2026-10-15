@@ -1486,8 +1486,8 @@ rounded down to even numbers and scaled so that the longer side is at most
 screen is read `fps` times a second; a frame equal to the previous one is
 written again only after 2 s. The frame read when the recording ends is the
 video's last frame, and the video ends one frame interval (1/`fps` s) after
-it, so that frame is shown for that long; `videoSeconds` counts from the
-first frame to the last, one frame interval less than the file plays. That
+it, so that frame is shown for that long; `videoSeconds` is the length the
+file plays, read from the file with one decimal. That
 read is waited for 2 s at most; without its frame the last sampled frame is
 the last one. The file is written in movie fragments of one second, so a
 copy taken while the recording runs plays up to its last whole fragment; a
