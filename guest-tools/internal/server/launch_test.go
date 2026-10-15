@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,7 +97,12 @@ func TestLaunchMissingPath(t *testing.T) {
 	c, _ := newRPCClient(t, Options{})
 	missing := filepath.Join(t.TempDir(), "no-such-program")
 	res := c.call("app.launch", proto.Message{"path": missing, "wait_window_ms": 0})
-	if res["ok"] != false || !strings.Contains(res.String("error"), "cannot start '"+missing+"'") || !strings.Contains(res.String("error"), "fs.stat") {
+	if runtime.GOOS == "windows" {
+		want := "'" + missing + "' names no file, also not with an extension of the command's PATHEXT; pass the file name with its extension, or check PATHEXT in env"
+		if res["ok"] != false || res.String("error") != want {
+			t.Fatalf("res %v", res)
+		}
+	} else if res["ok"] != false || !strings.Contains(res.String("error"), "cannot start '"+missing+"'") || !strings.Contains(res.String("error"), "fs.stat") {
 		t.Fatalf("res %v", res)
 	}
 	res = c.call("app.launch", proto.Message{})
