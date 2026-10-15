@@ -102,19 +102,38 @@ func NewReader(r io.Reader) *Reader {
 	return &Reader{sc: sc}
 }
 
-// Next returns the next message; io.EOF when the stream ends.
+// ErrNotMessage is the error of NextStrict for a line that is not a JSON
+// object with a string "t".
+var ErrNotMessage = errors.New("a line is not a JSON object with a string t")
+
+// Next returns the next message, skipping empty lines and lines that are not
+// a JSON object with a string "t"; io.EOF when the stream ends.
 func (r *Reader) Next() (Message, error) {
+	return r.next(false)
+}
+
+// NextStrict returns the next message, skipping empty lines; a line that is
+// not a JSON object with a string "t" returns ErrNotMessage. A line cut off
+// by a read error returns that error, and io.EOF the end of the stream.
+func (r *Reader) NextStrict() (Message, error) {
+	return r.next(true)
+}
+
+func (r *Reader) next(strict bool) (Message, error) {
 	for r.sc.Scan() {
 		line := r.sc.Bytes()
 		if len(line) == 0 {
 			continue
 		}
 		var m Message
-		if err := json.Unmarshal(line, &m); err != nil {
-			continue // tolerate garbage lines
-		}
-		if m.Type() == "" {
-			continue
+		if err := json.Unmarshal(line, &m); err != nil || m.Type() == "" {
+			if !strict {
+				continue
+			}
+			if err := r.sc.Err(); err != nil {
+				return nil, err
+			}
+			return nil, ErrNotMessage
 		}
 		return m, nil
 	}

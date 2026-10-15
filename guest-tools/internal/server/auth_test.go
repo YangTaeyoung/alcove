@@ -345,6 +345,28 @@ func TestAConnectionWithoutAuthGetsNothingButTheRefusalAfterTheTimeout(t *testin
 	c.expectRefusedAndClosed(t, errAuthTimeout)
 }
 
+func TestAMalformedLineBeforeAuthIsRefusedAtOnce(t *testing.T) {
+	a := startAuthServer(t, Options{AuthTimeout: time.Minute})
+	for _, line := range []string{"not json", `{"no":"type"}`} {
+		c := a.dial()
+		c.send(t, proto.Message{"t": "welcome", "v": 1})
+		if _, err := c.c.Write([]byte(line + "\n")); err != nil {
+			t.Fatal(err)
+		}
+		c.expectRefusedAndClosed(t, errUnauthenticated)
+	}
+}
+
+func TestAMalformedLineAfterAuthIsSkipped(t *testing.T) {
+	a := startAuthServer(t, Options{})
+	c := a.dial()
+	c.authenticate(t)
+	if _, err := c.c.Write([]byte("not json\n{\"no\":\"type\"}\n")); err != nil {
+		t.Fatal(err)
+	}
+	c.ping(t)
+}
+
 func TestALineLongerThan64KiBBeforeAuthIsRefused(t *testing.T) {
 	a := startAuthServer(t, Options{})
 	c := a.dial()

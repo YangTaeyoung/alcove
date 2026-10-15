@@ -3,6 +3,7 @@ package proto
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -39,6 +40,44 @@ func TestRoundTripAndTolerance(t *testing.T) {
 	}
 	if err := w.Send(Message{}); err == nil {
 		t.Fatal("untyped message must be rejected")
+	}
+}
+
+func TestNextStrictReturnsErrNotMessageForALineThatIsNotAMessage(t *testing.T) {
+	for _, line := range []string{"garbage", `{"no":"type"}`, `["t"]`, `{"t":1}`, "null"} {
+		r := NewReader(strings.NewReader("\n" + line + "\n{\"t\":\"ping\"}\n"))
+		if m, err := r.NextStrict(); err != ErrNotMessage {
+			t.Fatalf("%s: NextStrict returned %v, %v", line, m, err)
+		}
+		if m, err := r.NextStrict(); err != nil || m.Type() != "ping" {
+			t.Fatalf("%s: the next line read as %v, %v", line, m, err)
+		}
+	}
+}
+
+// failAfter returns data and then err.
+type failAfter struct {
+	data []byte
+	err  error
+}
+
+func (f *failAfter) Read(p []byte) (int, error) {
+	if len(f.data) == 0 {
+		return 0, f.err
+	}
+	n := copy(p, f.data)
+	f.data = f.data[n:]
+	return n, nil
+}
+
+func TestNextStrictReturnsTheReadErrorThatCutALineOff(t *testing.T) {
+	cut := errors.New("cut")
+	r := NewReader(&failAfter{data: []byte(`{"t":"ping"}` + "\n" + `{"t":"pi`), err: cut})
+	if m, err := r.NextStrict(); err != nil || m.Type() != "ping" {
+		t.Fatalf("first line %v, %v", m, err)
+	}
+	if m, err := r.NextStrict(); err != cut {
+		t.Fatalf("cut line %v, %v", m, err)
 	}
 }
 

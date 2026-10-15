@@ -175,8 +175,9 @@ func (q *handshakeQueue) leave(p *pendingHandshake) bool {
 // handshake writes the hello and, unless the server is Unauthenticated, reads
 // messages until the host signed the nonce. It reports whether the
 // connection is served. A refused connection gets the answer
-// unauthenticatedAnswer gives, if any, and a refused line. limit is lifted
-// once the connection is served.
+// unauthenticatedAnswer gives, if any, and a refused line; a line that is not
+// a message is refused as unauthenticated. limit is lifted once the
+// connection is served.
 func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 	w := proto.NewWriter(c)
 	write := func(m proto.Message) bool {
@@ -216,10 +217,12 @@ func (s *Server) handshake(c net.Conn, r *proto.Reader, limit *lineLimit) bool {
 		return false
 	}
 	for {
-		m, err := r.Next()
+		m, err := r.NextStrict()
 		if err != nil {
 			var ne net.Error
 			switch {
+			case errors.Is(err, proto.ErrNotMessage):
+				return refuse(reasonUnauthenticated, errUnauthenticated)
 			case errors.Is(err, errLongLine):
 				return refuse(reasonLongLine, errPreAuthLine)
 			case errors.As(err, &ne) && ne.Timeout():

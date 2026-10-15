@@ -171,10 +171,11 @@ compares the hello's `token` with the printed token before it signs.
 - `{"t":"refused","error":"<sentence>"}`, and the connection closes.
 
 Until `authed` the agent sends nothing else: no keepalive, no events, no
-`clipboard.changed`, no `resolution`. It ignores `welcome`, `ping` and `pong`.
-Any other message, `pair` of earlier hosts included, gets the refusal
+`clipboard.changed`, no `resolution`. It ignores `welcome`, `ping` and `pong`
+and empty lines. Any other message, `pair` of earlier hosts included, and a
+line that is not a JSON object with a string `t` get the refusal
 `this alcove-agent serves only a host that proves the VM's key; update the Alcove app on the host`
-and the connection closes. Before that line a `req` is answered with a `res`
+at once and the connection closes. Before that line a `req` is answered with a `res`
 that carries the sentence as `error`, an `exec` with an `exec.result` of
 `code` -1 that carries it as `out`, and a `file.end` with a `file.done` that
 carries it as `error`, so a host without key support shows the sentence.
@@ -248,7 +249,8 @@ between attempts, until the bind succeeds.
 | host → agent | `exec` | `cmd` (string) | run a command with the default shell and no time limit; answered with `exec.result` (`code` -1 and `out` "exec disabled" unless the agent was started with `--allow-exec`) |
 | agent → host | `exec.result` | `code`, `out` | exit code and combined stdout and stderr of `exec`; `out` keeps the last 200000 bytes, starting on a character boundary when older bytes were dropped (there is no `truncated` field) |
 
-Unknown `t` values are ignored. Strings are UTF-8; the guest clipboard is
+Unknown `t` values are ignored, and after `authed` so is a line that is not
+a JSON object with a string `t`. Strings are UTF-8; the guest clipboard is
 converted from/to UTF-16 on Windows by the agent.
 
 ## Requests and responses
