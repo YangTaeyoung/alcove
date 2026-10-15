@@ -88,10 +88,11 @@ func (c *rpcClient) event(name string) proto.Message {
 	}
 }
 
-// testSystem is a commandSystem of goos whose Windows folder is D:\WINDOWS
-// and whose agent environment is environ.
+// testSystem is a commandSystem of goos whose Windows folder is D:\WINDOWS,
+// whose base environment is environ and which has no files.
 func testSystem(goos string, environ ...string) commandSystem {
-	return commandSystem{goos: goos, environ: environ, windows: func() (string, error) { return `D:\WINDOWS`, nil }}
+	return commandSystem{goos: goos, environ: environ, windows: func() (string, error) { return `D:\WINDOWS`, nil },
+		isFile: func(string) bool { return false }}
 }
 
 // testPowerShellPrefix is the text before the command of every -Command the
@@ -113,16 +114,17 @@ func TestBuildCommandForms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"cmd.exe", "/S", "/C", "dir"}; !reflect.DeepEqual(cmd.Args, want) || cmd.Env != nil {
-		t.Fatalf("cmd args %q, env %q", cmd.Args, cmd.Env)
+	if want := []string{`D:\WINDOWS\System32\cmd.exe`, "/S", "/C", "dir"}; cmd.Path != want[0] || !reflect.DeepEqual(cmd.Args, want) ||
+		!reflect.DeepEqual(cmd.Env, []string{`PSModulePath=C:\Users\alcove\Documents\WindowsPowerShell\Modules`}) {
+		t.Fatalf("cmd path %q, args %q, env %q", cmd.Path, cmd.Args, cmd.Env)
 	}
 
-	cmd, err = buildCommand(proto.Message{"shell": "none", "argv": []any{"git", "status", "-s"}}, testSystem("windows"))
+	cmd, err = buildCommand(proto.Message{"shell": "none", "argv": []any{"git", "status", "-s"}}, windowsTestSystem(t, `C:\Tools\git.exe`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"git", "status", "-s"}; !reflect.DeepEqual(cmd.Args, want) {
-		t.Fatalf("none args %q", cmd.Args)
+	if want := []string{"git", "status", "-s"}; !reflect.DeepEqual(cmd.Args, want) || cmd.Path != `C:\Tools\git.exe` {
+		t.Fatalf("none path %q, args %q", cmd.Path, cmd.Args)
 	}
 
 	_, err = buildCommand(proto.Message{"shell": "none", "cmd": "ls"}, testSystem("linux"))
@@ -162,12 +164,21 @@ func TestBuildCommandForms(t *testing.T) {
 	if err == nil || err.Error() != "shell 'powershell' does not run argv; pass shell 'none' or leave shell out" {
 		t.Fatalf("shell with argv: %v", err)
 	}
-	if cmd, err := buildCommand(proto.Message{"argv": []any{"git"}}, testSystem("windows")); err != nil || !reflect.DeepEqual(cmd.Args, []string{"git"}) {
+	if cmd, err := buildCommand(proto.Message{"argv": []any{"git"}}, windowsTestSystem(t, `C:\Tools\git.exe`)); err != nil || !reflect.DeepEqual(cmd.Args, []string{"git"}) {
 		t.Fatalf("argv without shell: %v %v", cmd, err)
 	}
 }
 
-func TestWindowsPowerShellGetsTheAgentsEnvironmentWithOnlyItsOwnModuleFolder(t *testing.T) {
+func TestWindowsCmdWithoutAReadableWindowsFolderIsNotStarted(t *testing.T) {
+	sys := testSystem("windows")
+	sys.windows = func() (string, error) { return "", errors.New("GetSystemWindowsDirectoryW: access denied") }
+	_, err := buildCommand(proto.Message{"cmd": "dir", "shell": "cmd"}, sys)
+	if want := "cmd.exe could not be located (GetSystemWindowsDirectoryW: access denied); restart alcove-agent and retry"; err == nil || err.Error() != want {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestWindowsPowerShellGetsTheBaseEnvironmentWithOnlyItsOwnModuleFolder(t *testing.T) {
 	sys := testSystem("windows",
 		`PSModulePath=C:\Users\alcove\Documents\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules`,
 		`Path=C:\WINDOWS\system32;C:\Users\alcove\bin`,
@@ -193,7 +204,7 @@ func TestWindowsPowerShellGetsTheAgentsEnvironmentWithOnlyItsOwnModuleFolder(t *
 		t.Fatalf("env with the request's env\n got %q\nwant %q", cmd.Env, want)
 	}
 	if !reflect.DeepEqual(sys.environ[:1], []string{`PSModulePath=C:\Users\alcove\Documents\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules`}) {
-		t.Fatalf("building the command changed the agent's environment: %q", sys.environ)
+		t.Fatalf("building the command changed the base environment: %q", sys.environ)
 	}
 }
 

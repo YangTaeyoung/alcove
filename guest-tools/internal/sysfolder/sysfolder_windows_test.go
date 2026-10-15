@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -58,5 +59,67 @@ func TestTheMachineVariablesAreNotTakenFromTheEnvironment(t *testing.T) {
 	got := varsOfAProcessWith(t, "SystemRoot="+dir, "windir="+dir, "SystemDrive="+dir, "ProgramFiles="+dir, "ProgramFiles(x86)="+dir)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("with the variables set to %s: %v; expected %v", dir, got, want)
+	}
+}
+
+// sessionEnvironmentKey holds the machine's environment variables.
+const sessionEnvironmentKey = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+
+func TestMachineValuesListTheStringValuesOfAKey(t *testing.T) {
+	values, err := MachineValues(sessionEnvironmentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Value{}
+	for _, v := range values {
+		byName[strings.ToLower(v.Name)] = v
+	}
+	path, err := MachineString(sessionEnvironmentKey, "Path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := byName["path"]; got.Text != path || !got.Expand {
+		t.Fatalf("Path is %+v; expected the REG_EXPAND_SZ text %q", got, path)
+	}
+	for _, name := range []string{"pathext", "comspec", "os", "number_of_processors", "processor_architecture"} {
+		if byName[name].Text == "" {
+			t.Errorf("%s is missing from %+v", name, values)
+		}
+	}
+	if _, err := MachineValues(`SOFTWARE\Alcove\NoSuchKey`); err == nil {
+		t.Fatal("a missing key gave no error")
+	}
+}
+
+func TestTheProfileFolderOfTheCurrentAccountIsItsProfileDirectory(t *testing.T) {
+	tok, err := syscall.OpenCurrentProcessToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tok.Close()
+	tu, err := tok.GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := tu.User.Sid.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := tok.GetUserProfileDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vars, err := MachineVars()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("USERPROFILE", t.TempDir())
+	t.Setenv("SystemDrive", "Q:")
+	got, err := ProfileFolder(sid, vars)
+	if err != nil || !strings.EqualFold(got, want) {
+		t.Fatalf("ProfileFolder(%s) = %q, %v; expected %q", sid, got, err, want)
+	}
+	if _, err := ProfileFolder("S-1-5-21-1-2-3-999999", vars); err == nil {
+		t.Fatal("an unknown SID gave no error")
 	}
 }

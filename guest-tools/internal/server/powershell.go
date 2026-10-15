@@ -21,19 +21,24 @@ type powerShell struct {
 	system  string // its System32 folder
 }
 
-// windowsPowerShell returns Windows PowerShell below the Windows folder that
-// windowsFolder returns, with the System32 folder expanded from it by
-// sysfolder.
-func windowsPowerShell(windowsFolder func() (string, error)) (powerShell, error) {
-	windows, err := windowsFolder()
+// systemFolders returns the Windows folder that windowsFolder returns and its
+// System32 folder, expanded from it by sysfolder.
+func systemFolders(windowsFolder func() (string, error)) (windows, system string, err error) {
+	windows, err = windowsFolder()
 	var vars map[string]string
 	if err == nil {
 		vars, err = sysfolder.BaseVars(windows)
 	}
-	system := ""
 	if err == nil {
 		system, err = sysfolder.Expand(`%SystemRoot%\System32`, vars)
 	}
+	return windows, system, err
+}
+
+// windowsPowerShell returns Windows PowerShell below the Windows folder that
+// windowsFolder returns, with the System32 folder of systemFolders.
+func windowsPowerShell(windowsFolder func() (string, error)) (powerShell, error) {
+	windows, system, err := systemFolders(windowsFolder)
 	if err != nil {
 		return powerShell{}, fmt.Errorf("Windows PowerShell could not be located (%v); restart alcove-agent and retry", err)
 	}

@@ -27,21 +27,39 @@ const (
 // commandSystem is what buildCommand reads of the system it builds for.
 type commandSystem struct {
 	goos string
-	// environ is the agent's environment.
+	// environ is the base environment of the commands (childEnvironment).
 	environ []string
-	// windows returns the system's Windows folder; shell powershell calls it.
+	// windows returns the system's Windows folder; shells powershell and cmd
+	// call it.
 	windows func() (string, error)
+	// isFile reports whether a path names a file that is not a directory;
+	// the lookup of a bare argv[0] on Windows calls it.
+	isFile func(string) bool
 }
 
 // agentSystem returns the commandSystem of the running agent.
-func agentSystem() commandSystem {
-	return commandSystem{goos: runtime.GOOS, environ: os.Environ(), windows: windowsFolder}
+func agentSystem() (commandSystem, error) {
+	env, err := childEnvironment()
+	if err != nil {
+		return commandSystem{}, err
+	}
+	return commandSystem{goos: runtime.GOOS, environ: env, windows: windowsFolder, isFile: isFile}, nil
 }
 
-// buildCommand turns request fields into a command for sys. Shell
-// powershell runs powershell.exe of the Windows folder with commandArgs, in
-// the agent's environment with PSModulePath set to that PowerShell's own
-// module folder; env of the request is added after it.
+// isFile reports whether path names a file that is not a directory.
+func isFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
+}
+
+// buildCommand turns request fields into a command for sys. On Windows the
+// command's environment is the base environment of sys, with PSModulePath
+// set to Windows PowerShell's own module folder for shell powershell, which
+// runs powershell.exe of the Windows folder with commandArgs; shell cmd runs
+// cmd.exe of the System32 folder; a bare argv[0] is looked up by
+// lookWindowsProgram in that environment with env of the request added.
+// Elsewhere the command inherits the agent's environment. env of the request
+// is added after the environment.
 func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 	cmdline := req.String("cmd")
 	argv := req.Strings("argv")
@@ -59,8 +77,11 @@ func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("shell '%s' does not run argv; pass shell 'none' or leave shell out", shell)
 	}
 
+	windows := sys.goos == "windows"
 	var c *exec.Cmd
 	switch {
+	case len(argv) > 0 && windows:
+		c = &exec.Cmd{Path: argv[0], Args: slices.Clone(argv)}
 	case len(argv) > 0:
 		c = exec.Command(argv[0], argv[1:]...)
 	default:
@@ -85,7 +106,11 @@ func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 			if sys.goos != "windows" {
 				return nil, errors.New("shell 'cmd' exists only on Windows; use shell 'sh'")
 			}
-			c = exec.Command("cmd.exe", "/S", "/C", cmdline)
+			_, system, err := systemFolders(sys.windows)
+			if err != nil {
+				return nil, fmt.Errorf("cmd.exe could not be located (%v); restart alcove-agent and retry", err)
+			}
+			c = exec.Command(system+`\cmd.exe`, "/S", "/C", cmdline)
 			setRawCommandLine(c, cmdExeLine(cmdline))
 		case "sh":
 			c = exec.Command("/bin/sh", "-c", cmdline)
@@ -95,6 +120,9 @@ func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 	}
 
 	c.Dir = req.String("cwd")
+	if windows && c.Env == nil {
+		c.Env = slices.Clone(sys.environ)
+	}
 	if env := req.StringMap("env"); len(env) > 0 {
 		keys := make([]string, 0, len(env))
 		for k := range env {
@@ -107,6 +135,13 @@ func buildCommand(req proto.Message, sys commandSystem) (*exec.Cmd, error) {
 		for _, k := range keys {
 			c.Env = append(c.Env, k+"="+env[k])
 		}
+	}
+	if windows && len(argv) > 0 && !strings.ContainsAny(argv[0], `\/:`) {
+		program, ok := lookWindowsProgram(argv[0], c.Env, sys.isFile)
+		if !ok {
+			return nil, fmt.Errorf("'%s' is not in a folder of the command's PATH (the machine's PATH, or PATH of env); pass the full path of the program", argv[0])
+		}
+		c.Path = program
 	}
 	return c, nil
 }
@@ -142,7 +177,11 @@ func resolveHomePath(home, p string) string {
 // (the home directory without cwd), no console window and its own process
 // tree.
 func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
-	c, err := buildCommand(req, agentSystem())
+	sys, err := agentSystem()
+	if err != nil {
+		return nil, err
+	}
+	c, err := buildCommand(req, sys)
 	if err != nil {
 		return nil, err
 	}

@@ -38,6 +38,29 @@ func TestASystemFolderValueWithAnotherVariableOrNoDriveIsRefused(t *testing.T) {
 	}
 }
 
+func TestATextValueIsExpandedWithoutBeingAFolder(t *testing.T) {
+	vars := base(t)
+	vars["programfiles"] = `C:\Program Files`
+	for _, c := range []struct{ raw, want string }{
+		{`.COM;.EXE;.BAT`, `.COM;.EXE;.BAT`},
+		{`%ProgramFiles%\WindowsPowerShell\Modules;%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules`,
+			`C:\Program Files\WindowsPowerShell\Modules;C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules`},
+		{`%SystemRoot%`, `C:\WINDOWS`},
+		{`Windows_NT`, `Windows_NT`},
+		{``, ``},
+	} {
+		got, err := ExpandText(c.raw, vars)
+		if err != nil || got != c.want {
+			t.Errorf("%s gives %q, %v; expected %q", c.raw, got, err, c.want)
+		}
+	}
+	for _, raw := range []string{`%JAVA_HOME%\bin`, `%SystemRoot%\%USERNAME%`, `100%`, `%SystemRoot`} {
+		if got, err := ExpandText(raw, vars); err == nil {
+			t.Errorf("%q gives %q; expected an error", raw, got)
+		}
+	}
+}
+
 func TestAddedVariablesAreExpandedByName(t *testing.T) {
 	vars := base(t)
 	vars["programfiles(x86)"] = `C:\Program Files (x86)`

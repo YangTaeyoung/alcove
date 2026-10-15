@@ -7,11 +7,27 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 )
+
+// childEnvironment returns the agent's own environment.
+func childEnvironment() ([]string, error) { return os.Environ(), nil }
+
+// agentHome returns the home directory of the agent's user: $HOME, else the
+// one in the user database.
+func agentHome() string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h
+	}
+	if u, err := user.Current(); err == nil {
+		return u.HomeDir
+	}
+	return ""
+}
 
 func hideWindow(*exec.Cmd) {}
 

@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -198,8 +198,12 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 	started := c.Path
 	if sess, ok := v.sess, v.hasSess; ok {
 		runInSession(c, append(append([]string{}, sess.Env...), extra...), sess.Credential(), sess.ScopePrefix())
-	} else if len(extra) > 0 {
-		c.Env = append(os.Environ(), extra...)
+	} else if runtime.GOOS == "windows" || len(extra) > 0 {
+		base, err := childEnvironment()
+		if err != nil {
+			return nil, err
+		}
+		c.Env = append(base, extra...)
 	}
 
 	watch := waitMs > 0 && s.opt.UI != nil

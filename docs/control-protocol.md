@@ -842,7 +842,12 @@ this guest have no ui capability, so no window was waited for; wait for the
 program with vm.wait_for (process_started or text_visible)"` in place of
 `window` or `windowTimedOut`.
 
-- On Windows the program runs with the agent's elevated token; on Linux as
+- On Windows the program runs with the agent's elevated token, without the
+  desktop user's `HKCU\Environment`: its environment is built from the
+  machine's variables and the folders of the account's profile, with `env` on
+  top, as for `vm.exec` (see
+  [the agent protocol](agent-protocol.md#environment-of-a-command-on-windows));
+  pass what the program needs with `env`. On Linux it runs as
   the user of the guest's desktop session, in that session's environment
   (`WAYLAND_DISPLAY` or `DISPLAY`, `XDG_RUNTIME_DIR`, the session bus),
   in a session of its own. When the guest has systemd 254 or later, the session's runtime folder holds the user bus and the program is an executable file, it starts through `systemd-run --user --scope` in the user's service manager, so a restart of the guest tools does not end it; otherwise it runs in the guest tools' service and ends with it. See [the agent protocol](agent-protocol.md#the-desktop-session-linux). Its
@@ -2667,6 +2672,16 @@ and the `error` of its `problems`).
   a program started with `vm.app.launch` as the session user may not change
   them (see [the agent protocol](agent-protocol.md#the-desktop-session-linux)).
   `env` is an object of extra environment variables.
+- On Windows the command does not get the desktop user's `HKCU\Environment`
+  or the guest tools' own environment: it starts from the machine's variables
+  and the folders of the account's profile, with `env` on top (see
+  [the agent protocol](agent-protocol.md#environment-of-a-command-on-windows)).
+  Pass what a test needs with `env`. A bare `argv[0]` is looked up only in the
+  `PATH` of that environment, so a program of the user's own `PATH` (such as
+  `winget.exe`) needs its full path or a `PATH` in `env`; another name answers
+  `'<name>' is not in a folder of the command's PATH (the machine's PATH, or
+  PATH of env); pass the full path of the program`. The home folder is the
+  profile folder of the account (its `ProfileImagePath`), not `USERPROFILE`.
 - `stdin` (`vm.exec` only) is text the command reads from its standard input;
   without it the command reads end-of-file. A job of `vm.exec.start` gets its
   input through `vm.exec.write`.
@@ -2743,7 +2758,8 @@ and the `error` of its `problems`).
 - `vm.fs.list` reports `mtime` as RFC 3339 in UTC and `name` relative to
   `path` with `/` separators; `truncated` is true beyond 5000 entries.
 - Paths: `~`, `~/x` and relative paths resolve against the home directory of
-  the guest user: on Windows the user the guest tools run as, on Linux the
+  the guest user: on Windows the profile folder of the user the guest tools
+  run as (its `ProfileImagePath`, not `USERPROFILE`), on Linux the
   user of the guest's desktop session (`/root` without one). In a Linux
   guest the files these ops create in that home belong to the session user,
   unlike those a `vm.exec` command creates there, which belong to root (see

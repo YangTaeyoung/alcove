@@ -15,7 +15,6 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -176,18 +175,6 @@ func (s *Server) session() (session.Session, bool) {
 // homeDir returns the home directory that view reads.
 func (s *Server) homeDir() string {
 	return s.view().dir
-}
-
-// agentHome returns the home directory of the agent's user: $HOME, else the
-// one in the user database.
-func agentHome() string {
-	if h, err := os.UserHomeDir(); err == nil && h != "" {
-		return h
-	}
-	if u, err := user.Current(); err == nil {
-		return u.HomeDir
-	}
-	return ""
 }
 
 // capsCheckInterval is the time between two checks of the capabilities of
@@ -688,7 +675,11 @@ func (q serialQueue) run(f func()) bool {
 }
 
 func runShell(cmd string) (string, int) {
-	c, err := buildCommand(proto.Message{"cmd": cmd}, agentSystem())
+	sys, err := agentSystem()
+	if err != nil {
+		return err.Error(), 1
+	}
+	c, err := buildCommand(proto.Message{"cmd": cmd}, sys)
 	if err != nil {
 		return err.Error(), 1
 	}

@@ -5,7 +5,6 @@ package server
 import (
 	"errors"
 	"fmt"
-	"os/exec"
 	"syscall"
 	"time"
 	"unsafe"
@@ -62,8 +61,14 @@ func platformFileID(path string, follow bool) (fileID, error) {
 	return fileID{volume: uint64(info.VolumeSerialNumber), index: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}, nil
 }
 
+// platformShutdown runs shutdown.exe of the System32 folder as a
+// systemCommand.
 func platformShutdown() error {
-	return exec.Command("shutdown.exe", "/s", "/t", "0").Run()
+	c, err := systemCommand("shutdown.exe", "/s", "/t", "0")
+	if err != nil {
+		return err
+	}
+	return c.Run()
 }
 
 // resolutionSupported says whether setResolution can change the display mode.

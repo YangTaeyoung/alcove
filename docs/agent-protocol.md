@@ -365,7 +365,7 @@ between attempts, until the bind succeeds.
 | host → agent | `file.chunk` | `id`, `data` (base64, ≤ 256 KiB decoded) | file bytes |
 | host → agent | `file.end` | `id`, `sha256` | finish; the agent verifies the digest |
 | agent → host | `file.done` | `id`, `path` or `error` | result |
-| host → agent | `shutdown` | — | graceful OS shutdown (`shutdown /s /t 0` or `systemctl poweroff`); the UI helper is closed only after that command succeeded |
+| host → agent | `shutdown` | — | graceful OS shutdown (`shutdown.exe /s /t 0` of the System32 folder or `systemctl poweroff`); the UI helper is closed only after that command succeeded |
 | host → agent | `exec` | `cmd` (string) | run a command with the default shell and no time limit; answered with `exec.result` (`code` -1 and `out` "exec disabled" unless the agent was started with `--allow-exec`) |
 | agent → host | `exec.result` | `code`, `out` | exit code and combined stdout and stderr of `exec`; `out` keeps the last 200000 bytes, starting on a character boundary when older bytes were dropped (there is no `truncated` field) |
 
@@ -465,9 +465,14 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 
 - `cwd` is the working directory; `~`, `~/x` and relative paths resolve
   against the home directory of the agent's user (on Linux the
-  [desktop session](#the-desktop-session-linux)'s user), which is also the
-  working directory without `cwd`. The command runs as the agent's user (root
-  on Linux) and `env` adds variables to the agent's environment.
+  [desktop session](#the-desktop-session-linux)'s user; on Windows the
+  profile folder of the agent's account, read as described in
+  [Environment of a command on Windows](#environment-of-a-command-on-windows),
+  never from `USERPROFILE`), which is also the working directory without
+  `cwd`. The command runs as the agent's user (root on Linux) and `env` adds
+  variables to its environment: on Windows the
+  [environment of a command](#environment-of-a-command-on-windows), elsewhere
+  the agent's environment.
 - On Windows every child starts with `CREATE_NO_WINDOW`: it has no console
   window, and a GUI program started directly shows its own windows.
 - `exec.run` gives the child a pipe that carries the `stdin` text and then
@@ -480,11 +485,81 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   dropped, so a truncated stream starts on a character boundary. Other
   invalid UTF-8 becomes U+FFFD.
 - Killing a tree (timeout, `exec.kill`, `proc.kill` with `tree`) runs
-  `taskkill /F /T /PID <pid>` (`taskkill.exe` of the system folder) on Windows; elsewhere each child leads its own
+  `taskkill /F /T /PID <pid>` (`taskkill.exe` of the System32 folder, in the
+  environment of the system folders that a recipe of
+  [Windows PowerShell](#windows-powershell) gets) on Windows; elsewhere each child leads its own
   process group and the group receives SIGKILL. `taskkill` follows parent
   process ids, so on Windows a process whose parent had already exited (for
   example a server started by `cmd /c start /b`) is not part of the tree and
   keeps running; stop it with `proc.kill` by `pid` or `name`.
+
+#### Environment of a command on Windows
+
+The processes the agent starts on Windows for the host (`exec.run`,
+`exec.start`, the v1 `exec` and `app.launch`) do not get the agent's own
+environment, and so not the desktop user's `HKCU\Environment`, which an
+unelevated program of that user can change (`COR_PROFILER`,
+`DOTNET_STARTUP_HOOKS`, the user's `PATH` entries and the like). Each one
+starts with an environment the agent builds when the request arrives:
+
+- The machine's variables: the `REG_SZ` and `REG_EXPAND_SZ` values under
+  `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, such
+  as `PATHEXT`, `ComSpec`, `OS`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_*` and
+  `PSModulePath`. A `REG_EXPAND_SZ` value is expanded only from the system
+  folders that [App launch](#app-launch-applaunch) names (`%SystemRoot%`,
+  `%SystemDrive%`, `%windir%`, `%ProgramFiles%` and the like); a value that
+  names any other variable is left out. `Path` keeps, in order, the folders
+  that expand that way and start with a drive, the folders `app.launch`
+  searches.
+- Values the account cannot change as variables, which replace a machine
+  value of the same name: `USERNAME` and `USERDOMAIN` of the account of the
+  agent's token, `COMPUTERNAME` (`GetComputerNameW`); `USERPROFILE`,
+  `HOMEDRIVE` and `HOMEPATH` of the account's profile folder, the
+  `ProfileImagePath` of its SID under
+  `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList` expanded
+  from the system folders; `APPDATA` (`<profile>\AppData\Roaming`),
+  `LOCALAPPDATA` (`<profile>\AppData\Local`), `TEMP` and `TMP`
+  (`<profile>\AppData\Local\Temp`); `ProgramData` (the `ProgramData` value
+  of that key); `SystemRoot`, `windir`, `SystemDrive`, `ProgramFiles`,
+  `ProgramFiles(x86)`, `ProgramW6432`, `CommonProgramFiles`,
+  `CommonProgramFiles(x86)` and `CommonProgramW6432` of the system folders.
+- The request's `env` after it: a name given there replaces one of the same
+  name without regard to case.
+
+Folder redirection of `AppData`, the user's own variables and `PATH`
+entries (such as `%LOCALAPPDATA%\Microsoft\WindowsApps`, which holds app
+execution aliases like `winget.exe`), `OneDrive`, `PUBLIC`,
+`ALLUSERSPROFILE`, `LOGONSERVER` and `SESSIONNAME` are not part of it, and
+neither is a `PSModuleAnalysisCachePath` other than the machine's: pass what
+a command needs with `env`, or the full path of a program. A change an
+installer makes to the machine's variables reaches the next command without
+a restart of the agent.
+
+A bare `argv[0]` (without `\`, `/` or `:`) is looked up in the folders of
+the `PATH` of that environment, `env` included, that start with a drive or
+with `\\`, in order: the name itself when it has an extension, then the name
+with each extension of its `PATHEXT` (`.com`, `.exe`, `.bat`, `.cmd`
+without one). The working directory is not searched. A name found in none
+answers
+`'<name>' is not in a folder of the command's PATH (the machine's PATH, or PATH of env); pass the full path of the program`.
+`shell: "cmd"` runs `cmd.exe` of the System32 folder of the Windows folder
+that Windows reports (`GetSystemWindowsDirectoryW`); when that folder
+cannot be read the request answers
+`cmd.exe could not be located (<reason>); restart alcove-agent and retry`.
+
+When the environment cannot be built the request answers
+`the system folders could not be read (<reason>); restart alcove-agent and retry`,
+`the machine's environment variables could not be read (<reason>); restart alcove-agent and retry`,
+`the account of alcove-agent could not be read (<reason>); restart alcove-agent and retry`
+or
+`the profile folder of alcove-agent's account could not be read (<reason>); check the ProfileImagePath value of HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID>, then retry`.
+
+The home directory of the agent's user is the same profile folder. The
+agent's own processes take nothing of its environment either:
+`taskkill.exe`, `shutdown.exe` and the recipes of
+[Windows PowerShell](#windows-powershell) get the environment of the system
+folders below, and the UI helper gets its own
+([Windows and UI Automation](#windows-and-ui-automation-win-ui)).
 
 #### Windows PowerShell
 
@@ -514,11 +589,13 @@ the same way:
   a command name. The command can load one with `Import-Module <path>` (a
   script module only under a policy that allows scripts) or set
   `$env:PSModulePath` itself.
-- `shell: "powershell"` keeps the rest of the agent's environment, with the
-  request's `env` added after it. A recipe of the agent gets an environment of
-  the system folders only: `SystemRoot`, `windir`, `SystemDrive`, `ComSpec`,
-  `PATH` of the System32 folder, the Windows folder, `Wbem` and Windows
-  PowerShell's folder, and that `PSModulePath`.
+- `shell: "powershell"` gets the
+  [environment of a command](#environment-of-a-command-on-windows) with that
+  `PSModulePath`, and the request's `env` added after it. A recipe of the
+  agent gets an environment of the system folders only: `SystemRoot`,
+  `windir`, `SystemDrive`, `ComSpec`, `PATH` of the System32 folder, the
+  Windows folder, `Wbem` and Windows PowerShell's folder, and that
+  `PSModulePath`.
 - A `powershell.exe` started through `argv`, through `shell: "cmd"` or by the
   command itself gets none of this from the agent beyond the environment it
   inherits.
@@ -613,7 +690,10 @@ the same way:
   `'<name>' is not in the system folders of PATH or under HKLM App Paths; pass the full path of the program`.
 - The program starts directly with `args` as its arguments and with a normal
   window. Without `cwd` it runs in the directory of the program file; `cwd`
-  resolves like the `cwd` of `exec.run`. On Linux with a
+  resolves like the `cwd` of `exec.run`. On Windows the program runs as the
+  agent in the [environment of a command](#environment-of-a-command-on-windows),
+  without the desktop user's `HKCU\Environment`, and `env` adds variables to
+  that environment; the lookup of `path` above is unchanged. On Linux with a
   [desktop session](#the-desktop-session-linux) the program runs as the
   session's user in the session's environment, and `env` adds variables to
   that environment; otherwise it runs as the agent and `env` adds variables
@@ -1173,7 +1253,7 @@ agent sends one event per difference, each with the window object:
 ### Files (`fs.*`)
 
 - Paths: `~`, `~/x`, `~\x` and relative paths resolve against the home
-  directory of the agent's user (on Linux the [desktop session](#the-desktop-session-linux)'s user); results report absolute paths. On Windows a
+  directory of the agent's user (on Linux the [desktop session](#the-desktop-session-linux)'s user; on Windows the profile folder of the agent's account from the `ProfileList` key, see [Environment of a command on Windows](#environment-of-a-command-on-windows), never `USERPROFILE`); results report absolute paths. On Windows a
   drive without a separator after it (`C:foo`) and a path that starts at the
   root of the current drive (`\x`) are refused with a sentence that names the
   full form to pass.

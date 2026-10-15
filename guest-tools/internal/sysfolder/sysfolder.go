@@ -1,5 +1,5 @@
-// Package sysfolder expands the folder values of the machine's registry with
-// the system's own folders instead of the process environment.
+// Package sysfolder expands the folder and text values of the machine's
+// registry with the system's own folders instead of the process environment.
 package sysfolder
 
 import (
@@ -17,11 +17,32 @@ func BaseVars(windows string) (map[string]string, error) {
 	return map[string]string{"systemdrive": windows[:2], "systemroot": windows, "windir": windows}, nil
 }
 
-// Expand replaces the %VAR% references of raw with the values of vars, whose
-// keys are lower-case names. A reference to a name not in vars, an unmatched
-// '%', or a result that does not start with a drive letter and a backslash is
-// an error.
+// Value is a string value of a registry key: Text as stored, and Expand set
+// for a REG_EXPAND_SZ value.
+type Value struct {
+	Name   string
+	Text   string
+	Expand bool
+}
+
+// Expand replaces the %VAR% references of raw with the values of vars, as
+// ExpandText does, and requires the result to start with a drive letter and a
+// backslash.
 func Expand(raw string, vars map[string]string) (string, error) {
+	out, err := ExpandText(raw, vars)
+	if err != nil {
+		return "", err
+	}
+	if !HasDrive(out) || len(out) < 3 || out[2] != '\\' {
+		return "", fmt.Errorf("%q is not a folder on a drive", raw)
+	}
+	return out, nil
+}
+
+// ExpandText replaces the %VAR% references of raw with the values of vars,
+// whose keys are lower-case names. A reference to a name not in vars or an
+// unmatched '%' is an error.
+func ExpandText(raw string, vars map[string]string) (string, error) {
 	var b strings.Builder
 	rest := raw
 	for {
@@ -43,11 +64,7 @@ func Expand(raw string, vars map[string]string) (string, error) {
 		b.WriteString(v)
 		rest = rest[i+2+j:]
 	}
-	out := b.String()
-	if !HasDrive(out) || len(out) < 3 || out[2] != '\\' {
-		return "", fmt.Errorf("%q is not a folder on a drive", raw)
-	}
-	return out, nil
+	return b.String(), nil
 }
 
 // HasDrive reports whether s starts with a drive letter and a colon.

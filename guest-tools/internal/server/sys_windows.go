@@ -43,21 +43,24 @@ func prepareTree(*exec.Cmd) {}
 // listTimeout bounds the PowerShell run that lists the processes.
 const listTimeout = 30 * time.Second
 
-var procGetSystemDirectory = syscall.NewLazyDLL("kernel32.dll").NewProc("GetSystemDirectoryW")
-
-// systemProgram returns the path of a program in the Windows system folder,
-// or name alone when that folder cannot be read.
-func systemProgram(name string) string {
-	buf := make([]uint16, syscall.MAX_PATH)
-	n, _, _ := procGetSystemDirectory.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-	if n == 0 || int(n) >= len(buf) {
-		return name
+// systemCommand returns the command of the program name of the System32
+// folder of systemFolders, in the environment of the system folders only
+// that powerShell.systemEnv holds.
+func systemCommand(name string, args ...string) (*exec.Cmd, error) {
+	windows, system, err := systemFolders(windowsFolder)
+	if err != nil {
+		return nil, fmt.Errorf("%s could not be located (%v); restart alcove-agent and retry", name, err)
 	}
-	return filepath.Join(syscall.UTF16ToString(buf[:n]), name)
+	c := exec.Command(system+`\`+name, args...)
+	c.Env = powerShell{windows: windows, system: system}.systemEnv()
+	return c, nil
 }
 
 func taskkill(args ...string) ([]byte, error) {
-	c := exec.Command(systemProgram("taskkill.exe"), args...)
+	c, err := systemCommand("taskkill.exe", args...)
+	if err != nil {
+		return nil, err
+	}
 	hideWindow(c)
 	return c.CombinedOutput()
 }
@@ -217,13 +220,13 @@ func tokenElevated() bool {
 	return elevated != 0
 }
 
-// sessionEnvironmentKey holds the machine's PATH.
+// sessionEnvironmentKey holds the machine's environment variables.
 const sessionEnvironmentKey = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
 
-// resolveProgram returns systemProgramPath of path with the folders of the
-// machine's PATH, read from the registry, and the HKLM App Paths keys. Their
-// values are expanded with sysfolder.MachineVars; a folder or program that
-// names any other variable is left out.
+// resolveProgram returns systemProgramPath of path with machinePathFolders
+// of the machine's PATH, read from the registry, and the HKLM App Paths keys.
+// Their values are expanded with sysfolder.MachineVars; a folder or program
+// that names any other variable is left out.
 func resolveProgram(path string) (string, error) {
 	if strings.ContainsAny(path, `\/:`) {
 		return path, nil
@@ -233,12 +236,7 @@ func resolveProgram(path string) (string, error) {
 		return "", fmt.Errorf("the system folders could not be read (%v); pass the full path of the program", err)
 	}
 	raw, _ := sysfolder.MachineString(sessionEnvironmentKey, "Path")
-	var dirs []string
-	for _, dir := range strings.Split(raw, ";") {
-		if full, err := sysfolder.Expand(strings.TrimSpace(dir), vars); err == nil {
-			dirs = append(dirs, full)
-		}
-	}
+	dirs := machinePathFolders(raw, vars)
 	exists := func(p string) bool {
 		fi, err := os.Stat(p)
 		return err == nil && fi.Mode().IsRegular()
