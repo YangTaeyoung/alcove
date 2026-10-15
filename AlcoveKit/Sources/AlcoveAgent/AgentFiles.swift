@@ -70,9 +70,11 @@ func windowsCaseConflict(in names: [String]) -> (String, String)? {
     return nil
 }
 
-/// Whether the host file at `url` has an execute bit for its owner, its group or others.
+/// Whether the host file at `url`, or the file a link at `url` leads to, has an execute bit for its owner, its group
+/// or others.
 private func isExecutable(_ url: URL) -> Bool {
-    guard let mode = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.posixPermissions] as? NSNumber else { return false }
+    let target = url.resolvingSymlinksInPath()
+    guard let mode = (try? FileManager.default.attributesOfItem(atPath: target.path))?[.posixPermissions] as? NSNumber else { return false }
     return mode.intValue & 0o111 != 0
 }
 
@@ -156,7 +158,7 @@ extension AgentClient {
                     "path": .string(part), "data": .string(piece.base64EncodedString()),
                     "offset": .int(Int64(offset)), "truncate": .bool(offset == 0), "mkdirs": .bool(true),
                 ]
-                if executable, offset == 0 { request["executable"] = true }
+                if offset == 0 { request["executable"] = .bool(executable) }
                 _ = try await call("fs.write", request, timeout: timeout)
                 offset += piece.count
                 if piece.isEmpty { break }
@@ -277,7 +279,7 @@ extension AgentClient {
         let key: (String) -> String = { windows ? foldedName($0) : $0 }
         let kept = Set(preserving.map(key))
         let local = try syncSource(directory, toGuestPath: path, preserving: preserving)
-        var remote: [String: (name: String, size: Int, sha256: String)] = [:]
+        var remote: [String: (name: String, size: Int, sha256: String, executable: Bool?)] = [:]
         let root = try await call("fs.stat", ["path": .string(path)], timeout: timeout)
         if root["exists"]?.boolValue == true {
             let listing = try await call("fs.list", ["path": .string(path), "recursive": .bool(true), "sha256": .bool(true)], timeout: timeout)
@@ -294,7 +296,8 @@ extension AgentClient {
                 if refusingObstacles, folders.contains(key(name)) {
                     throw SyncObstacle(guestPath: joinGuestPath(path, name), isLink: entry["link"]?.boolValue == true)
                 }
-                remote[key(name)] = (name, entry["size"]?.intValue ?? -1, entry["sha256"]?.stringValue?.lowercased() ?? "")
+                remote[key(name)] = (name, entry["size"]?.intValue ?? -1, entry["sha256"]?.stringValue?.lowercased() ?? "",
+                                     entry["executable"]?.boolValue)
             }
         }
         var sent: [String] = []
@@ -302,7 +305,8 @@ extension AgentClient {
         var bytes = 0
         for file in local {
             let size = (try FileManager.default.attributesOfItem(atPath: file.url.path)[.size] as? Int) ?? -1
-            if let guest = remote[key(file.name)], guest.size == size, guest.sha256 == (try localDigest(of: file.url)) {
+            if let guest = remote[key(file.name)], guest.size == size, guest.executable.map({ $0 == isExecutable(file.url) }) ?? true,
+               guest.sha256 == (try localDigest(of: file.url)) {
                 skipped += 1
                 continue
             }

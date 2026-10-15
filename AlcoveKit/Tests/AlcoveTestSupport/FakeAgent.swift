@@ -97,8 +97,22 @@ public final class FakeFS: @unchecked Sendable {
     public var links: Set<String> = []
     /// Whether `fs.stat` and `fs.list` mark a link with `link`.
     public var reportsLinks = true
+    /// Whether `fs.list` gives each file `executable`, as Linux agents do.
+    public var reportsExecutable = false
+    /// The paths whose file has the execute bit: set and cleared by the `executable` field of `fs.write`, moved by
+    /// `fs.rename`.
+    private var executables: Set<String> = []
 
     public init() {}
+
+    /// Whether the file at `path` has the execute bit.
+    public func isExecutable(_ path: String) -> Bool { lock.lock(); defer { lock.unlock() }; return executables.contains(key(for: path)) }
+
+    /// Gives the file at `path` the execute bit, or takes it away.
+    public func setExecutable(_ path: String, _ on: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if on { executables.insert(key(for: path)) } else { executables.remove(key(for: path)) }
+    }
 
     private func fold(_ path: String) -> String { caseInsensitive ? path.lowercased() : path }
 
@@ -169,7 +183,10 @@ public final class FakeFS: @unchecked Sendable {
             var entries: [JSON] = found.keys.sorted().map { key in
                 let name = String(key.dropFirst(prefix.count)).replacingOccurrences(of: sep, with: "/")
                 let data = found[key]!
-                return ["name": .string(name), "dir": false, "size": .int(Int64(data.count)), "mtime": "2026-01-01T00:00:00Z", "sha256": .string(sha256Hex(data))]
+                var row: [String: JSON] = ["name": .string(name), "dir": false, "size": .int(Int64(data.count)), "mtime": "2026-01-01T00:00:00Z",
+                                           "sha256": .string(sha256Hex(data))]
+                if reportsExecutable { row["executable"] = .bool(executables.contains(key)) }
+                return .object(row)
             }
             for link in below.sorted() {
                 let name = String(link.dropFirst(prefix.count)).replacingOccurrences(of: sep, with: "/")
@@ -192,6 +209,9 @@ public final class FakeFS: @unchecked Sendable {
             if data.count < offset { data.append(Data(count: offset - data.count)) }
             data.replaceSubrange(offset..<min(offset + piece.count, data.count), with: piece)
             store[target] = data
+            if let executable = m["executable"]?.boolValue {
+                if executable { executables.insert(target) } else { executables.remove(target) }
+            }
             writtenPaths.append(path)
             return reply(m, ["size": .int(Int64(data.count))])
         case "fs.rename":
@@ -199,8 +219,11 @@ public final class FakeFS: @unchecked Sendable {
             guard let data = store[key(for: from)] else { return fail(m, "'\(from)' does not exist") }
             let existing = key(for: to)
             if store[existing] != nil, m["overwrite"]?.boolValue != true { return fail(m, "'\(to)' exists; pass overwrite to replace it") }
+            let wasExecutable = executables.remove(key(for: from)) != nil
+            executables.remove(existing)
             store[existing] = nil; store[key(for: from)] = nil
             store[to] = data
+            if wasExecutable { executables.insert(to) }
             return reply(m, ["path": .string(to)])
         case "fs.delete":
             let existed = store.removeValue(forKey: key(for: path)) != nil

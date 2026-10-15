@@ -65,8 +65,49 @@ final class AgentFilesTests: XCTestCase {
         let scriptWrites = writes.filter { $0["path"]?.stringValue == "/opt/app/run.sh.alcove-part" }
         let plainWrites = writes.filter { $0["path"]?.stringValue == "/opt/app/data.txt.alcove-part" }
         XCTAssertEqual(scriptWrites.map { $0["executable"] }, [.bool(true)])
-        XCTAssertEqual(plainWrites.count, 2)
-        XCTAssertTrue(plainWrites.allSatisfy { $0["executable"] == nil })
+        XCTAssertEqual(plainWrites.map { $0["executable"] }, [.bool(false), nil])
+    }
+
+    func testPushOfAHostLinkTakesTheModeOfItsTarget() async throws {
+        let fs = FakeFS()
+        let (_, client) = try await connected(fs)
+        let dir = try tempDir()
+        let data = dir.appendingPathComponent("data.txt")
+        try Data("plain".utf8).write(to: data)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: data.path)
+        let link = dir.appendingPathComponent("link.txt")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: data)
+        _ = try await client.pushFile(link, toGuestPath: "/opt/app/link.txt", overwrite: false)
+        XCTAssertFalse(fs.isExecutable("/opt/app/link.txt"))
+        XCTAssertEqual(fs["/opt/app/link.txt"], Data("plain".utf8))
+    }
+
+    func testSyncSendsAFileWhoseExecuteBitChangedOnTheHost() async throws {
+        let fs = FakeFS()
+        fs.reportsExecutable = true
+        let (agent, client) = try await connected(fs)
+        let dir = try tempDir()
+        let script = dir.appendingPathComponent("run.sh")
+        try Data("#!/bin/sh\n".utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: script.path)
+        var r = try await client.syncDirectory(dir, toGuestPath: "/opt/app", deleteExtras: false)
+        XCTAssertEqual(r.sent, ["run.sh"])
+        XCTAssertFalse(fs.isExecutable("/opt/app/run.sh"))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        r = try await client.syncDirectory(dir, toGuestPath: "/opt/app", deleteExtras: false)
+        XCTAssertEqual(r.sent, ["run.sh"])
+        XCTAssertTrue(fs.isExecutable("/opt/app/run.sh"))
+
+        r = try await client.syncDirectory(dir, toGuestPath: "/opt/app", deleteExtras: false)
+        XCTAssertEqual(r.sent, [])
+        XCTAssertEqual(r.skipped, 1)
+
+        fs.reportsExecutable = false
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: script.path)
+        r = try await client.syncDirectory(dir, toGuestPath: "/opt/app", deleteExtras: false)
+        XCTAssertEqual(r.skipped, 1, "a guest that reports no execute bit is compared by content alone")
+        _ = agent
     }
 
     func testPushDigestMismatch() async throws {

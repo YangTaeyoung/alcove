@@ -4,7 +4,7 @@ import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, eventSeqLine, observeParams, observePayload, type ObserveArgs } from "../observation.js";
 import { selectorParams, toSelector } from "../selector.js";
-import { clip, fail, text, typeMs, vmName, withoutEnvelope, DEPLOY_TIMEOUT_MS, STRUCTURED_LIST_MAX, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
+import { clip, fail, text, toolSentence, typeMs, vmName, withoutEnvelope, DEPLOY_TIMEOUT_MS, STRUCTURED_LIST_MAX, UI_CALL_TIMEOUT_MS, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -304,7 +304,7 @@ export function register(r: Registrar, client: ControlClient): void {
       const lines = [`started pid ${reply.pid}`];
       if (w) lines.push(windowLine(w));
       if (reply.windowTimedOut === true) lines.push(`no window appeared within ${wait} s; check alcove_list_windows`);
-      const noWait = typeof reply.noWindowWait === "string" ? reply.noWindowWait : undefined;
+      const noWait = typeof reply.noWindowWait === "string" ? toolSentence(reply.noWindowWait) : undefined;
       if (noWait) lines.push(noWait);
       const seq = eventSeqLine(reply);
       if (seq) lines.push(seq);
@@ -356,10 +356,11 @@ export function register(r: Registrar, client: ControlClient): void {
       const w = reply.window as Obj | undefined;
       if (w) lines.push(windowLine(w));
       if (reply.windowTimedOut === true) lines.push(`no window appeared within ${a.wait_window_s ?? DEPLOY_WAIT_WINDOW_S} s; check alcove_list_windows`);
-      if (typeof reply.noWindowWait === "string") lines.push(reply.noWindowWait);
+      if (typeof reply.noWindowWait === "string") lines.push(toolSentence(reply.noWindowWait));
       const seq = eventSeqLine(reply);
       if (seq) lines.push(seq);
       const structured = withoutEnvelope(reply);
+      if (typeof reply.noWindowWait === "string") structured.noWindowWait = toolSentence(reply.noWindowWait);
       if (Array.isArray(sent)) Object.assign(structured, { sent: sent.slice(0, STRUCTURED_LIST_MAX), sentCount: sent.length });
       return text(lines.join("\n"), structured);
     } catch (e) {
