@@ -221,10 +221,10 @@ struct ScriptRunner: Sendable {
             if run.usedAltSelector { entry["usedAltSelector"] = true }
             if run.usedFallback { entry["usedFallback"] = true }
             if run.positional { entry["positional"] = true }
+            if let acted = run.acted { held.note(step.op, step.params, result: acted) }
             switch outcome {
-            case .success(let value):
+            case .success:
                 entry["ok"] = true
-                held.note(step.op, step.params, result: value)
             case .failure(let error):
                 entry["ok"] = false
                 entry["error"] = .string(Task.isCancelled || error is CancellationError ? ScriptRunner.cancelledDuring(number) : "\(error)")
@@ -292,6 +292,9 @@ struct ScriptRunner: Sendable {
     /// What running one step brought.
     private struct StepRun {
         var outcome: Result<JSON, Error>
+        /// The result of the step's op, or of the click at its fallback point, when that op succeeded; the outcome can
+        /// still be a failure of its expectations.
+        var acted: JSON?
         /// Whether the step's op ran a second time with `altSelector` as its selector.
         var usedAltSelector = false
         /// Whether the step went on to the click at its `fallback` coordinates.
@@ -351,16 +354,25 @@ struct ScriptRunner: Sendable {
             }
         }
         switch acted {
-        case .success(let value): run.outcome = await expectations(of: step, number: number, vm: vm, token: token, after: value)
+        case .success(let value):
+            run.acted = value
+            run.outcome = await expectations(of: step, number: number, vm: vm, token: token, after: value)
         case .failure(let error): run.outcome = .failure(error)
         }
         return run
     }
 
-    /// Checks the result of a `vm.wait_for` step and waits for each expectation of `step`; `value` on success.
+    /// Checks the result of a `vm.wait_for` or `vm.batch` step and waits for each expectation of `step`; `value` on success.
     private func expectations(of step: Script.Step, number: Int, vm: String, token: String?, after value: JSON) async -> Result<JSON, Error> {
         if step.op == "vm.wait_for", value["matched"]?.intValue == -1 {
             return .failure(ScriptError(step: number, message: "vm.wait_for matched none of its conditions\(problems(value)); check the conditions or raise the timeout"))
+        }
+        if step.op == "vm.batch", let failed = value["failedStep"]?.intValue {
+            let steps = step.params["steps"]?.arrayValue ?? []
+            let op = failed >= 0 && failed < steps.count ? steps[failed]["op"]?.stringValue : nil
+            let which = op.map { "\($0), counted from 0" } ?? "counted from 0"
+            let error = value["error"]?.stringValue ?? "the step failed; check vm.status"
+            return .failure(ScriptError(step: number, message: "vm.batch stopped at its step \(failed) (\(which)): \(error)"))
         }
         let clock = ContinuousClock()
         let deadline = clock.now + .seconds(step.timeout)

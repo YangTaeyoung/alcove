@@ -72,8 +72,8 @@ extension ControlHandler {
     }
 
     /// Runs the steps of a batch in order and stops at the first one that throws. A batch that stops at a failed step or
-    /// is cancelled releases the buttons and keys that its `vm.mouse.down` and `vm.key.down` steps pressed and no later
-    /// step released.
+    /// is cancelled, while a step runs or during its observation, releases the buttons and keys that its `vm.mouse.down`
+    /// and `vm.key.down` steps pressed and no later step released.
     func batch(_ params: JSON) async throws -> JSON {
         let options = try observeOptions(params)
         let steps = try batchSteps(params, vm: try string(params, "name"))
@@ -102,7 +102,14 @@ extension ControlHandler {
             out["failedStep"] = .int(Int64(failure.step))
             out["error"] = .string(failure.message)
         }
-        if let before { try await addObservation(to: &out, t, after: "vm.batch", before: before, options) }
+        if let before {
+            do {
+                try await addObservation(to: &out, t, after: "vm.batch", before: before, options)
+            } catch is CancellationError {
+                if failure == nil { await release(held, on: t) }
+                throw CancellationError()
+            }
+        }
         return .object(out)
     }
 

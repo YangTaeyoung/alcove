@@ -354,8 +354,9 @@ and `results[i]` is the result of step `i` (`{}` for input and `sleep`,
 The first step that fails ends the batch; the reply is still a success and adds
 `failedStep` (its index) and `error` (its message). Steps after it do not
 run; steps before it keep their effect, except that a batch that stops at a
-failed step or is cancelled releases the buttons and keys that its
-`vm.mouse.down` and `vm.key.down` steps pressed and no later step released. A
+failed step or is cancelled (while a step runs or during its observation)
+releases the buttons and keys that its `vm.mouse.down` and `vm.key.down`
+steps pressed and no later step released. A
 batch whose steps all ran leaves them as its steps left them.
 
 ## Finding text
@@ -2274,12 +2275,16 @@ runs; problems are reported as `step N expectation M: …` or `step N condition
 M: …`, counted from 1. Every expectation must hold: each is waited for
 with its own `vm.wait_for`, for up to the step's `timeout` (default 10 s, 1 to
 600) counted from the end of the op, and at least 1 s. A `vm.wait_for` step
-fails when it matches nothing. The run stops at the first failing step. A
+fails when it matches nothing. A `vm.batch` step fails when the batch stopped
+at a failed step (its `failedStep`), with `vm.batch stopped at its step <i>
+(<op>, counted from 0): <the batch's error>`, and its expectations are not
+checked. The run stops at the first failing step. A
 run that fails or is cancelled releases the buttons and keys that its
-`vm.mouse.down` and `vm.key.down` steps pressed and no later step released,
-also those of the steps of a `vm.batch` step that ran (a batch that stopped
-at a failed step has released its own already); a run that passes leaves
-them as its steps left them.
+`vm.mouse.down` and `vm.key.down` steps pressed and no later step released:
+also those of a step whose op ran and whose expectation did not hold, and
+those of the steps of a `vm.batch` step that ran (a batch that stopped at a
+failed step, or that was cancelled, has released its own already); a run
+that passes leaves them as its steps left them.
 
 Errors and results: everything that prevents step 1 from starting answers with
 an error (`ok: false`): an unreadable, oversized (over 4 MiB) or malformed

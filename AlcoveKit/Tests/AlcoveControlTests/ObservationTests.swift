@@ -520,6 +520,20 @@ final class ObservationTests: XCTestCase {
                               .key(mac: a, q: nil, down: true), .key(mac: a, q: nil, down: false)])
     }
 
+    func testABatchCancelledDuringItsObservationReleasesWhatItsDownStepsPressed() async throws {
+        let (h, t) = await setup(frames: [solid(320, 192, 40)])
+        let shift = ObservationTests.shift
+        let batch = Task {
+            try await h.handle(op: "vm.batch", params: ["name": "Win", "steps": [["op": "vm.key.down", "key": "shift"]],
+                                                        "observe": "summary", "settleMs": 10000, "settleTimeoutMs": 30000])
+        }
+        while await t.sent.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        batch.cancel()
+        do { _ = try await batch.value; XCTFail("expected cancellation") } catch is CancellationError {}
+        let sent = await t.sent
+        XCTAssertEqual(sent, [.key(mac: shift, q: nil, down: true), .key(mac: shift, q: nil, down: false)])
+    }
+
     func testObservationHoldsInputGate() async throws {
         let base = solid(320, 192, 40)
         let (h, t) = await setup(frames: [base])

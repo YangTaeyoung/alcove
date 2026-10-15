@@ -1032,12 +1032,38 @@ final class ScriptTests: XCTestCase {
             "{\"op\": \"vm.key.press\", \"keys\": \"nosuchkey\"}, {\"op\": \"vm.mouse.down\", \"button\": \"middle\"}]}}"
         let failing = "{\"op\": \"vm.key.press\", \"params\": {\"keys\": \"nosuchkey\"}}"
         let failed = await run(rig, try script(steps([batch, failing])))
-        XCTAssertEqual(failed.failedStep, 2)
+        XCTAssertEqual(failed.failedStep, 1)
         let sent = await rig.target.sent
         XCTAssertEqual(ScriptTests.pressed(sent), [])
         XCTAssertEqual(sent.filter { if case .key = $0 { return true } else { return false } },
                        [.key(mac: 56, q: nil, down: true), .key(mac: 56, q: nil, down: false)])
         XCTAssertFalse(sent.contains { if case .btn = $0 { return true } else { return false } })
+    }
+
+    func testAFailedRunReleasesWhatAStepWhoseExpectationFailedPressed() async throws {
+        let rig = try await rig()
+        let never = "[{\"type\": \"file_exists\", \"path\": \"C:\\\\never\"}]"
+        let down = "{\"op\": \"vm.key.down\", \"params\": {\"key\": \"ctrl\"}, \"expect\": \(never), \"timeout\": 1}"
+        let failed = await run(rig, try script(steps([down])))
+        XCTAssertEqual(failed.failedStep, 1)
+        let sent = await rig.target.sent
+        XCTAssertEqual(ScriptTests.pressed(sent), [])
+        XCTAssertEqual(sent.last, .key(mac: 59, q: nil, down: false))
+    }
+
+    func testABatchStepThatStoppedAtAFailedStepFailsTheRunAndNamesThatStep() async throws {
+        let rig = try await rig()
+        let batch = "{\"label\": \"keys\", \"op\": \"vm.batch\", \"params\": {\"steps\": [{\"op\": \"vm.key.down\", \"key\": \"shift\"}, " +
+            "{\"op\": \"vm.key.press\", \"keys\": \"nosuchkey\"}]}}"
+        let result = await run(rig, try script(steps([batch, exec("after")])))
+        XCTAssertFalse(result.passed)
+        XCTAssertEqual(result.failedStep, 1)
+        XCTAssertEqual(result.error, "step 1 (keys) failed: vm.batch stopped at its step 1 (vm.key.press, counted from 0): "
+                       + "bad key spec 'nosuchkey': unknown key 'nosuchkey'; use a key name such as ctrl, shift, enter or a letter")
+        XCTAssertEqual(result.stepResults[0]["ok"]?.boolValue, false)
+        XCTAssertEqual(execCommands(rig), [])
+        let sent = await rig.target.sent
+        XCTAssertEqual(ScriptTests.pressed(sent), [])
     }
 
     /// The buttons and keys that `sent` leaves pressed, in the order they went down.
