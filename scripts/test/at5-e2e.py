@@ -184,6 +184,7 @@ class Run:
         self.touched_key = False
         self.agent_restarted = False
         self.dump = None
+        self.dump_listed = None
         self.probe_path = None
 
     # calls
@@ -386,7 +387,7 @@ class Run:
 
     def crash(self):
         """Crashes a fresh fixture with dumps enabled; returns (pid, the listing row of its dump, seconds from the click to the
-        listing, the click's reply)."""
+        listing)."""
         window = self.fixture(fresh=True)
         pid = window["pid"]
         if EXE not in self.enabled:
@@ -404,9 +405,18 @@ class Run:
                 break
             expect(time.monotonic() - began < 30, f"vm.crash_dumps.list has no dump of pid {pid} 30 s after the click on Crash: {self.dumps()!r}")
             time.sleep(1)
-        listed = time.monotonic() - began
+        self.dump_listed = time.monotonic()
+        listed = self.dump_listed - began
         self.dump = rows[0]["file"]
-        return pid, rows[0], listed, clicked
+        return pid, rows[0], listed
+
+    def since_without_dump(self):
+        """A sinceMinutes of 1 that leaves the run's dump out of a bundle: waits until the dump was listed more than 65 s ago."""
+        if self.dump_listed is not None:
+            left = self.dump_listed + 65 - time.monotonic()
+            if left > 0:
+                time.sleep(left)
+        return 1
 
     def collect(self, reply_timeout=300, **params):
         began = time.monotonic()
@@ -596,7 +606,6 @@ def _(run):
     seqs = [e["seq"] for e in entries]
     expect(seqs == list(range(1, len(entries) + 1)) and all(a["ms"] <= b["ms"] for a, b in zip(entries, entries[1:])),
            f"the trace lines have seq {seqs!r} and ms {[e['ms'] for e in entries]!r}")
-    framed = {}
     for op in ("vm.ui.type", "vm.ui.click"):
         ops = [e for e in entries if e["op"] == op]
         expect(len(ops) == 1 and ops[0]["ok"] is True, f"the trace has {len(ops)} lines for {op}: {ops!r}")
@@ -605,9 +614,10 @@ def _(run):
             expect(path and os.path.isfile(os.path.join(folder, path)), f"the {op} line names the {side} frame {path!r}, which is not a file in {folder}")
             with open(os.path.join(folder, path), "rb") as f:
                 expect(f.read(3) == b"\xff\xd8\xff", f"the {side} frame {path} of {op} is not a JPEG")
-            framed[f"{op} {side}"] = path
-    expect(not any(MESSAGE in json.dumps(e, ensure_ascii=False) and e["op"] == "vm.ui.type" and e["params"].get("text") != MESSAGE for e in entries),
-           "the trace changed the typed message")
+    typed = [e for e in entries if e["op"] == "vm.ui.type"][0]
+    expect(typed["params"].get("text") == MESSAGE and typed["params"].get("clear") is True,
+           f"the vm.ui.type line holds the params {typed['params']!r}; the Message field is not a password element, so the trace keeps "
+           f"text {MESSAGE!r} as typed")
     return (f"start {start_s:.2f} s, stop {stop_s:.2f} s; video {size} bytes, {probe['duration']:.2f} s, {probe['width']}x{probe['height']}; "
             f"{stopped['ops']} trace lines, {stopped['frames']} frames, dropped {stopped.get('droppedFrames')}")
 
@@ -654,7 +664,7 @@ def _(run):
     key = run.local_dumps()
     expect(key == {"": {"AlcoveCreated": "0x1"}, EXE: {"AlcoveCreated": "0x1", "DumpFolder": DUMPS, "DumpCount": "0x5", "DumpType": "0x1"}},
            f"reg query of {LOCAL_DUMPS} shows {key!r}")
-    pid, row, listed, clicked = run.crash()
+    pid, row, listed = run.crash()
     expect(row["bytes"] > 0 and re.fullmatch(re.escape(EXE) + r"(\(\d+\))?\." + str(pid) + r"\.dmp", row["file"]), f"the dump is listed as {row!r}")
     target = run.fresh_path("dumps", row["file"])
     began = time.monotonic()
@@ -739,22 +749,27 @@ def _(run):
 
 @check("vm.collect_diagnostics 8 s after a click on Hang names the fixture window as not responding")
 def _(run):
+    since = run.since_without_dump()
     window = run.fixture(fresh=True)
     run.focus()
     run.click("Hang")
     time.sleep(8)
     bundle = run.fresh_path("bundles", "hang")
-    r, took = run.collect(dir=bundle, processName="alcove-fixture")
+    r, took = run.collect(dir=bundle, processName="alcove-fixture", sinceMinutes=since)
     rows = lines(r["summary"])
     stuck = [l for l in rows if l.startswith("window not responding: ")]
     expect(any(f'"{TITLE}" (pid {window["pid"]}, {EXE})' in l for l in stuck) and took < 115,
            f"the collection took {took:.1f} s and its summary reads:\n{r['summary']}")
+    expect(not [f for f in r["files"] if f.startswith("dumps/")], f"the bundle of sinceMinutes {since} holds dumps: {sorted(r['files'])!r}")
     with open(os.path.join(bundle, "windows.json"), encoding="utf-8") as f:
         listed = [w for w in json.load(f)["windows"] if w["pid"] == window["pid"]]
     expect(listed and listed[0]["responding"] is False, f"windows.json lists the fixture as {listed!r}")
     tree = "ui-tree.txt" if "ui-tree.txt" in r["files"] else "ui-tree.error.txt"
+    expect(tree in r["files"], f"the bundle holds neither ui-tree.txt nor ui-tree.error.txt: {sorted(r['files'])!r}")
     with open(os.path.join(bundle, tree), encoding="utf-8") as f:
         tree_text = f.read().strip()
+    expect(tree == "ui-tree.txt" or "is not responding" in tree_text,
+           f"ui-tree.error.txt reads {tree_text!r}; expected the UI helper's sentence that the window is not responding")
     left = run.end(run.c, lambda: [p for p in run.own_processes() if p["pid"] == window["pid"]])
     expect(not left, f"the hung fixture pid {window['pid']} still runs 15 s after vm.process.kill")
     run.fixture_pids.discard(window["pid"])
@@ -769,10 +784,12 @@ def _(run):
     block = f"{marker['time']} error {SOURCE} (999)\n  {MARKER}"
     expect(not err and not images and block in out, f"alcove_event_log answered error={err} {out!r}; expected the block {block!r}")
     bundle = run.fresh_path("bundles", "mcp")
-    err, out, images = m.call("alcove_collect_diagnostics", {"name": run.vm, "dir": bundle, "since_minutes": 5, "process_name": "alcove-fixture"}, timeout=400)
+    since = run.since_without_dump()
+    err, out, images = m.call("alcove_collect_diagnostics", {"name": run.vm, "dir": bundle, "since_minutes": since, "process_name": "alcove-fixture"},
+                              timeout=400)
     rows = out.split("\n")
-    expect(not err and not images and f"directory: {bundle}" in rows and "files:" in rows and "  summary.txt" in rows,
-           f"alcove_collect_diagnostics answered error={err} {out!r}")
+    expect(not err and not images and f"directory: {bundle}" in rows and "files:" in rows and "  summary.txt" in rows
+           and not [row for row in rows if row.startswith("  dumps/")], f"alcove_collect_diagnostics answered error={err} {out!r}")
     with open(os.path.join(bundle, "summary.txt"), encoding="utf-8") as f:
         summary = f.read()
     expect(out.startswith(summary.rstrip("\n") + "\ndirectory: "), "the tool text does not start with summary.txt")
@@ -882,13 +899,11 @@ def _(run):
     run.call("vm.record.start", dir=folder)
     began = time.monotonic()
     rounds = 0
-    statuses = []
     while time.monotonic() - began < LONG_RECORDING_S:
         rounds += 1
         run.click("Titles")
         run.send_message(f"round {rounds} " + MESSAGE)
         status = run.call("vm.record.status")
-        statuses.append(status["seconds"])
         expect(status["recording"] is True and status["writeErrors"] == 0 and "videoError" not in status and "lastWriteError" not in status,
                f"vm.record.status after {time.monotonic() - began:.0f} s answered {status!r}")
         time.sleep(3)

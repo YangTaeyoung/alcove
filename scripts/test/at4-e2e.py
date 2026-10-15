@@ -24,13 +24,19 @@ The checks start the fixture app from C:\\alcove-apps\\alcove-e2e-app, Edge
 with the profile folder C:\\alcove-e2e\\edge-profile, Notepad, Character Map
 and the Services console, create junctions under C:\\alcove-e2e and restart
 the guest agent once through its scheduled task. Before Notepad starts, the
-files of its saved tabs are copied to a temporary directory on the host. However the run ends, a second
-connection stops the recording of the run, ends the processes the run started
-(the ones that run from the two folders, the Edge processes of that profile,
-and the Notepad, Character Map and console processes that were not running
-before), puts Notepad's saved tabs and the clipboard text back, removes the
-junctions with rmdir and deletes the two folders and the host directory of the
-run. When a step of that cannot finish, the script prints
+files of its saved tabs are copied to a temporary directory on the host.
+Check 19 stops the VM through the control server and starts it again when
+the data volume has at least 10 GiB free; check 20 takes the snapshot
+at4-events, restores and deletes it when the data volume has at least 18 GiB
+free. Each is skipped otherwise. However the run ends, a second connection
+starts the VM when the run left it stopped and waits for its guest tools,
+deletes the snapshot at4-events when the run sent vm.snapshot.create and
+vm.snapshot.list lists it, stops the recording of the run, ends the processes
+the run started (the ones that run from the two folders, the Edge processes
+of that profile, and the Notepad, Character Map and console processes that
+were not running before), puts Notepad's saved tabs and the clipboard text
+back, removes the junctions with rmdir and deletes the two folders and the
+host directory of the run. When a step of that cannot finish, the script prints
 `cleanup failed: ...` with what to do by hand and exits 1. SIGTERM, SIGHUP
 and SIGINT print `interrupted; restoring the guest...`, run the same cleanup
 and exit with 128 plus the signal's number (143, 129, 130); SIGHUP stays ignored
@@ -74,6 +80,18 @@ CHARMAP_TITLE = "Character Map"
 ELEVATED_FILE = GUEST + r"\elevated.txt"
 ELEVATED_TEXT = "elevated window"
 HIGH_INTEGRITY = 0x3000
+DATA_VOLUME = "/System/Volumes/Data"
+SNAPSHOT = "at4-events"
+SNAPSHOT_FREE_GIB = 18
+START_FREE_GIB = 10
+CMD = r"C:\Windows\System32\cmd.exe"
+INSTALL_SCRIPT = ("@echo off\r\n"
+                  "if \"%~1\"==\"fail\" (\r\n"
+                  "  echo installer failed on purpose>&2\r\n"
+                  "  exit /b 7\r\n"
+                  ")\r\n"
+                  "echo installed in %CD%> installed.txt\r\n"
+                  "exit /b 3010\r\n")
 NOTEPAD_STATE = "~/AppData/Local/Packages/Microsoft.WindowsNotepad_8wekyb3d8bbwe/LocalState"
 NOTEPAD_STATE_EXISTS = r"Test-Path -LiteralPath (Join-Path $HOME 'AppData\Local\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe\LocalState')"
 TRACKED = {"notepad": "notepad.exe", "mmc": "mmc.exe", "charmap": "charmap.exe"}
@@ -213,6 +231,11 @@ def under(path, folder):
     return path.lower().startswith(folder.lower() + "\\")
 
 
+def free_gib():
+    s = os.statvfs(DATA_VOLUME)
+    return s.f_bavail * s.f_frsize / (1 << 30)
+
+
 class Run:
     """The control connection, the VM and what the checks started or changed in the guest and on the host."""
 
@@ -237,6 +260,8 @@ class Run:
         self.notepad_names = None
         self.notepad_dirs = []
         self.title_bar_clicks = 0
+        self.vm_left_stopped = False
+        self.snapshot_begun = False
 
     # calls
 
@@ -260,6 +285,37 @@ class Run:
 
     def wait_for(self, conditions, timeout=30, **params):
         return self.call("vm.wait_for", timeout + 60, conditions=conditions, timeout=timeout, **params)
+
+    def start_vm(self, c=None):
+        """Starts the VM and waits until it runs with its guest tools connected; returns the seconds that took."""
+        c = c or self.c
+        began = time.monotonic()
+        c.call("vm.start", 300, name=self.vm)
+        while True:
+            status = c.call("vm.status", 60, name=self.vm)
+            if status.get("state") == "running" and status.get("tools") is True:
+                break
+            expect(time.monotonic() - began < 300, f"the guest tools are not connected 300 s after vm.start: {status!r}")
+            time.sleep(2)
+        self.vm_left_stopped = False
+        return time.monotonic() - began
+
+    def closed_dialog_seen(self, timeout):
+        """vm.wait_for of a window.closed event of the fixture dialog without since."""
+        return self.wait_for([{"type": "event", "event": "window.closed", "titleContains": DIALOG}], timeout=timeout)
+
+    def open_and_close_dialog(self):
+        """Opens and closes the fixture dialog; returns the seq of its window.closed event, which a wait without since finds."""
+        self.fixture()
+        self.focus()
+        self.click("Dialog")
+        there = self.wait_for([{"type": "ui_exists", "window": DIALOG, "role": "Button", "name": "OK"}], timeout=15)
+        expect(there["matched"] == 0, f"the dialog did not open: {there!r}")
+        self.close_dialog()
+        seen = self.closed_dialog_seen(15)
+        expect(seen["matched"] == 0 and seen["detail"]["window"]["title"] == DIALOG,
+               f"right after vm.window.action close, vm.wait_for event window.closed of {DIALOG!r} without since answered {seen!r}")
+        return seen["detail"]["seq"]
 
     def client(self):
         """A further connection to the control server, closed by the cleanup."""
@@ -579,6 +635,13 @@ class Run:
 
     def restore(self, c, touched, by_hand):
         """Puts the guest back; returns whether the guest could be reached."""
+        if self.vm_left_stopped and c.call("vm.status", 60, name=self.vm).get("state") == "stopped":
+            try:
+                self.start_vm(c)
+            except (ControlError, Failure) as e:
+                self.cleanup_error(f"'{self.vm}' was stopped by this run and could not be started again ({e}); start it with "
+                                   f"scripts/test/ctl.py vm.start, then {by_hand}")
+                return False
         end = time.time() + (120 if self.agent_restarted else 0)
         while True:
             status = c.call("vm.status", 60, name=self.vm)
@@ -589,6 +652,12 @@ class Run:
             if touched:
                 self.cleanup_error(f"'{self.vm}' is {status.get('state')} with tools {status.get('tools')!r}, so the guest was not cleaned; start it, {by_hand}")
             return False
+        if self.snapshot_begun:
+            try:
+                if SNAPSHOT in [s["name"] for s in c.call("vm.snapshot.list", 60, name=self.vm)["snapshots"]]:
+                    c.call("vm.snapshot.delete", 600, name=self.vm, snapshot=SNAPSHOT)
+            except ControlError as e:
+                self.cleanup_error(f"vm.snapshot.delete of {SNAPSHOT} answered {e}; delete the snapshot with scripts/test/ctl.py vm.snapshot.delete")
         if self.recording:
             try:
                 c.call("vm.record.stop", 120, name=self.vm)
@@ -1331,6 +1400,89 @@ def _(run):
            f"alcove_screenshot with marks answered error={err} {out!r} with {len(images)} images; the window is {window['w']}x{window['h']}")
     m.close()
     return f"found {ref}; clicked; Character Map pid {started.group(1)}; events since {since}; {marked[0]}"
+
+
+@check("vm.deploy of a single file writes it into guestDir with the marker and starts it; a second deploy sends nothing and restarts it")
+def _(run):
+    run.prepare_guest()
+    source = os.path.join(run.app_source(), EXE)
+    size = os.path.getsize(source)
+    folder = GUEST + r"\single"
+    launch = {"exe": EXE, "args": ["--log", GUEST + r"\single.log"]}
+    first = run.call("vm.deploy", 600, path=source, guestDir=folder, launch=launch)
+    expect(first["guestDir"] == folder and first["sent"] == [EXE] and first["skipped"] == 0 and first["bytes"] == size
+           and (first.get("window") or {}).get("title") == TITLE, f"the deploy of the file {source} answered {first!r}")
+    expect(run.names(folder) == [MARKER, EXE] and run.read(folder + "\\" + MARKER) == MARKER_TEXT,
+           f"{folder} holds {run.names(folder)!r} after the deploy of one file")
+    second = run.call("vm.deploy", 600, path=source, guestDir=folder, launch=launch)
+    expect(second["sent"] == [] and second["skipped"] == 1 and second["bytes"] == 0 and second["pid"] != first["pid"]
+           and (second.get("window") or {}).get("pid") == second["pid"], f"a second deploy of the unchanged file answered {second!r}")
+    running = {p["pid"] for p in run.own_processes() if under(p["path"] or "", folder)}
+    expect(running == {second["pid"]}, f"after the second deploy the processes from {folder} are {sorted(running)}; the second deploy started {second['pid']}")
+    left = run.end(run.c, lambda: [p for p in run.own_processes() if under(p["path"] or "", folder)])
+    expect(not left, f"the copy in {folder} still runs 15 s after vm.process.kill: {[p['pid'] for p in left]!r}")
+    return f"{size} bytes to {folder} as pid {first['pid']}; then sent nothing and restarted as pid {second['pid']}"
+
+
+@check("vm.deploy with an exe installer runs it in guestDir and returns 3010 as installCode, and names the code and output of a failing one")
+def _(run):
+    run.prepare_guest()
+    source = run.small_source("alcove-e2e-installer", {"install.cmd": INSTALL_SCRIPT})
+    folder = GUEST + r"\installer"
+    r = run.call("vm.deploy", 1000, path=source, guestDir=folder, install={"kind": "exe", "file": CMD, "args": ["/d", "/c", "install.cmd"]})
+    expect(r["guestDir"] == folder and r["sent"] == ["install.cmd"] and r.get("installCode") == 3010 and "pid" not in r,
+           f"the deploy with the installer answered {r!r}")
+    written = run.read(folder + r"\installed.txt").strip()
+    expect(written.lower() == f"installed in {folder}".lower(), f"the installer wrote {written!r}; it runs in {folder}")
+    message = run.refusal("vm.deploy", path=source, guestDir=folder, install={"kind": "exe", "file": CMD, "args": ["/d", "/c", "install.cmd", "fail"]})
+    expect(message == f"installer '{CMD}' exited with code 7: installer failed on purpose; fix the installer or its arguments and call vm.deploy again",
+           f"a deploy whose installer exits with code 7 failed with {message!r}")
+    return f"installCode 3010, the installer ran in {folder}; code 7 refused with the installer's output"
+
+
+@check("after vm.stop and vm.start an event condition without since does not match an event from before the stop, which vm.events still lists")
+def _(run):
+    free = free_gib()
+    if free < START_FREE_GIB:
+        raise Skipped(f"{free:.1f} GiB are free on {DATA_VOLUME}; a start of the VM needs {START_FREE_GIB} GiB")
+    closed = run.open_and_close_dialog()
+    run.agent_restarted = True
+    run.vm_left_stopped = True
+    stopped = run.call("vm.stop", 300)
+    expect(stopped["state"] == "stopped" and stopped["eventSeq"] >= closed, f"vm.stop answered {stopped!r}; the dialog's window.closed is event {closed}")
+    took = run.start_vm()
+    run.fixture_pids.clear()
+    late = run.closed_dialog_seen(3)
+    expect(late["matched"] == -1 and "problems" not in late,
+           f"after vm.stop and vm.start, vm.wait_for event window.closed of {DIALOG!r} without since answered {late!r}")
+    kept = [e for e in run.call("vm.events", since=closed - 1)["events"] if e["seq"] == closed]
+    expect(kept and kept[0]["name"] == "window.closed", f"vm.events no longer lists the event {closed} of before the stop: {kept!r}")
+    return f"window.closed {closed} before the stop; vm.stop eventSeq {stopped['eventSeq']}; tools after {took:.0f} s; the wait without since ran out"
+
+
+@check("after vm.snapshot.restore an event condition without since does not match an event from before the restore")
+def _(run):
+    free = free_gib()
+    if free < SNAPSHOT_FREE_GIB:
+        raise Skipped(f"{free:.1f} GiB are free on {DATA_VOLUME}; a snapshot needs {SNAPSHOT_FREE_GIB} GiB")
+    names = [s["name"] for s in run.call("vm.snapshot.list")["snapshots"]]
+    expect(SNAPSHOT not in names, f"'{run.vm}' already has a snapshot named {SNAPSHOT}; delete it with scripts/test/ctl.py vm.snapshot.delete and run this script again")
+    run.fixture()
+    run.snapshot_begun = True
+    run.call("vm.snapshot.create", 900, snapshot=SNAPSHOT)
+    after = free_gib()
+    expect(after >= START_FREE_GIB, f"{after:.1f} GiB are free after the snapshot; free disk space and run this script again")
+    closed = run.open_and_close_dialog()
+    run.agent_restarted = True
+    restored = run.call("vm.snapshot.restore", 900, snapshot=SNAPSHOT, waitTools=120)
+    expect(restored["tools"] is True and restored["eventSeq"] >= closed,
+           f"vm.snapshot.restore answered {restored!r}; the dialog's window.closed is event {closed}")
+    late = run.closed_dialog_seen(3)
+    expect(late["matched"] == -1 and "problems" not in late,
+           f"after vm.snapshot.restore, vm.wait_for event window.closed of {DIALOG!r} without since answered {late!r}")
+    run.call("vm.snapshot.delete", 600, snapshot=SNAPSHOT)
+    run.snapshot_begun = False
+    return f"window.closed {closed} before the restore; vm.snapshot.restore eventSeq {restored['eventSeq']}; {free:.1f} GiB free before the snapshot"
 
 
 def refusal_to_start(client, vm):
