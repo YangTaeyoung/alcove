@@ -22,7 +22,7 @@ Usage: agent-rpc-windows.py [--vm NAME] [--agent-port N] [--only N[,N...]]
 import argparse, base64, hashlib, json, ntpath, os, select, signal, socket, sys, time
 
 sys.dont_write_bytecode = True
-from alcove_ctl import ignore_stop_signals, stop_signal_handlers
+from alcove_ctl import STOP_SIGNALS, ignore_stop_signals, stop_signal_handlers
 from agent_key import AgentKeyError, agent_key, check_answer, first_message
 
 BASE = r"C:\alcove-e2e\rpc"
@@ -151,8 +151,13 @@ class Run:
             self.clipboard = None
 
     def start(self, **params):
-        r = self.a.call("exec.start", **params)
-        self.jobs.append(r["job"])
+        """Starts a job and records it for the cleanup; SIGTERM, SIGHUP and SIGINT are held until it is recorded."""
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        try:
+            r = self.a.call("exec.start", **params)
+            self.jobs.append(r["job"])
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
         return r["job"], r["pid"]
 
     def read_until(self, job, done, timeout=30):
