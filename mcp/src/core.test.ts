@@ -48,3 +48,12 @@ test("alcove_start_vm stops waiting and prints the refusal sentence without nami
     assert.deepEqual(calls.map((c) => c.op), ["vm.start", "vm.status"]);
   }
 });
+
+test("alcove_stop_vm prints the capture warning of vm.stop with tool names", async () => {
+  const warning = "the guest keeps the proxy settings and the CA certificate of the capture (the guest tools were not reachable); call vm.http.stop once vm.status shows tools";
+  const { run } = rig(register, { state: "stopped", captureEnded: true, warning });
+  assert.equal(textOf(await run("alcove_stop_vm", { name: "Win" })),
+    "Win: stopped\nwarning: the guest keeps the proxy settings and the CA certificate of the capture (the guest tools were not reachable); call alcove_http_capture_stop once alcove_vm_status shows tools");
+  const plain = rig(register, { state: "stopped" });
+  assert.equal(textOf(await plain.run("alcove_stop_vm", { name: "Win" })), "Win: stopped");
+});

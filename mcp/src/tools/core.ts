@@ -2,7 +2,7 @@
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
 import { actionResult, actionTimeout, changeResult, observeParams, observePayload, marksLegend, screenshotCaption, type ObserveArgs } from "../observation.js";
-import { clip, commandParams, commandPayload, fail, regionSchema, startTimeout, stdinParam, streamSections, text, typeMs, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
+import { clip, commandParams, commandPayload, fail, regionSchema, startTimeout, stdinParam, streamSections, text, toolSentence, typeMs, uiCallTimeout, vmName, type Registrar } from "../toolkit.js";
 
 /** What the text of a clipped command output says to read the rest. */
 const EXEC_CUT_HINT = "write the output to a file in the guest and read it in parts with alcove_fs_read, or run the command with alcove_exec_start and page it with alcove_exec_read";
@@ -107,14 +107,15 @@ export function register(r: Registrar, client: ControlClient): void {
     "alcove_stop_vm",
     {
       title: "Stop VM",
-      description: "Shut a VM down. By default it presses the ACPI power button and, when the guest has not shut down after 60 s, ends the engine (unsaved guest work is lost); force=true ends the engine at once.",
+      description: "Shut a VM down. By default it presses the ACPI power button and, when the guest has not shut down after 60 s, ends the engine (unsaved guest work is lost); force=true ends the engine at once. Returns the state, and a warning when the guest keeps the proxy settings of an HTTP capture that the stop ended.",
       inputSchema: { name: vmName, force: z.boolean().optional().describe("Kill immediately instead of a graceful shutdown") },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ name, force }) => {
       try {
         const r = await client.call("vm.stop", { name, force: force ?? false }, 180000);
-        return text(`${name}: ${r.state}`);
+        const warning = typeof r.warning === "string" ? `\nwarning: ${toolSentence(r.warning)}` : "";
+        return text(`${name}: ${r.state}${warning}`);
       } catch (e) {
         return fail(e);
       }
