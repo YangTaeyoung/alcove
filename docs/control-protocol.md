@@ -847,7 +847,8 @@ program with vm.wait_for (process_started or text_visible)"` in place of
   machine's variables and the folders of the account's profile, with `env` on
   top, as for `vm.exec` (see
   [the agent protocol](agent-protocol.md#environment-of-a-command-on-windows));
-  pass what the program needs with `env`. On Linux it runs as
+  pass what the program needs with `env`. A batch file runs through
+  `cmd.exe /D` as for `vm.exec`. On Linux it runs as
   the user of the guest's desktop session, in that session's environment
   (`WAYLAND_DISPLAY` or `DISPLAY`, `XDG_RUNTIME_DIR`, the session bus),
   in a session of its own. When the guest has systemd 254 or later, the session's runtime folder holds the user bus and the program is an executable file, it starts through `systemd-run --user --scope` in the user's service manager, so a restart of the guest tools does not end it; otherwise it runs in the guest tools' service and ends with it. See [the agent protocol](agent-protocol.md#the-desktop-session-linux). Its
@@ -2656,6 +2657,13 @@ and the `error` of its `problems`).
   'none' or leave shell out`. One of the two is required.
 - `cmd` is `cmd.exe /D /S /C "<command>"` of the system folder: it runs no
   `AutoRun` command of the registry, and the command runs as typed.
+- On Windows a batch file as `argv[0]` (`.bat` or `.cmd`, also a bare name
+  such as `npm` that `PATHEXT` turns into `npm.cmd`) runs through `cmd.exe
+  /D` of the system folder with each argument quoted for `cmd.exe`; an
+  argument with a line break or NUL is refused (see
+  [the agent protocol](agent-protocol.md#batch-files-on-windows)). The same
+  holds for `vm.app.launch` and for the `install` and `launch` files of
+  `vm.deploy`.
 - `powershell` is Windows PowerShell of the system folder with no profile,
   the `Restricted` execution policy (commands run, `.ps1` files and script
   modules do not) and only its own module folder in `PSModulePath`; see

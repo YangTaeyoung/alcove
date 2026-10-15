@@ -205,6 +205,11 @@ func (s *Server) appLaunch(ctx context.Context, req proto.Message) (proto.Messag
 		}
 		c.Env = append(base, extra...)
 	}
+	if file, err := prepareProgram(c); err != nil {
+		return nil, err
+	} else if file != "" {
+		started = file
+	}
 
 	watch := waitMs > 0 && s.opt.UI != nil
 	before := map[string]bool{}

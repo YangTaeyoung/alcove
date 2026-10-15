@@ -135,19 +135,7 @@ func envValue(env []string, name string) string {
 // The current directory is not searched. ok is false when no folder holds
 // such a file.
 func lookWindowsProgram(name string, env []string, isFile func(string) bool) (string, bool) {
-	var exts []string
-	for _, e := range strings.Split(strings.ToLower(envValue(env, "PATHEXT")), ";") {
-		if e == "" {
-			continue
-		}
-		if e[0] != '.' {
-			e = "." + e
-		}
-		exts = append(exts, e)
-	}
-	if len(exts) == 0 {
-		exts = []string{".com", ".exe", ".bat", ".cmd"}
-	}
+	exts := pathExts(env)
 	hasExt := strings.Contains(name, ".")
 	for _, dir := range strings.Split(envValue(env, "PATH"), ";") {
 		if !strings.HasPrefix(dir, `\\`) && (!sysfolder.HasDrive(dir) || len(dir) < 3 || dir[2] != '\\') {

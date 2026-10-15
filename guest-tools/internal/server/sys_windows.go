@@ -56,6 +56,26 @@ func systemCommand(name string, args ...string) (*exec.Cmd, error) {
 	return c, nil
 }
 
+// prepareProgram applies windowsStart to c with the System32 folder of
+// systemFolders, GetFullPathNameW and isFile, passes the command line of a
+// batch file as c's raw command line, and returns the file the process
+// runs.
+func prepareProgram(c *exec.Cmd) (string, error) {
+	_, system, sysErr := systemFolders(windowsFolder)
+	file, line, err := windowsStart(c, system, syscall.FullPath, isFile)
+	if err != nil {
+		return "", err
+	}
+	if line == "" {
+		return file, nil
+	}
+	if sysErr != nil {
+		return "", fmt.Errorf("cmd.exe could not be located to run the batch file '%s' (%v); restart alcove-agent and retry", file, sysErr)
+	}
+	setRawCommandLine(c, line)
+	return file, nil
+}
+
 func taskkill(args ...string) ([]byte, error) {
 	c, err := systemCommand("taskkill.exe", args...)
 	if err != nil {

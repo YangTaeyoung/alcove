@@ -175,8 +175,8 @@ func resolveHomePath(home, p string) string {
 }
 
 // newCommand builds a request's command with the working directory resolved
-// (the home directory without cwd), no console window and its own process
-// tree.
+// (the home directory without cwd), the program prepared by prepareProgram,
+// no console window and its own process tree.
 func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
 	sys, err := agentSystem()
 	if err != nil {
@@ -190,6 +190,9 @@ func (s *Server) newCommand(req proto.Message) (*exec.Cmd, error) {
 		c.Dir = resolveHomePath(s.homeDir(), c.Dir)
 	} else {
 		c.Dir = s.homeDir()
+	}
+	if _, err := prepareProgram(c); err != nil {
+		return nil, err
 	}
 	hideWindow(c)
 	prepareTree(c)

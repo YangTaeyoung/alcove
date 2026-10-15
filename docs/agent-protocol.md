@@ -457,7 +457,8 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 ### Commands (`exec.run`, `exec.start`)
 
 - With `argv` the program `argv[0]` starts directly with the remaining
-  elements as arguments. `shell` is then left out or `none`; another `shell`
+  elements as arguments; on Windows a batch file starts through `cmd.exe /D`
+  (see [Batch files on Windows](#batch-files-on-windows)). `shell` is then left out or `none`; another `shell`
   answers `shell '<shell>' does not run argv; pass shell 'none' or leave shell out`,
   and `cmd` together with `argv` answers `pass cmd or argv, not both`.
   `shell: "none"` without `argv` is an error.
@@ -567,6 +568,39 @@ agent's own processes take nothing of its environment either:
 [Windows PowerShell](#windows-powershell) get the environment of the system
 folders below, and the UI helper gets its own
 ([Windows and UI Automation](#windows-and-ui-automation-win-ui)).
+
+#### Batch files on Windows
+
+The program of `argv` (`exec.run`, `exec.start`) and of `app.launch` is read
+as a file before it starts:
+
+- A path with `\`, `/` or `:` whose last element has no extension gets the
+  first extension of the `PATHEXT` of the
+  [environment of a command](#environment-of-a-command-on-windows) for which
+  a file exists, joined with the working directory when it is relative.
+- When the path, joined with the working directory and made absolute by
+  Windows (`GetFullPathNameW`, which also drops trailing dots and spaces),
+  ends in `.bat` or `.cmd` without regard to case, the agent starts
+  `<System32>\cmd.exe` itself with the command line
+  `cmd.exe /D /E:ON /V:OFF /S /C ""<script>" <arguments>"`. `/D` keeps
+  `cmd.exe` from running the `AutoRun` commands of the registry, which the
+  start of a batch file by Windows itself would run. A bare name found
+  through `PATHEXT`, such as `npm` for `npm.cmd`, counts too.
+- Each argument is written for `cmd.exe`: in quotes when it is empty, ends
+  in `\`, or holds a control character or an ASCII character other than
+  letters, digits and `#$*+-./:?@\_`. Inside the quotes a `"` becomes `""`
+  after the backslashes before it are doubled, a `%` becomes `%%cd:~,%` so
+  that no variable is expanded, and the backslashes before the closing quote
+  are doubled; `!` stays literal (`/V:OFF`). `%~1` in the batch file gives
+  the argument back, with a `"` in it as `""` and a trailing `\` doubled.
+- An argument with CR, LF or NUL answers
+  `argument <n> of the batch file '<script>' holds a line break or NUL, which cmd.exe cannot pass to a batch file; pass it another way, such as in env, or run the batch file with shell 'cmd' and quote the command yourself`.
+  When the System32 folder cannot be read the answer is
+  `cmd.exe could not be located to run the batch file '<script>' (<reason>); restart alcove-agent and retry`.
+- `exec.list` shows the `argv` as sent, and `process.exited` of `app.launch`
+  names the batch file.
+- A `cmd.exe` that the batch file or any other command starts itself without
+  `/d` still runs the `AutoRun` commands.
 
 #### Windows PowerShell
 
@@ -704,7 +738,9 @@ the same way:
   A name found in none of them answers
   `'<name>' is not in the system folders of PATH or under HKLM App Paths; pass the full path of the program`.
 - The program starts directly with `args` as its arguments and with a normal
-  window. Without `cwd` it runs in the directory of the program file; `cwd`
+  window; on Windows a batch file starts through `cmd.exe /D` (see
+  [Batch files on Windows](#batch-files-on-windows)) and `process.exited`
+  names the batch file. Without `cwd` it runs in the directory of the program file; `cwd`
   resolves like the `cwd` of `exec.run`. On Windows the program runs as the
   agent in the [environment of a command](#environment-of-a-command-on-windows),
   without the desktop user's `HKCU\Environment`, and `env` adds variables to

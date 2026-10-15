@@ -29,6 +29,9 @@ func agentHome() string {
 	return ""
 }
 
+// prepareProgram leaves c as it is and returns "".
+func prepareProgram(*exec.Cmd) (string, error) { return "", nil }
+
 func hideWindow(*exec.Cmd) {}
 
 // windowsFolder answers that this system has no Windows folder.
