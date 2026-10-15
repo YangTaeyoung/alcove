@@ -520,6 +520,16 @@ final class VideoRecorderTests: XCTestCase {
         XCTAssertNotNil(summary.json["droppedFrames"]?.intValue)
     }
 
+    func testVideoSecondsCountsTheAppendedFramesWhenTheFileLengthCannotBeRead() async throws {
+        let dir = base.appendingPathComponent("unreadable")
+        let recording = Recording(vm: "Win", directory: dir, fps: 10, video: true, maxSeconds: 60,
+                                  frames: { movingFrame(64, 64, step: 0) }, sink: UnreadableLengthSink(url: dir.appendingPathComponent("video.mp4")))
+        try await recording.start()
+        let summary = await recording.stop()
+        XCTAssertEqual(summary.video, dir.appendingPathComponent("video.mp4").path)
+        XCTAssertEqual(summary.videoSeconds, 2.3)
+    }
+
     func testRecordingWithoutVideoWritesNone() async throws {
         let dir = base.appendingPathComponent("novideo")
         let sink = ProbeSink()
@@ -678,4 +688,13 @@ private func movingFrame(_ width: Int, _ height: Int, step: Int) -> Frame {
         }
     }
     return Frame(width: width, height: height, pixels: pixels)
+}
+
+/// Writes a file that is not a movie and reports 2.34 s appended.
+private struct UnreadableLengthSink: VideoSink {
+    let url: URL
+    var appendedSeconds: Double { 2.34 }
+    func append(frame: Frame, at time: Duration) {}
+    func finish() async { try? Data("not a movie".utf8).write(to: url) }
+    func playedSeconds() async -> Double? { nil }
 }

@@ -11,7 +11,7 @@ protocol VideoSink: Sendable {
     var droppedFrames: Int { get }
     /// Seconds of video appended.
     var appendedSeconds: Double { get }
-    /// Seconds the file plays after `finish()`; nil when there is no file that opens as a movie.
+    /// Seconds the file plays after `finish()`; nil when its length cannot be read.
     func playedSeconds() async -> Double?
     /// A sentence describing why the video could not be written; nil when it can.
     var errorMessage: String? { get }
@@ -25,7 +25,7 @@ extension VideoSink {
     var keptFile: Bool { false }
     var droppedFrames: Int { 0 }
     var appendedSeconds: Double { 0 }
-    func playedSeconds() async -> Double? { appendedSeconds }
+    func playedSeconds() async -> Double? { nil }
     var errorMessage: String? { nil }
     func appendFinal(frame: Frame, at time: Duration) async { append(frame: frame, at: time) }
 }
@@ -297,7 +297,7 @@ actor Recording {
         let videoURL = directory.appendingPathComponent("video.mp4")
         let size = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int) ?? nil
         let hasVideo = video && (sink.errorMessage == nil || sink.keptFile) && (size ?? 0) > 0
-        let played = hasVideo ? await sink.playedSeconds() : nil
+        let played = hasVideo ? await sink.playedSeconds() ?? sink.appendedSeconds : nil
         return Summary(dir: directory.path, video: hasVideo ? videoURL.path : nil,
                        trace: directory.appendingPathComponent(TraceWriter.traceName).path, frames: frameCount,
                        seconds: (seconds * 10).rounded() / 10, ops: lineCount,
