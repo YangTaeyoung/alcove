@@ -437,20 +437,24 @@ func TestAHelperStartReleasesTheClaimsOfLaunchesThatAnswered(t *testing.T) {
 func TestAHelperStartDuringALaunchKeepsItsClaimAndTheAnswerReleasesTheHold(t *testing.T) {
 	old := window("0x10", "Program Manager", 4)
 	var s *Server
-	var heldAtStart, claimedAfterStart bool
+	var helperStart sync.Once
+	var startedWhileHeld, claimedAfterStart bool
 	ui := &windowsUI{list: func(n int) ([]any, error) {
 		if n == 0 {
 			return []any{old}, nil
 		}
-		if n == 2 {
-			// The listing after the first choice: a helper starts while the launch runs.
-			s.launchMu.Lock()
-			heldAtStart = s.claimed.held["0x20"]
-			s.launchMu.Unlock()
-			s.HandleUIStart()
-			s.launchMu.Lock()
-			claimedAfterStart = s.claimed.ids["0x20"]
-			s.launchMu.Unlock()
+		s.launchMu.Lock()
+		held := s.claimed.held["0x20"]
+		s.launchMu.Unlock()
+		if held {
+			// The first listing that finds 0x20 held: a helper starts while the launch runs.
+			helperStart.Do(func() {
+				startedWhileHeld = true
+				s.HandleUIStart()
+				s.launchMu.Lock()
+				claimedAfterStart = s.claimed.ids["0x20"]
+				s.launchMu.Unlock()
+			})
 		}
 		return []any{window("0x20", "Fixture", 77), old}, nil
 	}}
@@ -460,8 +464,8 @@ func TestAHelperStartDuringALaunchKeepsItsClaimAndTheAnswerReleasesTheHold(t *te
 	if w, _ := res["window"].(map[string]any); w["id"] != "0x20" {
 		t.Fatalf("res %v", res)
 	}
-	if !heldAtStart || !claimedAfterStart {
-		t.Fatalf("held before the helper start: %v, claimed after it: %v", heldAtStart, claimedAfterStart)
+	if !startedWhileHeld || !claimedAfterStart {
+		t.Fatalf("a helper started while 0x20 was held: %v, claimed after it: %v", startedWhileHeld, claimedAfterStart)
 	}
 	s.launchMu.Lock()
 	held, claimed := len(s.claimed.held), s.claimed.ids["0x20"]
