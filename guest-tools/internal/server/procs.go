@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
@@ -64,11 +67,91 @@ func procKill(_ context.Context, req proto.Message) (proto.Message, error) {
 	if name == "" {
 		return nil, fmt.Errorf("missing pid or name")
 	}
-	n, err := killByName(name, tree)
+	n, err := killNamed(name, tree)
+	var refused *killRefusedError
+	if errors.As(err, &refused) {
+		return nil, err
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot kill '%s': %v; call proc.list to check it", name, err)
 	}
 	return proto.Message{"killed": n}, nil
+}
+
+// killNamed kills the processes of a name for proc.kill.
+var killNamed = killByName
+
+// killRefusedError is the answer of a kill by name that some processes
+// refused.
+type killRefusedError struct{ text string }
+
+func (e *killRefusedError) Error() string { return e.text }
+
+// killRefusal is the error of a kill by name of which denied processes
+// refused access and killed processes ended.
+func killRefusal(name string, killed, denied int) error {
+	verb := "were"
+	if killed == 1 {
+		verb = "was"
+	}
+	return &killRefusedError{fmt.Sprintf("could not kill %d of the %d processes named '%s' because access was denied (%d %s killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry",
+		denied, killed+denied, name, killed, verb)}
+}
+
+// procEntry is a running process as a kill by name on Windows sees it.
+type procEntry struct {
+	PID, PPID int
+	Name      string
+	// Created is the creation time, zero when it is unknown.
+	Created time.Time
+}
+
+// nameKillTargets returns the processes a kill by name on Windows ends: those
+// whose name equals name without regard to case, with ".exe" added to a name
+// without an extension, and with tree their descendants, each child before
+// its parent. A process counts as a child of its parent only when it was not
+// created before the parent. self and the processes below it are never
+// targets.
+func nameKillTargets(procs []procEntry, name string, tree bool, self int) []int {
+	if filepath.Ext(name) == "" {
+		name += ".exe"
+	}
+	byPID := make(map[int]procEntry, len(procs))
+	for _, p := range procs {
+		byPID[p.PID] = p
+	}
+	children := map[int][]int{}
+	for _, p := range procs {
+		parent, ok := byPID[p.PPID]
+		if !ok || p.PPID == p.PID {
+			continue
+		}
+		if !p.Created.IsZero() && !parent.Created.IsZero() && p.Created.Before(parent.Created) {
+			continue
+		}
+		children[p.PPID] = append(children[p.PPID], p.PID)
+	}
+	seen := map[int]bool{self: true}
+	out := []int{}
+	var visit func(pid int)
+	visit = func(pid int) {
+		if seen[pid] {
+			return
+		}
+		seen[pid] = true
+		if tree {
+			for _, c := range children[pid] {
+				visit(c)
+			}
+		}
+		out = append(out, pid)
+	}
+	for _, p := range procs {
+		if strings.EqualFold(p.Name, name) {
+			visit(p.PID)
+		}
+	}
+	return out
 }
 
 func killPID(pid int) error {

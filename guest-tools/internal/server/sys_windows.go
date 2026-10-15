@@ -87,27 +87,77 @@ func listProcesses() ([]procInfo, error) {
 	return parseWindowsProcesses(out)
 }
 
-// killByName runs taskkill on the image name and counts its SUCCESS lines.
+// killByName terminates the nameKillTargets of the running processes and
+// returns how many ended. Processes that refuse access make it answer
+// killRefusal; other failures, such as a process that ended meanwhile, are
+// not counted.
 func killByName(name string, tree bool) (int, error) {
-	if filepath.Ext(name) == "" {
-		name += ".exe"
-	}
-	args := []string{"/F"}
-	if tree {
-		args = append(args, "/T")
-	}
-	out, err := taskkill(append(args, "/IM", name)...)
-	killed := 0
-	for _, line := range strings.Split(string(out), "\n") {
-		if l := strings.TrimSpace(line); strings.HasPrefix(l, "SUCCESS") || strings.HasPrefix(l, "성공") {
-			killed++
-		}
-	}
-	var ee *exec.ExitError
-	if err != nil && killed == 0 && !errors.As(err, &ee) {
+	procs, err := processEntries(tree)
+	if err != nil {
 		return 0, err
 	}
+	killed, denied := 0, 0
+	for _, pid := range nameKillTargets(procs, name, tree, os.Getpid()) {
+		switch err := terminateProcess(pid); {
+		case err == nil:
+			killed++
+		case errors.Is(err, syscall.ERROR_ACCESS_DENIED):
+			denied++
+		}
+	}
+	if denied > 0 {
+		return 0, killRefusal(name, killed, denied)
+	}
 	return killed, nil
+}
+
+// processQueryLimitedInformation is PROCESS_QUERY_LIMITED_INFORMATION.
+const processQueryLimitedInformation = 0x1000
+
+// processEntries lists the running processes with their image names and,
+// when created is set, their creation times where they can be read.
+func processEntries(created bool) ([]procEntry, error) {
+	snap, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.CloseHandle(snap)
+	var e syscall.ProcessEntry32
+	e.Size = uint32(unsafe.Sizeof(e))
+	var procs []procEntry
+	for err := syscall.Process32First(snap, &e); err == nil; err = syscall.Process32Next(snap, &e) {
+		p := procEntry{PID: int(e.ProcessID), PPID: int(e.ParentProcessID), Name: syscall.UTF16ToString(e.ExeFile[:])}
+		if created {
+			p.Created = processCreated(p.PID)
+		}
+		procs = append(procs, p)
+	}
+	return procs, nil
+}
+
+// processCreated returns the creation time of pid, or the zero time when it
+// cannot be read.
+func processCreated(pid int) time.Time {
+	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
+	if err != nil {
+		return time.Time{}
+	}
+	defer syscall.CloseHandle(h)
+	var creation, exit, kernel, user syscall.Filetime
+	if syscall.GetProcessTimes(h, &creation, &exit, &kernel, &user) != nil {
+		return time.Time{}
+	}
+	return time.Unix(0, creation.Nanoseconds())
+}
+
+// terminateProcess ends pid with exit code 1.
+func terminateProcess(pid int) error {
+	h, err := syscall.OpenProcess(syscall.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		return err
+	}
+	defer syscall.CloseHandle(h)
+	return syscall.TerminateProcess(h, 1)
 }
 
 // sessionEnvironmentKey holds the machine's PATH.

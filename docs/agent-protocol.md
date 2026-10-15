@@ -391,13 +391,16 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   8192 characters with a trailing `…` when longer, after each run of invalid
   UTF-8 bytes became one U+FFFD (`exec.list` cuts its `cmd` the same way).
 - `proc.kill` with `pid` answers `killed: 1` or an error. With `name` it kills
-  every process of that exact name: on Windows through
-  `taskkill /F [/T] /IM <name>` (`.exe` is added to a name without an
-  extension) and `killed` counts the lines of `taskkill` output that begin
-  with `SUCCESS` (English) or `성공` (Korean), which with `tree` includes
-  children; on other display languages it is 0 even when processes were
-  killed, and a refused kill also answers `killed: 0`. Elsewhere by
-  case-insensitive name comparison.
+  every process of that name, compared without regard to case, except the
+  agent itself. On Windows `.exe` is added to a name without an extension;
+  the agent lists the processes and terminates each match and, with `tree`,
+  its descendants, children first (a process created before its listed
+  parent does not count as that parent's child, and the agent and the
+  processes below it are left out). `killed` counts the processes that were
+  terminated. When any of them refuses access the answer is the error
+  `could not kill <n> of the <total> processes named '<name>' because access was denied (<k> were killed); restart alcove-agent elevated through the scheduled task that alcove-agent --install creates, then retry`.
+  Elsewhere `killed` counts the processes that were sent SIGKILL, with `tree`
+  to the process group a match leads.
   No match answers `killed: 0`.
 
 ### App launch (`app.launch`)
