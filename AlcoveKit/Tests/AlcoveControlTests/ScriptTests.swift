@@ -573,15 +573,17 @@ final class ScriptTests: XCTestCase {
     func testARunCancelledWhileItsVMStartsForTheSnapshotEndsBeforeTheRestore() async throws {
         let rig = try await rig(state: .stopped, startsVMForScriptSnapshot: true)
         await rig.target.setSnapshotList([VMController.SnapshotInfo(name: "clean", vmStateSize: 1, date: Date())])
-        await rig.target.setStartDuration(.milliseconds(300))
+        let latch = Latch()
+        await rig.target.setStartLatch(latch)
         let parsed = try script(steps([exec("one")]))
         let handler = rig.handler
         let task = Task {
             await ScriptRunner(handler: handler).run(parsed, vm: nil, variables: [:], owner: "script:test.json", snapshot: "clean", progress: nil)
         }
-        let starting = await eventually("the run starts the VM") { await rig.target.startsBegun == 1 }
+        let starting = await eventually("the run starts the VM") { await latch.arrivals == 1 }
         XCTAssertTrue(starting)
         task.cancel()
+        await latch.open()
         let result = await task.value
         XCTAssertEqual(result.stepsRun, 0)
         XCTAssertEqual(result.error, "the run was cancelled before step 1; start it again")
@@ -594,8 +596,48 @@ final class ScriptTests: XCTestCase {
         XCTAssertNil(after)
     }
 
+    func testAStartForAScriptSnapshotIsNotMadeWhenTheDiskDoesNotListTheSnapshot() async throws {
+        let rig = try await rig(state: .stopped, startsVMForScriptSnapshot: true)
+        await rig.target.setSnapshotList([VMController.SnapshotInfo(name: "clean", vmStateSize: 1, date: Date())])
+        let result = await run(rig, try script(steps([exec("one")])), snapshot: "clen")
+        XCTAssertEqual(result.stepsRun, 0)
+        XCTAssertEqual(result.error, "restoring snapshot 'clen' failed: no snapshot 'clen' in 'Win'; call vm.snapshot.list")
+        let begun = await rig.target.startsBegun
+        XCTAssertEqual(begun, 0)
+        let calls = await rig.target.snapshotCalls
+        XCTAssertEqual(calls, [])
+        let after = try await leasedBy(rig)
+        XCTAssertNil(after)
+    }
+
+    func testAStartForAScriptSnapshotIsRefusedForAVMWithASuspendedSession() async throws {
+        let rig = try await rig(state: .stopped, startsVMForScriptSnapshot: true)
+        await rig.target.setSnapshotList([VMController.SnapshotInfo(name: "clean", vmStateSize: 1, date: Date())])
+        await rig.target.setSuspended(true)
+        let result = await run(rig, try script(steps([exec("one")])), snapshot: "clean")
+        XCTAssertEqual(result.stepsRun, 0)
+        XCTAssertEqual(result.error, "'Win' has a suspended session that restoring snapshot 'clean' would replace; "
+                       + "resume it with vm.start or discard the suspended state first, then run the script again")
+        let begun = await rig.target.startsBegun
+        XCTAssertEqual(begun, 0)
+        let suspended = await rig.target.isSuspended()
+        XCTAssertTrue(suspended, "the saved session is kept")
+        let calls = await rig.target.snapshotCalls
+        XCTAssertEqual(calls, [])
+    }
+
+    func testAnEngineFailureOfTheSnapshotRestoreNamesTheNextStepAndTheRestoreOnce() async throws {
+        let rig = try await rig()
+        await rig.target.setSnapshotList([VMController.SnapshotInfo(name: "clean", vmStateSize: 1, date: Date())])
+        await rig.target.setSnapshotError(QMPClient.QMPError.job(id: "alcove-snapshot-load-1", error: "Error while loading VM state: Invalid argument"))
+        let result = await run(rig, try script(steps([exec("one")])), snapshot: "clean")
+        XCTAssertEqual(result.error, "restoring snapshot 'clean' failed: Error while loading VM state: Invalid argument; "
+                       + "check vm.status and vm.snapshot.list")
+    }
+
     func testAStartForAScriptSnapshotThatFailsEndsTheRunBeforeStep1() async throws {
         let rig = try await rig(state: .stopped, startsVMForScriptSnapshot: true)
+        await rig.target.setSnapshotList([VMController.SnapshotInfo(name: "clean", vmStateSize: 1, date: Date())])
         await rig.target.setStartError(VMController.ControllerError.engineDidNotStart("the engine is broken; reinstall it"))
         let result = await run(rig, try script(steps([exec("one")])), snapshot: "clean")
         XCTAssertEqual(result.stepsRun, 0)

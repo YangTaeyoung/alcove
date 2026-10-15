@@ -178,10 +178,10 @@ extension ControlHandler {
         leases.active(vm: vm, now: clock())?.token == token
     }
 
-    /// Whether the registry has a VM named `vm` and it is stopped or failed.
-    func vmIsInactive(_ vm: String) async -> Bool {
-        guard let t = await lookUp(vm) else { return false }
-        return await !t.state().isActive
+    /// The VM named `vm` when the registry has it and it is stopped or failed; nil otherwise.
+    func inactiveTarget(_ vm: String) async -> VMTarget? {
+        guard let t = await lookUp(vm), await !t.state().isActive else { return nil }
+        return t
     }
 
     func scriptRun(_ params: JSON) async throws -> JSON {

@@ -72,6 +72,12 @@ final class ControlStateTests: XCTestCase {
         await t.setSnapshotError(QMPClient.QMPError.disconnected("peer closed"))
         let restore = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
         XCTAssertEqual(restore, "snapshot restore failed: the engine closed the connection (peer closed); check vm.status")
+        await t.setSnapshotError(QMPClient.QMPError.job(id: "alcove-snapshot-load-1", error: "Error while loading VM state: Invalid argument"))
+        let load = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
+        XCTAssertEqual(load, "snapshot restore failed: Error while loading VM state: Invalid argument; check vm.status and vm.snapshot.list")
+        await t.setSnapshotError(QMPClient.QMPError.command(name: "snapshot-load", class: "GenericError", desc: "Device 'disk0' is not writable"))
+        let command = await failure(h, "vm.snapshot.restore", ["name": "Win", "snapshot": "clean", "waitTools": 0])
+        XCTAssertEqual(command, "snapshot restore failed: Device 'disk0' is not writable; check vm.status and vm.snapshot.list")
     }
 
     func testSnapshotListFailureCarriesTheEngineText() async throws {

@@ -190,13 +190,29 @@ struct ScriptRunner: Sendable {
 
     /// Restores the snapshot and runs the steps; returns the failure sentence, or nil when all passed. `held` takes in
     /// the buttons and keys that the steps which ran pressed and did not release. When the handler starts VMs for
-    /// script snapshots, a VM that is stopped or failed is started (`vm.start`) before the restore.
+    /// script snapshots, a VM that is stopped or failed is started (`vm.start`) before the restore once its disk lists
+    /// the snapshot and it has no suspended session; otherwise the run ends before anything is started.
     private func execute(_ script: Script, vm: String, token: String?, holdsOwnLease: Bool, snapshot: String?,
                          progress: (@Sendable (Int, Script.Step, Result<JSON, Error>) -> Void)?,
                          leaseLost: inout Bool, held: inout ControlHandler.HeldInput, into result: inout ScriptResult) async -> String? {
         if let snapshot {
             let cancelled = "the run was cancelled before step 1; start it again"
-            if handler.startsVMForScriptSnapshot, await handler.vmIsInactive(vm) {
+            func restoreFailed(_ error: Error) -> String {
+                let reason = "\(error)"
+                let prefix = ControlHandler.restoreFailurePrefix
+                return "restoring snapshot '\(snapshot)' failed: " + (reason.hasPrefix(prefix) ? String(reason.dropFirst(prefix.count)) : reason)
+            }
+            if handler.startsVMForScriptSnapshot, let target = await handler.inactiveTarget(vm) {
+                do { try await handler.requireSnapshot(snapshot, in: target) }
+                catch {
+                    if Task.isCancelled || error is CancellationError { return cancelled }
+                    return restoreFailed(error)
+                }
+                if await target.isSuspended() {
+                    return "'\(vm)' has a suspended session that restoring snapshot '\(snapshot)' would replace; "
+                        + "resume it with vm.start or discard the suspended state first, then run the script again"
+                }
+                if Task.isCancelled { return cancelled }
                 do { _ = try await call(.snapshot, "vm.start", base(vm, token, [:])) }
                 catch {
                     if Task.isCancelled || error is CancellationError { return cancelled }
@@ -207,7 +223,7 @@ struct ScriptRunner: Sendable {
             do { _ = try await call(.snapshot, "vm.snapshot.restore", base(vm, token, ["snapshot": .string(snapshot)])) }
             catch {
                 if Task.isCancelled || error is CancellationError { return cancelled }
-                return "restoring snapshot '\(snapshot)' failed: \(error)"
+                return restoreFailed(error)
             }
         }
         var stepsBytes = 0

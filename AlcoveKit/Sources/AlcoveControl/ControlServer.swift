@@ -109,7 +109,7 @@ public final class ControlServer: @unchecked Sendable {
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }
         var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
-        let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
+        let maxLen = Self.maxSocketPathBytes
         guard path.utf8.count <= maxLen else { return false }
         withUnsafeMutablePointer(to: &addr.sun_path) { p in p.withMemoryRebound(to: CChar.self, capacity: maxLen + 1) { dst in _ = path.withCString { strncpy(dst, $0, maxLen) } } }
         return withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } } == 0
@@ -119,7 +119,7 @@ public final class ControlServer: @unchecked Sendable {
     /// queue (`RecognitionQueue.warmUp`) before the first connection is accepted.
     public func start(loadingRecognizers: Bool = false) throws {
         var addr = sockaddr_un()
-        let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
+        let maxLen = Self.maxSocketPathBytes
         guard socketPath.utf8.count <= maxLen else { throw ServerError.pathTooLong(socketPath) }
         try? FileManager.default.createDirectory(atPath: (socketPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)

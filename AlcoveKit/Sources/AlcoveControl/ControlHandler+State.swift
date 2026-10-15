@@ -117,7 +117,7 @@ extension ControlHandler {
                 try await t.restoreSnapshot(named: snapshot)
             } catch {
                 _ = await passEvents(of: t)
-                throw ControlError.failed("snapshot restore failed: \(engineReason(error))")
+                throw ControlError.failed(ControlHandler.restoreFailurePrefix + ControlHandler.restoreFailureReason(error))
             }
             let restored = await passEvents(of: t)
             let after = Task { await self.afterRestore(t, snapshot: snapshot, waitTools: wait) }
@@ -246,7 +246,9 @@ extension ControlHandler {
         do { return try await t.snapshots() } catch { throw ControlError.failed("snapshot list failed: \(engineReason(error))") }
     }
 
-    private func requireSnapshot(_ snapshot: String, in t: VMTarget) async throws {
+    /// Throws `no snapshot '<s>' in '<vm>'; call vm.snapshot.list` when the disk of `t` does not list `snapshot`, and the
+    /// `snapshot list failed` sentence when it cannot be read.
+    func requireSnapshot(_ snapshot: String, in t: VMTarget) async throws {
         guard try await snapshotList(t).contains(where: { $0.name == snapshot }) else {
             throw ControlError.failed("no snapshot '\(snapshot)' in '\(t.name)'; call vm.snapshot.list")
         }
@@ -265,6 +267,19 @@ extension ControlHandler {
 
     /// A sentence for an engine failure: the engine's own message when it gave one, otherwise the next step.
     nonisolated func engineReason(_ error: Error) -> String { ControlHandler.engineSentence(error) }
+
+    /// The start of the sentence of a failed `vm.snapshot.restore`.
+    static let restoreFailurePrefix = "snapshot restore failed: "
+
+    /// The reason of a failed `vm.snapshot.restore`: `engineSentence(error)`, followed by the next step when it is the
+    /// engine's own message.
+    nonisolated static func restoreFailureReason(_ error: Error) -> String {
+        let reason = engineSentence(error)
+        switch error as? QMPClient.QMPError {
+        case .job?, .command?: return reason + "; check vm.status and vm.snapshot.list"
+        default: return reason
+        }
+    }
 
     nonisolated static func engineSentence(_ error: Error) -> String {
         let restart = "restart the VM with vm.stop and vm.start"

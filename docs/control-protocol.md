@@ -1233,9 +1233,10 @@ image for later writes, and the image file keeps its size.
 - `vm.snapshot.restore` and `vm.snapshot.delete` of a name that is not listed
   answer `no snapshot '<s>' in '<vm>'; call vm.snapshot.list`.
 - A failure of the engine answers `snapshot create failed: <message>`,
-  `snapshot restore failed: <message>` or `snapshot delete failed: <message>`
-  with the engine's message, or `the engine closed the connection (<reason>);
-  check vm.status` when the engine went away.
+  `snapshot restore failed: <message>; check vm.status and vm.snapshot.list`
+  or `snapshot delete failed: <message>` with the engine's message, or `the
+  engine closed the connection (<reason>); check vm.status` when the engine
+  went away.
 
 ## Port forwards
 
@@ -2336,8 +2337,8 @@ Errors and results: everything that prevents step 1 from starting answers with
 an error (`ok: false`): an unreadable, oversized (over 4 MiB) or malformed
 script, an undefined variable, a condition that does not parse, no VM, a lease
 refusal, a failed snapshot restore (`restoring snapshot '<s>' failed:
-<reason>`, the reason as `vm.snapshot.restore` gives it), a cancellation
-before step 1. A run
+<reason>`, the reason as `vm.snapshot.restore` gives it after its `snapshot
+restore failed: `), a cancellation before step 1. A run
 cancelled during the restore of `snapshot` ends when the restore has ended
 (see `vm.snapshot.restore` in [Snapshots](#snapshots)) and holds its lease
 until then. Otherwise the
@@ -2585,11 +2586,17 @@ FAILED: step 2 failed after 0.7 s
   `alcovectl serve` may still start the VM, and the engine check of
   [Starting](#starting) then refuses one of the two hosts. A stopped VM is
   started by a `vm.start` step of the script or, with `--snapshot`, before
-  the restore (a VM with a session saved to disk resumes it, and the restore
-  then replaces it); every VM the run started is stopped when the run ends,
-  also after a failure or a signal. A start for `--snapshot` that fails ends
-  the command with exit 2 and `'<vm>' could not be started to restore
-  snapshot '<s>': start failed: <reason>`. The lock file stays in the bundle.
+  the restore; every VM the run started is stopped when the run ends, also
+  after a failure or a signal. Before that start the snapshot is looked up on
+  the stopped VM's disk, and nothing is started when the disk does not list
+  it (`restoring snapshot '<s>' failed: no snapshot '<s>' in '<vm>'; call
+  vm.snapshot.list`) or when the VM has a session saved to disk, which the
+  restore would replace (`'<vm>' has a suspended session that restoring
+  snapshot '<s>' would replace; resume it with vm.start or discard the
+  suspended state first, then run the script again`); the saved session is
+  kept. A start for `--snapshot` that fails ends the command with exit 2 and
+  `'<vm>' could not be started to restore snapshot '<s>': start failed:
+  <reason>`. The lock file stays in the bundle.
 - SIGINT, SIGTERM and SIGHUP stop the run: through a server, the command
   closes its connection, the server cancels the run before its next step and
   releases the run's lease, and the command prints `INTERRUPTED` at once.
