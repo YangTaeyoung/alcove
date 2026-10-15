@@ -8,6 +8,9 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -52,16 +55,31 @@ func ownLogFolder(dir string) (string, error) {
 	return dir, nil
 }
 
-// installAtLogon installs a systemd system unit on Linux whose command line
-// carries peerArgs.
+// installAtLogon installs the running binary as /usr/local/bin/alcove-agent
+// and the systemd system unit alcove-agent.service, whose command line
+// carries peerArgs, and starts or restarts the service.
 func installAtLogon(port int, allowExec bool, peerArgs []string, _ string) error {
 	exe, err := os.Executable()
 	if err != nil {
-		return err
+		return fmt.Errorf("the path of the running alcove-agent cannot be read (%v); run it by its full path", err)
 	}
-	dst := "/usr/local/bin/alcove-agent"
-	if data, err := os.ReadFile(exe); err == nil {
-		_ = os.WriteFile(dst, data, 0o755)
+	in := systemdInstall{exe: exe, bin: "/usr/local/bin/alcove-agent", unit: "/etc/systemd/system/alcove-agent.service",
+		systemctl: func(args ...string) ([]byte, error) { return exec.Command("systemctl", args...).CombinedOutput() }}
+	return in.run(port, allowExec, peerArgs)
+}
+
+// systemdInstall copies exe to bin, writes the unit file unit and runs
+// systemctl.
+type systemdInstall struct {
+	exe, bin, unit string
+	systemctl      func(args ...string) ([]byte, error)
+}
+
+// run installs the binary, writes the unit and runs systemctl daemon-reload,
+// enable and restart, stopping at the first step that fails.
+func (in systemdInstall) run(port int, allowExec bool, peerArgs []string) error {
+	if err := in.copyBinary(); err != nil {
+		return err
 	}
 	extra := ""
 	if allowExec {
@@ -80,12 +98,84 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-`, dst, port, extra)
-	if err := os.WriteFile("/etc/systemd/system/alcove-agent.service", []byte(unit), 0o644); err != nil {
-		return err
+`, in.bin, port, extra)
+	if err := os.WriteFile(in.unit, []byte(unit), 0o644); err != nil {
+		return fmt.Errorf("cannot write %s (%v); run alcove-agent --install as root", in.unit, err)
 	}
-	if out, err := exec.Command("systemctl", "enable", "--now", "alcove-agent").CombinedOutput(); err != nil {
-		return fmt.Errorf("systemctl: %v: %s", err, out)
+	for _, step := range [][]string{{"daemon-reload"}, {"enable", "alcove-agent"}, {"restart", "alcove-agent"}} {
+		if out, err := in.systemctl(step...); err != nil {
+			return fmt.Errorf("systemctl %s failed (%v: %s); check journalctl -u alcove-agent, then run alcove-agent --install again",
+				strings.Join(step, " "), err, strings.TrimSpace(string(out)))
+		}
 	}
 	return nil
+}
+
+// copyBinary replaces bin with exe, unless they are the same file.
+func (in systemdInstall) copyBinary() error {
+	if a, err := os.Stat(in.exe); err == nil {
+		if b, err := os.Stat(in.bin); err == nil && os.SameFile(a, b) {
+			return nil
+		}
+	}
+	data, err := os.ReadFile(in.exe)
+	if err != nil {
+		return fmt.Errorf("cannot read %s (%v); run alcove-agent --install from a copy you can read", in.exe, err)
+	}
+	if err := replaceFile(in.bin, data, 0o755); err != nil {
+		return fmt.Errorf("cannot replace %s (%v); run alcove-agent --install as root", in.bin, err)
+	}
+	return nil
+}
+
+// replaceFile writes data to a new file beside path, flushes it to disk and
+// renames it over path, which works while path is a running program.
+func replaceFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	done := false
+	defer func() {
+		if !done {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	done = true
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
+}
+
+// ensureHome sets HOME to the home directory of the agent's user when the
+// agent was started without one, as systemd starts a system service.
+func ensureHome() {
+	if os.Getenv("HOME") != "" {
+		return
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		_ = os.Setenv("HOME", u.HomeDir)
+	}
 }

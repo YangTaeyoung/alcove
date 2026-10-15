@@ -52,6 +52,7 @@ func main() {
 		return
 	}
 
+	ensureHome()
 	var alcoveDir, uiaDir, movedApps string
 	var movedData []string
 	var dataErr, lockErr, appsErr, programDataErr error

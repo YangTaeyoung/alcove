@@ -36,6 +36,10 @@ func refuseReparse(path string) error {
 	return nil
 }
 
+// ensureHome does nothing on Windows, where the agent runs in the user's
+// logon session.
+func ensureHome() {}
+
 // lockDataFolder locks the Alcove folder under the ProgramData folder and its
 // uia folder to Administrators and SYSTEM and returns the Alcove folder.
 func lockDataFolder() (string, error) {
