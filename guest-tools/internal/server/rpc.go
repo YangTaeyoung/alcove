@@ -56,9 +56,11 @@ type conn struct {
 	done chan struct{} // closed when the writer has stopped
 	stop chan struct{} // closed to ask the writer to stop
 
-	// caps is the capability list sent last on the connection.
-	capsMu sync.Mutex
-	caps   []string
+	// caps is the capability list sent last on the connection; capsFollowed
+	// is set once the host has sent its first message after the handshake.
+	capsMu       sync.Mutex
+	caps         []string
+	capsFollowed bool
 }
 
 // setCaps records caps as the list sent on the connection.
@@ -66,6 +68,21 @@ func (c *conn) setCaps(caps []string) {
 	c.capsMu.Lock()
 	c.caps = caps
 	c.capsMu.Unlock()
+}
+
+// followCaps records that the host has sent its first message after the
+// handshake.
+func (c *conn) followCaps() {
+	c.capsMu.Lock()
+	c.capsFollowed = true
+	c.capsMu.Unlock()
+}
+
+// capsFollowedYet reports whether followCaps has run.
+func (c *conn) capsFollowedYet() bool {
+	c.capsMu.Lock()
+	defer c.capsMu.Unlock()
+	return c.capsFollowed
 }
 
 // replaceCaps records caps and reports whether it differs from the list

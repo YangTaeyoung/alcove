@@ -84,15 +84,19 @@ The hello carries the list the agent found last. The agent checks its
 capabilities once when it starts serving, before it accepts a connection,
 so a hello does not wait for a check; a connection that arrives during that
 first check is accepted after it. On Linux a check looks up the desktop
-session, so a hello does not wait for `loginctl`. Right after the handshake the agent checks its capabilities and,
-when they differ from the hello's, sends `{"t":"caps","caps":[…]}` with the
-whole new list before any other message, which replaces the hello's. A host
-can receive that line before it has finished its own handshake steps and
-applies it to the hello. While a connection is open the agent checks its
-capabilities again every 5 s, once for all connections, and sends the same
-line to each connection whose last list differs. On Linux this is how `clipboard` appears once a user signs in to the
-desktop after the host connected, as an autologin does a few seconds after the
-agent starts at boot, and disappears when the session ends.
+session, so a hello does not wait for `loginctl`.
+
+When the host has sent its first message after the handshake (its
+`welcome`, or a request), the agent checks its capabilities and, when they
+differ from the hello's, sends `{"t":"caps","caps":[…]}` with the whole new
+list before it handles that message; the list replaces the hello's. Events
+can come before that line. While a connection whose host has sent that
+first message is open, the agent checks its capabilities again every 5 s,
+once for all such connections, and sends the same line to each of them
+whose last list differs. On Linux this is how `clipboard` appears once a
+user signs in to the desktop after the host connected, as an autologin does
+a few seconds after the agent starts at boot, and disappears when the
+session ends.
 
 ### The desktop session (Linux)
 

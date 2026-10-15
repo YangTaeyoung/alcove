@@ -205,10 +205,11 @@ func TestCapsAreSentAgainWhenTheClipboardAppears(t *testing.T) {
 	capsCheckInterval = 20 * time.Millisecond
 	t.Cleanup(func() { capsCheckInterval = old })
 	cb := &toggleClipboard{}
-	_, r, _, _ := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
+	_, r, w, _ := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
 	if capSet(expect(t, r, "hello"))["clipboard"] {
 		t.Fatal("hello lists a clipboard that is not there")
 	}
+	send(t, w, proto.Message{"t": "welcome", "v": 1})
 	cb.on.Store(true)
 	if !capSet(expect(t, r, "caps"))["clipboard"] {
 		t.Fatal("the caps update lacks the clipboard")
@@ -234,7 +235,7 @@ func (c *gatedClipboard) Available() bool {
 	return c.on.Load()
 }
 
-func TestTheHelloCarriesTheCapsFoundLastAndTheirCheckFollowsTheHandshake(t *testing.T) {
+func TestTheHelloCarriesTheCapsFoundLastAndTheirCheckFollowsTheHostsFirstMessage(t *testing.T) {
 	cb := &gatedClipboard{gate: make(chan struct{})}
 	cb.on.Store(true)
 	_, r, _, first := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
@@ -253,9 +254,10 @@ func TestTheHelloCarriesTheCapsFoundLastAndTheirCheckFollowsTheHandshake(t *test
 	if !capSet(expect(t, r2, "hello"))["clipboard"] {
 		t.Fatal("the second hello does not carry the caps found last")
 	}
+	send(t, proto.NewWriter(c), proto.Message{"t": "welcome", "v": 1})
 	close(cb.gate)
 	if capSet(expect(t, r2, "caps"))["clipboard"] {
-		t.Fatal("the caps checked after the handshake keep a clipboard that is gone")
+		t.Fatal("the caps checked after the host's welcome keep a clipboard that is gone")
 	}
 }
 
@@ -287,6 +289,82 @@ func TestTheFirstHelloCarriesTheCapsCheckedWhenServeStarted(t *testing.T) {
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	if !capSet(expect(t, proto.NewReader(c), "hello"))["clipboard"] {
 		t.Fatal("the first hello does not carry the caps checked when Serve started")
+	}
+}
+
+// countedClipboard is a toggleClipboard that counts the calls of Available.
+type countedClipboard struct {
+	toggleClipboard
+	calls atomic.Int64
+}
+
+func (c *countedClipboard) Available() bool {
+	c.calls.Add(1)
+	return c.on.Load()
+}
+
+func TestTheCapsLineWaitsForTheHostsFirstMessageAfterTheHandshake(t *testing.T) {
+	old := capsCheckInterval
+	capsCheckInterval = 20 * time.Millisecond
+	t.Cleanup(func() { capsCheckInterval = old })
+	cb := &countedClipboard{}
+	cb.on.Store(true)
+	s, r, w, first := startServerS(t, Options{Clipboard: cb, HomeDir: t.TempDir()})
+	expect(t, r, "hello")
+	send(t, w, proto.Message{"t": "welcome", "v": 1})
+	go func() {
+		for {
+			if _, err := r.Next(); err != nil {
+				return
+			}
+		}
+	}()
+
+	c, err := net.Dial("tcp", first.RemoteAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	r2, w2 := proto.NewReader(c), proto.NewWriter(c)
+	if !capSet(expect(t, r2, "hello"))["clipboard"] {
+		t.Fatal("the hello lacks the clipboard")
+	}
+	cb.on.Store(false)
+	checked := cb.calls.Load()
+	deadline := time.Now().Add(10 * time.Second)
+	for cb.calls.Load() < checked+2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the capabilities were not checked twice within 10 s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	stop, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.emit("mark", proto.Message{})
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	m, err := r2.Next()
+	close(stop)
+	<-stopped
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Type() != "ev" || m.String("name") != "mark" {
+		t.Fatalf("before the host's first message the agent sent %v", m)
+	}
+	send(t, w2, proto.Message{"t": "welcome", "v": 1})
+	if capSet(expect(t, r2, "caps"))["clipboard"] {
+		t.Fatal("the caps line after the welcome keeps a clipboard that is gone")
 	}
 }
 

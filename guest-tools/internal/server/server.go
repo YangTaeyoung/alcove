@@ -359,9 +359,6 @@ func (s *Server) handle(c net.Conn) {
 	defer cancel()
 
 	cn.setCaps(sentCaps)
-	if caps := s.caps(); cn.replaceCaps(caps) {
-		send(proto.Message{"t": "caps", "caps": caps})
-	}
 	s.addConn(cn)
 	defer s.removeConn(cn)
 
@@ -389,6 +386,7 @@ func (s *Server) handle(c net.Conn) {
 			x.discard()
 		}
 	}()
+	hostReady := false
 	for {
 		m, err := r.Next()
 		if err != nil {
@@ -396,6 +394,10 @@ func (s *Server) handle(c net.Conn) {
 				lg.Printf("read: %v", err)
 			}
 			return
+		}
+		if !hostReady {
+			hostReady = true
+			s.sendCapsUpdate(cn)
 		}
 		switch m.Type() {
 		case "ping":
@@ -556,13 +558,30 @@ func (s *Server) openConns() []*conn {
 	return conns
 }
 
+// sendCapsUpdate runs when the host of c has sent its first message after
+// the handshake: it checks the capabilities, sends {"t":"caps"} with the
+// list to c when it differs from the hello's, and from then on lets
+// watchCaps update c.
+func (s *Server) sendCapsUpdate(c *conn) {
+	if caps := s.caps(); c.replaceCaps(caps) {
+		c.send(proto.Message{"t": "caps", "caps": caps})
+	}
+	c.followCaps()
+}
+
 // watchCaps checks the capabilities every capsCheckInterval while a
-// connection is open and sends {"t":"caps"} with the new list to each
-// connection whose last list, the hello's at first, differs.
+// connection that sendCapsUpdate has followed is open, and sends
+// {"t":"caps"} with the new list to each such connection whose last list
+// differs.
 func (s *Server) watchCaps() {
 	for {
 		time.Sleep(s.timing.caps)
-		conns := s.openConns()
+		var conns []*conn
+		for _, c := range s.openConns() {
+			if c.capsFollowedYet() {
+				conns = append(conns, c)
+			}
+		}
 		if len(conns) == 0 {
 			continue
 		}
