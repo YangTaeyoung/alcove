@@ -94,7 +94,7 @@ export function register(r: Registrar, client: ControlClient): void {
         }
         const toolsPart = !wait ? ""
           : tools ? "; guest tools connected (desktop ready)"
-          : refused !== undefined ? `; ${refused}`
+          : refused !== undefined ? `; ${refused.replace(`the guest tools in '${name}' `, "the guest tools ")}`
           : "; guest tools did not connect in time (no tools installed, or still booting) — use alcove_wait_idle and alcove_screenshot";
         return text(`${name}: ${r.state}${r.ephemeral === true ? " (changes will be discarded when it stops)" : ""}${toolsPart}`);
       } catch (e) {

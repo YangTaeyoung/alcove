@@ -161,6 +161,14 @@ test("capture start and stop print the op's warning, and stop says when it only 
     "no capture was running; what an earlier capture left in the guest (proxy settings, CA certificate) was cleared");
 });
 
+test("capture start and stop name tools instead of control ops in the op's warning", async () => {
+  const started = rig(register, { proxy: "10.0.2.2:1", env: {}, caInstalled: false, systemProxySet: false, warning: "the CA was not installed; call vm.http.stop, then vm.http.start" });
+  assert.match(textOf(await started.run("alcove_http_capture_start", { name: "vm" })), /\nwarning: the CA was not installed; call alcove_http_capture_stop, then alcove_http_capture_start$/);
+  const stopped = rig(register, { exchanges: 0, warning: "the guest keeps them because the VM is paused; call vm.resume, then vm.http.stop again" });
+  assert.equal(textOf(await stopped.run("alcove_http_capture_stop", { name: "vm" })),
+    "capture stopped; 0 exchanges were captured\nwarning: the guest keeps them because the VM is paused; call alcove_resume_vm, then alcove_http_capture_stop again");
+});
+
 test("alcove_http_rule takes a status from 200 to 599", async () => {
   let schema: Record<string, unknown> = {};
   const registrar: Registrar = { tool: (_set, name, config) => { if (name === "alcove_http_rule") schema = config.inputSchema as Record<string, unknown>; } };

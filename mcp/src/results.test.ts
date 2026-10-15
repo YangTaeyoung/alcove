@@ -48,6 +48,14 @@ test("alcove_record_status prints write errors and a video error", async () => {
   assert.deepEqual(r.structuredContent, { recording: true, dir: "/d", seconds: 12, ops: 3, writeErrors: 1, lastWriteError: "disk full", videoError: "the video stopped" });
 });
 
+test("alcove_record_stop and alcove_record_status name tools instead of control ops in write errors and the video error", async () => {
+  const stop = rig(registerEvidence, { dir: "/d", trace: "/d/t", frames: 0, seconds: 1, ops: 1, writeErrors: 1, lastWriteError: "trace line 2 could not be written: the VM is not running; check vm.status" });
+  assert.match(textOf(await stop.run("alcove_record_stop", { name: "vm" })), /\nwrite errors: 1 \(last: trace line 2 could not be written: the VM is not running; check alcove_vm_status\)$/);
+  const status = rig(registerEvidence, { recording: true, dir: "/d", seconds: 1, ops: 1, writeErrors: 1, lastWriteError: "frame f could not be written: check vm.status", videoError: "the video could not be written: check vm.status" });
+  assert.equal(textOf(await status.run("alcove_record_status", { name: "vm" })),
+    "recording to /d; 1 s, 1 operations so far; 1 write errors (last: frame f could not be written: check alcove_vm_status); video: the video could not be written: check alcove_vm_status");
+});
+
 test("clipped lists and command output name a way to see the rest", async () => {
   const many = Array.from({ length: 4000 }, (_, i) => ({ dir: false, size: 1, mtime: "t", name: `file-${i}-${"x".repeat(20)}` }));
   assert.match(textOf(await rig(registerFiles, { entries: many }).run("alcove_fs_list", { name: "vm", path: "C:\\" })), /\[truncated; list a subfolder/);

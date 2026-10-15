@@ -2,7 +2,7 @@
 // listing and reading, and response rules.
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
-import { clip, fail, text, vmName, withoutEnvelope, type Registrar } from "../toolkit.js";
+import { clip, fail, text, toolSentence, vmName, withoutEnvelope, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -96,7 +96,7 @@ export function register(r: Registrar, client: ControlClient): void {
         ...Object.entries((reply.env as Record<string, unknown>) ?? {}).map(([k, v]) => `${k}=${v}`),
       ];
       if (reply.guestCAPath) lines.push(`CA file in the guest: ${reply.guestCAPath}`);
-      if (reply.warning) lines.push(`warning: ${reply.warning}`);
+      if (reply.warning) lines.push(`warning: ${toolSentence(String(reply.warning))}`);
       return text(lines.join("\n"), withoutEnvelope(reply));
     } catch (e) {
       return fail(e);
@@ -114,7 +114,7 @@ export function register(r: Registrar, client: ControlClient): void {
       const lines = [reply.staleCleared === true
         ? "no capture was running; what an earlier capture left in the guest (proxy settings, CA certificate) was cleared"
         : `capture stopped; ${reply.exchanges ?? 0} exchanges were captured`];
-      if (reply.warning) lines.push(`warning: ${reply.warning}`);
+      if (reply.warning) lines.push(`warning: ${toolSentence(String(reply.warning))}`);
       return text(lines.join("\n"), withoutEnvelope(reply));
     } catch (e) {
       return fail(e);

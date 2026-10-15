@@ -2,7 +2,7 @@
 // dumps and the one-call diagnostics bundle.
 import { z } from "zod";
 import { ControlError, type ControlClient } from "../control.js";
-import { clip, fail, text, vmName, withoutEnvelope, type Registrar } from "../toolkit.js";
+import { clip, fail, text, toolSentence, vmName, withoutEnvelope, type Registrar } from "../toolkit.js";
 
 type Obj = Record<string, unknown>;
 
@@ -28,7 +28,7 @@ function summaryLines(r: Obj): string[] {
   if (r.ops !== undefined) lines.push(`ops: ${r.ops}`);
   if (r.seconds !== undefined) lines.push(`seconds: ${r.seconds}`);
   const errors = Number(r.writeErrors ?? 0);
-  if (errors > 0) lines.push(`write errors: ${errors}${typeof r.lastWriteError === "string" ? ` (last: ${r.lastWriteError})` : ""}`);
+  if (errors > 0) lines.push(`write errors: ${errors}${typeof r.lastWriteError === "string" ? ` (last: ${toolSentence(r.lastWriteError)})` : ""}`);
   if (r.videoSeconds !== undefined) lines.push(`video seconds: ${r.videoSeconds}`);
   const dropped = Number(r.droppedFrames ?? 0);
   if (dropped > 0) lines.push(`dropped video frames: ${dropped}`);
@@ -89,8 +89,8 @@ export function register(r: Registrar, client: ControlClient): void {
       const notes = [
         `recording to ${reply.dir}`,
         `${reply.seconds ?? 0} s, ${reply.ops ?? 0} operations so far`,
-        ...(errors > 0 ? [`${errors} write errors${typeof reply.lastWriteError === "string" ? ` (last: ${reply.lastWriteError})` : ""}`] : []),
-        ...(typeof reply.videoError === "string" ? [`video: ${reply.videoError}`] : []),
+        ...(errors > 0 ? [`${errors} write errors${typeof reply.lastWriteError === "string" ? ` (last: ${toolSentence(reply.lastWriteError)})` : ""}`] : []),
+        ...(typeof reply.videoError === "string" ? [`video: ${toolSentence(reply.videoError)}`] : []),
       ];
       return text(notes.join("; "), {
         recording: true, dir: reply.dir, seconds: reply.seconds, ops: reply.ops,
