@@ -23,7 +23,7 @@ import (
 	"github.com/YangTaeyoung/alcove/guest-tools/internal/proto"
 )
 
-const AgentVersion = "0.2.0"
+const AgentVersion = "0.2.1"
 
 // Options configure the agent.
 type Options struct {

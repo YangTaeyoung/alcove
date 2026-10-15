@@ -50,7 +50,7 @@ the address check; they still have to prove the key.
 Agent → host on connect:
 
 ```
-{"t":"hello","v":1,"proto":2,"os":"windows"|"linux","agent":"0.2.0","token":"<uuid>","caps":["files","shutdown","resolution","clipboard","exec","rpc","jobs","proc","fs","ui"],"auth":"key","nonce":"<64 hex digits>"}
+{"t":"hello","v":1,"proto":2,"os":"windows"|"linux","agent":"0.2.1","token":"<uuid>","caps":["files","shutdown","resolution","clipboard","exec","rpc","jobs","proc","fs","ui"],"auth":"key","nonce":"<64 hex digits>"}
 ```
 
 `token` is read by the agent from the SMBIOS OEM strings (type 11) that the

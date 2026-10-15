@@ -176,6 +176,13 @@ func TestTheHelloAsksForASignatureOfANewNonce(t *testing.T) {
 	}
 }
 
+func TestTheHelloCarriesTheReleaseVersion(t *testing.T) {
+	a := startAuthServer(t, Options{})
+	if got := a.dial().hello.String("agent"); got != "0.2.1" {
+		t.Fatalf("hello agent %q, expected 0.2.1", got)
+	}
+}
+
 func TestTheHostsSignatureOfTheTokenAndTheNonceIsServed(t *testing.T) {
 	a := startAuthServer(t, Options{})
 	c := a.dial()
