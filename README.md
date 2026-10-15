@@ -49,7 +49,7 @@ clipboard and file sharing.
 |---|---|
 | **Windows 11 ARM and Linux** | Apple silicon guests at near-native speed through `-accel hvf`. Unattended Windows install included. |
 | **Our own display path** | A QEMU display backend written for this project shares the framebuffer through memory; the app draws it with Metal and sends input back over a unix socket. |
-| **Guest tools** | A small Go agent for Windows and Linux: clipboard both ways, file drop, shell commands and background jobs, processes, file access, display modes that follow the window. |
+| **Guest tools** | A small Go agent for Windows and Linux: clipboard both ways, file drop, shell commands and background jobs, processes, file access, display modes that follow the window (Windows). |
 | **Snapshots and suspend** | qcow2 snapshots with VM state, plus suspend-to-disk that resumes where you left off. |
 | **USB passthrough** | Hot-plug host USB devices into a running guest. |
 | **Agent automation** | A documented control protocol and an MCP server: screenshot, click, drag, scroll, type, key combos, shell commands and background jobs, processes, clipboard, file push, pull and folder sync, guest file read and write, recordings with a trace and a video, the guest event log, crash dumps, a one-call diagnostics bundle, and HTTP and HTTPS capture with canned, delayed or dropped answers. |

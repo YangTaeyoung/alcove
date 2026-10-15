@@ -108,7 +108,7 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.mouse.down` / `vm.mouse.up` | `name`, `button?` ("left" default), `x?` and `y?` together, observe params | `{}` or `{observation}` — presses or releases the button and leaves it so; with `x`/`y` the pointer moves there first |
 | `vm.key.press` | `name`, `keys` (string like "ctrl+alt+delete", "enter", "win+r"), `hold?` ms (0 to 10000, default 0), observe params | `{}` or `{observation}` — presses modifiers then the key, releases in reverse |
 | `vm.key.down` / `vm.key.up` | `name`, `key`, observe params | `{}` or `{observation}` |
-| `vm.type` | `name`, `text`, `delay?` ms per key (0 to 1000, default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content (the guest reports the first 700,000 bytes of UTF-8 of a longer text, and those are compared), otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again`. Guest tools without a clipboard answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs wl-copy or xclip in its session), so text outside the US layout cannot be typed; install one and restart the guest tools, or type US-layout text only`; text whose message to the guest tools would reach 1 MiB answers `the text is too large for the guest clipboard (<n> bytes of UTF-8; one message to the guest tools holds less than 1 MiB); split it over several vm.type calls`. Each of these sentences that names an op names `vm.ui.type` when that op typed the text. The guest clipboard holds the text afterwards |
+| `vm.type` | `name`, `text`, `delay?` ms per key (0 to 1000, default 12), observe params | `{}` or `{observation}` — US-layout text typing; text with a character outside the layout is put into the guest clipboard and pasted with `ctrl+v` when tools are connected. The paste is sent once the guest reports that text as its clipboard content (the guest reports the first 700,000 bytes of UTF-8 of a longer text, and those are compared), otherwise the op answers `the guest clipboard did not take the text, so nothing was typed; call vm.type again`. Guest tools without a clipboard answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), so text outside the US layout cannot be typed; sign in to the guest's desktop and install wl-clipboard or xclip there, or type US-layout text only`; text whose message to the guest tools would reach 1 MiB answers `the text is too large for the guest clipboard (<n> bytes of UTF-8; one message to the guest tools holds less than 1 MiB); split it over several vm.type calls`. Each of these sentences that names an op names `vm.ui.type` when that op typed the text. The guest clipboard holds the text afterwards |
 | `vm.batch` | `name`, `steps`, observe params | `{completed, results, failedStep?, error?, observation?}` — see [Batches](#batches) |
 | `vm.find_text` | `name`, `query?`, `regex?`, `region?`, `languages?` | `{matches, lines}` — see [Finding text](#finding-text) |
 | `vm.wait_for` | `name`, `conditions`, `timeout?`, observe params | `{matched, waited, type?, detail?, problems?, observation?}` — see [Waiting for conditions](#waiting-for-conditions) |
@@ -118,12 +118,12 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.exec.write` | `name`, `job`, `data`, `eof?` | `{}` — writes to the job's stdin; `eof` closes it |
 | `vm.exec.kill` | `name`, `job` | `{state}` — kills the job's process tree |
 | `vm.exec.list` | `name` | `{jobs: [{job, pid, state, code?, cmd, started}]}` |
-| `vm.process.list` | `name`, `filter?` | `{processes: [{pid, ppid, name, path, command, memoryKB}]}` — `filter` is a case-insensitive substring of the process name |
+| `vm.process.list` | `name`, `filter?` | `{processes: [{pid, ppid, name, path, command, memoryKB}]}` — `filter` is a case-insensitive substring of the process name; on Linux `name` is the kernel's process name (`sshd` for `sshd: /usr/sbin/sshd …`) |
 | `vm.process.kill` | `name`, `pid?` or `processName?`, `tree?` | `{killed}` — `tree` also kills child processes |
-| `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` — a `text` whose message to the guest tools would reach 1 MiB answers `the clipboard text is too large for one message to the guest tools (<n> bytes of UTF-8; a message holds less than 1 MiB); set a shorter text` |
-| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` |
+| `vm.clipboard.get` / `vm.clipboard.set` | `name` / `name`, `text` | `{text}` / `{}` — a `text` whose message to the guest tools would reach 1 MiB answers `the clipboard text is too large for one message to the guest tools (<n> bytes of UTF-8; a message holds less than 1 MiB); set a shorter text`; guest tools without the `clipboard` capability answer `the guest tools in '<vm>' have no clipboard (a Linux guest needs a signed-in desktop session with wl-copy or xclip), so <op> cannot run; sign in to the guest's desktop and install wl-clipboard or xclip there, then retry` and nothing is sent to them |
+| `vm.push_file` | `name`, `path` (host), `dest?` ("desktop"/"downloads"; any other value answers `dest must be 'desktop' or 'downloads'; pass guestPath for another folder`) or `guestPath?`, `overwrite?` | `{guestPath}`; with `guestPath` also `{bytes, sha256}` — `dest` puts the file into that folder of the guest user (on Linux the user of the desktop session, who owns the file); a relative `guestPath` lies below that user's home; with `guestPath` a host file with an execute bit becomes executable in a Linux guest |
 | `vm.pull_file` | `name`, `guestPath`, `path` (host) | `{path, bytes, sha256}` |
-| `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` |
+| `vm.sync_dir` | `name`, `path` (host directory), `guestPath`, `delete?` | `{sent: [..], skipped, deleted: [..], bytes}` — files the copy sends keep the execute bit of their host file in a Linux guest |
 | `vm.fs.list` | `name`, `path`, `recursive?` | `{entries: [{name, dir, size, mtime}], truncated}` |
 | `vm.fs.read` | `name`, `path`, `offset?`, `length?` (≤ 262144), `tail?` (lines) | `{text, size, eof}` |
 | `vm.fs.write` | `name`, `path`, `text`, `append?` | `{size}` |
@@ -150,8 +150,8 @@ through `vm.exec.read`, `vm.exec.list` or the `job.exited` event of
 | `vm.ui.click` | `name`, `ref` or `selector`, `button?`, `count?`, observe params | `{x, y, node, observation?}` — a mouse click on the element |
 | `vm.ui.type` | `name`, `ref` or `selector`, `text`, `clear?`, `submit?`, observe params | `{node, observation?}` — a click on the element, then keys |
 | `vm.ui.action` | `name`, `ref` or `selector`, `action`, `value?`, observe params | `{node, pending?, unresponsive?, gone?, observation?}` — a UI Automation pattern call |
-| `vm.app.launch` | `name`, `path`, `args?`, `cwd?`, `env?`, `waitWindow?` s (default 15) | `{pid, window?, windowTimedOut?}` — see [Launching and deploying apps](#launching-and-deploying-apps) |
-| `vm.deploy` | `name`, `path` (host), `guestDir?`, `install?`, `launch?`, `killRunning?`, `waitWindow?` s (default 20) | `{guestDir, sent, skipped, bytes, installCode?, pid?, window?, windowTimedOut?}` |
+| `vm.app.launch` | `name`, `path`, `args?`, `cwd?`, `env?`, `waitWindow?` s (default 15) | `{pid, window?, windowTimedOut?, noWindowWait?}` — see [Launching and deploying apps](#launching-and-deploying-apps) |
+| `vm.deploy` | `name`, `path` (host), `guestDir?`, `install?`, `launch?`, `killRunning?`, `waitWindow?` s (default 20) | `{guestDir, sent, skipped, bytes, installCode?, pid?, window?, windowTimedOut?, noWindowWait?}` |
 | `vm.events` | `name`, `since?` | `{events, next, first}` — see [Guest events](#guest-events) |
 | `vm.record.start` | `name`, `fps?` (1 to 30, default 5), `video?` (default true), `maxSeconds?` (1 to 86400, default 900), `dir?` (host) | `{dir}` — see [Recordings](#recordings) |
 | `vm.record.stop` | `name` | `{dir, trace, frames, seconds, ops, writeErrors, lastWriteError?, video?, videoSeconds?, droppedFrames?}` |
@@ -825,9 +825,17 @@ strings), and waits up to `waitWindow` seconds (0 to 300, default 15; 0 does
 not wait) for the window it opens. It needs guest tools that run commands and
 runs in the concurrent lane. The result is `{pid}` and, when a window was
 waited for, either `window` (a window object) or `windowTimedOut: true`.
+Guest tools without the `ui` capability (Linux) wait for no window: with a
+`waitWindow` above 0 the result carries `noWindowWait: "the guest tools of
+this guest have no ui capability, so no window was waited for; wait for the
+program with vm.wait_for (process_started or text_visible)"` in place of
+`window` or `windowTimedOut`.
 
-- The program runs with the agent's elevated token and with the null device
-  as standard input and output.
+- On Windows the program runs with the agent's elevated token; on Linux as
+  the user of the guest's desktop session, in that session's environment
+  (`WAYLAND_DISPLAY` or `DISPLAY`, `XDG_RUNTIME_DIR`, the session bus),
+  see [the agent protocol](agent-protocol.md#the-desktop-session-linux). Its
+  standard input and output are the null device.
 - While the VM has an HTTP capture, the program's environment also holds the
   capture's proxy variables (see [Starting a capture](#starting-a-capture)); the program of
   `vm.deploy`'s `launch` gets them the same way, its installer does not.
@@ -895,12 +903,12 @@ the first has finished. The steps, in order:
    call vm.deploy again`, a timeout `installer '<file>' did not finish within
    900 s and was stopped; run it with vm.exec.start to see where it waits`.
 7. `launch`: as `vm.app.launch` with `guestDir` as the default `cwd`; the
-   result gains `pid` and `window` or `windowTimedOut`. A failure here
+   result gains `pid` and `window`, `windowTimedOut` or `noWindowWait`. A failure here
    answers `the files were copied to <guestDir>, but starting <exe> failed:
    <reason>`.
 
 The result is `{guestDir, sent, skipped, bytes, installCode?, pid?, window?,
-windowTimedOut?}`. A second deploy of an unchanged directory has `sent: []`
+windowTimedOut?, noWindowWait?}`. A second deploy of an unchanged directory has `sent: []`
 and still stops and starts the app.
 
 Rules for `guestDir`, checked before any file is written:
@@ -1315,7 +1323,10 @@ of the last frame read. A guest that does not offer the mode may pick another
 one or leave the size as it was. When the size changed to one other than the
 request, the result carries `warning: "the guest set <w>x<h>, not <W>x<H>; it
 does not offer that mode"`; an unchanged size gets no warning. The op needs a
-running VM with connected guest tools.
+running VM with connected guest tools that have the `resolution` capability
+(Windows guest tools); others answer `the guest tools in '<vm>' cannot change
+the display mode of this guest; change it in the guest's display settings`
+without asking the guest.
 
 ## Guest environment
 
@@ -1339,7 +1350,11 @@ in the order of this table.
 The result lists one row per requested setting: `setting`, `ok`, `detail` (what
 the script printed, e.g. the new time or zone id; the script's error text when
 `ok` is false) and `takesEffect` — `now` or `app restart` (programs started
-afterwards see it). A setting
+afterwards see it). The `clock` row's `detail` is the guest's new UTC time as
+`yyyy-MM-ddTHH:mm:ssZ` on Windows and Linux (Linux: `date -u -s @<seconds>`,
+then `date -u +%Y-%m-%dT%H:%M:%SZ`), the `timeZone` row's the zone id the
+guest reports afterwards (Linux: `timedatectl set-timezone`, then
+`timedatectl show -p Timezone --value`). A setting
 the guest OS has no script for is a row with `ok: false` and `detail` `not
 supported on <os> guests`. The op itself succeeds when a row fails, so read
 the rows.
@@ -1396,7 +1411,11 @@ that makes the later ones impossible:
 | `scale` | `<p> %` or `not checked on this guest` | never | |
 | `proxy` | the guest's system proxy held against the VM's HTTP capture, see [Doctor row](#doctor-row) | something of an earlier capture is left in the guest, the system proxy points at another port than the capture's, or the guest printed no proxy settings | |
 
-`session` is `locked` on Windows while a `LogonUI` process exists. `scale` is
+`session` is `locked` on Windows while a `LogonUI` process exists. On Linux
+`session` names the user of the desktop session the guest tools found and is
+`locked` while logind reports `LockedHint` for it; with no session it is the
+`the guest reported no user` row; guest tools that do not know `session.info`
+report the user the probe runs as. `scale` is
 the system DPI a newly started DPI-aware process reads on Windows, as a
 percentage of 96. A fact the guest cannot measure reads `not checked on this
 guest` and counts as ok.

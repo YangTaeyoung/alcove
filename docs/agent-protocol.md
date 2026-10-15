@@ -72,12 +72,67 @@ Capabilities:
 
 | `caps` entry | Present when | Meaning |
 |---|---|---|
-| `files`, `shutdown`, `resolution` | always | `file.*`, `shutdown`, `resolution.set` |
-| `clipboard` | the guest has a usable clipboard | `clipboard.*` |
+| `files`, `shutdown` | always | `file.*`, `shutdown` |
+| `resolution` | Windows agents | `resolution.set` |
+| `clipboard` | the guest has a usable clipboard: on Linux a [desktop session](#the-desktop-session-linux) whose display has its tool (`wl-paste` and `wl-copy` for Wayland, `xclip` for X11) | `clipboard.*` |
 | `exec` | started with `--allow-exec` | the v1 `exec` message |
 | `rpc` | always (agents with `proto` 2) | `req` / `res` / `ev` |
-| `jobs`, `proc`, `fs` | started with `--allow-exec` | `exec.*`, `proc.*`, `fs.*` and `app.launch` operations |
+| `jobs`, `proc`, `fs` | started with `--allow-exec` | `exec.*`, `proc.*`, `fs.*`, `app.launch` and `session.info` operations |
 | `ui` | Windows agents | `win.*` and `ui.*` operations and the window events |
+
+The agent checks its capabilities again every 3 s while a connection is
+open. When the list differs from the one it last sent on that connection it
+sends `{"t":"caps","caps":[…]}` with the whole new list, which replaces the
+hello's. On Linux this is how `clipboard` appears once a user signs in to the
+desktop after the host connected, as an autologin does a few seconds after the
+agent starts at boot, and disappears when the session ends.
+
+### The desktop session (Linux)
+
+The Linux agent is a root system service (`alcove-agent --install` writes the
+systemd unit `alcove-agent.service`). It finds the desktop session with
+`loginctl list-sessions` and `loginctl show-session`: of the sessions of
+class `user` that are not closing, the active session of `seat0`, else the
+only graphical one (type `wayland`, `x11` or `mir`), else the one that began
+first. The user's home directory and groups come from the user database. A
+lookup is reused for 2 s.
+
+- The home directory of the agent's paths is that user's: `~`, `~/x`,
+  relative paths, the `cwd` of `exec.*` and `app.launch`, the working
+  directory of `exec.*` without `cwd`, the `Desktop` and `Downloads` folders
+  of `file.begin` and the folders `fs.delete` refuses. Without a session it is
+  the agent's own home directory (`/root`).
+- `app.launch` and the clipboard tools run as that user (its user id, group
+  id and groups) with the session's environment: `HOME`, `USER`, `LOGNAME`,
+  the agent's `PATH`, `XDG_RUNTIME_DIR=/run/user/<uid>` when that folder
+  exists, `WAYLAND_DISPLAY` (the `wayland-0` socket in it, else the first
+  other `wayland-<n>`) for a Wayland session, `DISPLAY` when logind names the
+  session's display, `DBUS_SESSION_BUS_ADDRESS` when the folder holds `bus`,
+  and `XDG_SESSION_TYPE`. `env` of `app.launch` is added to that environment.
+- `exec.*` keeps the agent's identity: the commands run as root with the
+  agent's environment, in which `HOME` is root's home directory when systemd
+  started the agent without one.
+- A file `file.begin` creates, and the `Desktop` or `Downloads` folder it
+  creates, belong to the session's user. Files and folders the `fs.*`
+  operations create belong to root.
+- Without a session `app.launch` runs as the agent with its environment, and
+  the clipboard is the one the agent's own `WAYLAND_DISPLAY` or `DISPLAY`
+  names, if any.
+
+`alcove-agent --install` on Linux writes the running program to a temporary
+file in `/usr/local/bin`, flushes it to disk and renames it over
+`/usr/local/bin/alcove-agent`, which works while the old agent runs from that
+file; it then writes the unit and runs `systemctl daemon-reload`,
+`systemctl enable alcove-agent` and `systemctl restart alcove-agent`. It
+prints `installed` only after every step succeeded. A step that fails ends
+the install with exit code 1, a line on stderr that begins
+`install failed: ` and the same line in `/var/log/alcove/install.log`:
+`cannot read <file> (<reason>); run alcove-agent --install from a copy you can read`,
+`cannot replace /usr/local/bin/alcove-agent (<reason>); run alcove-agent --install as root`,
+`cannot write /etc/systemd/system/alcove-agent.service (<reason>); run alcove-agent --install as root` or
+`systemctl <step> failed (<error>: <output>); check journalctl -u alcove-agent, then run alcove-agent --install again`.
+Run it from ssh or a terminal: the restart also ends a command that the
+agent started.
 
 ## Host key
 
@@ -235,13 +290,14 @@ between attempts, until the bind succeeds.
 | host → agent | `auth` | `signature` | prove the VM's key ([Host key](#host-key)) |
 | agent → host | `authed` | — | the `auth` succeeded; the connection is served |
 | both | `ping` / `pong` | — | keepalive every 10 s |
+| agent → host | `caps` | `caps` | the capabilities changed; the list replaces the hello's ([Handshake](#handshake)) |
 | host → agent | `clipboard.set` | `text` (string) | put text on the guest clipboard |
 | host → agent | `clipboard.get` | — | ask for the current text; answered with `clipboard.text` |
 | agent → host | `clipboard.text` | `text` | reply to `clipboard.get`; text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
 | agent → host | `clipboard.changed` | `text` | the guest clipboard changed (text only in v1; polled via the clipboard sequence number on Windows, `wl-paste --watch`/`xclip` polling on Linux); text longer than 700000 bytes of UTF-8 is cut to that size on a character boundary |
-| host → agent | `resolution.set` | `w`, `h` | ask the guest to switch its primary display mode |
+| host → agent | `resolution.set` | `w`, `h` | ask the guest to switch its primary display mode (agents with the `resolution` capability; others log the request and ignore it) |
 | agent → host | `resolution` | `w`, `h` | current primary display mode (sent after hello and on change) |
-| host → agent | `file.begin` | `id`, `name`, `size`, `dest` ("desktop"/"downloads") | start a file push |
+| host → agent | `file.begin` | `id`, `name`, `size`, `dest` ("desktop"/"downloads") | start a file push into the `Desktop` or `Downloads` folder of the home directory (on Linux the [desktop session](#the-desktop-session-linux)'s) |
 | host → agent | `file.chunk` | `id`, `data` (base64, ≤ 256 KiB decoded) | file bytes |
 | host → agent | `file.end` | `id`, `sha256` | finish; the agent verifies the digest |
 | agent → host | `file.done` | `id`, `path` or `error` | result |
@@ -270,7 +326,7 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - An unknown `op` answers `unknown op '<op>'; update alcove-agent`.
 - A `req` without `id` (or with `id: null`) is not run; it answers
   `{"t":"res","id":null,"ok":false,"error":"the request has no id; give every req an id to match its answer"}`.
-- The `exec.*`, `proc.*` and `fs.*` operations and `app.launch` answer
+- The `exec.*`, `proc.*` and `fs.*` operations, `app.launch` and `session.info` answer
   `exec disabled; start alcove-agent with --allow-exec` unless the agent was
   started with `--allow-exec`. `ping`, `win.*` and `ui.*` do not need it.
 - `ev` messages are not replies. They go to every open connection. The events
@@ -297,11 +353,12 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 | `fs.list` | `path`; `recursive` (bool); `sha256` (bool) | `entries`: [{`name` (relative, `/` separators), `dir`, `size`, `mtime`, `sha256`, `link`}], `truncated` (more than 5000 entries), `skipped` (entries that could not be read, when above 0) |
 | `fs.read` | `path`, `offset` (default 0), `length` (default and cap 262144) | `data` (base64), `size` (of the file), `eof`, `encoding` |
 | `fs.tail` | `path`, `lines` (default 200) | `data` (base64 of the last lines, taken from at most the last 262144 bytes), `size`, `encoding` |
-| `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool) | `size` (of the file afterwards) |
+| `fs.write` | `path`, `data` (base64), `offset` (default 0), `truncate` (bool), `append` (bool), `mkdirs` (bool), `executable` (bool; outside Windows it adds the execute bit wherever the file has the read bit, Windows ignores it) | `size` (of the file afterwards) |
 | `fs.rename` | `from`, `to`, `overwrite` (bool) | `path` |
 | `fs.mkdir` | `path` | `path` |
 | `fs.delete` | `path`, `recursive` (bool) | `deleted` (bool) |
 | `app.launch` | `path`; `args` ([string]); `cwd`; `env` (object of strings); `wait_window_ms` (default 15000, 0 skips the wait, cap 300000) | `pid`, `window` (a window object, when a window was found) |
+| `session.info` | — | on Linux the [desktop session](#the-desktop-session-linux): `session` (logind id), `user`, `uid`, `home`, `type` (`wayland`, `x11`, `tty`, …), `locked` (logind `LockedHint`); no fields without a session. Windows agents do not know the op |
 | `win.list` | — | `windows`: [window object] |
 | `win.action` | `window`, `action` (`focus`, `minimize`, `maximize`, `restore`, `close`, `move`, `resize`); `x`, `y` for `move`; `w`, `h` for `resize` | `window` (after the action, `null` when it is gone); `closed` (bool, for `close`) |
 | `ui.tree` | `window` (default `foreground`), `root` (ref), `depth` (default 12, at most 256), `max` (default 300, cap 2000), `filter` (`interactive` default, `all`) | `window`, `nodes`, `truncated` |
@@ -330,8 +387,10 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   | `sh` | `/bin/sh -c <cmd>` |
 
 - `cwd` is the working directory; `~`, `~/x` and relative paths resolve
-  against the home directory of the agent's user, which is also the working
-  directory without `cwd`. `env` adds variables to the agent's environment.
+  against the home directory of the agent's user (on Linux the
+  [desktop session](#the-desktop-session-linux)'s user), which is also the
+  working directory without `cwd`. The command runs as the agent's user (root
+  on Linux) and `env` adds variables to the agent's environment.
 - On Windows every child starts with `CREATE_NO_WINDOW`: it has no console
   window, and a GUI program started directly shows its own windows.
 - `exec.run` gives the child a pipe that carries the `stdin` text and then
@@ -386,8 +445,12 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
 - Windows lists `Win32_Process` (`mem_kb` is the working set) through the
   system folder's Windows PowerShell, at most 30 s
   (`listing the processes took longer than 30 s; retry`); elsewhere
-  `ps axo pid=,ppid=,rss=,args=` (`name` is the base name of the first
-  argument, `path` is set when that argument is absolute). Each `cmd` is cut to
+  `ps axo pid=,ppid=,rss=,args=`: `name` is the kernel's name of the process
+  (`/proc/<pid>/comm`, at most 15 bytes), or the base name of the first
+  argument when that is the same name or begins with a kernel name of 15
+  bytes, or when there is no `/proc`; a program that rewrites its arguments,
+  such as `sshd: /usr/sbin/sshd -D [listener] …`, is named `sshd`. `path` is
+  set when the first argument is absolute. Each `cmd` is cut to
   8192 characters with a trailing `…` when longer, after each run of invalid
   UTF-8 bytes became one U+FFFD (`exec.list` cuts its `cmd` the same way).
 - `proc.kill` with `pid` answers `killed: 1` or an error. With `name` it kills
@@ -435,8 +498,11 @@ agent → host   {"t":"ev","name":"job.exited","job":"j3","code":0}
   `'<name>' is not in the system folders of PATH or under HKLM App Paths; pass the full path of the program`.
 - The program starts directly with `args` as its arguments and with a normal
   window. Without `cwd` it runs in the directory of the program file; `cwd`
-  resolves like the `cwd` of `exec.run`. `env` adds variables to the agent's
-  environment; a name given there replaces one of the same name
+  resolves like the `cwd` of `exec.run`. On Linux with a
+  [desktop session](#the-desktop-session-linux) the program runs as the
+  session's user in the session's environment, and `env` adds variables to
+  that environment; otherwise it runs as the agent and `env` adds variables
+  to the agent's environment. A name given in `env` replaces one of the same name
   (case-insensitive on Windows), and an empty name or one that contains `=`
   answers `env names cannot be empty or contain '='`. Its standard input,
   output and error are the null device, so a console program that reads its
@@ -992,7 +1058,7 @@ agent sends one event per difference, each with the window object:
 ### Files (`fs.*`)
 
 - Paths: `~`, `~/x`, `~\x` and relative paths resolve against the home
-  directory of the agent's user; results report absolute paths. On Windows a
+  directory of the agent's user (on Linux the [desktop session](#the-desktop-session-linux)'s user); results report absolute paths. On Windows a
   drive without a separator after it (`C:foo`) and a path that starts at the
   root of the current drive (`\x`) are refused with a sentence that names the
   full form to pass.
@@ -1062,6 +1128,7 @@ agent sends one event per difference, each with the window object:
   A link itself is deleted without what it leads to.
 - The host transfers a file as `fs.write` pieces to `<path>.alcove-part`,
   compares `fs.stat` with `sha256` against its own digest and then renames;
+  the first piece carries `executable` when the host file has an execute bit;
   downloads use `fs.stat` with `sha256` and `fs.read` pieces.
 
 ### Limits
