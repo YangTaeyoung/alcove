@@ -633,6 +633,8 @@ the line to `install.log` too, each with its next step:
 
 | Step | Line after `install failed: ` |
 |---|---|
+| finding the running program | `the path of this alcove-agent.exe could not be read (<reason>); run alcove-agent --install again from the folder that holds alcove-agent.exe` |
+| reading the running program | `<file> could not be read (<reason>); copy alcove-agent.exe to a local folder and run alcove-agent --install from there` |
 | copying the program to `C:\Program Files\Alcove` | `could not write <file> (<reason>); delete <file>, then run alcove-agent --install again from an elevated prompt`, or `the copy at <file> holds <n> bytes instead of <m>; delete <file>, then run alcove-agent --install again from an elevated prompt` |
 | creating the scheduled task | `the scheduled task AlcoveAgent could not be created (<error>: <schtasks output>); run alcove-agent --install again from an elevated prompt` |
 | adding the firewall rule | `the firewall rule AlcoveAgent for TCP port <port> could not be added (<error>: <netsh output>); run alcove-agent --install again from an elevated prompt` |
@@ -1028,10 +1030,15 @@ agent sends one event per difference, each with the window object:
   directory, whether or not `recursive` is set. The path is compared as given
   and with a `\\?\` prefix removed and the links, junctions and short names of
   its parent folder resolved; the home directory as given and with its links
-  resolved. A path that names the same folder (by file identity) as one of
-  those or as the root of a drive is refused as well, so other names for
-  them, such as `\\localhost\C$\…`, `\\127.0.0.1\C$\…` or
-  `\\?\UNC\localhost\C$\…`, are refused too. A link itself is deleted without what it leads to.
+  resolved. A folder whose identity (volume serial number and file index on
+  Windows, device and inode elsewhere, read without following a link at its
+  end) equals that of one of those folders or of the root of its own volume
+  is refused as well, so other names for them, such as `\\localhost\C$\…`,
+  `\\127.0.0.1\C$\…` or `\\?\UNC\localhost\C$\…`, are refused too. A folder
+  is also refused while its identity, its volume root or the identity of one
+  of those existing folders cannot be read, for example
+  `refusing to delete '<path>': its identity could not be read (<reason>), so it cannot be told apart from the home directory; delete its contents instead, or use exec.run if this is intended`.
+  A link itself is deleted without what it leads to.
 - The host transfers a file as `fs.write` pieces to `<path>.alcove-part`,
   compares `fs.stat` with `sha256` against its own digest and then renames;
   downloads use `fs.stat` with `sha256` and `fs.read` pieces.

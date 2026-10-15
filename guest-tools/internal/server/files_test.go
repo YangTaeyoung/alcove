@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -715,6 +716,54 @@ func TestFsDeleteRefusesTheHomeDirectoryUnderAnotherSpellingOfItsName(t *testing
 	}
 	if _, err := os.Stat(filepath.Join(home, "keep")); err != nil {
 		t.Fatalf("home content deleted: %v", err)
+	}
+}
+
+func TestFsDeleteRefusesAFolderWhoseIdentityCannotBeRead(t *testing.T) {
+	c, home := fsHome(t)
+	for _, name := range []string{"unreadable", "other", "file"} {
+		if name == "file" {
+			if err := os.WriteFile(filepath.Join(home, name), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.Mkdir(filepath.Join(home, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := readFileID
+	var failing string
+	readFileID = func(path string, follow bool) (fileID, error) {
+		if path == failing {
+			return fileID{}, errors.New("sharing violation")
+		}
+		return read(path, follow)
+	}
+	t.Cleanup(func() { readFileID = read })
+
+	failing = filepath.Join(home, "unreadable")
+	res := c.call("fs.delete", proto.Message{"path": "unreadable", "recursive": true})
+	want := "refusing to delete '" + failing + "': its identity could not be read (sharing violation), so it cannot be told apart from the home directory; delete its contents instead, or use exec.run if this is intended"
+	if res["ok"] != false || res.String("error") != want {
+		t.Fatalf("unreadable folder: %v", res)
+	}
+
+	failing = filepath.Clean(home)
+	other := filepath.Join(home, "other")
+	res = c.call("fs.delete", proto.Message{"path": "other", "recursive": true})
+	want = "refusing to delete '" + other + "': the identity of " + failing + " could not be read (sharing violation), so it cannot be told apart from that folder; delete its contents instead, or use exec.run if this is intended"
+	if res["ok"] != false || res.String("error") != want {
+		t.Fatalf("unreadable home: %v", res)
+	}
+
+	failing = filepath.Join(home, "file")
+	if res := c.ok("fs.delete", proto.Message{"path": "file"}); res["deleted"] != true {
+		t.Fatalf("file: %v", res)
+	}
+	failing = ""
+	if res := c.ok("fs.delete", proto.Message{"path": "unreadable"}); res["deleted"] != true {
+		t.Fatalf("readable folder: %v", res)
 	}
 }
 

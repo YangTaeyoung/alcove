@@ -677,14 +677,39 @@ func (s *Server) protectedFromDelete(path string) bool {
 	return err == nil && pathContains(path, real, filepath.Separator, fold)
 }
 
-// sameAsProtected reports whether fi, the Lstat of a path, is a folder that is
-// the same file as the home directory, one of its ancestors or a file-system
-// root, the home directory taken as given and with its links resolved.
-func (s *Server) sameAsProtected(fi os.FileInfo) bool {
+// fileID identifies a file or folder on its volume.
+type fileID struct{ volume, index uint64 }
+
+// readFileID returns the identity of path; follow says whether a link at the
+// end of path is followed.
+var readFileID = platformFileID
+
+// homeRefusal is the error of fs.delete for path, which is the home
+// directory or contains it.
+func homeRefusal(path string) error {
+	return fmt.Errorf("refusing to delete '%s': it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended", path)
+}
+
+// identityRefusal returns the refusal of fs.delete for path, whose Lstat is
+// fi, when it is a folder whose identity equals that of the root of its
+// volume, the home directory or one of its ancestors, the home directory
+// taken as given and with its links resolved. A folder whose identity, or
+// whose volume root, cannot be read is refused, and so is every folder while
+// the identity of one of those existing folders cannot be read. Other paths
+// answer nil.
+func (s *Server) identityRefusal(path string, fi os.FileInfo) error {
 	if !fi.IsDir() {
-		return false
+		return nil
 	}
-	folders := fileSystemRoots()
+	const next = "delete its contents instead, or use exec.run if this is intended"
+	target, err := readFileID(path, false)
+	if err != nil {
+		return fmt.Errorf("refusing to delete '%s': its identity could not be read (%v), so it cannot be told apart from the home directory; %s", path, err, next)
+	}
+	folders, err := volumeRoots(path)
+	if err != nil {
+		return fmt.Errorf("refusing to delete '%s': the root of its volume could not be read (%v), so it cannot be told apart from that root; %s", path, err, next)
+	}
 	if s.opt.HomeDir != "" {
 		home := filepath.Clean(s.opt.HomeDir)
 		homes := []string{home}
@@ -703,11 +728,18 @@ func (s *Server) sameAsProtected(fi os.FileInfo) bool {
 		}
 	}
 	for _, p := range folders {
-		if st, err := os.Stat(p); err == nil && os.SameFile(fi, st) {
-			return true
+		id, err := readFileID(p, true)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("refusing to delete '%s': the identity of %s could not be read (%v), so it cannot be told apart from that folder; %s", path, p, err, next)
+		}
+		if id == target {
+			return homeRefusal(path)
 		}
 	}
-	return false
+	return nil
 }
 
 // resolveParent returns path without a \\?\ prefix before a drive letter and
@@ -729,7 +761,7 @@ func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, 
 		return nil, err
 	}
 	if s.protectedFromDelete(path) || s.protectedFromDelete(resolveParent(path)) {
-		return nil, fmt.Errorf("refusing to delete '%s': it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended", path)
+		return nil, homeRefusal(path)
 	}
 	fi, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -738,8 +770,8 @@ func (s *Server) fsDelete(_ context.Context, req proto.Message) (proto.Message, 
 	if err != nil {
 		return nil, fmt.Errorf("cannot stat '%s': %v", path, err)
 	}
-	if s.sameAsProtected(fi) {
-		return nil, fmt.Errorf("refusing to delete '%s': it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended", path)
+	if err := s.identityRefusal(path, fi); err != nil {
+		return nil, err
 	}
 	if fi.IsDir() && !req.Bool("recursive") {
 		children, err := os.ReadDir(path)

@@ -4,6 +4,7 @@ package server
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -28,6 +29,20 @@ func TestFsDeleteRefusesTheHomeDirectoryThroughTheAdminShare(t *testing.T) {
 	if _, err := os.Stat(adminShare("localhost", home)); err != nil {
 		t.Skipf("the administrative share is not reachable (%v); the Server service may be off", err)
 	}
+	held, err := os.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	inside := exec.Command(systemProgram("PING.EXE"), "-n", "60", "127.0.0.1")
+	inside.Dir = home
+	hideWindow(inside)
+	if err := inside.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { inside.Wait(); close(exited) }()
+	t.Cleanup(func() { inside.Process.Kill(); <-exited })
 	c, _ := newRPCClient(t, Options{HomeDir: home})
 	want := "it is the home directory or contains it; delete its contents instead, or use exec.run if this is intended"
 	for _, tc := range []struct {
