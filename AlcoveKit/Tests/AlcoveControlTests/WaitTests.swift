@@ -1382,7 +1382,7 @@ final class WaitTests: XCTestCase {
         XCTAssertEqual(message, ControlHandler.ControlError.noTools("Win").description)
     }
 
-    func testAConditionThatNeedsCommandsIsRefusedWhenTheToolsDoNotAllowThem() async throws {
+    func testAConditionWhoseGuestCallsNeedAllowExecIsRefusedWithoutIt() async throws {
         let agent = FakeAgent()
         agent.caps = ["clipboard", "files"]
         let (h, t) = try await agentRig(agent, frames: [solid(64, 64, 10)])
@@ -1391,10 +1391,12 @@ final class WaitTests: XCTestCase {
             ["type": "file_exists", "path": "C:\\a"], ["type": "port_listening", "port": 80],
             ["type": "log_matches", "path": "C:\\x.log", "pattern": "a"], ["type": "job_output_matches", "job": "j1", "pattern": "a"],
         ]
+        let calls = ["process_started": "proc.list", "process_exited": "proc.list", "file_exists": "fs.stat", "port_listening": "exec.run",
+                     "log_matches": "fs.tail and fs.stat", "job_output_matches": "exec.read"]
         for condition in conditions {
             let type = try XCTUnwrap(condition["type"]?.stringValue)
             let message = try await ended(h, ["name": "Win", "timeout": 300, "conditions": [["type": "screen_idle", "seconds": 100], condition]])
-            XCTAssertEqual(message, "condition 1: guest tools in 'Win' do not allow running commands, which \(type) needs; start alcove-agent with --allow-exec")
+            XCTAssertEqual(message, "condition 1: \(type) calls \(calls[type] ?? "?") in the guest, which guest tools in 'Win' allow only when alcove-agent runs with --allow-exec; start alcove-agent with --allow-exec")
         }
         XCTAssertTrue(agent.received.filter { $0["t"]?.stringValue == "req" }.isEmpty, "\(agent.received)")
         let frames = await t.frameCalls

@@ -138,6 +138,18 @@ enum WaitCondition: Sendable {
         }
     }
 
+    /// The guest agent ops an agent condition calls, as a phrase; nil for the other kinds.
+    var guestCalls: String? {
+        switch self {
+        case .processStarted, .processExited: return "proc.list"
+        case .fileExists: return "fs.stat"
+        case .portListening: return "exec.run"
+        case .logMatches: return "fs.tail and fs.stat"
+        case .jobOutputMatches: return "exec.read"
+        default: return nil
+        }
+    }
+
     var needsFrame: Bool { kind == .screen || kind == .text }
     var needsAgent: Bool { !needsFrame }
     var needsUI: Bool { kind == .ui }

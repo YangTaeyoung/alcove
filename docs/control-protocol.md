@@ -532,11 +532,14 @@ seconds older than the moment the condition is judged. A
 condition that needs guest tools
 (`process_*`, `file_exists`, `port_listening`, `log_matches`,
 `job_output_matches`) answers `guest tools are not connected in '<vm>'; ...`
-when they are not connected after a wait of up to 25 s. These conditions run
-guest commands, which the guest tools allow only when `alcove-agent` was
-started with `--allow-exec`: without it the wait is refused before it starts
-with `condition <i>: guest tools in '<vm>' do not allow running commands,
-which <type> needs; start alcove-agent with --allow-exec`. If several
+when they are not connected after a wait of up to 25 s. These conditions call
+guest agent ops that the guest tools serve only when `alcove-agent` was
+started with `--allow-exec`: `process_*` calls `proc.list`, `file_exists`
+`fs.stat`, `port_listening` `exec.run`, `log_matches` `fs.tail` and `fs.stat`,
+and `job_output_matches` `exec.read`. Without it the wait is refused before
+it starts with `condition <i>: <type> calls <ops> in the guest, which guest
+tools in '<vm>' allow only when alcove-agent runs with --allow-exec; start
+alcove-agent with --allow-exec`. If several
 conditions hold on the same tick, the one with the lowest index wins.
 
 The result is `{matched, waited, type?, detail?, problems?, observation?}`:

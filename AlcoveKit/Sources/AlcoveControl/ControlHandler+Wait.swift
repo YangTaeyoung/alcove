@@ -166,7 +166,8 @@ extension ControlHandler {
         }
         if let agent, let index = conditions.firstIndex(where: { $0.kind == .agent }),
            let hello = await agent.hello, !hello.capabilities.contains("exec") {
-            throw ControlError.failed("condition \(index): guest tools in '\(t.name)' do not allow running commands, which \(conditions[index].typeName) needs; start alcove-agent with --allow-exec")
+            let condition = conditions[index]
+            throw ControlError.failed("condition \(index): \(condition.typeName) calls \(condition.guestCalls ?? "ops") in the guest, which guest tools in '\(t.name)' allow only when alcove-agent runs with --allow-exec; start alcove-agent with --allow-exec")
         }
 
         var states: [WaitState] = []
@@ -280,8 +281,9 @@ extension ControlHandler {
             if clock.now >= deadline { break }
             try await Task.sleep(until: tickEnd, clock: clock)
         }
-        // After the last tick the agent and UI conditions are looked at; when none ended the wait, the text readings
-        // in flight get `recognitionGrace`, and every condition is looked at once more.
+        // After the last tick every condition that is not a text condition takes in its agent or helper call in flight
+        // when that call has ended; when none ended the wait, the text readings in flight get `recognitionGrace`, and
+        // every condition is looked at once more.
         if !settled {
             for (index, condition) in conditions.enumerated() where condition.text == nil {
                 guard let collected = await collect(condition, state: &states[index], until: clock.now) else { continue }
