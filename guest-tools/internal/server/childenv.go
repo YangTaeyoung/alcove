@@ -29,8 +29,11 @@ type windowsEnvInputs struct {
 
 // systemFolderVariables are the variables windowsChildEnv sets from
 // windowsEnvInputs.folders, spelled as Windows spells them.
-var systemFolderVariables = []string{"SystemRoot", "windir", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
-	"CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432"}
+var systemFolderVariables = []string{"SystemRoot", "windir", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)", "ProgramFiles(Arm)",
+	"ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramFiles(Arm)", "CommonProgramW6432"}
+
+// logonPrompt is the PROMPT of a Windows logon environment.
+const logonPrompt = "$P$G"
 
 // sessionVariables are the upper-case names of the variables windowsChildEnv
 // takes from the account and the system folders and never from the machine
@@ -41,6 +44,8 @@ var sessionVariables = map[string]bool{"USERNAME": true, "USERDOMAIN": true, "CO
 
 // windowsChildEnv returns the base environment of the processes the agent
 // starts on Windows, sorted by the upper-case names:
+//   - PROMPT of logonPrompt, which a machine value PROMPT that the next
+//     rule keeps replaces;
 //   - each machine value whose name is not empty, has no '=' and is not one
 //     of sessionVariables: a REG_SZ value as stored, a REG_EXPAND_SZ value
 //     expanded from machineExpansionVars by sysfolder.ExpandText and left out
@@ -57,6 +62,7 @@ func windowsChildEnv(in windowsEnvInputs) []string {
 	expand := machineExpansionVars(in.machine, in.folders)
 	vars := map[string]string{}
 	set := func(name, value string) { vars[strings.ToUpper(name)] = name + "=" + value }
+	set("PROMPT", logonPrompt)
 	for _, v := range in.machine {
 		if !machineVariable(v.Name) {
 			continue

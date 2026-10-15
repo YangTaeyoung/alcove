@@ -525,7 +525,9 @@ starts with an environment the agent builds when the request arrives:
   `JAVA_HOME` itself is not expanded again). A value that names any other
   variable, such as `%USERPROFILE%`, `%TEMP%` or a `REG_EXPAND_SZ` value, is
   left out. `Path` keeps, in order, the folders that expand that way and
-  start with a drive, the folders `app.launch` searches.
+  start with a drive, the folders `app.launch` searches. `PROMPT` is
+  `$P$G`, the prompt of a logon environment, unless a machine value
+  `PROMPT` is kept this way.
 - Values the account cannot change as variables, which replace a machine
   value of the same name: `USERNAME` and `USERDOMAIN` of the account of the
   agent's token, `COMPUTERNAME` (`GetComputerNameW`); `USERPROFILE`,
@@ -537,16 +539,18 @@ starts with an environment the agent builds when the request arrives:
   (`<profile>\AppData\Local\Temp`); `ProgramData` and `ALLUSERSPROFILE`
   (the `ProgramData` value of that key) and `PUBLIC` (its `Public` value),
   both expanded from the system folders; `SystemRoot`, `windir`,
-  `SystemDrive`, `ProgramFiles`,
-  `ProgramFiles(x86)`, `ProgramW6432`, `CommonProgramFiles`,
-  `CommonProgramFiles(x86)` and `CommonProgramW6432` of the system folders.
+  `SystemDrive`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramFiles(Arm)`,
+  `ProgramW6432`, `CommonProgramFiles`, `CommonProgramFiles(x86)`,
+  `CommonProgramFiles(Arm)` and `CommonProgramW6432` of the system folders,
+  each Program Files variable only when the machine has its value (see
+  [App launch](#app-launch-applaunch)).
 - The request's `env` after it: a name given there replaces one of the same
   name without regard to case.
 
 Folder redirection of `AppData`, the user's own variables and `PATH`
 entries (such as `%LOCALAPPDATA%\Microsoft\WindowsApps`, which holds app
-execution aliases like `winget.exe`), `OneDrive`, `LOGONSERVER` and
-`SESSIONNAME` are not part of it, and
+execution aliases like `winget.exe`), `OneDrive`, `LOGONSERVER`,
+`USERDOMAIN_ROAMINGPROFILE` and `SESSIONNAME` are not part of it, and
 neither is a `PSModuleAnalysisCachePath` other than the machine's: pass what
 a command needs with `env`, or the full path of a program. A change an
 installer makes to the machine's variables reaches the next command without
@@ -748,11 +752,17 @@ the same way:
   from the machine, never from the agent's environment: `%SystemDrive%`,
   `%SystemRoot%` and `%windir%` from the system's Windows folder
   (`GetSystemWindowsDirectoryW`), and `%ProgramFiles%`, `%ProgramFiles(x86)%`,
-  `%ProgramW6432%`, `%CommonProgramFiles%`, `%CommonProgramFiles(x86)%` and
-  `%CommonProgramW6432%` from their `…Dir` values under
-  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion`, and any other name, one
-  level deep, from a `REG_SZ` value of that `Session Manager\Environment` key
-  that is not one of the account's variables of
+  `%ProgramFiles(Arm)%`, `%ProgramW6432%`, `%CommonProgramFiles%`,
+  `%CommonProgramFiles(x86)%`, `%CommonProgramFiles(Arm)%` and
+  `%CommonProgramW6432%` from their values under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion` (`ProgramFilesDir`,
+  `ProgramFilesDir (x86)`, `ProgramFilesDir (Arm)`, `ProgramW6432Dir`,
+  `CommonFilesDir`, `CommonFilesDir (x86)`, `CommonFilesDir (Arm)`,
+  `CommonW6432Dir`), each expanded from the Windows folder alone; one whose
+  value is missing, empty or not a folder on a drive is not defined. Any
+  other name is expanded, one level deep, from a `REG_SZ` value of that
+  `Session Manager\Environment` key that is not one of the account's
+  variables of
   [Environment of a command on Windows](#environment-of-a-command-on-windows).
   A folder or program that names any other variable, or does not start with
   a drive, is skipped. When

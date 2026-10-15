@@ -1,6 +1,10 @@
 package sysfolder
 
-import "testing"
+import (
+	"errors"
+	"reflect"
+	"testing"
+)
 
 func base(t *testing.T) map[string]string {
 	t.Helper()
@@ -75,5 +79,67 @@ func TestAddedVariablesAreExpandedByName(t *testing.T) {
 	got, err := Expand(`%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe`, vars)
 	if want := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`; err != nil || got != want {
 		t.Fatalf("got %q, %v; expected %q", got, err, want)
+	}
+}
+
+// readValues returns a reader of the values of values that fails for a name
+// values does not hold.
+func readValues(values map[string]string) func(string) (string, error) {
+	return func(name string) (string, error) {
+		v, ok := values[name]
+		if !ok {
+			return "", errors.New("the value does not exist")
+		}
+		return v, nil
+	}
+}
+
+func TestTheProgramFilesFoldersOfAnArmMachineAreRead(t *testing.T) {
+	vars, err := folderVars(`C:\WINDOWS`, readValues(map[string]string{
+		"ProgramFilesDir":       `C:\Program Files`,
+		"ProgramFilesDir (x86)": `C:\Program Files (x86)`,
+		"ProgramFilesDir (Arm)": `C:\Program Files (Arm)`,
+		"ProgramW6432Dir":       `C:\Program Files`,
+		"CommonFilesDir":        `C:\Program Files\Common Files`,
+		"CommonFilesDir (x86)":  `C:\Program Files (x86)\Common Files`,
+		"CommonFilesDir (Arm)":  `C:\Program Files (Arm)\Common Files`,
+		"CommonW6432Dir":        `C:\Program Files\Common Files`,
+	}))
+	want := map[string]string{
+		"systemdrive":             `C:`,
+		"systemroot":              `C:\WINDOWS`,
+		"windir":                  `C:\WINDOWS`,
+		"programfiles":            `C:\Program Files`,
+		"programfiles(x86)":       `C:\Program Files (x86)`,
+		"programfiles(arm)":       `C:\Program Files (Arm)`,
+		"programw6432":            `C:\Program Files`,
+		"commonprogramfiles":      `C:\Program Files\Common Files`,
+		"commonprogramfiles(x86)": `C:\Program Files (x86)\Common Files`,
+		"commonprogramfiles(arm)": `C:\Program Files (Arm)\Common Files`,
+		"commonprogramw6432":      `C:\Program Files\Common Files`,
+	}
+	if err != nil || !reflect.DeepEqual(vars, want) {
+		t.Fatalf("got %v, %v; expected %v", vars, err, want)
+	}
+}
+
+func TestAProgramFilesValueThatIsMissingEmptyOrNotAFolderIsLeftOut(t *testing.T) {
+	vars, err := folderVars(`D:\WINDOWS`, readValues(map[string]string{
+		"ProgramFilesDir":      `%SystemDrive%\Program Files`,
+		"CommonFilesDir":       `%ProgramFiles%\Common Files`,
+		"ProgramW6432Dir":      ``,
+		"CommonFilesDir (Arm)": `Program Files (Arm)\Common Files`,
+	}))
+	want := map[string]string{
+		"systemdrive":  `D:`,
+		"systemroot":   `D:\WINDOWS`,
+		"windir":       `D:\WINDOWS`,
+		"programfiles": `D:\Program Files`,
+	}
+	if err != nil || !reflect.DeepEqual(vars, want) {
+		t.Fatalf("got %v, %v; expected %v", vars, err, want)
+	}
+	if _, err := folderVars(`WINDOWS`, readValues(nil)); err == nil {
+		t.Fatal("a Windows folder without a drive gave no error")
 	}
 }

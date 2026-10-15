@@ -17,6 +17,44 @@ func BaseVars(windows string) (map[string]string, error) {
 	return map[string]string{"systemdrive": windows[:2], "systemroot": windows, "windir": windows}, nil
 }
 
+// programFilesValues maps the variables of the Program Files folders to the
+// names of their values under HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion.
+var programFilesValues = map[string]string{
+	"programfiles":            "ProgramFilesDir",
+	"programfiles(x86)":       "ProgramFilesDir (x86)",
+	"programfiles(arm)":       "ProgramFilesDir (Arm)",
+	"programw6432":            "ProgramW6432Dir",
+	"commonprogramfiles":      "CommonFilesDir",
+	"commonprogramfiles(x86)": "CommonFilesDir (x86)",
+	"commonprogramfiles(arm)": "CommonFilesDir (Arm)",
+	"commonprogramw6432":      "CommonW6432Dir",
+}
+
+// folderVars returns BaseVars of the Windows folder windows and each Program
+// Files variable of programFilesValues whose value, read by value, expands
+// with BaseVars by Expand. A value that value cannot read, that is "" or that
+// does not expand is left out.
+func folderVars(windows string, value func(name string) (string, error)) (map[string]string, error) {
+	base, err := BaseVars(windows)
+	if err != nil {
+		return nil, err
+	}
+	vars := make(map[string]string, len(base)+len(programFilesValues))
+	for name, dir := range base {
+		vars[name] = dir
+	}
+	for name, v := range programFilesValues {
+		raw, err := value(v)
+		if err != nil || raw == "" {
+			continue
+		}
+		if dir, err := Expand(raw, base); err == nil {
+			vars[name] = dir
+		}
+	}
+	return vars, nil
+}
+
 // Value is a string value of a registry key: Text as stored, and Expand set
 // for a REG_EXPAND_SZ value.
 type Value struct {

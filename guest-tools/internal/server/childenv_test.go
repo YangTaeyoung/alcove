@@ -20,7 +20,9 @@ func testEnvInputs(t *testing.T) windowsEnvInputs {
 	}
 	folders["programfiles"] = `D:\Program Files`
 	folders["programfiles(x86)"] = `D:\Program Files (x86)`
+	folders["programfiles(arm)"] = `D:\Program Files (Arm)`
 	folders["commonprogramfiles"] = `D:\Program Files\Common Files`
+	folders["commonprogramfiles(arm)"] = `D:\Program Files (Arm)\Common Files`
 	return windowsEnvInputs{
 		machine: []sysfolder.Value{
 			{Name: "ComSpec", Text: `%SystemRoot%\system32\cmd.exe`, Expand: true},
@@ -72,6 +74,7 @@ func TestTheWindowsChildEnvironmentIsBuiltFromTheMachineAndTheProfile(t *testing
 		`ALLUSERSPROFILE=D:\ProgramData`,
 		`APPDATA=D:\Users\alcove\AppData\Roaming`,
 		`CommonProgramFiles=D:\Program Files\Common Files`,
+		`CommonProgramFiles(Arm)=D:\Program Files (Arm)\Common Files`,
 		`COMPUTERNAME=DESKTOP-1`,
 		`ComSpec=D:\WINDOWS\system32\cmd.exe`,
 		`HOMEDRIVE=D:`,
@@ -85,7 +88,9 @@ func TestTheWindowsChildEnvironmentIsBuiltFromTheMachineAndTheProfile(t *testing
 		`PROCESSOR_ARCHITECTURE=ARM64`,
 		`ProgramData=D:\ProgramData`,
 		`ProgramFiles=D:\Program Files`,
+		`ProgramFiles(Arm)=D:\Program Files (Arm)`,
 		`ProgramFiles(x86)=D:\Program Files (x86)`,
+		`PROMPT=$P$G`,
 		`PSModulePath=D:\Program Files\WindowsPowerShell\Modules;D:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules`,
 		`PUBLIC=D:\Users\Public`,
 		`SystemDrive=D:`,
@@ -131,6 +136,24 @@ func TestAMachineValueExpandsTheMachinesOwnTextValuesOneLevel(t *testing.T) {
 		if got := envValue(env, name); got != want {
 			t.Errorf("%s is %q; expected %q", name, got, want)
 		}
+	}
+}
+
+func TestAMachinePromptValueReplacesTheLogonPrompt(t *testing.T) {
+	in := testEnvInputs(t)
+	in.machine = append(in.machine, sysfolder.Value{Name: "Prompt", Text: "$D $P$G"})
+	env := windowsChildEnv(in)
+	if got := envValue(env, "PROMPT"); got != "$D $P$G" {
+		t.Fatalf("PROMPT is %q", got)
+	}
+	n := 0
+	for _, kv := range env {
+		if name, _, _ := strings.Cut(kv, "="); strings.EqualFold(name, "PROMPT") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("the environment holds %d PROMPT entries: %q", n, env)
 	}
 }
 

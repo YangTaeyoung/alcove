@@ -22,39 +22,14 @@ const ProfileListKey = `SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList
 // currentVersionKey holds the Program Files folders of the machine.
 const currentVersionKey = `SOFTWARE\Microsoft\Windows\CurrentVersion`
 
-// programFilesValues maps the variables of the Program Files folders to their
-// values under currentVersionKey.
-var programFilesValues = map[string]string{
-	"programfiles":            "ProgramFilesDir",
-	"programfiles(x86)":       "ProgramFilesDir (x86)",
-	"programw6432":            "ProgramW6432Dir",
-	"commonprogramfiles":      "CommonFilesDir",
-	"commonprogramfiles(x86)": "CommonFilesDir (x86)",
-	"commonprogramw6432":      "CommonW6432Dir",
-}
-
-// MachineVars returns BaseVars of the system's Windows folder and the Program
-// Files variables whose values under currentVersionKey expand with them. No
-// environment variable is read.
+// MachineVars returns folderVars of the system's Windows folder with the
+// values under currentVersionKey. No environment variable is read.
 func MachineVars() (map[string]string, error) {
 	windows, err := WindowsFolder()
 	if err != nil {
 		return nil, err
 	}
-	vars, err := BaseVars(windows)
-	if err != nil {
-		return nil, err
-	}
-	for name, value := range programFilesValues {
-		raw, err := MachineString(currentVersionKey, value)
-		if err != nil || raw == "" {
-			continue
-		}
-		if dir, err := Expand(raw, vars); err == nil {
-			vars[name] = dir
-		}
-	}
-	return vars, nil
+	return folderVars(windows, func(name string) (string, error) { return MachineString(currentVersionKey, name) })
 }
 
 // MachineString returns a REG_SZ or REG_EXPAND_SZ value of a key of
