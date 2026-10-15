@@ -12,7 +12,26 @@ import AlcoveQMP
 /// bytes of it for `writeStallLimit`, is closed. A request whose reply alone is
 /// longer than `maxOutboxBytes` is answered with a failure that says so.
 public final class ControlServer: @unchecked Sendable {
-    public enum ServerError: Error, Equatable { case socket(errno: Int32), bind(path: String, errno: Int32), listen(errno: Int32), pathTooLong(String) }
+    public enum ServerError: Error, Equatable, CustomStringConvertible {
+        case socket(errno: Int32), bind(path: String, errno: Int32), listen(errno: Int32), pathTooLong(String)
+
+        public var description: String {
+            switch self {
+            case .socket(let e):
+                return "a unix socket could not be created (\(String(cString: strerror(e)))); start the control server again"
+            case .bind(let path, let e):
+                return "the socket \(path) could not be bound (\(String(cString: strerror(e)))); make its folder writable or choose another path"
+            case .listen(let e):
+                return "the socket could not accept connections (\(String(cString: strerror(e)))); start the control server again"
+            case .pathTooLong(let path):
+                return "the socket path \(path) is \(path.utf8.count) bytes long, and a unix socket path on macOS holds at most "
+                    + "\(ControlServer.maxSocketPathBytes) bytes (\(ControlServer.maxSocketPathBytes + 1) with the closing NUL byte); choose a shorter path"
+            }
+        }
+    }
+
+    /// The longest socket path in bytes that `sockaddr_un.sun_path` holds with its closing NUL byte.
+    public static let maxSocketPathBytes = MemoryLayout.size(ofValue: sockaddr_un().sun_path) - 1
 
     public static var defaultSocketPath: String {
         (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/Alcove/control.sock")

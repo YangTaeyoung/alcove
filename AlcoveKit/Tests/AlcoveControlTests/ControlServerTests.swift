@@ -96,6 +96,23 @@ final class ControlServerTests: XCTestCase {
         XCTAssertEqual(noObject, ["ok": false, "id": .null, "error": "missing or invalid parameter 'op'"])
     }
 
+    func testASocketPathLongerThanMacOSAllowsIsRefusedWithASentenceThatNamesTheLimit() throws {
+        let handler = ControlHandler(registry: FakeRegistry(targets: [:]), hostKind: "test", captureDirectory: scratchCaptureDirectory)
+        let base = "/tmp/alcove-ctl-\(UUID().uuidString.prefix(8))-"
+        let longest = base + String(repeating: "x", count: 103 - base.utf8.count - 5) + ".sock"
+        XCTAssertEqual(longest.utf8.count, 103)
+        let accepted = ControlServer(handler: handler, socketPath: longest)
+        XCTAssertNoThrow(try accepted.start())
+        accepted.stop()
+        let tooLong = base + String(repeating: "y", count: 104 - base.utf8.count - 5) + ".sock"
+        let refused = ControlServer(handler: handler, socketPath: tooLong)
+        XCTAssertThrowsError(try refused.start()) {
+            XCTAssertEqual("\($0)", "the socket path \(tooLong) is 104 bytes long, and a unix socket path on macOS holds at most 103 bytes "
+                           + "(104 with the closing NUL byte); choose a shorter path")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tooLong))
+    }
+
     private func startServer(_ handler: ControlHandler, loadingRecognizers: Bool = false,
                              writeStallLimit: Duration = .seconds(30), maxOutboxBytes: Int = 64 << 20) throws -> (ControlServer, String) {
         let path = "/tmp/alcove-ctl-\(UUID().uuidString.prefix(8)).sock"

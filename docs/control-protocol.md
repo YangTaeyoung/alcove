@@ -24,6 +24,11 @@ each VM it runs (as `vm.stop` without `force`) and exits.
 `alcovectl serve --dir DIR` serves the VMs in DIR (default `ALCOVE_VM_DIR`,
 else `~/Library/Application Support/Alcove/VMs`); DIR may be a symbolic link
 to the folder, and each VM's bundle path is then spelled under DIR.
+`--socket PATH` listens on PATH instead of the default socket. A unix socket
+path on macOS holds at most 103 bytes (104 with the closing NUL byte); a
+longer PATH stops the command with `cannot start control server: the socket
+path <path> is <n> bytes long, and a unix socket path on macOS holds at most
+103 bytes (104 with the closing NUL byte); choose a shorter path`.
 
 Transport: newline-delimited JSON. Request `{"id": n, "op": "...", ...params}`;
 response `{"id": n, "ok": true, ...result}` or `{"id": n, "ok": false, "error": "message"}`.
