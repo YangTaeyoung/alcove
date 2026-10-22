@@ -1,6 +1,6 @@
 {
   "name": "alcove-mcp-server",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "MCP server that lets coding agents drive Alcove virtual machines (screenshots, mouse, keyboard, shell)",
   "type": "module",
   "bin": { "alcove-mcp": "dist/index.js" },

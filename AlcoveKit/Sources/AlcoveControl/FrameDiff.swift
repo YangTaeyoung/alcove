@@ -19,11 +19,15 @@ public struct FrameDiff: Sendable, Equatable {
         guard a.width == b.width, a.height == b.height else {
             return FrameDiff(changedTiles: cols * rows, totalTiles: cols * rows, rect: b.bounds)
         }
+        if a.pixels == b.pixels {
+            return FrameDiff(changedTiles: 0, totalTiles: cols * rows, rect: nil)
+        }
         var changed = 0
         var minX = Int.max, minY = Int.max, maxX = 0, maxY = 0
-        a.pixels.withUnsafeBytes { pa in
-            b.pixels.withUnsafeBytes { pb in
-                let pa = pa.bindMemory(to: UInt8.self), pb = pb.bindMemory(to: UInt8.self)
+        a.pixels.withUnsafeBytes { rawA in
+            b.pixels.withUnsafeBytes { rawB in
+                guard let pa = rawA.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let pb = rawB.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
                 for ty in 0..<rows { for tx in 0..<cols {
                     let x0 = tx * tile, y0 = ty * tile
                     let x1 = min(x0 + tile, b.width), y1 = min(y0 + tile, b.height)
@@ -38,11 +42,15 @@ public struct FrameDiff: Sendable, Equatable {
         return FrameDiff(changedTiles: changed, totalTiles: cols * rows, rect: rect)
     }
 
-    private static func tileChanged(_ a: UnsafeBufferPointer<UInt8>, _ b: UnsafeBufferPointer<UInt8>,
+    private static func tileChanged(_ a: UnsafePointer<UInt8>, _ b: UnsafePointer<UInt8>,
                                     width: Int, x0: Int, x1: Int, y0: Int, y1: Int) -> Bool {
+        let rowBytes = (x1 - x0) * 4
         for y in y0..<y1 {
-            var o = (y * width + x0) * 4
-            for _ in x0..<x1 {
+            let rowStart = (y * width + x0) * 4
+            if memcmp(a + rowStart, b + rowStart, rowBytes) == 0 { continue }
+            var o = rowStart
+            let rowEnd = rowStart + rowBytes
+            while o < rowEnd {
                 if abs(Int(a[o]) - Int(b[o])) > channelThreshold
                     || abs(Int(a[o + 1]) - Int(b[o + 1])) > channelThreshold
                     || abs(Int(a[o + 2]) - Int(b[o + 2])) > channelThreshold { return true }

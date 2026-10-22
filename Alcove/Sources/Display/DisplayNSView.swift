@@ -222,8 +222,9 @@ final class DisplayNSView: MTKView {
             adoptCursor(define)
         case .mouse(let position):
             guard position.con == Self.console else { return }
-            renderer?.setMouse(position)
-            needsDisplay = true
+            if renderer?.setMouse(position) == true {
+                needsDisplay = true
+            }
         case .bye:
             displayEnded()
         case .unknown:

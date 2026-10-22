@@ -157,7 +157,9 @@ public struct Frame: Sendable, Equatable {
                 ctx.textPosition = CGPoint(x: tag.minX + padding, y: tag.minY + padding + descent)
                 CTLineDraw(label, ctx)
             }
-            for i in stride(from: 3, to: buffer.count, by: 4) { buffer[i] = 255 }
+            if let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                for i in stride(from: 3, to: buffer.count, by: 4) { base[i] = 255 }
+            }
             return true
         }
         guard drawn else { return self }
@@ -180,10 +182,12 @@ public struct Frame: Sendable, Equatable {
                                       space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo) else { return false }
             ctx.interpolationQuality = quality
             ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            if let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                for i in stride(from: 3, to: buffer.count, by: 4) { base[i] = 255 }
+            }
             return true
         }
         guard ok else { return nil }
-        for i in stride(from: 3, to: data.count, by: 4) { data[i] = 255 }
         return Frame(width: width, height: height, pixels: data)
     }
 }

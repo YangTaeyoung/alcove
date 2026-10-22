@@ -244,6 +244,7 @@ final class VMSession: Identifiable {
     func saveConfig(_ newConfig: VMConfig) throws {
         try bundle.save(newConfig)
         config = newConfig
+        AppControlServer.shared.updateSessions(AppModel.shared.sessions)
         Task { [controller] in try? await controller.update(config: newConfig) }
     }
 

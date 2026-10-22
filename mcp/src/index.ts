@@ -24,7 +24,7 @@ try {
 }
 
 const client = new LeasedControlClient();
-const server = new McpServer({ name: "alcove-mcp-server", version: "0.2.1" }, { instructions: serverInstructions(enabled) });
+const server = new McpServer({ name: "alcove-mcp-server", version: "0.2.2" }, { instructions: serverInstructions(enabled) });
 const reg = registrar(server, enabled);
 registerCore(reg, client);
 registerActions(reg, client);

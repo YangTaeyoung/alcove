@@ -319,7 +319,7 @@ actor AgentLink {
 /// Adapts a `VMController` (plus a lazily connected agent) to `VMTarget`.
 public actor ControllerTarget: VMTarget {
     public nonisolated let name: String
-    public let controller: VMController
+    public nonisolated let controller: VMController
     private let frameSource = FrameSource()
     /// Whether `ALCOVE_FRAME_SOURCE=screendump` was in the environment when the process first asked for a frame.
     private static let screendumpOnly = ProcessInfo.processInfo.environment["ALCOVE_FRAME_SOURCE"] == "screendump"

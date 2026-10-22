@@ -34,12 +34,17 @@ final class FrameSource: @unchecked Sendable {
         }
         guard let mapping else { return nil }
         let rowBytes = surface.w * 4
-        var out = Data(count: rowBytes * surface.h)
+        let totalBytes = rowBytes * surface.h
+        var out = Data(count: totalBytes)
         let copied: Bool = mapping.withBytes { src in
             guard src.count >= surface.stride * surface.h else { return false }
             out.withUnsafeMutableBytes { dst in
-                for row in 0..<surface.h {
-                    memcpy(dst.baseAddress! + row * rowBytes, src.baseAddress! + row * surface.stride, rowBytes)
+                if surface.stride == rowBytes {
+                    memcpy(dst.baseAddress!, src.baseAddress!, totalBytes)
+                } else {
+                    for row in 0..<surface.h {
+                        memcpy(dst.baseAddress! + row * rowBytes, src.baseAddress! + row * surface.stride, rowBytes)
+                    }
                 }
             }
             return true

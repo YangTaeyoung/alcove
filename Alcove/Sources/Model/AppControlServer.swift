@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Synchronization
 import AlcoveControl
 import AlcoveEngine
 
@@ -33,6 +34,7 @@ final class AppControlServer {
             startFailure = nil
             return
         }
+        updateSessions(AppModel.shared.sessions)
         let h = ControlHandler(registry: registry, hostKind: "app", captureDirectory: ProxyProcess.defaultCADirectory)
         let s = ControlServer(handler: h, socketPath: path)
         do {
@@ -52,6 +54,11 @@ final class AppControlServer {
         server?.stop()
         server = nil
         handler = nil
+    }
+
+    /// Updates the session snapshot held by `registry` so control requests do not hop to `@MainActor` on every lookup.
+    func updateSessions(_ sessions: [VMSession]) {
+        registry.updateSessions(sessions.map { ($0.id, $0.name, $0.controller) })
     }
 
     /// Ends the active recordings, restores the guests of the running HTTP captures and ends the captures; returns
@@ -118,25 +125,36 @@ final class AppControlServer {
 /// app currently shows, so automation never drives a controller whose bundle
 /// is in the Trash or whose observers were discarded.
 actor AppVMRegistry: VMRegistry {
+    typealias SessionEntry = (id: String, name: String, controller: VMController)
+
     private var targets: [String: ControllerTarget] = [:]
+    private let cachedSessions = Mutex<[SessionEntry]?>(nil)
+
+    nonisolated func updateSessions(_ sessions: [SessionEntry]) {
+        cachedSessions.withLock { $0 = sessions }
+    }
+
+    private func currentSessions() async -> [SessionEntry] {
+        if let cached = cachedSessions.withLock({ $0 }) { return cached }
+        let live: [SessionEntry] = await MainActor.run {
+            AppModel.shared.sessions.map { ($0.id, $0.name, $0.controller) }
+        }
+        cachedSessions.withLock { if $0 == nil { $0 = live } }
+        return live
+    }
 
     func names() async -> [String] {
-        let live: [(id: String, name: String)] = await MainActor.run {
-            AppModel.shared.sessions.map { ($0.id, $0.name) }
-        }
+        let live = await currentSessions()
         prune(keeping: Set(live.map(\.id)))
         return live.map(\.name)
     }
 
     func target(named name: String) async -> VMTarget? {
-        let snapshot: (found: (id: String, controller: VMController)?, liveIDs: Set<String>) = await MainActor.run {
-            let sessions = AppModel.shared.sessions
-            let match = sessions.first { $0.name == name }
-            return (match.map { ($0.id, $0.controller) }, Set(sessions.map(\.id)))
-        }
-        prune(keeping: snapshot.liveIDs)
-        guard let found = snapshot.found else { return nil }
-        if let cached = targets[found.id], await cached.controller === found.controller {
+        let live = await currentSessions()
+        let found = live.first { $0.name == name }
+        prune(keeping: Set(live.map(\.id)))
+        guard let found else { return nil }
+        if let cached = targets[found.id], cached.controller === found.controller {
             return cached
         }
         let t = ControllerTarget(name: name, controller: found.controller)
@@ -164,8 +182,10 @@ extension AppVMRegistry: VMProvisioning {
 
     /// The controller of the session called `name`.
     private func controller(named name: String) async throws -> VMController {
-        let found = await MainActor.run { AppModel.shared.sessions.first { $0.name == name }?.controller }
-        guard let found else { throw ControlHandler.ControlError.noSuchVM(name) }
+        let live = await currentSessions()
+        guard let found = live.first(where: { $0.name == name })?.controller else {
+            throw ControlHandler.ControlError.noSuchVM(name)
+        }
         return found
     }
 }

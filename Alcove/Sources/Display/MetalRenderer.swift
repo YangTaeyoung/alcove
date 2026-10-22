@@ -48,6 +48,7 @@ final class MetalRenderer {
     private var surfaceTexture: MTLTexture?
     private var surface: SharedFramebuffer?
     private var geometry: FromQEMU.SurfaceSwitch?
+    private var dirtyRect: (x0: Int, y0: Int, x1: Int, y1: Int)?
 
     private var cursorTexture: MTLTexture?
     private var cursorHotspot = (x: 0, y: 0)
@@ -139,13 +140,15 @@ final class MetalRenderer {
         self.surface = surface
         self.geometry = geometry
         self.surfaceTexture = texture
+        self.dirtyRect = nil
         update(rect: FromQEMU.Update(con: geometry.con, x: 0, y: 0, w: geometry.w, h: geometry.h))
     }
 
-    /// Copy `rect` (surface pixel coordinates) from shared memory into the
-    /// texture. Rectangles are clipped to the surface; empty results are ignored.
+    /// Record `rect` (surface pixel coordinates) as dirty so the next draw
+    /// copies the union of pending updates from shared memory into the texture.
+    /// Rectangles are clipped to the surface; empty results are ignored.
     func update(rect: FromQEMU.Update) {
-        guard let texture = surfaceTexture, let surface, let geometry else { return }
+        guard surfaceTexture != nil, let surface, let geometry else { return }
         let x0 = max(rect.x, 0), y0 = max(rect.y, 0)
         let x1 = min(rect.x + rect.w, geometry.w), y1 = min(rect.y + rect.h, geometry.h)
         guard x1 > x0, y1 > y0 else { return }
@@ -153,7 +156,21 @@ final class MetalRenderer {
         let offset = y0 * geometry.stride + x0 * 4
         // The last row read ends at offset + (height-1)*stride + width*4 <= stride*h <= size.
         guard offset + (height - 1) * geometry.stride + width * 4 <= surface.size else { return }
-        let region = MTLRegionMake2D(x0, y0, width, height)
+        if let existing = dirtyRect {
+            dirtyRect = (min(existing.x0, x0), min(existing.y0, y0), max(existing.x1, x1), max(existing.y1, y1))
+        } else {
+            dirtyRect = (x0, y0, x1, y1)
+        }
+    }
+
+    /// Upload the coalesced dirty region to `surfaceTexture` right before drawing.
+    private func flushDirtyRect() {
+        guard let dirty = dirtyRect, let texture = surfaceTexture, let surface, let geometry else { return }
+        dirtyRect = nil
+        let width = dirty.x1 - dirty.x0, height = dirty.y1 - dirty.y0
+        let offset = dirty.y0 * geometry.stride + dirty.x0 * 4
+        guard offset + (height - 1) * geometry.stride + width * 4 <= surface.size else { return }
+        let region = MTLRegionMake2D(dirty.x0, dirty.y0, width, height)
         texture.replace(region: region, mipmapLevel: 0,
                         withBytes: surface.baseAddress.advanced(by: offset),
                         bytesPerRow: geometry.stride)
@@ -164,6 +181,7 @@ final class MetalRenderer {
         surfaceTexture = nil
         surface = nil
         geometry = nil
+        dirtyRect = nil
         clearCursor()
     }
 
@@ -187,9 +205,13 @@ final class MetalRenderer {
     }
 
     /// Update the guest-reported cursor position (surface pixels) and visibility.
-    func setMouse(_ mouse: FromQEMU.MousePosition) {
+    /// Returns true when the cursor overlay changed and needs a redraw.
+    @discardableResult
+    func setMouse(_ mouse: FromQEMU.MousePosition) -> Bool {
+        let changed = cursorPosition.x != mouse.x || cursorPosition.y != mouse.y || cursorVisible != mouse.on
         cursorPosition = (mouse.x, mouse.y)
         cursorVisible = mouse.on
+        return changed && cursorTexture != nil
     }
 
     /// Forget the cursor image and hide the overlay.
@@ -208,6 +230,7 @@ final class MetalRenderer {
               let descriptor = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        flushDirtyRect()
         commandBuffer.label = "alcove.frame"
         descriptor.colorAttachments[0].loadAction = .clear
         descriptor.colorAttachments[0].clearColor = MetalRenderer.clearColor

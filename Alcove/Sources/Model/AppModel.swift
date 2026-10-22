@@ -25,7 +25,9 @@ final class AppModel {
     /// Why no engine is available (nil when `engine` is set).
     private(set) var engineIssue: String?
     /// One session per loadable bundle, sorted by name. Empty while the engine is missing.
-    private(set) var sessions: [VMSession] = []
+    private(set) var sessions: [VMSession] = [] {
+        didSet { AppControlServer.shared.updateSessions(sessions) }
+    }
     /// Bundles that exist on disk but could not be loaded, as "name: reason".
     private(set) var loadFailures: [String] = []
     /// Number of bundles on disk that cannot be shown because the engine is missing.
