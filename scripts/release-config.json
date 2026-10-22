@@ -1,0 +1,11 @@
+{
+  "repository": "YangTaeyoung/alcove",
+  "bundle_id": "io.github.yangtaeyoung.Alcove",
+  "team_id": "G54PSSU8W5",
+  "sparkle_version": "2.10.0",
+  "sparkle_sha256": "c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c",
+  "sparkle_key_account": "io.github.yangtaeyoung.Alcove",
+  "sparkle_public_key": "971cCU8UyVb3qewcAGGSXIRt6PPjM6KMeA3CxulcEbU=",
+  "feed_url": "https://github.com/YangTaeyoung/alcove/releases/latest/download/appcast.xml",
+  "minimum_system_version": "15.0"
+}

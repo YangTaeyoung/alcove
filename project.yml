@@ -11,10 +11,15 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "15.0"
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "-"
-    ENABLE_HARDENED_RUNTIME: NO
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 packages:
   AlcoveKit:
     path: AlcoveKit
+  # Same version as scripts/release-config.json (whose tools sign the updates).
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.10.0
 targets:
   Alcove:
     type: application
@@ -50,18 +55,28 @@ targets:
         product: AlcoveAgent
       - package: AlcoveKit
         product: AlcoveControl
+      - package: Sparkle
+        product: Sparkle
     info:
       path: Alcove/Info.plist
       properties:
         CFBundleName: Alcove
         CFBundleDisplayName: Alcove
         CFBundleIdentifier: io.github.yangtaeyoung.Alcove
-        CFBundleShortVersionString: "0.2.2"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "0.2.3"
+        CFBundleVersion: "5"
         LSMinimumSystemVersion: "15.0"
         NSPrincipalClass: NSApplication
         NSHighResolutionCapable: true
         LSApplicationCategoryType: public.app-category.developer-tools
+        # Sparkle 2 (AppUpdater.swift); values from scripts/release-config.json, which
+        # scripts/release-macos.sh checks against these before it builds.
+        SUFeedURL: https://github.com/YangTaeyoung/alcove/releases/latest/download/appcast.xml
+        SUPublicEDKey: 971cCU8UyVb3qewcAGGSXIRt6PPjM6KMeA3CxulcEbU=
+        SUEnableAutomaticChecks: true
+        SUAutomaticallyUpdate: false
+        SUEnableSystemProfiling: false
+        SUFeedURLOverrideAllowed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.yangtaeyoung.Alcove

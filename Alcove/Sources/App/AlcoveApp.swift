@@ -92,8 +92,17 @@ struct AlcoveCommands: Commands {
     @FocusedValue(\.vmCommands) private var vm
     @Environment(\.openWindow) private var openWindow
     private let model = AppModel.shared
+    @Bindable private var updater = AppUpdater.shared
 
     var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { updater.checkForUpdates() }
+                .disabled(!updater.canCheckForUpdates)
+            if updater.isAvailable {
+                Toggle("Automatically Check for Updates", isOn: $updater.automaticallyChecksForUpdates)
+            }
+        }
+
         CommandGroup(replacing: .newItem) {
             Button("New Virtual Machine…") {
                 openWindow(id: LibraryView.windowID)
@@ -155,6 +164,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let failure = control.startFailure {
             model.pendingError = [model.pendingError, failure].compactMap { $0 }.joined(separator: "\n\n")
         }
+        // Sparkle (Release builds with a feed only); see AppUpdater.
+        AppUpdater.shared.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

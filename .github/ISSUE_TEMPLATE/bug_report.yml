@@ -125,7 +125,7 @@ body:
       description: >
         Only for guest tools problems. `alcovectl agent <name>` prints the
         handshake, or read the first line of the agent log.
-      placeholder: "0.2.2"
+      placeholder: "0.2.3"
     validations:
       required: false
 
